@@ -1,0 +1,8 @@
+name: minir
+version: 0.1.0
+description: "Minir — minimal local-first memory provider template: SQLite turn/note store, keyword recall, four tools. Stdlib only; fork it to build your own provider."
+author: chaorenex1
+license: MIT
+tags:
+  - memory
+  - template

@@ -1,0 +1,14 @@
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+.venv/
+venv/
+*.egg-info/
+dist/
+build/
+
+# Local memory databases (turns/notes) and journals
+*.db
+*.db-wal
+*.db-shm
