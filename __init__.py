@@ -10,6 +10,9 @@ Fork this as a starting point:
 * ``register(ctx)`` plus the lifecycle methods below are the contract surface.
 * ``store.py`` is the storage layer — swap it for your backend (API client,
   vector index, knowledge graph) and keep this module's shape.
+* ``turn_counter.py`` holds the base / dialectic-reasoning layer counters that turn
+  ``on_turn_start`` ticks into queued jobs (a session + the time window to reason
+  over); the worker that consumes them is the hook for your own reasoning pass.
 * Delete optional methods you do not need instead of leaving empty overrides;
   the ABC already provides no-op defaults.
 
@@ -41,6 +44,13 @@ from agent.memory_provider import (
 from tools.registry import tool_error
 
 from .store import MinirStore, format_when
+from .turn_counter import (
+    DEFAULT_BASE_INTERVAL,
+    DEFAULT_DIALECTIC_INTERVAL,
+    DEFAULT_SESSION_MODE,
+    TRACKER,
+    Trigger,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -86,6 +96,19 @@ def _env_int(name: str, default: int) -> int:
         return default
 
 
+def _env_str(name: str, default: str) -> str:
+    """String env override; empty/unset falls back to *default*."""
+    return str(os.environ.get(name, "")).strip() or default
+
+
+def _as_interval(value: Any, default: int) -> int:
+    """Config value -> turn interval >= 1 (anything unparsable falls back to *default*)."""
+    try:
+        return max(1, int(value))
+    except (TypeError, ValueError):
+        return default
+
+
 class MinirMemoryProvider(MemoryProvider):
     """Local-first memory: SQLite turn/note store + keyword recall."""
 
@@ -98,6 +121,16 @@ class MinirMemoryProvider(MemoryProvider):
         except (TypeError, ValueError):
             default_limit = _DEFAULT_PREFETCH_LIMIT
         self._prefetch_limit = max(1, min(20, _env_int("MINIR_PREFETCH_LIMIT", default_limit)))
+
+        # Layer cadence: how many turns each layer accumulates before it reasons over the
+        # history it has not seen yet (see turn_counter.py).
+        self._base_interval = max(1, _env_int(
+            "MINIR_BASE_INTERVAL", _as_interval(self._config.get("base_interval"), DEFAULT_BASE_INTERVAL)))
+        self._dialectic_interval = max(1, _env_int(
+            "MINIR_DIALECTIC_INTERVAL",
+            _as_interval(self._config.get("dialectic_interval"), DEFAULT_DIALECTIC_INTERVAL)))
+        self._session_mode = _env_str("MINIR_SESSION_MODE", str(
+            self._config.get("session_mode") or DEFAULT_SESSION_MODE))
 
         self._store: Optional[MinirStore] = None
         self._session_id = ""
@@ -124,6 +157,12 @@ class MinirMemoryProvider(MemoryProvider):
         self._store = MinirStore(db_path)
         self._session_id = session_id or ""
         self._agent_context = str(kwargs.get("agent_context") or "primary")
+        # Configure before opening the session: intervals/mode apply to sessions opened later
+        # (an already-running session keeps the cadence it started with).
+        TRACKER.configure(base_interval=self._base_interval,
+                          dialectic_interval=self._dialectic_interval,
+                          default_mode=self._session_mode)
+        TRACKER.begin(self._session_id, mode=self._session_mode)
         with self._lock:
             self._cached = None
         logger.debug("Minir store ready at %s", db_path)
@@ -147,12 +186,22 @@ class MinirMemoryProvider(MemoryProvider):
             {"key": "prefetch_limit", "description": "Maximum memory items injected per turn",
              "type": "integer", "default": str(_DEFAULT_PREFETCH_LIMIT),
              "minimum": 1, "maximum": 20, "env_var": "MINIR_PREFETCH_LIMIT"},
+            {"key": "base_interval", "description": "Turns the base layer accumulates before it reasons",
+             "type": "integer", "default": str(DEFAULT_BASE_INTERVAL),
+             "minimum": 1, "env_var": "MINIR_BASE_INTERVAL"},
+            {"key": "dialectic_interval",
+             "description": "Turns the dialectic-reasoning layer accumulates before it reasons",
+             "type": "integer", "default": str(DEFAULT_DIALECTIC_INTERVAL),
+             "minimum": 1, "env_var": "MINIR_DIALECTIC_INTERVAL"},
+            {"key": "session_mode", "description": "Mode stamped on each newly opened session",
+             "type": "text", "default": DEFAULT_SESSION_MODE, "env_var": "MINIR_SESSION_MODE"},
         ]
 
     # -- prompt + recall ------------------------------------------------------
 
     def system_prompt_block(self) -> str:
         """STATIC prompt text; dynamic recall goes through ``prefetch()``."""
+        logger.info("Minir system_prompt_block (built once per session)")
         return (
             "# Minir Memory\n"
             f"Active. Long-term memory lives in {_PROVIDER_LABEL}'s local store.\n"
@@ -239,6 +288,8 @@ class MinirMemoryProvider(MemoryProvider):
     def on_memory_write(self, action: str, target: str, content: str,
                         metadata: Optional[dict[str, Any]] = None) -> None:
         """Mirror built-in memory-tool writes so both stores stay searchable."""
+        logger.info("Minir on_memory_write: action=%s target=%s chars=%d",
+                    action, target, len(content or ""))
         if self._store is None or not self._capture or not (content or "").strip():
             return
         try:
@@ -250,11 +301,84 @@ class MinirMemoryProvider(MemoryProvider):
         except Exception as exc:
             logger.debug("Minir memory mirror failed: %s", exc)
 
+    # -- turn counting (base / dialectic-reasoning layers) ---------------------
+
+    def on_turn_start(self, turn_number: int, message: str, **kwargs) -> None:
+        """Per-turn tick: advance both layer counters and queue the jobs that came due.
+
+        The host passes its own session turn number (already incremented for this turn), so
+        the counters follow the conversation instead of a second, drifting count. Fires for
+        every user turn — including a trivial prompt that ``sync_turn`` skips — and, being a
+        memory-provider hook, never for a subagent or cron turn.
+        """
+        if self._store is None or self._agent_context not in ("", "primary"):
+            return
+        try:
+            self._dispatch(TRACKER.tick(self._session_id, turn_number))
+        except Exception as exc:  # counting must never break a turn
+            logger.warning("Minir on_turn_start failed: %s", exc)
+
+    def on_pre_compress(self, messages: Optional[list[dict[str, Any]]] = None) -> str:
+        """Compression is a reasoning boundary: flush the dialectic tail before the
+        history it covers is summarized away. The queue is the return channel, so this
+        returns ``""`` — compression insights are not this layer's job."""
+        try:
+            self._dispatch(TRACKER.tail(self._session_id))
+        except Exception as exc:
+            logger.warning("Minir on_pre_compress failed: %s", exc)
+        return ""
+
+    def on_session_end(self, messages: Optional[list[dict[str, Any]]] = None) -> None:
+        """Real session boundary: flush the un-reasoned tail once, then stop counting.
+
+        The host queues this ahead of ``on_session_switch`` on one serialized worker, so the
+        counter always reflects every turn of the ending session. ``tail()`` is watermark-based
+        and therefore a no-op when the tail is already covered — a ``/new`` reaches this
+        method, ``on_session_finalize`` and ``on_session_reset`` for the same boundary.
+        """
+        try:
+            self._dispatch(TRACKER.tail(self._session_id, close=True))
+        except Exception as exc:
+            logger.warning("Minir on_session_end failed: %s", exc)
+
+    def _dispatch(self, triggers: list[Trigger]) -> None:
+        """Persist each due job (session + window) for a layer worker to pick up."""
+        if not triggers:
+            return
+        for trigger in triggers:
+            job_id: Optional[int] = None
+            if self._store is not None:
+                try:
+                    job_id = self._store.record_job(trigger.layer, trigger.session_id,
+                                                    trigger.from_ts, trigger.to_ts, trigger.turns)
+                except Exception as exc:
+                    logger.warning("Minir job record failed: %s", exc)
+            logger.info("Minir %s-layer job queued (#%s): session=%s turns=%d window=%s..%s",
+                        trigger.layer, job_id, trigger.session_id or "-", trigger.turns,
+                        format_when(trigger.from_ts), format_when(trigger.to_ts))
+
     # -- session lifecycle ----------------------------------------------------
 
     def on_session_switch(self, new_session_id: str, *, parent_session_id: str = "",
                           reset: bool = False, rewound: bool = False, **kwargs) -> None:
         """Rebind per-session state after /resume, /branch, /reset, /new or compression."""
+        previous_id = self._session_id
+        new_session_id = new_session_id or ""
+        if new_session_id and new_session_id != previous_id:
+            if reset:
+                # New conversation: flush the old tail (a no-op when on_session_end already
+                # did, which is the usual /new path), freeze it, and open the next session.
+                self._dispatch(TRACKER.tail(previous_id, close=True))
+                TRACKER.stop(previous_id)
+                TRACKER.begin(new_session_id, mode=self._session_mode)
+            elif parent_session_id:
+                # /branch: the branch carries the transcript forward, so it continues the
+                # parent's counters instead of re-reasoning history the parent already covered.
+                TRACKER.inherit(previous_id, new_session_id)
+            else:
+                # /resume: a different session id continues from a persisted transcript; the
+                # host's turn number rehydrates the count on the first tick.
+                TRACKER.begin(new_session_id, mode=self._session_mode)
         self._session_id = new_session_id or self._session_id
         if reset:
             with self._lock:
@@ -311,6 +435,7 @@ class MinirMemoryProvider(MemoryProvider):
             return json.dumps({"deleted": self._store.forget(note_id), "note_id": note_id})
         if tool_name == "minir_stats":
             return json.dumps({**self._store.stats(), "session_id": self._session_id,
+                               "layers": TRACKER.snapshot(self._session_id),
                                "capture_turns": self._capture, "prefetch_limit": self._prefetch_limit})
         return tool_error(f"Unknown tool: {tool_name}")
 
@@ -383,9 +508,80 @@ _TOOL_FORGET = _tool_schema(
     {"note_id": _prop("Id of the note to delete.", "integer")}, ("note_id",))
 _TOOL_STATS = _tool_schema(
     "minir_stats",
-    "Report Minir store statistics — turn/note/session counts and the database path.")
+    "Report Minir store statistics — turn/note/session/job counts, the base + dialectic "
+    "layer counters for this session, and the database path.")
 
 
 def register(ctx) -> None:
-    """Entry point the Hermes loader calls; registers this provider under its name."""
+    """Entry point the Hermes loader calls: the provider plus its plugin-hook observers.
+
+    The counting loop itself lives on the *memory-provider* surface (``on_turn_start`` is
+    the only hook the host hands a per-session turn number, and it is never fired for a
+    subagent or cron turn). The plugin hooks below cannot carry it — the host runs the
+    hot ones (``pre/post_llm_call``, ``post_tool_call``) under a 30s timeout that *abandons*
+    a slow callback and suppresses it for 60s, and ``on_session_end`` there is a per-turn
+    event, not a session boundary — so they are used for what they are: session identity
+    and per-turn logs.
+    """
     ctx.register_memory_provider(MinirMemoryProvider())
+    ctx.register_hook("on_session_start", _on_session_start)
+    ctx.register_hook("on_session_reset", _on_session_reset)
+    ctx.register_hook("on_session_finalize", _on_session_finalize)
+    ctx.register_hook("pre_llm_call", _on_pre_llm_call)
+    ctx.register_hook("post_llm_call", _on_post_llm_call)
+    ctx.register_hook("post_tool_call", _on_post_tool_call)
+
+
+# -- plugin hooks -------------------------------------------------------------
+# Handlers must return None: ``pre_llm_call`` injects a returned string into the user
+# message, and the host sends a non-empty ``on_session_finalize`` result to the chat.
+
+def _on_session_start(session_id: str = "", model: str = "", platform: str = "", **kwargs) -> None:
+    """Record the session the host just opened (the first tick opens it too, defensively)."""
+    try:
+        TRACKER.begin(session_id)
+        logger.info("Minir on_session_start: session=%s model=%s platform=%s",
+                    session_id or "-", model or "-", platform or "-")
+    except Exception as exc:
+        logger.warning("Minir on_session_start failed: %s", exc)
+
+
+def _on_session_reset(session_id: str = "", old_session_id: str = "",
+                      reason: str = "", **kwargs) -> None:
+    """``/new``/``/reset``: stop the old counters, stamp the mode onto the new session.
+
+    The provider's ``on_session_switch(reset=True)`` already ran (the host fires it first),
+    so this is the idempotent second half: ``begin`` never resets progress it did not create.
+    """
+    try:
+        if old_session_id:
+            TRACKER.stop(old_session_id)
+        TRACKER.begin(session_id)
+        logger.info("Minir on_session_reset: %s -> %s (reason=%s)",
+                    old_session_id or "-", session_id or "-", reason or "-")
+    except Exception as exc:
+        logger.warning("Minir on_session_reset failed: %s", exc)
+
+
+def _on_session_finalize(session_id: str = "", **kwargs) -> None:
+    """Process teardown for one session: stop counting it. Returns nothing on purpose."""
+    try:
+        TRACKER.stop(session_id)
+        logger.info("Minir on_session_finalize: session=%s", session_id or "-")
+    except Exception as exc:
+        logger.warning("Minir on_session_finalize failed: %s", exc)
+
+
+def _on_pre_llm_call(session_id: str = "", turn_id: str = "", **kwargs) -> None:
+    logger.info("Minir pre_llm_call: session=%s turn=%s", session_id or "-", turn_id or "-")
+
+
+def _on_post_llm_call(session_id: str = "", turn_id: str = "", model: str = "", **kwargs) -> None:
+    logger.info("Minir post_llm_call: session=%s turn=%s model=%s",
+                session_id or "-", turn_id or "-", model or "-")
+
+
+def _on_post_tool_call(tool_name: str = "", session_id: str = "",
+                       duration_ms: Any = None, **kwargs) -> None:
+    logger.info("Minir post_tool_call: %s in %sms (session=%s)",
+                tool_name or "-", duration_ms, session_id or "-")

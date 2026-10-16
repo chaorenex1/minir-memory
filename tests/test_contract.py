@@ -35,16 +35,25 @@ def test_instantiates_without_host_runtime(plugin_package):
 
 def test_register_captures_provider(plugin_package):
     class FakeContext:
+        """Stand-in for the host's register context: the provider call plus the plugin
+        hooks the plugin subscribes to (``_ProviderCollector.register_hook`` forwards to a
+        real ``PluginContext``, so hooks are available on the memory-provider path too)."""
+
         def __init__(self):
             self.provider = None
+            self.hooks = {}
 
         def register_memory_provider(self, provider):
             self.provider = provider
+
+        def register_hook(self, name, callback):
+            self.hooks[name] = callback
 
     ctx = FakeContext()
     plugin_package.register(ctx)
     assert isinstance(ctx.provider, MemoryProvider)
     assert ctx.provider.name == "minir"
+    assert ctx.hooks
 
 
 def test_discovery_markers_present(plugin_package):
@@ -66,6 +75,42 @@ def test_manifest_name_matches_provider_name(plugin_package):
     assert declared == plugin_package.MinirMemoryProvider({}).name
     if PLUGIN_ROOT.name == "minir":
         assert PLUGIN_ROOT.name == declared
+
+
+def test_manifest_declares_every_registered_hook(plugin_package):
+    """``hermes plugins validate`` fails the manifest when ``register()`` subscribes to a hook
+    that ``provides_hooks`` does not declare — keep the two lists in step."""
+    class FakeContext:
+        def __init__(self):
+            self.hooks = []
+
+        def register_memory_provider(self, provider):
+            pass
+
+        def register_hook(self, name, callback):
+            self.hooks.append(name)
+
+    ctx = FakeContext()
+    plugin_package.register(ctx)
+
+    declared = []
+    in_block = False
+    for line in (PLUGIN_ROOT / "plugin.yaml").read_text(encoding="utf-8-sig").splitlines():
+        if line.startswith("provides_hooks:"):
+            in_block = True
+            continue
+        if in_block:
+            if line.startswith("  - "):
+                declared.append(line[4:].strip())
+            elif line.strip() and not line.startswith(" "):
+                break
+    assert declared, "register() subscribes to hooks, so provides_hooks must not be empty"
+    assert sorted(declared) == sorted(ctx.hooks)
+    try:  # host mode only: the names must be real events the host will deliver
+        from hermes_cli.plugins import VALID_HOOKS
+    except Exception:
+        return
+    assert set(declared) <= VALID_HOOKS, sorted(set(declared) - VALID_HOOKS)
 
 
 def test_tool_schemas_are_openai_shaped(plugin_package):

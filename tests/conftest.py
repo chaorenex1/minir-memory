@@ -42,14 +42,27 @@ if _workspace and _workspace not in sys.path:
 def _try_import(name: str) -> Optional[types.ModuleType]:
     try:
         return __import__(name, fromlist=["_"])
-    except BaseException:  # missing, or a host module needing more runtime than the test env has
+    except BaseException as exc:  # missing, or a host module needing more runtime than the test env has
+        _IMPORT_ERRORS[name] = f"{type(exc).__name__}: {exc}"
         return None
 
+
+_IMPORT_ERRORS: dict[str, str] = {}
 
 _host_memory_provider = _try_import("agent.memory_provider")
 _host_tool_registry = _try_import("tools.registry")
 CONTRACT_MODE = "host" if _host_memory_provider and _host_tool_registry else (
     "shim" if not _host_memory_provider and not _host_tool_registry else "partial")
+
+if _workspace and CONTRACT_MODE != "host":
+    # Pointing at a workspace and quietly testing against the shim is a lie: the shim cannot
+    # fail, so a contract break would show up as a pass. Fail loudly instead, with the reason.
+    _reasons = "; ".join(f"{name} -> {error}" for name, error in _IMPORT_ERRORS.items()) or "unknown import failure"
+    raise RuntimeError(
+        f"HERMES_WORKSPACE={_workspace!r} is set but the host modules did not import "
+        f"(contract mode = {CONTRACT_MODE}): {_reasons}. "
+        f"Install the workspace's dependencies, or unset HERMES_WORKSPACE to run the hermetic shim suite."
+    )
 
 
 def _namespace(name: str) -> types.ModuleType:
@@ -226,8 +239,26 @@ def make_provider(plugin_package, tmp_path):
 @pytest.fixture(autouse=True)
 def _clean_minir_env(monkeypatch):
     """Config written by tests must not be shadowed by the developer's environment."""
-    for key in ("MINIR_CAPTURE_TURNS", "MINIR_PREFETCH_LIMIT"):
+    for key in ("MINIR_CAPTURE_TURNS", "MINIR_PREFETCH_LIMIT", "MINIR_BASE_INTERVAL",
+                "MINIR_DIALECTIC_INTERVAL", "MINIR_SESSION_MODE"):
         monkeypatch.delenv(key, raising=False)
+
+
+@pytest.fixture(autouse=True)
+def _clean_tracker(plugin_package):
+    """The counting registry is process-wide (see turn_counter.TRACKER), so isolate tests:
+    drop every session and restore the default cadence a previous test may have configured."""
+    counter = plugin_package.turn_counter
+
+    def _reset():
+        counter.TRACKER.reset()
+        counter.TRACKER.configure(base_interval=counter.DEFAULT_BASE_INTERVAL,
+                                  dialectic_interval=counter.DEFAULT_DIALECTIC_INTERVAL,
+                                  default_mode=counter.DEFAULT_SESSION_MODE)
+
+    _reset()
+    yield
+    _reset()
 
 
 @pytest.fixture()

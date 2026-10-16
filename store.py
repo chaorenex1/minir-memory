@@ -1,13 +1,17 @@
 """SQLite storage for the Minir memory plugin — stdlib only.
 
-Two tables:
+Three tables:
 
 * ``turns`` — completed conversation turns, one row per user/assistant message,
   kept per ``session_id`` so recall can cite which session something came from.
 * ``notes`` — explicit memories: ``minir_remember`` tool calls and mirrored
   built-in memory-tool writes (``MemoryProvider.on_memory_write``).
+* ``jobs`` — one row per layer job the turn counter queued (see ``turn_counter.py``):
+  the session and half-open time window ``(from_ts, to_ts]`` the job must reason over.
+  Rows land as ``pending``; the worker that consumes them is not part of this template.
 
-``search()`` is a portable "match any query token" scan over both tables — good
+``search()`` is a portable "match any query token" scan over the ``turns`` and
+``notes`` tables — good
 enough for a template and dependency-free. Swap in SQLite FTS5, embeddings, or
 a remote index when you outgrow it; only ``search()`` and the write methods are
 part of the plugin's internal contract.
@@ -45,6 +49,18 @@ CREATE TABLE IF NOT EXISTS notes (
     created_at REAL NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_notes_created ON notes(created_at DESC);
+CREATE TABLE IF NOT EXISTS jobs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    layer TEXT NOT NULL,
+    session_id TEXT NOT NULL DEFAULT '',
+    from_ts REAL NOT NULL,
+    to_ts REAL NOT NULL,
+    turns INTEGER NOT NULL DEFAULT 0,
+    status TEXT NOT NULL DEFAULT 'pending',
+    created_at REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_jobs_status ON jobs(status, id);
+CREATE INDEX IF NOT EXISTS idx_jobs_session ON jobs(session_id);
 """
 
 
@@ -121,6 +137,27 @@ class MinirStore:
             self._conn.commit()
             return int(cur.rowcount)
 
+    def record_job(self, layer: str, session_id: str, from_ts: float, to_ts: float,
+                   turns: int = 0, *, status: str = "pending") -> int:
+        """Queue one layer job (session + reasoning window); returns its row id."""
+        with self._lock:
+            cur = self._conn.execute(
+                "INSERT INTO jobs (layer, session_id, from_ts, to_ts, turns, status, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (layer, session_id, float(from_ts), float(to_ts), int(turns), status, time.time()),
+            )
+            self._conn.commit()
+            return int(cur.lastrowid)
+
+    def pending_jobs(self, limit: int = 20) -> list[dict[str, Any]]:
+        """Oldest-first queued jobs, the handoff a layer worker consumes."""
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT id, layer, session_id, from_ts, to_ts, turns, status, created_at FROM jobs "
+                "WHERE status = 'pending' ORDER BY id LIMIT ?", (max(1, min(int(limit), 200)),),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
     # -- reads ----------------------------------------------------------------
 
     def search(self, query: str, limit: int = 5) -> list[dict[str, Any]]:
@@ -170,11 +207,15 @@ class MinirStore:
             turns = self._conn.execute("SELECT COUNT(*) AS n FROM turns").fetchone()["n"]
             notes = self._conn.execute("SELECT COUNT(*) AS n FROM notes").fetchone()["n"]
             sessions = self._conn.execute("SELECT COUNT(DISTINCT session_id) AS n FROM turns").fetchone()["n"]
+            jobs = self._conn.execute("SELECT COUNT(*) AS n FROM jobs").fetchone()["n"]
+            pending = self._conn.execute(
+                "SELECT COUNT(*) AS n FROM jobs WHERE status = 'pending'").fetchone()["n"]
         try:
             size = self.path.stat().st_size
         except OSError:
             size = 0
         return {"turns": int(turns), "notes": int(notes), "sessions": int(sessions),
+                "jobs": int(jobs), "pending_jobs": int(pending),
                 "db_path": str(self.path), "db_bytes": size}
 
     def close(self) -> None:
