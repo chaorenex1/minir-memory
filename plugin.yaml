@@ -1,6 +1,6 @@
 name: minir
-version: 0.1.0
-description: "Minir — minimal local-first memory provider template: SQLite turn/note store, keyword recall, four tools, and base/dialectic layer turn counting. Stdlib only; fork it to build your own provider."
+version: 0.4.0
+description: "Minir — local-first memory plugin: base/dialectic layer artifacts in SQLite, FTS5 recall over every conclusion, five-section user/AI cards, depth-1-3 dialectic reasoning over host history, identity files, adviser-review injection, and a context engine that folds progressively and writes a Task Handoff summary. Stores no transcripts. Stdlib only; fork it."
 author: chaorenex1
 license: MIT
 tags:

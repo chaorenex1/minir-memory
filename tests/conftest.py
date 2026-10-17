@@ -50,8 +50,9 @@ def _try_import(name: str) -> Optional[types.ModuleType]:
 _IMPORT_ERRORS: dict[str, str] = {}
 
 _host_memory_provider = _try_import("agent.memory_provider")
+_host_context_engine = _try_import("agent.context_engine")
 _host_tool_registry = _try_import("tools.registry")
-CONTRACT_MODE = "host" if _host_memory_provider and _host_tool_registry else (
+CONTRACT_MODE = "host" if _host_memory_provider and _host_context_engine and _host_tool_registry else (
     "shim" if not _host_memory_provider and not _host_tool_registry else "partial")
 
 if _workspace and CONTRACT_MODE != "host":
@@ -170,6 +171,102 @@ def _install_memory_provider_shim() -> None:
     _namespace("agent").memory_provider = provider_module
 
 
+def _install_context_engine_shim() -> None:
+    """Minimal stand-in for ``agent.context_engine`` (only the surface this plugin uses)."""
+    module = _namespace("agent.context_engine")
+
+    class ContextEngine:  # noqa: D101 - the real contract lives in agent/context_engine.py
+        last_prompt_tokens: int = 0
+        last_completion_tokens: int = 0
+        last_total_tokens: int = 0
+        threshold_tokens: int = 0
+        context_length: int = 0
+        compression_count: int = 0
+        threshold_percent: float = 0.75
+        protect_first_n: int = 3
+        protect_last_n: int = 6
+        emit_automatic_compaction_status: bool = True
+
+        @property
+        def name(self) -> str:
+            raise NotImplementedError
+
+        def update_from_response(self, usage: dict) -> None:
+            raise NotImplementedError
+
+        def should_compress(self, prompt_tokens=None) -> bool:
+            raise NotImplementedError
+
+        def compress(self, messages: list, current_tokens=None, focus_topic=None,
+                     force: bool = False, memory_context: str = "") -> list:
+            raise NotImplementedError
+
+        def should_compress_info(self, prompt_tokens=None):
+            return self.should_compress(prompt_tokens), None
+
+        def prune_tool_results_only(self, messages: list, current_tokens=None):
+            return messages, 0
+
+        def select_context(self, request_messages: list, *, conversation_messages=None,
+                           incoming_message=None, budget_tokens: int = 0):
+            return None
+
+        def on_turn_complete(self, messages: list, usage=None, **kwargs) -> None:
+            return None
+
+        def should_compress_preflight(self, messages: list) -> bool:
+            return False
+
+        def should_defer_preflight_to_real_usage(self, rough_tokens: int) -> bool:
+            return False
+
+        def has_content_to_compress(self, messages: list) -> bool:
+            return True
+
+        def on_session_start(self, session_id: str, **kwargs) -> None:
+            return None
+
+        def on_session_end(self, session_id: str, messages: list) -> None:
+            return None
+
+        def on_session_reset(self) -> None:
+            self.last_prompt_tokens = 0
+            self.last_completion_tokens = 0
+            self.last_total_tokens = 0
+            self.compression_count = 0
+
+        def get_tool_schemas(self) -> list:
+            return []
+
+        def handle_tool_call(self, name: str, args: dict, **kwargs) -> str:
+            return json.dumps({"error": f"Unknown context engine tool: {name}"})
+
+        def get_status(self) -> dict:
+            last_prompt = max(self.last_prompt_tokens, 0)
+            return {
+                "last_prompt_tokens": last_prompt,
+                "threshold_tokens": self.threshold_tokens,
+                "context_length": self.context_length,
+                "usage_percent": (min(100, last_prompt / self.context_length * 100)
+                                  if self.context_length else 0),
+                "compression_count": self.compression_count,
+            }
+
+        def clone_for_agent(self):
+            import copy
+
+            return copy.deepcopy(self)
+
+        def update_model(self, model: str, context_length: int, base_url: str = "",
+                         api_key: str = "", provider: str = "", api_mode: str = "") -> None:
+            self.context_length = int(context_length or 0)
+            self.threshold_tokens = int(self.context_length * self.threshold_percent)
+
+    module.ContextEngine = ContextEngine
+    module.sanitize_memory_context = lambda text: text
+    _namespace("agent").context_engine = module
+
+
 def _install_tool_registry_shim() -> None:
     """Minimal stand-in for ``tools.registry`` (only the surface this plugin uses)."""
     registry = _namespace("tools.registry")
@@ -187,6 +284,8 @@ def _install_tool_registry_shim() -> None:
 
 if _host_memory_provider is None:
     _install_memory_provider_shim()
+if _host_context_engine is None:
+    _install_context_engine_shim()
 if _host_tool_registry is None:
     _install_tool_registry_shim()
 
@@ -237,10 +336,21 @@ def make_provider(plugin_package, tmp_path):
 
 
 @pytest.fixture(autouse=True)
+def _no_layer_reasoning(monkeypatch):
+    """Layer reasoning runs a real host model call; tests opt in per test.
+
+    The background drain would otherwise race any assertion about the job queue, and the
+    suite would depend on the machine's auxiliary model.
+    """
+    monkeypatch.setenv("MINIR_REASONING_ENABLED", "false")
+
+
+@pytest.fixture(autouse=True)
 def _clean_minir_env(monkeypatch):
     """Config written by tests must not be shadowed by the developer's environment."""
-    for key in ("MINIR_CAPTURE_TURNS", "MINIR_PREFETCH_LIMIT", "MINIR_BASE_INTERVAL",
-                "MINIR_DIALECTIC_INTERVAL", "MINIR_SESSION_MODE"):
+    for key in ("MINIR_PREFETCH_LIMIT", "MINIR_BASE_INTERVAL", "MINIR_CONTEXT_CADENCE",
+                "MINIR_DIALECTIC_INTERVAL", "MINIR_DIALECTIC_CADENCE",
+                "MINIR_DIALECTIC_DEPTH", "MINIR_HANDOFF_ENABLED", "MINIR_SESSION_MODE"):
         monkeypatch.delenv(key, raising=False)
 
 
@@ -255,6 +365,7 @@ def _clean_tracker(plugin_package):
         counter.TRACKER.configure(base_interval=counter.DEFAULT_BASE_INTERVAL,
                                   dialectic_interval=counter.DEFAULT_DIALECTIC_INTERVAL,
                                   default_mode=counter.DEFAULT_SESSION_MODE)
+        plugin_package._ACTIVE_PROVIDER = None
 
     _reset()
     yield
@@ -263,5 +374,5 @@ def _clean_tracker(plugin_package):
 
 @pytest.fixture()
 def provider(make_provider):
-    """Default provider with turn capture enabled."""
-    return make_provider({"capture_turns": True, "prefetch_limit": 5})
+    """Default provider: keyword recall over notes, layer reasoning off."""
+    return make_provider({"prefetch_limit": 5})

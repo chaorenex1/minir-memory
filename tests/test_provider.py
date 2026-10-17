@@ -3,55 +3,154 @@
 from __future__ import annotations
 
 import json
+import sqlite3
 import sys
+import time
 import types
+
+
+def _no_model_call(*args, **kwargs):
+    """Poisons the layer model call: any test that reaches it fails loudly."""
+    raise AssertionError("the layer worker must not call the model in this test")
 
 
 def test_initialize_creates_profile_scoped_store(provider, tmp_path):
     assert (tmp_path / "minir-memory" / "memory.db").exists()
 
 
-def test_sync_turn_persists_and_new_instance_recalls(plugin_package, make_provider):
-    first = make_provider({"capture_turns": True})
-    first.sync_turn("We standardized on SQLite for the memory store", "Good choice.")
+def test_notes_survive_a_new_instance(plugin_package, make_provider):
+    first = make_provider({})
+    first.handle_tool_call("minir_remember", {"content": "We standardized on SQLite for the store"})
     first.shutdown()
 
-    second = make_provider({"capture_turns": True})  # same tmp home -> same db file
-    block = second.prefetch("SQLite memory store")
+    second = make_provider({})  # same tmp home -> same db file
+    block = second.prefetch("SQLite store")
     assert "SQLite" in block
     assert block.startswith("## Minir recall")
 
 
-def test_sync_turn_records_turn_author(provider):
+def test_no_conversation_content_is_persisted_anywhere(plugin_package, make_provider, monkeypatch):
+    """The provider's whole point of honour: turns are reasoned over in memory and dropped."""
+    monkeypatch.setenv("MINIR_REASONING_ENABLED", "true")
+    monkeypatch.setattr(plugin_package.worker, "call_model", lambda task, *args, **kwargs: (
+        "## Adviser Review\n- r\n\n## Constraints\n- c\n\n## Preferences\n- p\n\n"
+        "## Second Brain\n- [tool] t"
+        if task == plugin_package.worker.DIALECTIC_LAYER_TASK else
+        "## Session Summary\n- s\n\n## User Representation\n- [goal] x\n\n"
+        "## User Peer Card\n- y\n\n## AI Self Representation\n- direct\n\n"
+        "## AI Identity Card\n- careful"))
+    provider = make_provider({"base_interval": 1, "dialectic_interval": 1})
+    provider.on_turn_start(1, "m")
+    provider.sync_turn("the secret sauce is a staging cluster in Frankfurt", "noted")
+    provider._worker.stop()
+    db_path = provider._store.path
+    provider.shutdown()
+
+    connection = sqlite3.connect(str(db_path))
+    try:
+        tables = [row[0] for row in connection.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table'")]
+        assert "turns" not in tables
+        for table in tables:
+            if table.startswith("sqlite_"):
+                continue
+            rows = connection.execute(f"SELECT * FROM {table}").fetchall()
+            assert "Frankfurt" not in str(rows), f"{table} must hold no conversation content"
+    finally:
+        connection.close()
+
+
+def test_a_restart_expires_windows_it_can_no_longer_read(plugin_package, make_provider):
+    """The content lived in the old process's memory; the job it queued must not be retried."""
+    provider = make_provider({"base_interval": 1, "dialectic_interval": 1})
+    provider.on_turn_start(1, "m")
+    pending = provider._store.pending_jobs()
+    assert pending, "the tick queued jobs"
+    db_path = provider._store.path
+    provider.shutdown()
+
+    # A later process opens the same store: the jobs are closed, not re-queued.
+    reopened = plugin_package.store.MinirStore(db_path)
+    try:
+        later = time.time() + 0.001  # that process started just after these jobs were queued
+        assert reopened.expire_open_jobs("gone", before=later) == len(pending)
+        assert reopened.pending_jobs() == []
+        statuses = {row["status"] for row in reopened._conn.execute("SELECT status FROM jobs")}
+        assert statuses == {"expired"}
+    finally:
+        reopened.close()
+
+
+def test_sync_turn_keeps_the_author_for_the_base_layer(plugin_package, make_provider, monkeypatch):
+    monkeypatch.setenv("MINIR_REASONING_ENABLED", "true")
+    monkeypatch.setattr(plugin_package.worker, "call_model", _no_model_call)
+    provider = make_provider({})
     provider.sync_turn("kv cache tuning preferences", "Noted.",
                        turn_author={"id": "u1", "name": "alice", "is_bot": False})
-    rows = provider._store.search("kv cache tuning")
-    assert rows and rows[0]["author"] == "alice"
+    assert [(row["author"], row["author_id"]) for row in provider._transcript.messages("session-test")] \
+        == [("alice", "u1"), ("", "")]
 
 
-def test_sync_turn_skipped_when_capture_disabled(make_provider):
-    provider = make_provider({"capture_turns": False})
+def test_sync_turn_does_nothing_when_the_layers_are_off(make_provider):
+    provider = make_provider({})
     provider.sync_turn("something important about staging deploys", "ok")
-    assert provider._store.stats()["turns"] == 0
+    assert provider._transcript.messages("session-test") == []
 
 
-def test_sync_turn_skipped_for_non_primary_context(make_provider):
+def test_sync_turn_skipped_for_non_primary_context(plugin_package, make_provider, monkeypatch):
     """Host contract: subagent/cron/flush contexts must not write memory."""
-    provider = make_provider({"capture_turns": True}, agent_context="subagent")
+    monkeypatch.setenv("MINIR_REASONING_ENABLED", "true")
+    monkeypatch.setattr(plugin_package.worker, "call_model", _no_model_call)
+    provider = make_provider({}, agent_context="subagent")
     provider.sync_turn("subagent scratch work that should not persist", "ok")
-    assert provider._store.stats()["turns"] == 0
+    assert provider._transcript.messages("session-test") == []
 
 
-def test_sync_turn_skips_trivial_prompts(provider):
+def test_sync_turn_skips_trivial_prompts(plugin_package, make_provider, monkeypatch):
+    monkeypatch.setenv("MINIR_REASONING_ENABLED", "true")
+    monkeypatch.setattr(plugin_package.worker, "call_model", _no_model_call)
+    provider = make_provider({})
     provider.sync_turn("thanks!", "You're welcome.")
-    assert provider._store.stats()["turns"] == 0
+    assert provider._transcript.messages("session-test") == []
 
 
-def test_capture_can_be_enabled_by_env(plugin_package, make_provider, monkeypatch):
-    monkeypatch.setenv("MINIR_CAPTURE_TURNS", "false")
-    provider = make_provider({"capture_turns": True})  # env wins over config
-    provider.sync_turn("env precedence check for capture", "ok")
-    assert provider._store.stats()["turns"] == 0
+def test_a_message_never_lands_on_a_window_edge(plugin_package):
+    """Windows are ``(from, to]``, so a message stamped exactly on an edge would be invisible to
+    both neighbouring windows. Clocks are coarser than the tick→arrival gap, so the buffer keeps
+    every message strictly past the newest edge instead of relying on the clock."""
+    buffer = plugin_package.transcript.TranscriptBuffer()
+    buffer.mark_edge("s", 100.0)
+    buffer.add("s", "user", "on the edge", created_at=100.0)   # a tie with the edge
+    buffer.add("s", "user", "before the edge", created_at=50.0)
+    stamps = [row["created_at"] for row in buffer.messages("s")]
+    assert all(stamp > 100.0 for stamp in stamps)
+    assert [row["content"] for row in buffer.window("s", 100.0, 100.01)] == ["on the edge",
+                                                                           "before the edge"]
+    buffer.mark_edge("s", 50.0)  # an older edge must never move the mark back
+    buffer.add("s", "user", "after", created_at=150.0)
+    assert buffer.messages("s")[-1]["created_at"] == 150.0
+
+
+def test_the_provider_never_buffers_a_message_on_an_edge(plugin_package, make_provider, monkeypatch):
+    """The regression that motivated ``mark_edge``: an interval of 1 puts a window edge on the
+    very turn that follows it, and a coarse clock can stamp the message on that edge."""
+    monkeypatch.setenv("MINIR_REASONING_ENABLED", "true")
+    monkeypatch.setattr(plugin_package.worker, "call_model", _no_model_call)
+    provider = make_provider({"base_interval": 1, "dialectic_interval": 1})
+    provider.on_turn_start(1, "m")
+    edge = provider._store.pending_jobs()[0]["to_ts"]
+    provider.sync_turn("deploy the plugin on Windows", "noted")
+    message = provider._transcript.messages("session-test")[0]
+    assert message["created_at"] > edge
+    assert provider._transcript.window("session-test", edge, time.time() + 1), \
+        "the turn that triggered the window must still be inside it"
+
+
+def test_reasoning_can_be_enabled_by_env(make_provider, monkeypatch):
+    monkeypatch.setenv("MINIR_REASONING_ENABLED", "true")
+    provider = make_provider({"reasoning_enabled": False})  # env wins over config
+    assert provider._reasoning is True
+    assert provider._worker.enabled is True
 
 
 def test_prefetch_limit_can_be_set_by_env(make_provider, monkeypatch):
@@ -144,7 +243,7 @@ def test_search_results_are_excerpted(provider):
 
 
 def test_recall_block_is_bounded(make_provider):
-    provider = make_provider({"capture_turns": True, "prefetch_limit": 20})
+    provider = make_provider({"prefetch_limit": 20})
     for index in range(10):
         provider._store.remember(f"bounded note {index} " + "y" * 400)
     block = provider.prefetch("bounded")
@@ -302,6 +401,174 @@ def test_stats_report_layer_counters_and_jobs(provider):
     assert (stats["jobs"], stats["pending_jobs"]) == (1, 1)
     assert stats["layers"]["layers"]["dialectic"]["turns"] == 10
     assert stats["layers"]["layers"]["base"]["interval"] == 20
+    assert stats["reasoning_enabled"] is False  # the test bootstrap disables the model calls
+    assert stats["artifacts"] == []
+
+
+def test_a_boundary_drains_content_the_cadence_already_flushed(plugin_package, make_provider):
+    """The live defect: a layer fires on a turn's tick, so its watermark moves *before* the
+    turn's messages exist — and ``to_ts`` is then stamped behind them. Nothing would ever
+    reason over that turn. The boundary drain asks the content watermark instead."""
+    provider = make_provider({"base_interval": 1, "dialectic_interval": 1})
+    provider.on_turn_start(1, "m")
+    # The tick jobs ran to completion before this turn's messages existed (an initialize-time
+    # drain, say), which is what leaves the watermark behind the content.
+    for job in provider._store.pending_jobs():
+        provider._store.complete_job(job["id"], job["to_ts"])
+    provider._transcript.add_turn("session-test", "deploy on Windows", "noted")
+    assert plugin_package.turn_counter.TRACKER.tail("session-test") == []
+
+    provider.on_session_end([])
+    jobs = provider._store.pending_jobs()
+    assert [job["layer"] for job in jobs] == ["base", "dialectic"], "both layers owed that turn"
+    # The queued window starts at the content watermark and reaches forward, so the next drain
+    # actually sees the turn the cadence had already counted.
+    for job in jobs:
+        covered = provider._transcript.window("session-test", job["from_ts"], time.time() + 1)
+        assert [row["content"] for row in covered] == ["deploy on Windows", "noted"]
+
+
+def test_a_boundary_is_quiet_while_a_queued_job_still_owns_the_content(plugin_package, make_provider):
+    provider = make_provider({"base_interval": 1, "dialectic_interval": 1})
+    provider.on_turn_start(1, "m")
+    provider._transcript.add_turn("session-test", "deploy on Windows", "noted")
+    before = len(provider._store.pending_jobs())
+    provider.on_session_end([])
+    # The two tick jobs are still queued; they read to ``now`` when they run, so the boundary
+    # must not add a third one for the same turns.
+    assert len(provider._store.pending_jobs()) == before
+
+
+def test_prefetch_injects_the_published_layer_artifacts(provider):
+    provider._store.put_layer_state("base", "user:default",
+                                    "## Session Summary\n- s\n\n## User Representation\n- [fact] f\n\n"
+                                    "## User Peer Card\n- works on Windows\n\n"
+                                    "## AI Self Representation\n- direct\n\n"
+                                    "## AI Identity Card\n- terse")
+    provider._store.put_layer_state("dialectic", "agent:minir",
+                                    "## Adviser Review\n- run a smoke test\n\n"
+                                    "## Constraints\n- never edit outside the repo\n\n"
+                                    "## Preferences\n- act first\n\n## Second Brain\n- [tool] pytest")
+    block = provider.prefetch("nothing matches this query")
+    assert block.startswith("## Minir layer state")
+    assert "### User model (v1)" in block and "### Agent model (v1)" in block
+    assert "works on Windows" in block and "run a smoke test" in block
+    status = provider.recall_status()
+    assert status is not None and status.count == 9, "one item per injected bullet"
+
+
+def test_layer_state_prefers_the_participants_own_model(plugin_package, make_provider):
+    provider = make_provider({"base_interval": 50})
+    provider._store.put_layer_state("base", "user:ada",
+                                    "## Session Summary\n- Ada\n\n## User Representation\n- [fact] Ada\n\n"
+                                    "## User Peer Card\n- a\n\n## AI Self Representation\n- a\n\n"
+                                    "## AI Identity Card\n- a")
+    time.sleep(0.002)  # a later publish must be later, whatever the clock's resolution
+    provider._store.put_layer_state("base", "user:zoë",
+                                    "## Session Summary\n- Zoë\n\n## User Representation\n- [fact] Zoë\n\n"
+                                    "## User Peer Card\n- z\n\n## AI Self Representation\n- z\n\n"
+                                    "## AI Identity Card\n- z")
+    provider.on_turn_start(1, "m", author_id="ada", author_name="Ada")
+    assert "Ada" in provider.prefetch("q")
+    # A participant with no artifact yet falls back to the most recently published one, which
+    # for a single-user profile is always that user's.
+    provider.on_turn_start(2, "m", author_id="bob", author_name="Bo")
+    block = provider.prefetch("q")
+    assert "Zoë" in block and "Ada" not in block
+
+
+def test_an_oversized_message_cannot_empty_or_own_the_budget(plugin_package):
+    """One long paste must neither consume the whole budget nor leave an empty bucket (which the
+    oldest-session eviction would then index)."""
+    buffer = plugin_package.transcript.TranscriptBuffer(max_chars=25)
+    buffer.add("s", "user", "x" * 5000)
+    assert buffer.messages("s") == []  # it could not fit the budget at all
+    buffer.add("s", "user", "short")
+    assert [row["content"] for row in buffer.messages("s")] == ["short"]
+
+    async_buffer = plugin_package.transcript.TranscriptBuffer(max_chars=9000)
+    async_buffer.add("s", "user", "y" * 5000)
+    assert len(async_buffer.messages("s")[0]["content"]) == 4001  # capped, ellipsis included
+    async_buffer.add("s", "user", "later")  # must not raise
+    assert len(async_buffer.messages("s")) == 2
+
+
+def test_eviction_skips_a_bucket_a_huge_message_emptied(plugin_package):
+    buffer = plugin_package.transcript.TranscriptBuffer(max_chars=10, max_sessions=1)
+    buffer.add("emptied", "user", "z" * 100)   # bigger than the whole budget -> empty bucket
+    buffer.add("fresh", "user", "ok")          # evicting the empty one must not raise
+    assert buffer.messages("emptied") == []
+    assert [row["content"] for row in buffer.messages("fresh")] == ["ok"]
+
+
+def test_sync_turn_survives_a_transcript_failure(plugin_package, make_provider, monkeypatch):
+    """The one hook the host calls after every turn must not be able to raise into its worker."""
+    monkeypatch.setenv("MINIR_REASONING_ENABLED", "true")
+    provider = make_provider({"base_interval": 1, "dialectic_interval": 1})
+
+    def explode(*args, **kwargs):
+        raise RuntimeError("transcript exploded")
+
+    monkeypatch.setattr(provider._transcript, "add_turn", explode)
+    provider.sync_turn("deploy the plugin on Windows", "noted")  # must not raise
+    provider.on_turn_start(1, "m")  # and the provider stays usable
+
+
+def test_sync_turn_records_the_author_from_the_tick(plugin_package, make_provider, monkeypatch):
+    monkeypatch.setenv("MINIR_REASONING_ENABLED", "true")
+    monkeypatch.setattr(plugin_package.worker, "call_model", _no_model_call)
+    provider = make_provider({})
+    provider.on_turn_start(1, "m", author_id="u-42", author_name="Ada")
+    provider.sync_turn("deploy the plugin on Windows", "noted")
+    rows = provider._transcript.messages("session-test")
+    assert [(row["author"], row["author_id"]) for row in rows] == [("Ada", "u-42"), ("", "")]
+
+
+def test_sync_turn_prefers_the_host_supplied_author(plugin_package, make_provider, monkeypatch):
+    monkeypatch.setenv("MINIR_REASONING_ENABLED", "true")
+    monkeypatch.setattr(plugin_package.worker, "call_model", _no_model_call)
+    provider = make_provider({})
+    provider.on_turn_start(1, "m", author_id="stale", author_name="Stale")
+    provider.sync_turn("deploy the plugin on Windows", "noted",
+                       turn_author={"id": "u-7", "name": "Bo", "is_bot": False})
+    assert provider._transcript.messages("session-test")[0]["author_id"] == "u-7"
+
+
+def test_layer_reasoning_runs_end_to_end(plugin_package, make_provider, monkeypatch):
+    """Reasoning enabled: a turn ends, both layers publish, and the next prefetch carries them."""
+    monkeypatch.setenv("MINIR_REASONING_ENABLED", "true")
+    monkeypatch.setattr(plugin_package.worker, "call_model", lambda task, system, prompt, **kw: (
+        "## Adviser Review\n- ran a smoke test\n\n## Constraints\n- keep answers terse\n\n"
+        "## Preferences\n- act first\n\n## Second Brain\n- [tool] pytest"
+        if task == plugin_package.worker.DIALECTIC_LAYER_TASK else
+        "## Session Summary\n- deploy on Windows\n\n## User Representation\n- [goal] ship\n\n"
+        "## User Peer Card\n- wants evidence\n\n## AI Self Representation\n- direct\n\n"
+        "## AI Identity Card\n- careful"))
+
+    provider = make_provider({"base_interval": 1, "dialectic_interval": 1}, agent_identity="Masía")
+    provider.on_turn_start(1, "m")
+    provider.sync_turn("deploy on Windows", "noted")
+    provider._worker.stop()  # join the background drain before asserting
+
+    assert provider._store.pending_jobs() == []
+    assert [job["status"] for job in provider._store.claim_jobs(limit=9)] == []  # nothing left to do
+    subjects = sorted(state["subject"] for state in provider._store.all_layer_states())
+    assert subjects == ["agent:Masía", "user:default"]
+    block = provider.prefetch("q")
+    assert "deploy on Windows" in block and "ran a smoke test" in block
+
+
+def test_reasoning_disabled_never_calls_the_model(plugin_package, make_provider, monkeypatch):
+    def explode(*args, **kwargs):
+        raise AssertionError("reasoning is off: no model call may happen")
+
+    monkeypatch.setattr(plugin_package.worker, "call_model", explode)
+    provider = make_provider({"base_interval": 1, "dialectic_interval": 1})
+    provider.on_turn_start(1, "m")
+    provider.sync_turn("deploy on Windows", "noted")
+    provider.on_session_end([])
+    assert len(provider._store.pending_jobs()) == 2  # queued, never drained
+    assert provider._store.all_layer_states() == []
 
 
 def test_register_wires_the_provider_and_its_hooks(plugin_package):
@@ -326,3 +593,168 @@ def test_register_wires_the_provider_and_its_hooks(plugin_package):
     for callback in ctx.hooks.values():
         assert callback(session_id="s", old_session_id="o", reason="new_session", turn_id="t",
                         model="m", platform="cli", tool_name="terminal", duration_ms=3) is None
+
+
+# -- cold start, review injection, metrics ------------------------------------
+
+def test_cold_start_is_gated_to_the_primary_bound_session(plugin_package, make_provider, monkeypatch):
+    monkeypatch.setenv("MINIR_REASONING_ENABLED", "true")
+    provider = make_provider({"dialectic_depth": 1})
+    provider._worker._enabled = False  # inspect the queue, do not race a background drain
+    provider._identity = "I am Masía."  # the context that makes a cold start meaningful
+
+    plugin_package._on_session_start(session_id="child", provider=provider)
+    assert provider._store.pending_jobs() == [], "a child session must not queue a model job"
+
+    plugin_package._on_session_start(session_id="session-test", provider=provider)
+    jobs = provider._store.pending_jobs()
+    assert [(job["layer"], job["turns"], job["session_id"]) for job in jobs] == [
+        ("dialectic", 0, "session-test")]
+
+
+def test_cold_start_rejects_a_non_primary_agent_context(plugin_package, make_provider, monkeypatch):
+    monkeypatch.setenv("MINIR_REASONING_ENABLED", "true")
+    provider = make_provider({}, agent_context="subagent")
+    provider._worker._enabled = False
+    plugin_package._on_session_start(session_id="session-test", provider=provider)
+    assert provider._store.pending_jobs() == []
+
+
+def test_review_is_injected_once_per_turn(plugin_package, make_provider):
+    provider = make_provider({})
+    provider._store.put_layer_state(
+        "dialectic", "agent:minir",
+        "## Adviser Review\n- ran the smoke test\n\n"
+        "## Constraints\n- never edit outside the repo\n\n"
+        "## Preferences\n- act first\n\n"
+        "## Second Brain\n- [tool] pytest",
+        session_id="session-test")
+    first = plugin_package._on_pre_llm_call(
+        session_id="session-test", turn_id="turn-1", provider=provider)
+    assert first and "[minir adviser review" in first and "ran the smoke test" in first
+    assert plugin_package._on_pre_llm_call(
+        session_id="session-test", turn_id="turn-1", provider=provider) is None
+    assert plugin_package._on_pre_llm_call(
+        session_id="session-test", turn_id="turn-2", provider=provider)
+    assert plugin_package._on_pre_llm_call(
+        session_id="other", turn_id="turn-3", provider=provider) is None
+    assert plugin_package._on_pre_llm_call(
+        session_id="session-test", turn_id="turn-4", provider=provider,
+        parent_session_id="parent") is None
+
+
+def test_post_tool_call_aggregates_metrics(plugin_package, make_provider):
+    provider = make_provider({})
+    for duration in (10, 30):
+        plugin_package._on_post_tool_call(
+            tool_name="terminal", session_id="session-test", duration_ms=duration, provider=provider)
+    plugin_package._on_post_tool_call(
+        tool_name="terminal", session_id="session-test", duration_ms=5, provider=provider,
+        error=True)
+    stats = json.loads(provider.handle_tool_call("minir_stats", {}))
+    assert stats["tool_metrics"]["terminal"] == {
+        "count": 3, "total_ms": 45.0, "max_ms": 30.0, "errors": 1}
+    provider.flush_metrics()
+    assert provider._store.stats()["metrics"] == 1
+
+
+def test_layers_reason_from_host_history_and_publish_searchable_sections(
+        plugin_package, make_provider, tmp_path, monkeypatch):
+    """The restart-durable path: a job reads state.db, not the in-process buffer."""
+    monkeypatch.setenv("MINIR_REASONING_ENABLED", "true")
+    monkeypatch.setattr(plugin_package.worker, "call_model", lambda task, system, prompt, **kw: (
+        "## Adviser Review\n- ran the deploy smoke test\n\n## Constraints\n- never edit outside the repo\n\n"
+        "## Preferences\n- act first\n\n## Second Brain\n- [project] kubernetes deploy"
+        if task == plugin_package.worker.DIALECTIC_LAYER_TASK else
+        "## Session Summary\n- kubernetes deploy\n\n## User Representation\n- [goal] deploy the cluster\n\n"
+        "## User Peer Card\n- wants evidence\n\n## AI Self Representation\n- direct\n\n"
+        "## AI Identity Card\n- careful with user files"))
+    provider = make_provider({"base_interval": 1, "dialectic_interval": 1})
+    state_path = tmp_path / "state.db"
+    connection = sqlite3.connect(str(state_path))
+    try:
+        connection.executescript(
+            "CREATE TABLE messages (id INTEGER PRIMARY KEY, session_id TEXT, message_uid TEXT,"
+            " role TEXT, content TEXT, timestamp REAL, active INTEGER DEFAULT 1,"
+            " _compressed_summary INTEGER DEFAULT 0);")
+        stamp = time.time()
+        connection.executemany(
+            "INSERT INTO messages (session_id, message_uid, role, content, timestamp)"
+            " VALUES (?, ?, ?, ?, ?)",
+            [("session-test", "u1", "user", "deploy the kubernetes cluster", stamp),
+             ("session-test", "a1", "assistant", "running the deploy smoke test", stamp + 0.001),
+             ("session-test", "u2", "user", "[Assistant Rules] not user intent", stamp + 0.002)])
+        connection.commit()
+    finally:
+        connection.close()
+
+    provider.on_turn_start(1, "m")
+    provider.on_session_end([])  # drain the boundary without adding buffer content
+    provider._worker.stop()
+
+    assert provider._store.layer_state("base", "user:default") is not None
+    assert provider._store.layer_state("dialectic", "agent:minir") is not None
+    hits = provider._store.search("kubernetes deploy", session_id="session-test")
+    assert hits and any(row["kind"] == "base.user_representation" for row in hits)
+    assert not any("not user intent" in row["text"] for row in hits)
+    review = provider.review_block("session-test")
+    assert "deploy smoke test" in review
+
+
+def test_search_never_exposes_a_conclusion_as_a_forgettable_note(plugin_package, provider):
+    provider._store.put_layer_state(
+        "base", "user:default",
+        "## Session Summary\n- deploy\n\n## User Representation\n- [goal] deploy\n\n"
+        "## User Peer Card\n- terse\n\n## AI Self Representation\n- direct\n\n"
+        "## AI Identity Card\n- careful", session_id="session-test")
+    payload = json.loads(provider.handle_tool_call("minir_search", {"query": "deploy"}))
+    conclusion = next(row for row in payload["results"] if row["kind"].startswith("base."))
+    assert "id" not in conclusion and "note_id" not in conclusion
+    assert "conclusion_id" not in conclusion
+
+    note_id = json.loads(provider.handle_tool_call(
+        "minir_remember", {"content": "a forgettable note"}))["note_id"]
+    found = json.loads(provider.handle_tool_call("minir_search", {"query": "forgettable"}))
+    note = next(row for row in found["results"] if row["kind"] == "note")
+    assert note["note_id"] == note_id and note["id"] == note_id
+
+
+def test_boundary_queues_a_state_db_tail_after_the_buffer_was_lost(
+        plugin_package, make_provider, tmp_path):
+    provider = make_provider({})
+    provider._transcript.clear()
+    connection = sqlite3.connect(str(tmp_path / "state.db"))
+    try:
+        connection.executescript(
+            "CREATE TABLE messages (id INTEGER PRIMARY KEY, session_id TEXT, role TEXT,"
+            " content TEXT, timestamp REAL);")
+        connection.execute(
+            "INSERT INTO messages (session_id, role, content, timestamp) VALUES (?, ?, ?, ?)",
+            ("session-test", "user", "history-only tail", time.time()))
+        connection.commit()
+    finally:
+        connection.close()
+
+    provider.on_session_end([])
+    jobs = provider._store.pending_jobs()
+    assert {(job["layer"], job["session_id"]) for job in jobs} >= {
+        ("base", "session-test"), ("dialectic", "session-test")}
+
+
+def test_prefetch_does_not_inject_another_sessions_review_or_summary(provider):
+    provider._store.put_layer_state(
+        "base", "user:default",
+        "## Session Summary\n- old session secret\n\n## User Representation\n- [goal] old goal\n\n"
+        "## User Peer Card\n- durable trait\n\n## AI Self Representation\n- old stance\n\n"
+        "## AI Identity Card\n- durable identity",
+        session_id="other-session")
+    provider._store.put_layer_state(
+        "dialectic", "agent:minir",
+        "## Adviser Review\n- old advice\n\n## Constraints\n- durable constraint\n\n"
+        "## Preferences\n- durable preference\n\n## Second Brain\n- [project] durable project",
+        session_id="other-session")
+    block = provider.prefetch("q")
+    assert "durable trait" in block and "durable identity" in block
+    assert "durable constraint" in block and "durable project" in block
+    assert "old session secret" not in block and "old advice" not in block
+    assert "old goal" not in block and "old stance" not in block
