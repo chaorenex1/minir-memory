@@ -27,19 +27,21 @@ no key to configure; set `reasoning_enabled: false` to keep the provider a pure 
 `handoff_enabled: false` to keep compression off the summary model.
 
 ```
-plugin.yaml            manifest (name/version/description + metadata)
-__init__.py            register(ctx) + MinirMemoryProvider + the engine export
-store.py               SQLite storage: notes, conclusions + FTS5, jobs, metrics
-history.py             read-only host history, profile resolution, identity files
-transcript.py          in-memory, bounded window of the session's messages (never persisted)
-turn_counter.py        base / dialectic layer turn counters + job windows
-worker.py              drains jobs into five-section/dialectic artifacts at depth 1-3
-handoff.py             Task Handoff compression prompt + validation
-cadence.py             the dialectic beat, shared by the provider and the engine
-context_engine.py      progressive lossless context management (context.engine: minir)
-agent_loop.py          one-shot in-process AIAgent runs — sync + async (Feishu-shaped)
-adviser.py             optional adviser route + its two handlers (adviser_consult)
-prompts/               operator-supplied Task Handoff template
+pyproject.toml         package metadata, pytest config, pip entry point
+plugin/minir/          the deployable plugin directory (copy this to plugins/minir)
+  plugin.yaml          manifest (name/version/description + metadata)
+  __init__.py          register(ctx) + MinirMemoryProvider + the engine export
+  store.py             SQLite storage: notes, conclusions + FTS5, jobs, metrics
+  history.py           read-only host history, profile resolution, identity files
+  transcript.py        in-memory, bounded window of the session's messages (never persisted)
+  turn_counter.py      base / dialectic layer turn counters + job windows
+  worker.py            drains jobs into five-section/dialectic artifacts at depth 1-3
+  handoff.py           Task Handoff compression prompt + validation
+  cadence.py           the dialectic beat, shared by the provider and the engine
+  context_engine.py    progressive lossless context management (context.engine: minir)
+  agent_loop.py        one-shot in-process AIAgent runs — sync + async (Feishu-shaped)
+  adviser.py           optional adviser route + its two handlers (adviser_consult)
+  prompts/             operator-supplied Task Handoff template
 tests/                 pytest suite: contract, store, transcript, provider, counting, worker, engine
 scripts/verify_against_host.py   end-to-end check against the real Hermes install
 ```
@@ -366,13 +368,21 @@ authoritative and a pending summary row expires without polluting recall.
 
 ## Install & activate
 
-Clone the repo **into a directory whose name equals the provider name** and point
-`memory.provider` at it:
+Clone the repo anywhere, then install the plugin **into a directory whose name equals the
+provider name** and point `memory.provider` at it:
 
 ```bash
-# Windows (git-bash); use $HERMES_HOME/plugins/minir on Linux/macOS
-git clone <your-fork-url> "$LOCALAPPDATA/hermes/plugins/minir"
+# Windows (git-bash); use $HERMES_HOME on Linux/macOS
+git clone <your-fork-url> ~/src/minir-memory
+mkdir -p "$LOCALAPPDATA/hermes/plugins"
+cp -R ~/src/minir-memory/plugin/minir "$LOCALAPPDATA/hermes/plugins/minir"
 ```
+
+`pip install .` is the alternative for the **memory provider**: the wheel ships
+`plugin/minir` as a top-level `minir` package and declares the `hermes_agent.memory_providers`
+entry point, so discovery resolves it without a directory copy. The context engine
+(`context.engine: minir`) resolves only from `$HERMES_HOME/plugins/<name>`, so keep the
+directory install for that surface. Use exactly one install visible on the discovery path.
 
 ```yaml
 # $HERMES_HOME/config.yaml
@@ -432,24 +442,23 @@ HERMES_WORKSPACE=/path/to/hermes/workspace python -m pytest tests -q
 python scripts/verify_against_host.py
 
 # 4. Hermes' own registration validator / discovery doctor
-hermes plugins validate .
-hermes plugins doctor .
+hermes plugins validate plugin/minir
+hermes plugins doctor plugin/minir
 ```
 
 `tests/conftest.py` reports which mode it ran in (`contract mode = host|partial|shim`).
 Host mode is the one that counts — and `HERMES_WORKSPACE` set to a workspace whose modules do
 not import now *fails* the run (with the import error) instead of silently testing the shim,
-which cannot fail. The pytest config lives in `tests/pytest.ini` so the
-run's rootdir stays inside `tests/` — the repo root is itself a Python package (the
-plugin's `__init__.py`), and pytest would otherwise import the plugin as a test module
-before running anything.
+which cannot fail. Pytest config lives in `pyproject.toml` (`testpaths = ["tests"]`); the plugin
+package is `plugin/minir`, so it is never collected as a test module.
 
 ## Fork checklist
 
-1. **Rename** `minir` → your name in: the installed directory, `plugin.yaml` `name:`, the
+1. **Rename** `minir` → your name in: the `plugin/minir/` directory, `plugin.yaml` `name:`, the
    provider's `name` property, the engine's `name` property (it must equal the directory name for
-   `context.engine` to resolve), tool prefixes, and `MINIR_*` env vars.
-2. **Replace the storage**: `store.py` is self-contained (open/remember/forget/
+   `context.engine` to resolve), tool prefixes, `MINIR_*` env vars, and the `pyproject.toml`
+   package/entry-point names.
+2. **Replace the storage**: `plugin/minir/store.py` is self-contained (open/remember/forget/
    record_job/claim_jobs/complete_job/fail_job/layer_state/search/stats/close). Keep that method
    shape and `__init__.py` needs no edits; go further for a remote backend (HTTP client,
    background write queue, retries). Whatever you add, keep the two invariants the tests pin:
@@ -515,8 +524,8 @@ before running anything.
 * `ctx.register_skill(name, ...)` inside `register()` to ship a skill with the provider.
 * A sibling `cli.py` (scanned by `plugins/memory` via `discover_plugin_cli_commands()`)
   for provider-specific `hermes` subcommands.
-* Pip distribution with a `hermes_agent.memory_providers` entry point instead of a
-  directory install.
+* The `hermes_agent.memory_providers` entry point is already declared in `pyproject.toml`;
+  this plugin ships no `cli.py`, so `hermes <provider>` subcommands are unavailable.
 
 ## License
 

@@ -14,7 +14,7 @@ shim and the host ever disagree, the host wins and the shim is what to fix;
 ``CONTRACT_MODE`` records which mode the run used.
 
 The plugin package is loaded the way the Hermes loader loads it: a synthetic
-package whose root is this directory (``__init__.py`` + relative imports).
+package whose root is ``plugin/minir`` (``__init__.py`` + relative imports).
 """
 
 from __future__ import annotations
@@ -32,7 +32,7 @@ from typing import Any, Optional
 
 import pytest
 
-ROOT = Path(__file__).resolve().parents[1]
+ROOT = Path(__file__).resolve().parents[1] / "plugin" / "minir"
 
 _workspace = os.environ.get("HERMES_WORKSPACE", "").strip()
 if _workspace and _workspace not in sys.path:

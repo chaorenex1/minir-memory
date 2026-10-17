@@ -6,11 +6,13 @@ These assertions hold against the real host (authoritative) and the shim alike.
 from __future__ import annotations
 
 import json
+import tomllib
 from pathlib import Path
 
 from agent.memory_provider import MemoryProvider
 
-PLUGIN_ROOT = Path(__file__).resolve().parents[1]
+PLUGIN_ROOT = Path(__file__).resolve().parents[1] / "plugin" / "minir"
+REPO_ROOT = PLUGIN_ROOT.parents[1]
 
 _VALID_TOOL_ARG_TYPES = {"string", "integer", "number", "boolean", "array", "object"}
 
@@ -75,6 +77,17 @@ def test_manifest_name_matches_provider_name(plugin_package):
     assert declared == plugin_package.MinirMemoryProvider({}).name
     if PLUGIN_ROOT.name == "minir":
         assert PLUGIN_ROOT.name == declared
+
+
+def test_pyproject_matches_manifest(plugin_package):
+    """The version lives in both plugin.yaml (host metadata) and pyproject.toml (packaging);
+    a pip install must not advertise a release the manifest disagrees with."""
+    manifest = (PLUGIN_ROOT / "plugin.yaml").read_text(encoding="utf-8-sig")
+    declared = next(line.split(":", 1)[1].strip() for line in manifest.splitlines()
+                    if line.startswith("version:"))
+    project = tomllib.loads((REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8"))["project"]
+    assert project["version"] == declared
+    assert project["entry-points"]["hermes_agent.memory_providers"]["minir"] == "minir"
 
 
 def test_manifest_declares_every_registered_hook(plugin_package):

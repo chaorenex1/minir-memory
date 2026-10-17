@@ -1,0 +1,58 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "minir-memory"
+version = "0.4.0"
+description = "Local-first Hermes memory plugin: base/dialectic layer artifacts in SQLite, FTS5 recall, and progressive context management."
+readme = "README.md"
+requires-python = ">=3.11"
+authors = [{ name = "chaorenex1" }]
+license = { text = "MIT" }
+keywords = ["hermes", "hermes-agent", "memory", "plugin", "sqlite", "sqlite-fts5"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Plugins",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Text Processing :: Indexing",
+]
+
+# Hermes also resolves pip-installed providers through this group. A checkout installed
+# into `$HERMES_HOME/plugins/minir` still wins. The installed package is top-level `minir`
+# (mapped from `plugin/minir`), so its directory name matches the provider name and
+# `resolve_module_origin` resolves it without a namespace package.
+[project.entry-points."hermes_agent.memory_providers"]
+minir = "minir"
+
+[project.optional-dependencies]
+dev = ["pytest>=8"]
+
+[tool.setuptools]
+include-package-data = false
+
+# `plugin/` is only a source container; the wheel ships its `minir` child as a top-level
+# package so the installed directory name equals the provider name.
+[tool.setuptools.packages.find]
+where = ["plugin"]
+include = ["minir*"]
+
+# Files the plugin reads from disk at runtime: the manifest (discovery/validation) and the
+# Task Handoff template (`handoff.py` resolves it next to itself).
+[tool.setuptools.package-data]
+minir = ["plugin.yaml", "prompts/*.md"]
+
+[tool.setuptools.exclude-package-data]
+minir = ["__pycache__/*", "*.py[cod]"]
+
+# Run from the repository root: `python -m pytest` or `python -m pytest tests -q`.
+# `plugin/minir` is the importable plugin package; nothing at the repository root is
+# collected as a package, so no inifile-inside-tests workaround is needed.
+[tool.pytest.ini_options]
+minversion = "8.0"
+testpaths = ["tests"]
+addopts = "-q"

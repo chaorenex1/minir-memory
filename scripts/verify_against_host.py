@@ -14,7 +14,7 @@ What it proves (against the host install running on this machine, not a mock):
 6. The counting loop queues jobs        — ``on_turn_start`` ticks + ``on_session_end`` tail flush
 7. Its plugin hooks are live            — the real plugin manager delivers ``on_session_start``
 
-It works in a throwaway ``HERMES_HOME`` (a temp dir where this repo is copied to
+It works in a throwaway ``HERMES_HOME`` (a temp dir where ``plugin/minir`` is copied to
 ``plugins/minir``); your real Hermes home, config, and memory are untouched.
 
 Usage::
@@ -38,7 +38,7 @@ import tempfile
 from pathlib import Path
 from typing import Optional
 
-REPO_ROOT = Path(__file__).resolve().parents[1]
+PLUGIN_ROOT = Path(__file__).resolve().parents[1] / "plugin" / "minir"
 PLUGIN_NAME = "minir"  # must equal plugin.yaml name and the provider's name property
 
 _PROBE = r"""
@@ -237,14 +237,14 @@ def detect_host() -> tuple[str, str]:
 
 
 def stage_plugin(home: Path) -> Path:
-    """Copy this repo to ``<home>/plugins/<name>`` (the layout discovery expects), minus dev cruft.
+    """Copy ``plugin/<name>`` to ``<home>/plugins/<name>`` (the layout discovery expects).
 
     Also writes the ``memory.<name>`` config block, so the probe can prove the layer cadence
     is read from ``config.yaml`` rather than from a default.
     """
     target = home / "plugins" / PLUGIN_NAME
-    shutil.copytree(REPO_ROOT, target, ignore=shutil.ignore_patterns(
-        ".git", "__pycache__", ".pytest_cache", "*.pyc", "*.db", "*.db-wal", "*.db-shm"))
+    shutil.copytree(PLUGIN_ROOT, target, ignore=shutil.ignore_patterns(
+        "__pycache__", "*.pyc", "*.db", "*.db-wal", "*.db-shm"))
     (home / "config.yaml").write_text(
         "memory:\n"
         f"  provider: {PLUGIN_NAME}\n"
