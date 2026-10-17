@@ -51,6 +51,7 @@ from agent.memory_provider import (
 )
 from tools.registry import tool_error
 
+from . import adviser
 from . import history as host_history
 from .store import MinirStore, format_when
 from .transcript import TranscriptBuffer
@@ -82,6 +83,9 @@ _MAX_BLOCK_CHARS = 2000           # recall block injected into the prompt is tru
 _MAX_LAYER_CHARS = 1200           # layer artifacts injected next to it are capped separately
 _MAX_TOOL_EXCERPT = 600           # text excerpt returned by the minir_search tool
 _MAX_AUTHOR_CACHE = 64            # per-session last-seen author, bounded like the turn counter
+# Durable base cards are explicit-recall only: prefetch must not inject them, even when an
+# FTS query happens to match. ``minir_search`` still returns them.
+_PREFETCH_EXCLUDED_KINDS = frozenset({"base.user_peer_card", "base.ai_identity_card"})
 
 _ACTIVE_PROVIDER: Optional["MinirMemoryProvider"] = None
 """The provider instance ``initialize`` actually opened.
@@ -326,7 +330,8 @@ class MinirMemoryProvider(MemoryProvider):
 
         def _work() -> None:
             try:
-                rows = self._search(query, session_id=session)
+                rows = self._search(query, session_id=session,
+                                    exclude=_PREFETCH_EXCLUDED_KINDS)
                 block = self._format_block(rows)
                 with self._lock:
                     self._cached = (session, block, len(rows))
@@ -344,9 +349,10 @@ class MinirMemoryProvider(MemoryProvider):
         inline search (cheap for local SQLite). A remote backend should return
         only the cached block here and do all I/O in ``queue_prefetch``.
 
-        The layer artifacts are read live (one indexed row each, no model call) and
-        prepended: they are what the base/dialectic layers last concluded about this user
-        and this agent, which is rarely what a keyword query would have surfaced.
+        The dialectic artifact is read live (one indexed row, no model call) and prepended:
+        it is what the agent layer last concluded about how this assistant should work, which
+        is rarely what a keyword query would have surfaced. Base-layer cards are deliberately
+        not injected here; they stay recallable through ``minir_search``.
         """
         session = session_id or self._session_id
         block, count = "", 0
@@ -355,7 +361,8 @@ class MinirMemoryProvider(MemoryProvider):
             block, count = cached
         elif self._store is not None and (query or "").strip() and not is_trivial_prompt(query):
             try:
-                rows = self._search(query, session_id=session)
+                rows = self._search(query, session_id=session,
+                                    exclude=_PREFETCH_EXCLUDED_KINDS)
                 block, count = self._format_block(rows), len(rows)
             except Exception as exc:
                 logger.debug("Minir prefetch search failed: %s", exc)
@@ -368,28 +375,26 @@ class MinirMemoryProvider(MemoryProvider):
         return block
 
     def _layer_block(self, session: str) -> tuple[str, int]:
-        """Last published base/dialectic artifacts as one block; counts its bullet items.
+        """Last published dialectic artifact as one block; counts its bullet items.
 
-        The base artifact is looked up for the participant this session last spoke through
-        (falling back to the newest one, which is what a single-user profile always is).
+        The base artifact is deliberately absent: its durable cards are not injected into the
+        prompt, only the agent's own working model is. Base cards remain reachable through
+        ``minir_search``.
         """
         if self._store is None or self._worker is None:
             return "", 0
         try:
-            author = str((self._authors.get(session) or {}).get("id") or "")
             wanted = (
-                ("User model", BASE_LAYER, self._worker.user_subject(author_id=author)),
                 ("Agent model", DIALECTIC_LAYER, self._worker.dialectic_subject()),
             )
             lines: list[str] = []
             size = items = 0
             for title, layer, subject in wanted:
                 state = self._store.layer_state(layer, subject) or self._store.newest_layer_state(layer)
-                # An artifact published by another session keeps its durable cards but loses
-                # the previous session's summary/focus/review, or the next turn would follow
-                # stale advice.
-                drop = ("## Session Summary",) if layer == BASE_LAYER else ()
-                body = previous_content(layer, state, session, drop=drop).strip()
+                # An artifact published by another session keeps its durable constraints and
+                # preferences but loses the previous session's review, or the next turn would
+                # follow stale advice.
+                body = previous_content(layer, state, session).strip()
                 if not body:
                     continue
                 chunk = f"### {title} (v{(state or {}).get('version', 0)})\n{body}"
@@ -810,14 +815,20 @@ class MinirMemoryProvider(MemoryProvider):
 
     # -- internals ------------------------------------------------------------
 
-    def _search(self, query: str, limit: Optional[Any] = None, *,
-                session_id: str = "") -> list[dict[str, Any]]:
+    def _search(self, query: str, limit: Optional[Any] = None, *, session_id: str = "",
+                exclude: frozenset[str] = frozenset()) -> list[dict[str, Any]]:
         try:
             requested = int(limit) if limit is not None else self._prefetch_limit
         except (TypeError, ValueError):
             requested = self._prefetch_limit
         session = session_id or self._session_id
-        return self._store.search(query, limit=max(1, min(20, requested)), session_id=session)
+        # Over-fetch when filtering: otherwise excluded cards can occupy the whole limit and
+        # hide recallable rows behind them. The store caps the candidate count at 20.
+        search_limit = max(1, min(20, requested + (2 * len(exclude) if exclude else 0)))
+        rows = self._store.search(query, limit=search_limit, session_id=session)
+        if exclude:
+            rows = [row for row in rows if row.get("kind") not in exclude][:requested]
+        return rows
 
     def _take_cached(self, session: str) -> Optional[tuple[str, int]]:
         """Consume the queued recall for *session*; ``None`` when there is nothing usable."""
@@ -920,6 +931,14 @@ def register(ctx) -> None:
                       lambda **kwargs: _on_post_llm_call(provider=provider, **kwargs))
     ctx.register_hook("post_tool_call",
                       lambda **kwargs: _on_post_tool_call(provider=provider, **kwargs))
+    # Second surface of the same directory: the auxiliary ``adviser`` route + its in-process
+    # agent loop (``adviser_consult``). Optional by design — a host without the auxiliary-task
+    # API (or a config that refuses the key) must still get the memory provider, so a failure
+    # here is logged and swallowed rather than raising out of ``register()``.
+    try:
+        adviser.register(ctx)
+    except Exception as exc:
+        logger.warning("Minir adviser registration failed: %s", exc)
 
 
 # -- plugin hooks -------------------------------------------------------------

@@ -487,7 +487,8 @@ class LayerWorker:
             self._store.complete_job(job_id, end, error="empty window")
             logger.debug("Minir %s-layer job #%s covered no messages", layer, job_id)
             return
-        publications = (self._merge_participants(rows, session, start, end)
+        publications = (self._merge_participants(rows, session, start, end,
+                                                 turns=int(job.get("turns") or 0))
                         if layer == BASE_LAYER
                         else self._merge_dialectic(rows, cold=cold, session=session))
         for subject, content in publications:
@@ -513,12 +514,14 @@ class LayerWorker:
         return rows
 
     def _merge_participants(self, rows: list[dict[str, Any]], session: str = "",
-                            from_ts: float = 0.0, to_ts: float = 0.0) -> list[tuple[str, str]]:
+                            from_ts: float = 0.0, to_ts: float = 0.0,
+                            turns: int = 0) -> list[tuple[str, str]]:
         """Base layer: one merged artifact per participant + one canonical chunk summary.
 
-        The artifact's ``## Session Summary`` is replaced with the rolling projection of the
-        session's chunk chain after the new chunk is appended. The model's fresh Session Summary
-        body is the local compression of this window, never an independent final summary.
+        The artifact's ``## Session Summary`` is replaced with the newest chunk only: older
+        chunks stay as independent records for same-session FTS recall and are not re-projected
+        into the live artifact. The model's fresh Session Summary body is the local compression
+        of this window, never an independent final summary.
         """
         speakers: dict[str, int] = {}
         for row in rows:
@@ -539,11 +542,20 @@ class LayerWorker:
             if not chunk_text:
                 chunk_text = _section_body(content, "## Session Summary")
         if chunk_text.strip() and session:
+            # ``job["turns"]`` is the session's cumulative turn count at dispatch, not this
+            # window's span. The newest job may also drain past that stamp to "now", so this
+            # is the best available bound and is stored as metadata, never used for coverage.
+            to_turn = int(turns) or None
+            from_turn = None
+            if to_turn:
+                previous_turn = self._store.latest_chunk_turn(session)
+                from_turn = min(previous_turn + 1, to_turn) if previous_turn else 1
             self._store.add_chunk_summary(
                 session, from_ts, to_ts, chunk_text,
                 evidence=json.dumps([row.get("message_uid") for row in rows
-                                     if row.get("message_uid")]))
-            projection = self._store.rolling_session_summary(session)
+                                     if row.get("message_uid")]),
+                from_turn=from_turn, to_turn=to_turn)
+            projection = self._store.latest_chunk_summary(session)
             publications = [(subject, _replace_section(content, "## Session Summary", projection))
                             for subject, content in publications]
         return publications

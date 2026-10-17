@@ -19,8 +19,10 @@
   five base-layer sections, the dialectic review/constraints/preferences/second-brain, local
   compression chunks, and final session summaries. ``conclusions_fts`` is an FTS5 trigram index
   over it (CJK-safe); when FTS5 is unavailable, ``search()`` falls back to the token scan.
-  ``session_chunk_summary`` is the canonical local-compression chain; the base artifact's
-  ``## Session Summary`` is only its projection and is never written as a competing row.
+  ``session_chunk_summary`` is the canonical local-compression chain; each row records the time
+  and session-turn range it covers. The base artifact's ``## Session Summary`` projects only the
+  newest active chunk; older (including superseded) chunks stay as independent rows and remain
+  searchable inside their own session.
 * ``metrics`` — aggregated tool counters, flushed in batches rather than per call.
 
 ``search()`` enforces session isolation: session summaries, reviews, current-focus statements
@@ -90,6 +92,8 @@ CREATE TABLE IF NOT EXISTS conclusions (
     evidence TEXT NOT NULL DEFAULT '[]',
     from_ts REAL,
     to_ts REAL,
+    from_turn INTEGER,
+    to_turn INTEGER,
     version INTEGER NOT NULL DEFAULT 0,
     status TEXT NOT NULL DEFAULT 'active',
     created_at REAL NOT NULL,
@@ -114,7 +118,8 @@ _ADDED_COLUMNS: dict[str, tuple[tuple[str, str], ...]] = {
              ("finished_at", "REAL"), ("error", "TEXT NOT NULL DEFAULT ''"),
              ("processed_ts", "REAL")),
     "layer_state": (("session_id", "TEXT NOT NULL DEFAULT ''"),),
-    "conclusions": (("from_ts", "REAL"), ("to_ts", "REAL")),
+    "conclusions": (("from_ts", "REAL"), ("to_ts", "REAL"),
+                    ("from_turn", "INTEGER"), ("to_turn", "INTEGER")),
 }
 
 # Tables a previous release wrote that this one must not keep: earlier versions persisted every
@@ -375,21 +380,24 @@ class MinirStore:
     def _put_conclusion_locked(self, kind: str, key: str, content: str, *, session_id: str = "",
                                subject: str = "", evidence: str = "[]", status: str = "active",
                                created_at: Optional[float] = None, version: int = 0,
-                               from_ts: Optional[float] = None, to_ts: Optional[float] = None) -> int:
+                               from_ts: Optional[float] = None, to_ts: Optional[float] = None,
+                               from_turn: Optional[int] = None,
+                               to_turn: Optional[int] = None) -> int:
         """Upsert one conclusion under the caller's lock; returns the resulting version."""
         stamp = time.time()
         self._conn.execute(
             "INSERT INTO conclusions (kind, key, session_id, subject, content, evidence, "
-            "from_ts, to_ts, version, status, created_at, updated_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
+            "from_ts, to_ts, from_turn, to_turn, version, status, created_at, updated_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
             "ON CONFLICT(kind, key) DO UPDATE SET content = excluded.content, "
             "session_id = excluded.session_id, subject = excluded.subject, "
             "evidence = excluded.evidence, from_ts = excluded.from_ts, "
-            "to_ts = excluded.to_ts, version = conclusions.version + 1, "
+            "to_ts = excluded.to_ts, from_turn = excluded.from_turn, "
+            "to_turn = excluded.to_turn, version = conclusions.version + 1, "
             "status = excluded.status, updated_at = excluded.updated_at",
             (kind, key, session_id or "", subject or "", (content or "")[:_MAX_CONTENT],
-             evidence or "[]", from_ts, to_ts, max(0, int(version)), status,
-             created_at or stamp, stamp))
+             evidence or "[]", from_ts, to_ts, from_turn, to_turn, max(0, int(version)),
+             status, created_at or stamp, stamp))
         row = self._conn.execute(
             "SELECT version FROM conclusions WHERE kind = ? AND key = ?", (kind, key)).fetchone()
         return int(row["version"]) if row is not None else 0
@@ -397,13 +405,14 @@ class MinirStore:
     def put_conclusion(self, kind: str, key: str, content: str, *, session_id: str = "",
                        subject: str = "", evidence: str = "[]", status: str = "active",
                        created_at: Optional[float] = None, version: int = 0,
-                       from_ts: Optional[float] = None, to_ts: Optional[float] = None) -> int:
+                       from_ts: Optional[float] = None, to_ts: Optional[float] = None,
+                       from_turn: Optional[int] = None, to_turn: Optional[int] = None) -> int:
         """Publish one conclusion and index it for FTS recall."""
         with self._lock:
             result = self._put_conclusion_locked(
                 kind, key, content, session_id=session_id, subject=subject, evidence=evidence,
                 status=status, created_at=created_at, version=version,
-                from_ts=from_ts, to_ts=to_ts)
+                from_ts=from_ts, to_ts=to_ts, from_turn=from_turn, to_turn=to_turn)
             self._conn.commit()
             return result
 
@@ -453,11 +462,13 @@ class MinirStore:
     # -- session chunk chain --------------------------------------------------
 
     def add_chunk_summary(self, session_id: str, from_ts: float, to_ts: float, content: str,
-                          *, evidence: str = "[]") -> int:
+                          *, evidence: str = "[]", from_turn: Optional[int] = None,
+                          to_turn: Optional[int] = None) -> int:
         """Append one local compression summary to the session's canonical chain.
 
         Idempotent by ``(session, from_ts, to_ts)``. A window already superseded by a final
-        summary is not reopened.
+        summary is not reopened. ``from_turn``/``to_turn`` are the session turn range this
+        local compression covers; timestamps alone cannot express it after a /resume.
         """
         key = f"chunk:{session_id}:{float(from_ts):.6f}:{float(to_ts):.6f}"
         with self._lock:
@@ -469,7 +480,8 @@ class MinirStore:
             version = self._put_conclusion_locked(
                 "session_chunk_summary", key, content, session_id=session_id,
                 subject="session", evidence=evidence, status="active",
-                from_ts=float(from_ts), to_ts=float(to_ts))
+                from_ts=float(from_ts), to_ts=float(to_ts),
+                from_turn=from_turn, to_turn=to_turn)
             self._conn.commit()
             return version
 
@@ -493,35 +505,36 @@ class MinirStore:
                 (session_id,)).fetchone()
         return float(row["ts"]) if row is not None and row["ts"] is not None else 0.0
 
-    def rolling_session_summary(self, session_id: str, *, max_chars: int = 4_000) -> str:
-        """Derived projection for the base artifact's ``## Session Summary`` section.
+    def latest_chunk_turn(self, session_id: str) -> int:
+        """Highest turn any chunk of this session covers, active or superseded."""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT MAX(to_turn) AS turn FROM conclusions "
+                "WHERE kind = 'session_chunk_summary' AND session_id = ?",
+                (session_id,)).fetchone()
+        value = row["turn"] if row is not None else None
+        return int(value) if value is not None else 0
 
-        Composed from the active chunk chain, seeded by the latest active final summary. It is
-        never persisted as an independent FTS conclusion.
+    def latest_chunk_summary(self, session_id: str, *, max_chars: int = 4_000) -> str:
+        """Projection for the base artifact's ``## Session Summary`` section.
+
+        Only the newest active chunk is projected: it is the current window record. Older
+        chunks stay as independent rows (with their turn range) for same-session FTS recall.
         """
-        parts: list[str] = []
-        final = self.newest_conclusion("session_summary", session_id=session_id)
-        final_body = str((final or {}).get("content") or "").strip()
-        if final_body:
-            parts.append(f"### Prior summarized context\n{final_body}")
         chunks = self.chunk_summaries(session_id)
-        kept: list[str] = []
-        size = sum(len(part) + 1 for part in parts)
-        for chunk in reversed(chunks):
-            body = str(chunk.get("content") or "").strip()
-            if not body:
-                continue
-            when = ""
-            if chunk.get("from_ts") is not None and chunk.get("to_ts") is not None:
-                when = f" · {format_when(float(chunk['from_ts']))}–{format_when(float(chunk['to_ts']))}"
-            block = f"### Local chunk{when}\n{body}"
-            if size + len(block) + 1 > max_chars and kept:
-                kept.append("### […older local chunks omitted]")
-                break
-            kept.append(block)
-            size += len(block) + 1
-        parts.extend(reversed(kept))
-        return "\n\n".join(parts)[:max_chars].strip()
+        if not chunks:
+            return ""
+        chunk = chunks[-1]
+        body = str(chunk.get("content") or "").strip()
+        if not body:
+            return ""
+        header = "### Local chunk"
+        if chunk.get("from_turn") is not None and chunk.get("to_turn") is not None:
+            header += f" · turns {int(chunk['from_turn'])}-{int(chunk['to_turn'])}"
+        elif chunk.get("from_ts") is not None and chunk.get("to_ts") is not None:
+            header += (f" · {format_when(float(chunk['from_ts']))}"
+                       f"–{format_when(float(chunk['to_ts']))}")
+        return f"{header}\n{body}"[:max_chars].strip()
 
     def supersede_chunk_summaries(self, session_id: str) -> int:
         """Close the chain after a final summary has been adopted."""
@@ -761,13 +774,16 @@ class MinirStore:
         capped = max(1, min(int(limit), 20))
         visibility, visible_params = self._visibility_sql(session_id)
         rows: list[dict[str, Any]] = []
+        # Historical chunk summaries stay recallable inside their own session after a final
+        # summary supersedes them; the visibility predicate keeps them from leaking elsewhere.
+        status = "(c.status = 'active' OR c.kind = 'session_chunk_summary')"
         fts_terms = [term for term in terms if len(term) >= 3]
         if self._fts and fts_terms:
             match = " OR ".join(f'"{term.replace(chr(34), chr(34) * 2)}"' for term in fts_terms)
             sql = (
                 "SELECT c.*, bm25(conclusions_fts) AS rank FROM conclusions_fts "
                 "JOIN conclusions c ON c.id = conclusions_fts.rowid "
-                f"WHERE conclusions_fts MATCH ? AND c.status = 'active' AND {visibility} "
+                f"WHERE conclusions_fts MATCH ? AND {status} AND {visibility} "
                 "ORDER BY rank LIMIT ?")
             try:
                 with self._lock:
@@ -778,7 +794,7 @@ class MinirStore:
         if not rows:
             where = " OR ".join("lower(c.content) LIKE ?" for _ in terms)
             sql = (
-                f"SELECT c.*, 0 AS rank FROM conclusions c WHERE c.status = 'active' "
+                f"SELECT c.*, 0 AS rank FROM conclusions c WHERE {status} "
                 f"AND {visibility} AND ({where}) "
                 "ORDER BY c.updated_at DESC LIMIT ?")
             with self._lock:
@@ -812,6 +828,8 @@ class MinirStore:
                 "author": row.get("subject") or kind,
                 "subject": row.get("subject") or "",
                 "session_id": row.get("session_id") or "",
+                "from_turn": row.get("from_turn"),
+                "to_turn": row.get("to_turn"),
                 "score": float(overlap) + _KIND_WEIGHT.get(kind, 0.5),
                 "rank": float(row.get("rank") or 0),
             })

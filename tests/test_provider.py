@@ -439,7 +439,7 @@ def test_a_boundary_is_quiet_while_a_queued_job_still_owns_the_content(plugin_pa
     assert len(provider._store.pending_jobs()) == before
 
 
-def test_prefetch_injects_the_published_layer_artifacts(provider):
+def test_prefetch_injects_only_the_dialectic_artifact(provider):
     provider._store.put_layer_state("base", "user:default",
                                     "## Session Summary\n- s\n\n## User Representation\n- [fact] f\n\n"
                                     "## User Peer Card\n- works on Windows\n\n"
@@ -451,30 +451,12 @@ def test_prefetch_injects_the_published_layer_artifacts(provider):
                                     "## Preferences\n- act first\n\n## Second Brain\n- [tool] pytest")
     block = provider.prefetch("nothing matches this query")
     assert block.startswith("## Minir layer state")
-    assert "### User model (v1)" in block and "### Agent model (v1)" in block
-    assert "works on Windows" in block and "run a smoke test" in block
+    assert "### Agent model (v1)" in block
+    assert "### User model" not in block
+    assert "run a smoke test" in block
+    assert "works on Windows" not in block and "## User Peer Card" not in block
     status = provider.recall_status()
-    assert status is not None and status.count == 8, "one item per injected bullet"
-
-
-def test_layer_state_prefers_the_participants_own_model(plugin_package, make_provider):
-    provider = make_provider({"base_interval": 50})
-    provider._store.put_layer_state("base", "user:ada",
-                                    "## Session Summary\n- session a\n\n## User Representation\n- [fact] Ada\n\n"
-                                    "## User Peer Card\n- Ada\n\n## AI Self Representation\n- a\n\n"
-                                    "## AI Identity Card\n- a")
-    time.sleep(0.002)  # a later publish must be later, whatever the clock's resolution
-    provider._store.put_layer_state("base", "user:zoë",
-                                    "## Session Summary\n- session z\n\n## User Representation\n- [fact] Zoë\n\n"
-                                    "## User Peer Card\n- Zoë\n\n## AI Self Representation\n- z\n\n"
-                                    "## AI Identity Card\n- z")
-    provider.on_turn_start(1, "m", author_id="ada", author_name="Ada")
-    assert "Ada" in provider.prefetch("q")
-    # A participant with no artifact yet falls back to the most recently published one, which
-    # for a single-user profile is always that user's.
-    provider.on_turn_start(2, "m", author_id="bob", author_name="Bo")
-    block = provider.prefetch("q")
-    assert "Zoë" in block and "Ada" not in block
+    assert status is not None and status.count == 4, "one item per injected dialectic bullet"
 
 
 def test_an_oversized_message_cannot_empty_or_own_the_budget(plugin_package):
@@ -535,7 +517,7 @@ def test_sync_turn_prefers_the_host_supplied_author(plugin_package, make_provide
 
 
 def test_layer_reasoning_runs_end_to_end(plugin_package, make_provider, monkeypatch):
-    """Reasoning enabled: a turn ends, both layers publish, and the next prefetch carries them."""
+    """Reasoning enabled: a turn ends, both layers publish, and prefetch carries only the agent one."""
     monkeypatch.setenv("MINIR_REASONING_ENABLED", "true")
     monkeypatch.setattr(plugin_package.worker, "call_model", lambda task, system, prompt, **kw: (
         "## Adviser Review\n- ran a smoke test\n\n## Constraints\n- keep answers terse\n\n"
@@ -555,7 +537,8 @@ def test_layer_reasoning_runs_end_to_end(plugin_package, make_provider, monkeypa
     subjects = sorted(state["subject"] for state in provider._store.all_layer_states())
     assert subjects == ["agent:Masía", "user:default"]
     block = provider.prefetch("q")
-    assert "wants evidence" in block and "ran a smoke test" in block
+    assert "ran a smoke test" in block and "keep answers terse" in block
+    assert "wants evidence" not in block, "base cards are search-only"
 
 
 def test_reasoning_disabled_never_calls_the_model(plugin_package, make_provider, monkeypatch):
@@ -754,19 +737,49 @@ def test_prefetch_does_not_inject_another_sessions_review_or_summary(provider):
         "## Preferences\n- durable preference\n\n## Second Brain\n- [project] durable project",
         session_id="other-session")
     block = provider.prefetch("q")
-    assert "durable trait" in block and "durable identity" in block
     assert "durable constraint" in block and "durable project" in block
-    assert "old session secret" not in block and "old advice" not in block
+    assert "old advice" not in block
+    assert "durable trait" not in block and "durable identity" not in block
+    assert "old session secret" not in block
     assert "old goal" not in block and "old stance" not in block
 
 
-def test_prefetch_does_not_inject_the_session_summary_projection(provider):
+def test_prefetch_never_injects_durable_base_cards_from_fts(provider):
+    provider._store.put_conclusion("base.user_peer_card", "user:default",
+                                   "durable peer card secret", subject="user:default")
+    provider._store.put_conclusion("base.ai_identity_card", "agent:minir",
+                                   "durable identity card secret", subject="agent:minir")
+    provider._store.remember("durable peer card note")
+
+    block = provider.prefetch("durable peer card secret")
+    assert "durable peer card note" in block
+    assert "durable peer card secret" not in block
+    assert "durable identity card secret" not in block
+
+    provider.queue_prefetch("durable peer card secret")
+    thread = provider._prefetch_thread
+    if thread is not None:
+        thread.join(timeout=5.0)
+    cached = provider.prefetch("durable peer card secret")
+    assert "durable peer card note" in cached
+    assert "durable peer card secret" not in cached
+    assert "durable identity card secret" not in cached
+
+    payload = json.loads(provider.handle_tool_call(
+        "minir_search", {"query": "durable peer card secret"}))
+    kinds = {row["kind"] for row in payload["results"]}
+    assert "base.user_peer_card" in kinds and "base.ai_identity_card" in kinds, \
+        "explicit minir_search still exposes the durable cards"
+
+
+def test_prefetch_does_not_inject_any_base_artifact(provider):
     provider._store.put_layer_state(
         "base", "user:default",
         "## Session Summary\n- OLD PROJECTION\n\n## User Representation\n- [goal] current\n\n"
         "## User Peer Card\n- durable preference\n\n## AI Self Representation\n- direct\n\n"
         "## AI Identity Card\n- careful")
     block = provider.prefetch("q")
-    assert "durable preference" in block
+    assert block == ""
+    assert "durable preference" not in block
     assert "OLD PROJECTION" not in block
     assert "## Session Summary" not in block

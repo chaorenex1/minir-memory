@@ -37,6 +37,8 @@ worker.py              drains jobs into five-section/dialectic artifacts at dept
 handoff.py             Task Handoff compression prompt + validation
 cadence.py             the dialectic beat, shared by the provider and the engine
 context_engine.py      progressive lossless context management (context.engine: minir)
+agent_loop.py          one-shot in-process AIAgent runs — sync + async (Feishu-shaped)
+adviser.py             optional adviser route + its two handlers (adviser_consult)
 prompts/               operator-supplied Task Handoff template
 tests/                 pytest suite: contract, store, transcript, provider, counting, worker, engine
 scripts/verify_against_host.py   end-to-end check against the real Hermes install
@@ -110,10 +112,10 @@ back to the process-wide active provider, since the host can construct the plugi
 "reason over session X's history in `(from_ts, to_ts]`". A job is one row in the store's `jobs`
 table; `worker.py` drains it from the host's `state.db` (plus the uncommitted buffer), calls the
 auxiliary model, and publishes a merged artifact into `layer_state` and its sections into the
-FTS-indexed `conclusions` table. `prefetch()` injects the newest base (user) and dialectic (agent)
-artifacts ahead of recall, so the next turn sees who the user is and how this agent should work —
-without the conversations it was derived from. The base artifact's `## Session Summary` is a
-projection of the chunk chain and is **not injected**; only its durable cards are.
+FTS-indexed `conclusions` table. `prefetch()` injects only the newest dialectic (agent) artifact
+ahead of recall, so the next turn sees how this agent should work — without the conversations it
+was derived from. Base-layer artifacts are deliberately **not injected**; their cards remain
+recallable through `minir_search`.
 
 | Layer | Models | Artifact sections | Subject key |
 | --- | --- | --- | --- |
@@ -128,12 +130,15 @@ valid pass. `layer_state.version` counts the refreshes; the newest version is wh
 (bounded to 1200 chars) next to the recall block (bounded to 2000).
 
 The base layer's `## Session Summary` is **not an independent summary**: every base refresh writes
-one `session_chunk_summary` (session + time range) to the canonical local-compression chain, and the
-artifact's section is the rolling projection of that chain. The previous projection is deliberately
-omitted from the next base merge prompt (only the other four sections carry forward), so chunks do
-not recursively copy the whole chain. The dialectic worker reads the chain and is instructed to
-reconcile contradictions across chunks (later evidence wins; stale claims and completed blockers
-are removed). `base.session_summary` is not written as a competing FTS conclusion.
+one `session_chunk_summary` (session + time range + turn range) to the canonical local-compression
+chain, and the artifact's section projects **only the newest active chunk** — the current window
+record. Older chunks stay as independent rows with their turn range and remain searchable by
+`minir_search` inside their own session, even after a final summary supersedes them; they are not
+re-projected into the live artifact. The previous projection is deliberately omitted from the next
+base merge prompt (only the other four sections carry forward), so chunks do not recursively copy
+the whole chain. The dialectic worker reads the full active chain and is instructed to reconcile
+contradictions across chunks (later evidence wins; stale claims and completed blockers are
+removed). `base.session_summary` is not written as a competing FTS conclusion.
 
 The model may be told who the assistant is from
 `$HERMES_HOME/minir-memory/agents/<profile>/identity.md` and `preference.md`; the profile comes from
@@ -208,6 +213,81 @@ Without those blocks the host's normal auto chain applies (main model first), ex
 `plugins/memory/query_rewrite.py` does it. Every failure is contained: the worker is a daemon
 thread, a layer refresh never raises into a turn, and `reasoning_enabled: false` makes
 `sync_turn` a no-op so no window is buffered and no model is ever called.
+
+## The adviser auxiliary (optional agent loop)
+
+`adviser.py` puts a second-opinion agent inside this plugin: an `auxiliary.adviser` model route
+plus one `adviser_consult` tool that runs a **real agent loop** (its own LLM + tools) rather than a
+one-shot completion. The loop is not adviser-specific — it lives in `agent_loop.py` and can be
+reused for any one-shot peer run (a review, a summary, a critic):
+
+```python
+from . import agent_loop
+
+result = agent_loop.run("message", context="evidence", model="", provider="",
+                        toolsets=["file"], system_message="be blunt")
+result = await agent_loop.run_async("message", context="evidence", toolsets=["file"])
+result.answer, result.api_calls, result.model, result.provider, result.toolsets
+```
+
+The external surface is deliberately small — **message, context, system message, model, provider,
+toolsets**. Everything else is resolved inside, the way the gateway resolves a message before it
+builds an agent (`_resolve_model_and_runtime` in
+`plugins/platforms/feishu/feishu_comment.py`): `_resolve_gateway_model(_load_gateway_config())`
+for the model (with the provider's default as the fallback), `_resolve_runtime_agent_kwargs()` for
+`api_key`/`base_url`/`api_mode`/`credential_pool` and the gateway's fallback chain, and
+`resolve_reasoning_config(config, model)` for the final model — the chokepoint that makes
+`reasoning_effort` reach the adapter. The system message goes to the *turn*
+(`run_conversation(..., system_message=...)`), so the user message stays exactly what the caller
+asked and the instructions stay instructions.
+
+A pinned `provider` that differs from the gateway route is *re-resolved as a provider*
+(`resolve_runtime_provider`), so an override is a real route and not another provider's model with
+the main key.
+
+Both entry points share one implementation: construct one `AIAgent` with `quiet_mode=True`,
+`skip_context_files=True`, `skip_memory=True`, `skip_background_review=True`,
+`load_soul_identity=True`, the fixed tool budget (`MAX_ITERATIONS`, the Feishu comment agent's 15)
+and an explicit `enabled_toolsets`, call `run_conversation(prompt, system_message=...)`, and
+`close()` it in a `finally` so a long-lived host does not leak tool subprocesses or HTTP clients.
+`run_async` is `asyncio.to_thread` around the same run, because `AIAgent`'s loop is synchronous (no
+`async def` in `run_agent`/`agent.conversation_loop`); the blocking HTTP and tool subprocesses stay
+off the event loop, and `close()` still happens in the thread that built the agent.
+
+`adviser.py` therefore only owns what the caller owns: the `auxiliary.adviser` block
+(`provider`/`model`/`toolsets`), the adviser brief as the run's **system message**, and the tool
+entry. `handle(args)` is the sync handler and `handle_async(args)` the async one. The tool is
+registered as `handler=handle_async, is_async=True` — the host bridges that for sync callers
+(`tools.registry.dispatch` → `_run_async`) and awaits it on a gateway loop, so one consult does not
+stall other conversations. The pairing matters: an async handler with `is_async=False` would hand a
+coroutine to the result normaliser.
+
+```yaml
+auxiliary:
+  adviser:
+    provider: ''            # '' / auto / main = the gateway's route; anything else is re-resolved
+    model: ''               # '' = the gateway's model
+    toolsets: []            # e.g. [file, web]; empty = no tools, one completion
+```
+
+`register()` adds both surfaces next to the memory provider — `ctx.register_auxiliary_task("adviser")`
+for the config block/picker entry and `ctx.register_tool(...)` for `adviser_consult` — and the tool is
+declared under `provides_tools:` in `plugin.yaml`, which is what `hermes plugins validate` checks.
+Registration is deliberately *optional*: if the host refuses the auxiliary key (another plugin owns
+it), the warning is logged and the memory provider still loads, because the provider is why the
+directory is imported at all. The key is process-wide, so a standalone `adviser` plugin cannot stay
+installed next to this one — the second registration is refused (route) or ignored (tool name).
+
+Why a private `AIAgent` instead of `ctx.subagent_lifecycle.launch()`: the adviser is a **peer** of the
+caller (advice, not delegated work), it must not appear in the delegation tree, and it needs its own
+model route rather than the delegation config. The cost is the private `run_agent` import that
+`hermes plugins validate` reports as a catalog-rule-9 warning — the same trade the Feishu plugin
+makes, and the reason this surface is one module you can delete wholesale.
+
+One ordering trap, documented in `agent_loop.run`: `run_agent` bootstraps the managed environment and
+*replaces* `sys.path`, so importing it after `hermes_cli.config` orphans that module's lazy
+`hermes_yaml`/`ruamel` import. `run_agent` is imported first, inside the runner, every time.
+
 
 ## The context engine (progressive lossless context)
 
@@ -317,10 +397,11 @@ hand-edited config.yaml are equivalent. Every key also has an env override —
 when both are set. Layer intervals, depth and `reasoning_enabled` are read when a session opens.
 
 Every published conclusion is searchable: `notes`, the five base sections, the dialectic
-review/constraints/preferences/second brain, and compression handoffs. The index uses FTS5
-`trigram` so Chinese queries work; if the SQLite build lacks FTS5, `minir_search` falls back to
-a token scan. Session summaries, reviews and handoffs only match their own `session_id`; user peer
-cards, AI identity, second-brain rows and notes recall across sessions.
+review/constraints/preferences/second brain, local compression chunks (including superseded
+history), and compression handoffs. The index uses FTS5 `trigram` so Chinese queries work; if the
+SQLite build lacks FTS5, `minir_search` falls back to a token scan. Session summaries, reviews,
+handoffs and chunks only match their own `session_id`; user peer cards, AI identity, second-brain
+rows and notes recall across sessions.
 
 Restart Hermes (an already-running Gateway/TUI keeps the previous code in memory).
 Data lands in `$HERMES_HOME/minir-memory/memory.db`; delete that file to reset. A database

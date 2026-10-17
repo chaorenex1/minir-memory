@@ -167,6 +167,19 @@ try:
     assert module.TRACKER.snapshot("hook-session") is not None, \
         "on_session_start hook did not reach the plugin's tracker"
 
+    # The same register() puts the adviser surface on the host. A tool the model cannot call —
+    # or a route the config layer does not know — is not a delivered feature, so both are
+    # asserted against the real plugin manager and the real tool registry.
+    from hermes_cli.plugins import get_plugin_auxiliary_tasks
+    from tools.registry import registry as tool_registry
+
+    aux_keys = sorted(task["key"] for task in get_plugin_auxiliary_tasks())
+    assert "adviser" in aux_keys, "the adviser auxiliary route was not registered: %%r" %% aux_keys
+    adviser_entry = tool_registry.get_entry("adviser_consult")
+    assert adviser_entry is not None, "adviser_consult was not registered in the tool registry"
+    assert adviser_entry.toolset == "adviser", "unexpected toolset: %%r" %% adviser_entry.toolset
+    assert adviser_entry.is_async is True, "adviser_consult must be registered as an async handler"
+
     print(json.dumps({
         "discovered": len(names),
         "provider": provider.name,
@@ -176,6 +189,7 @@ try:
         "jobs": stats["jobs"],
         "dialectic_turns": layers["dialectic"]["turns"],
         "engine": {"loaded": engine.name, "folded_messages": len(history) - len(folded)},
+        "adviser": {"aux_tasks": aux_keys, "tool": "adviser_consult", "toolset": adviser_entry.toolset},
         "queue": [{"layer": job["layer"], "session": job["session_id"], "turns": job["turns"],
                    "window": [round(job["from_ts"], 3), round(job["to_ts"], 3)], "status": job["status"]}
                   for job in provider._store.pending_jobs()],

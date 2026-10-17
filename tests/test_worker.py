@@ -50,11 +50,11 @@ def worker(plugin_package, store, transcript):
     return instance
 
 
-def _dispatch(store, transcript, session, layer, from_ts, to_ts):
+def _dispatch(store, transcript, session, layer, from_ts, to_ts, turns=0):
     """Queue a job exactly the way the provider does: the edge is registered with the transcript
     first, so a message that shares the stamp is pushed strictly past it."""
     transcript.mark_edge(session, to_ts)
-    return store.record_job(layer, session, from_ts, to_ts)
+    return store.record_job(layer, session, from_ts, to_ts, turns=turns)
 
 
 # -- window resolution --------------------------------------------------------
@@ -164,7 +164,7 @@ def test_merge_bumps_the_version_and_feeds_the_previous_artifact_forward(store, 
     assert "Wants terse answers" in worker.calls[1]["prompt"], \
         "the merge pass must see the durable previous sections"
     assert "## Session Summary" not in worker.calls[1]["prompt"], \
-        "the rolling projection must be recomputed, not fed back"
+        "the latest-chunk projection must be recomputed, not fed back"
 
 
 def test_dialectic_layer_publishes_constraints_preferences_review(plugin_package, store, transcript):
@@ -422,28 +422,45 @@ def test_a_dialectic_audit_failure_keeps_the_initial_draft(plugin_package, store
 
 # -- canonical chunk chain ----------------------------------------------------
 
-def test_base_refresh_appends_a_chunk_and_projects_it_into_the_artifact(store, transcript, worker):
+def test_base_refresh_appends_a_chunk_and_projects_only_the_newest(store, transcript, worker):
     transcript.add(SESSION, "user", "first window", created_at=10.0)
-    _dispatch(store, transcript, SESSION, BASE, 0.0, 20.0)
+    _dispatch(store, transcript, SESSION, BASE, 0.0, 20.0, turns=1)
     assert worker.run_once() == 1
 
     chunks = store.chunk_summaries(SESSION)
     assert len(chunks) == 1
     assert "Ships a Hermes memory plugin" in chunks[0]["content"]
     assert store.newest_conclusion("base.session_summary") is None, \
-        "the rolling view must not be a second independent conclusion"
+        "the projection must not be a second independent conclusion"
 
     artifact = store.layer_state(BASE, "user:default")["content"]
     assert "## Session Summary" in artifact
     assert "Ships a Hermes memory plugin" in artifact
-    assert "Local chunk" in artifact, "the base section is the rolling chain projection"
+    assert "Local chunk" in artifact, "the base section projects the newest chunk"
 
     transcript.add(SESSION, "user", "second window", created_at=30.0)
-    _dispatch(store, transcript, SESSION, BASE, 20.0, 40.0)
+    _dispatch(store, transcript, SESSION, BASE, 20.0, 40.0, turns=2)
     assert worker.run_once() == 1
     assert len(store.chunk_summaries(SESSION)) == 2
-    projection = store.rolling_session_summary(SESSION)
-    assert projection.count("Local chunk") == 2
+    projection = store.latest_chunk_summary(SESSION)
+    assert projection.count("Local chunk") == 1, "only the newest chunk is projected"
+    artifact = store.layer_state(BASE, "user:default")["content"]
+    assert artifact.count("Local chunk") == 1
+
+
+def test_each_chunk_records_the_turn_range_it_covers(store, transcript, worker):
+    transcript.add(SESSION, "user", "first window", created_at=10.0)
+    _dispatch(store, transcript, SESSION, BASE, 0.0, 20.0, turns=3)
+    assert worker.run_once() == 1
+    chunk = store.chunk_summaries(SESSION)[0]
+    assert (chunk["from_turn"], chunk["to_turn"]) == (1, 3)
+
+    transcript.add(SESSION, "user", "second window", created_at=30.0)
+    _dispatch(store, transcript, SESSION, BASE, 20.0, 40.0, turns=5)
+    assert worker.run_once() == 1
+    chunk = store.chunk_summaries(SESSION)[-1]
+    assert (chunk["from_turn"], chunk["to_turn"]) == (4, 5)
+    assert "turns 4-5" in store.latest_chunk_summary(SESSION)
 
 
 def test_final_summary_supersedes_the_chunk_chain(store, transcript, worker):
@@ -456,8 +473,13 @@ def test_final_summary_supersedes_the_chunk_chain(store, transcript, worker):
                          session_id=SESSION, subject="session", status="active")
     assert store.supersede_chunk_summaries(SESSION) == 1
     assert store.chunk_summaries(SESSION) == []
-    projection = store.rolling_session_summary(SESSION)
-    assert "Prior summarized context" in projection and "## Goal" in projection
+    assert store.latest_chunk_summary(SESSION) == "", \
+        "a superseded chunk is history, not the live window record"
+    hits = store.search("Hermes memory", session_id=SESSION)
+    assert any(row["kind"] == "session_chunk_summary" for row in hits), \
+        "historical chunks stay searchable inside their session"
+    assert not any(row["kind"] == "session_chunk_summary"
+                   for row in store.search("Hermes memory", session_id="other-session"))
 
 
 def test_dialectic_prompt_consumes_the_chunk_chain(store, transcript, worker):
@@ -482,7 +504,7 @@ def test_base_prompt_does_not_feed_the_previous_projection_back(store, transcrip
     _dispatch(store, transcript, SESSION, BASE, 0.0, 20.0)
     assert worker.run_once() == 1
     prompt = worker.calls[0]["prompt"]
-    assert "OLD PROJECTION" not in prompt, "the rolling projection must not be fed back"
+    assert "OLD PROJECTION" not in prompt, "the latest-chunk projection must not be fed back"
     assert "durable peer" in prompt, "the other four sections still carry forward"
 
 
