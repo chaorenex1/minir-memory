@@ -126,6 +126,39 @@ def test_manifest_declares_every_registered_hook(plugin_package):
     assert set(declared) <= VALID_HOOKS, sorted(set(declared) - VALID_HOOKS)
 
 
+def test_manifest_declares_registered_middleware(plugin_package):
+    """``hermes plugins validate`` compares registered middleware to ``provides_middleware``."""
+    class FakeContext:
+        def __init__(self):
+            self.middleware = []
+
+        def register_memory_provider(self, provider):
+            pass
+
+        def register_hook(self, name, callback):
+            pass
+
+        def register_middleware(self, kind, callback):
+            self.middleware.append(kind)
+
+    ctx = FakeContext()
+    plugin_package.register(ctx)
+
+    declared = []
+    in_block = False
+    for line in (PLUGIN_ROOT / "plugin.yaml").read_text(encoding="utf-8-sig").splitlines():
+        if line.startswith("provides_middleware:"):
+            in_block = True
+            continue
+        if in_block:
+            if line.startswith("  - "):
+                declared.append(line[4:].strip())
+            elif line.strip() and not line.startswith(" "):
+                break
+    assert ctx.middleware == ["llm_request"]
+    assert set(declared) == set(ctx.middleware)
+
+
 def test_tool_schemas_are_openai_shaped(plugin_package):
     schemas = plugin_package.MinirMemoryProvider({}).get_tool_schemas()
     assert schemas, "a memory provider should expose at least one tool"

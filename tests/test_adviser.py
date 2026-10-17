@@ -283,5 +283,6 @@ def test_provider_registration_survives_a_refused_auxiliary_key(plugin_package):
 
     assert len(ctx.memory_providers) == 1
     assert ctx.hooks == ["on_session_start", "on_session_reset", "on_session_finalize",
-                         "pre_llm_call", "post_llm_call", "post_tool_call"]
+                         "pre_llm_call", "post_llm_call", "post_tool_call", "pre_tool_call",
+                         "on_interim_message", "post_api_request", "api_request_error"]
     assert ctx.calls == []

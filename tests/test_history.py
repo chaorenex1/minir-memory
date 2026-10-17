@@ -85,6 +85,36 @@ def test_latest_timestamp_skips_a_newest_summary_row(plugin_package, tmp_path):
     assert plugin_package.history.latest_ts(path, "s1") == 20.0
 
 
+def test_adviser_injection_is_stripped_from_tool_evidence(plugin_package, tmp_path):
+    path = tmp_path / "state.db"
+    _state_db(path)
+    connection = sqlite3.connect(str(path))
+    try:
+        connection.execute(
+            "INSERT INTO messages (session_id, role, content, timestamp, message_uid, tool_name,"
+            " active, _compressed_summary) VALUES ('s1', 'tool', ?, 10.8, 't2', 'terminal', 1, 0)",
+            ("pytest: 4 passed\n\n[adviser — advisory only]\n"
+             "- [concern] check stderr\n[end adviser]",))
+        connection.execute(
+            "INSERT INTO messages (session_id, role, content, timestamp, message_uid,"
+            " active, _compressed_summary) VALUES ('s1', 'assistant', ?, 10.9, 'a2', 1, 0)",
+            ("[adviser — advisory only]\n- only an injection\n[end adviser]",))
+        connection.execute(
+            "INSERT INTO messages (session_id, role, content, timestamp, message_uid,"
+            " active, _compressed_summary) VALUES ('s1', 'user', ?, 10.95, 'u9', 1, 0)",
+            ("[adviser-only mode — advisory only]\nPropose the change.\n"
+             "[end adviser-only mode]",))
+        connection.commit()
+    finally:
+        connection.close()
+
+    rows = plugin_package.history.read_messages(
+        path, "s1", 10.0, 11.0, roles=("user", "assistant", "tool"))
+    tool = next(row for row in rows if row["message_uid"] == "t2")
+    assert tool["content"] == "pytest: 4 passed"
+    assert all("adviser" not in row["content"] for row in rows)
+
+
 def test_role_filter_can_include_tool_rows_for_the_dialectic_review(plugin_package, tmp_path):
     path = tmp_path / "state.db"
     _state_db(path)

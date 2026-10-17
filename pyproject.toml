@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "minir-memory"
-version = "0.5.0"
-description = "Local-first Hermes memory plugin: base/dialectic layer artifacts in SQLite, FTS5 recall, and progressive context management."
+version = "0.6.0"
+description = "Local-first Hermes memory plugin: base/dialectic layer artifacts in SQLite, FTS5 recall, per-turn adviser mode, and progressive context management."
 readme = "README.md"
 requires-python = ">=3.11"
 authors = [{ name = "chaorenex1" }]

@@ -121,8 +121,13 @@ def _prompt(message: str, context: str = "") -> str:
 
 
 def run(message: str, *, context: str = "", model: str = "", provider: str = "",
-        toolsets: Optional[Sequence[str]] = None, system_message: str = "") -> AgentRun:
-    """Run one agent loop on *message* and return its answer. Never leaves an agent open."""
+        toolsets: Optional[Sequence[str]] = None, system_message: str = "",
+        max_iterations: int = MAX_ITERATIONS) -> AgentRun:
+    """Run one agent loop on *message* and return its answer. Never leaves an agent open.
+
+    ``max_iterations`` is the tool-call budget for this peer run. The default is the Feishu
+    comment agent's 15; a narrow reviewer should pass a smaller bound (adviser mode uses 3).
+    """
     from run_agent import AIAgent  # first: it replaces sys.path (managed environment bootstrap)
 
     resolved_model, runtime = _resolve_model_and_runtime()
@@ -134,7 +139,7 @@ def run(message: str, *, context: str = "", model: str = "", provider: str = "",
         model=final_model,
         **_agent_kwargs(final_provider, final_model, runtime),
         enabled_toolsets=tools or None,
-        max_iterations=MAX_ITERATIONS,
+        max_iterations=max(1, int(max_iterations or MAX_ITERATIONS)),
         # A peer run brings its own instructions and evidence: no project context files, no host
         # memory, no background review fork. ``load_soul_identity`` stays on so the run speaks in
         # the operator's configured voice.
@@ -163,8 +168,10 @@ def run(message: str, *, context: str = "", model: str = "", provider: str = "",
 
 async def run_async(message: str, *, context: str = "", model: str = "", provider: str = "",
                     toolsets: Optional[Sequence[str]] = None,
-                    system_message: str = "") -> AgentRun:
+                    system_message: str = "",
+                    max_iterations: int = MAX_ITERATIONS) -> AgentRun:
     """Await :func:`run` off the event loop (see the module docstring for why a thread)."""
     return await asyncio.to_thread(run, message, context=context, model=model,
                                    provider=provider, toolsets=toolsets,
-                                   system_message=system_message)
+                                   system_message=system_message,
+                                   max_iterations=max_iterations)

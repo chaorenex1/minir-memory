@@ -53,6 +53,7 @@ from tools.registry import tool_error
 
 from . import adviser
 from . import history as host_history
+from .adviser_mode import AdviserMode
 from .store import MinirStore, format_when
 from .transcript import TranscriptBuffer
 from .turn_counter import (
@@ -212,6 +213,9 @@ class MinirMemoryProvider(MemoryProvider):
         self._metrics: dict[str, dict[str, Any]] = {}
         self._metrics_seen = 0
         self._review_turns: dict[str, str] = {}  # session -> last turn already injected
+        # Per-turn side channel: event ring + reviewer worker + llm_request delivery. Constructed
+        # before initialize (the host may register hooks first); every path guards on the store.
+        self._adviser_mode = AdviserMode(self)
 
     # -- contract -------------------------------------------------------------
 
@@ -233,6 +237,7 @@ class MinirMemoryProvider(MemoryProvider):
         global _ACTIVE_PROVIDER
         _ACTIVE_PROVIDER = self
         self._session_id = session_id or ""
+        self._adviser_mode.session_started(self._session_id)
         self._agent_context = str(kwargs.get("agent_context") or "primary")
         # Identity the host hands us: drives which subject each layer's artifact belongs to.
         self._user_id = str(kwargs.get("user_id") or "")
@@ -527,6 +532,9 @@ class MinirMemoryProvider(MemoryProvider):
     def _prepare_compression(self, session_id: str) -> None:
         if self._store is None or not session_id or self._agent_context not in ("", "primary"):
             return
+        # Compression is a hard boundary: in-flight adviser advice is stale once the window is
+        # rewritten, and the gate below suppresses new reviews until the engine releases it.
+        self._adviser_mode.session_reset(session_id)
         if not self._reasoning or self._worker is None or not self._worker.enabled:
             return  # reasoning disabled: there is no worker that could drain a job
         now = time.time()
@@ -557,6 +565,7 @@ class MinirMemoryProvider(MemoryProvider):
         """
         try:
             self._flush_boundary(self._session_id, close=True)
+            self._adviser_mode.session_end(self._session_id)
         except Exception as exc:
             logger.warning("Minir on_session_end failed: %s", exc)
 
@@ -658,6 +667,9 @@ class MinirMemoryProvider(MemoryProvider):
                 # host's turn number rehydrates the count on the first tick.
                 TRACKER.begin(new_session_id, mode=self._session_mode)
         self._session_id = new_session_id or self._session_id
+        if previous_id and reset:
+            self._adviser_mode.session_reset(previous_id)
+        self._adviser_mode.session_started(self._session_id)
         if reset:
             with self._lock:
                 self._cached = None
@@ -676,6 +688,8 @@ class MinirMemoryProvider(MemoryProvider):
         if worker is not None:
             worker.kick(spawn=spawn_context_thread)
             worker.stop()  # bounded join: the store cannot close under a draining job
+        self._adviser_mode.session_end(self._session_id)
+        self._adviser_mode.stop()  # no review may touch the store after this point
         self.flush_metrics()
         # Only now that no drain is in flight: a queued boundary job must still find its window.
         self._transcript.clear()
@@ -783,19 +797,25 @@ class MinirMemoryProvider(MemoryProvider):
             self._review_turns[session] = turn
             return True
 
-    def advisory_block(self, session_id: str = "", turn_id: str = "") -> str:
-        """Drain pending dialectic advices into one bounded injection block.
+    def advisory_block(self, session_id: str = "", turn_id: str = "",
+                       *, source: str = "") -> str:
+        """Drain pending advices into one bounded injection block.
 
         The advices are the actionable half of the dialectic review; the six corrected cards
         stay on the base layer and are never injected here. Marking them injected happens
         after the block is built, so a tool loop does not receive the same advice twice.
+
+        ``source`` narrows the ledger for the turn-boundary channel. The provider passes
+        ``dialectic`` there: adviser-mode advice is staged by ``llm_request`` and confirmed by
+        ``post_api_request``, so draining it here would mark it injected before it was sent.
         """
         if self._store is None:
             return ""
         session = session_id or self._session_id
         if not session:
             return ""
-        rows = self._store.pending_advisories(session, limit=_MAX_ADVICE_ITEMS)
+        rows = self._store.pending_advisories(
+            session, limit=_MAX_ADVICE_ITEMS, source=source)
         if not rows:
             return ""
         header, footer = "[minir adviser — advisory only]", "[end minir adviser]"
@@ -807,7 +827,8 @@ class MinirMemoryProvider(MemoryProvider):
         for row in rows:
             severity = str(row.get("severity") or "concern")
             target = str(row.get("target") or "")
-            label = f"[{severity} · {target}]" if target else f"[{severity}]"
+            source = str(row.get("source") or "dialectic")
+            label = f"[{source} · {severity} · {target}]" if target else f"[{source} · {severity}]"
             line = f"- {label} {str(row.get('content') or '').strip()}"
             decision = str(row.get("decision") or "").strip()
             if decision:
@@ -1021,6 +1042,37 @@ def register(ctx) -> None:
                       lambda **kwargs: _on_post_llm_call(provider=provider, **kwargs))
     ctx.register_hook("post_tool_call",
                       lambda **kwargs: _on_post_tool_call(provider=provider, **kwargs))
+    # ``adviser_only`` is enforced before execution; returning action=block wins the gate.
+    ctx.register_hook("pre_tool_call",
+                      lambda **kwargs: _on_pre_tool_call(provider=provider, **kwargs))
+    # Adviser mode observers: the event ring needs the assistant's intent (interim text and
+    # successful API responses with tool calls), the tool outcome, and the final answer.
+    ctx.register_hook("on_interim_message",
+                      lambda **kwargs: _on_interim_message(provider=provider, **kwargs))
+    ctx.register_hook("post_api_request",
+                      lambda **kwargs: _on_post_api_request(provider=provider, **kwargs))
+    ctx.register_hook("api_request_error",
+                      lambda **kwargs: _on_api_request_error(provider=provider, **kwargs))
+    # Adviser mode's mid-loop delivery seam. The memory-provider context forwards register_* to
+    # a real PluginContext; a bare test/older host may not expose it, so registration is optional.
+    register_middleware = getattr(ctx, "register_middleware", None)
+    if callable(register_middleware):
+        try:
+            register_middleware(
+                "llm_request",
+                lambda **kwargs: _on_llm_request(provider=provider, **kwargs))
+        except Exception as exc:
+            logger.warning("Minir adviser-mode middleware registration failed: %s", exc)
+    register_command = getattr(ctx, "register_command", None)
+    if callable(register_command):
+        try:
+            register_command(
+                "adviser",
+                lambda raw_args="": _adviser_command(provider=provider, raw_args=raw_args),
+                description="Toggle the per-turn adviser mode (on/off/status/log/cadence/mode).",
+                args_hint="[on|off|status|log|cadence N|mode watch|adviser_only]")
+        except Exception as exc:
+            logger.warning("Minir /adviser command registration failed: %s", exc)
     # Second surface of the same directory: the auxiliary ``adviser`` route + its in-process
     # agent loop (``adviser_consult``). Optional by design — a host without the auxiliary-task
     # API (or a config that refuses the key) must still get the memory provider, so a failure
@@ -1054,6 +1106,7 @@ def _on_session_start(session_id: str = "", model: str = "", platform: str = "",
         TRACKER.begin(session_id)
         resolved = _resolve_provider(provider)
         if resolved is not None:
+            resolved._adviser_mode.session_started(session_id)
             resolved.cold_start(session_id)
         logger.info("Minir on_session_start: session=%s model=%s platform=%s",
                     session_id or "-", model or "-", platform or "-")
@@ -1089,6 +1142,7 @@ def _on_session_finalize(session_id: str = "", provider: Optional[MinirMemoryPro
         TRACKER.stop(session_id)
         resolved = _resolve_provider(provider)
         if resolved is not None:
+            resolved._adviser_mode.session_end(session_id)
             resolved.flush_metrics()
         logger.info("Minir on_session_finalize: session=%s", session_id or "-")
     except Exception as exc:
@@ -1113,11 +1167,21 @@ def _on_pre_llm_call(session_id: str = "", turn_id: str = "",
             return None
         if session_id and provider._session_id and session_id != provider._session_id:
             return None
+        # The adviser-mode event ring needs the user's goal for this turn; the advice delivery
+        # below is the existing turn-boundary channel (both sources share the ledger).
+        provider._adviser_mode.on_pre_llm_call(
+            session_id=session_id, turn_id=turn_id,
+            user_message=kwargs.get("user_message"))
+        # ``adviser_only`` is a policy mode, not a different reviewer: the brief tells the main
+        # agent to propose changes instead of executing them, and ``pre_tool_call`` enforces it.
+        brief = provider._adviser_mode.mode_brief(session_id)
         # The dialectic advices are the actionable channel. When the ledger exists, the review
         # summary already rides ``prefetch``; do not inject it a second time through this hook.
-        advices = provider.advisory_block(session_id, turn_id)
+        advices = provider.advisory_block(session_id, turn_id, source="dialectic")
         if advices:
-            return advices
+            return f"{brief}\n\n{advices}" if brief else advices
+        if brief:
+            return brief
         if provider.has_advisories(session_id):
             return None
         history = kwargs.get("conversation_history") or []
@@ -1137,6 +1201,11 @@ def _on_post_llm_call(session_id: str = "", turn_id: str = "", model: str = "",
                       provider: Optional[MinirMemoryProvider] = None, **kwargs) -> None:
     logger.info("Minir post_llm_call: session=%s turn=%s model=%s",
                 session_id or "-", turn_id or "-", model or "-")
+    resolved = _resolve_provider(provider)
+    if resolved is not None:
+        resolved._adviser_mode.on_post_llm_call(
+            session_id=session_id, turn_id=turn_id,
+            assistant_response=kwargs.get("assistant_response"))
 
 
 def _on_post_tool_call(tool_name: str = "", session_id: str = "",
@@ -1148,3 +1217,68 @@ def _on_post_tool_call(tool_name: str = "", session_id: str = "",
     if resolved is not None:
         resolved.record_metric(tool_name, duration_ms,
                                error=bool(kwargs.get("error") or kwargs.get("is_error")))
+        resolved._adviser_mode.on_post_tool_call(
+            session_id=session_id, turn_id=str(kwargs.get("turn_id") or ""),
+            tool_name=tool_name, status=str(kwargs.get("status") or ""),
+            args=kwargs.get("args"), result=kwargs.get("result"),
+            error_message=str(kwargs.get("error_message") or ""),
+            error=kwargs.get("error"), is_error=kwargs.get("is_error"))
+
+
+def _on_pre_tool_call(tool_name: str = "", session_id: str = "",
+                      provider: Optional[MinirMemoryProvider] = None,
+                      **kwargs) -> Optional[dict[str, str]]:
+    """``adviser_only`` enforcement: block mutating tools before they execute."""
+    resolved = _resolve_provider(provider)
+    if resolved is not None and resolved._adviser_mode.blocks_tool(session_id, tool_name):
+        return {"action": "block",
+                "message": (f"adviser_only mode: {tool_name} is a mutating tool. "
+                            "Propose the exact change for the user to apply instead.")}
+    return None
+
+
+def _on_interim_message(session_id: str = "", turn_id: str = "", text: Any = None,
+                        iteration: Any = None,
+                        provider: Optional[MinirMemoryProvider] = None, **kwargs) -> None:
+    """Record the assistant's mid-loop intent (the reviewer's missing half of a tool event)."""
+    resolved = _resolve_provider(provider)
+    if resolved is not None:
+        resolved._adviser_mode.on_interim_message(
+            session_id=session_id, turn_id=turn_id, text=text, iteration=iteration)
+
+
+def _on_post_api_request(session_id: str = "", turn_id: str = "", api_request_id: str = "",
+                         assistant_message: Any = None, assistant_tool_call_count: Any = 0,
+                         provider: Optional[MinirMemoryProvider] = None, **kwargs) -> None:
+    """Record intent and confirm that a request's staged advice actually left the process."""
+    resolved = _resolve_provider(provider)
+    if resolved is not None:
+        resolved._adviser_mode.on_post_api_request(
+            session_id=session_id, turn_id=turn_id, api_request_id=api_request_id,
+            assistant_message=assistant_message,
+            assistant_tool_call_count=assistant_tool_call_count)
+
+
+def _on_api_request_error(session_id: str = "", api_request_id: str = "",
+                          provider: Optional[MinirMemoryProvider] = None, **kwargs) -> None:
+    """A failed attempt did not deliver its advice: return staged rows to pending."""
+    resolved = _resolve_provider(provider)
+    if resolved is not None:
+        resolved._adviser_mode.on_api_request_error(
+            session_id=session_id, api_request_id=api_request_id)
+
+
+def _on_llm_request(request: Any = None, provider: Optional[MinirMemoryProvider] = None,
+                    **kwargs) -> Optional[dict[str, Any]]:
+    """``llm_request`` middleware: the only mid-tool-loop advice injection seam in Hermes."""
+    resolved = _resolve_provider(provider)
+    if resolved is None:
+        return None
+    return resolved._adviser_mode.handle_llm_request(request=request, **kwargs)
+
+
+def _adviser_command(raw_args: str = "", provider: Optional[MinirMemoryProvider] = None) -> str:
+    resolved = _resolve_provider(provider)
+    if resolved is None:
+        return "adviser: the memory provider is not initialized."
+    return resolved._adviser_mode.command(raw_args)

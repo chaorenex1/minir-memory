@@ -13,6 +13,13 @@ pass reviews those cards against that history. The review can correct the base a
 pre-overwrite snapshot and an FTS index are kept) and emits severity-ranked advices, which are
 injected into later turns for the main session or the user to decide.
 
+It also ships an optional **adviser mode**: a fast, per-turn side channel that watches the live
+tool loop (user goal, assistant intent, tool results), asks the same auxiliary reviewer for
+actionable advice, and injects it before the next model request through the host's `llm_request`
+middleware. Unlike the dialectic layer it never writes base cards or revisions; it only appends
+to the shared advice ledger with `source='adviser_mode'`. Turn it on per session with
+`/adviser on`.
+
 **It stores no transcripts.** The worker reads `(from_ts, to_ts]` messages from
 `$HERMES_HOME/state.db` read-only (plus the in-process buffer for turns not yet committed) and
 persists only what the layers *derived* from them plus notes you asked to keep. Derived content
@@ -46,6 +53,7 @@ plugin/minir/          the deployable plugin directory (copy this to plugins/min
   context_engine.py    audited summary compression (context.engine: minir)
   agent_loop.py        one-shot in-process AIAgent runs — sync + async (Feishu-shaped)
   adviser.py           optional adviser route + the adviser toolset (adviser_consult)
+  adviser_mode.py      per-turn side channel: event ring, reviewer worker, llm_request delivery
   session_search.py    read-only multi-shape search over the host's session store (state.db)
   prompts/             operator-supplied Task Handoff template
 tests/                 pytest suite: contract, store, transcript, provider, counting, worker, engine
@@ -96,23 +104,28 @@ both surfaces:
 | --- | --- |
 | `on_session_start(session_id=, model=, platform=)` | record the session; queue one cold-start *base* job when history exists, gated to the bound primary session |
 | `on_session_reset(session_id=, old_session_id=, reason=)` | `/new`, `/reset`: stop the old counters, initialize the new session |
-| `on_session_finalize(session_id=)` | process teardown: stop counting, flush tool metrics |
-| `pre_llm_call` | inject pending dialectic advices into the user message; fall back to the legacy session review only when no advice ledger exists |
-| `post_llm_call` / `post_tool_call` | per-turn logging; `post_tool_call` also aggregates tool counters |
+| `on_session_finalize(session_id=)` | process teardown: stop counting, expire adviser-mode advice, flush tool metrics |
+| `pre_llm_call` | record the turn's user goal; inject pending dialectic advices (and the `adviser_only` brief); adviser-mode advice stays for the `llm_request` staging path; fall back to the legacy session review only when no advice ledger exists |
+| `post_llm_call` / `post_tool_call` | per-turn logging; `post_tool_call` also aggregates tool counters and feeds the adviser-mode event ring |
+| `pre_tool_call` | `adviser_only` enforcement: block mutating tools before execution and tell the model to propose the change instead |
+| `on_interim_message` | record the assistant's mid-loop intent for the adviser-mode reviewer |
+| `post_api_request` / `api_request_error` | confirm adviser-mode delivery or return staged advice to pending |
 
 Every hook `register()` subscribes to must also be listed under `provides_hooks:` in
 `plugin.yaml` — `hermes plugins validate` fails the manifest otherwise (`hermes plugins doctor`
 warns). `tests/test_contract.py` keeps the two lists in step.
 
-These carry **no counting state**: the hot ones (`pre_llm_call`, `post_llm_call`,
-`post_tool_call`, `on_session_start`) run under the host's 30s `plugins.hook_callback_timeout`,
+These carry **no counting state**: the hot ones (`pre_tool_call`, `pre_llm_call`,
+`post_llm_call`, `post_tool_call`, `on_interim_message`, `post_api_request`,
+`on_session_start`) run under the host's 30s `plugins.hook_callback_timeout`,
 which *abandons* a slow callback and suppresses it for 60s. They therefore never call a model:
-`on_session_start` only enqueues, `pre_llm_call` reads a cached review, and `post_tool_call`
-increments an in-memory counter. The plugin-level `on_session_end` is a per-turn event (not a
-session boundary), so the real boundary uses the memory-provider method. Every handler except
-`pre_llm_call` returns `None`; `on_session_finalize` must stay empty because the host sends a
-non-empty result to the chat. `register()` closes the hooks over the provider instance and falls
-back to the process-wide active provider, since the host can construct the plugin twice.
+`on_session_start` only enqueues, `pre_llm_call` reads the advice ledger, and `post_tool_call`
+increments an in-memory counter and appends one bounded event. The plugin-level `on_session_end` is a per-turn event (not a
+session boundary, so the real boundary uses the memory-provider method. Observer callbacks return
+`None`; `pre_llm_call` may return injected context and `pre_tool_call` may return a block in
+`adviser_only`. `on_session_finalize` must stay empty because the host sends a non-empty result to
+the chat. `register()` closes the hooks over the provider instance and falls back to the
+process-wide active provider, since the host can construct the plugin twice.
 
 ## The two layers (base / dialectic)
 
@@ -427,6 +440,81 @@ One ordering trap, documented in `agent_loop.run`: `run_agent` bootstraps the ma
 *replaces* `sys.path`, so importing it after `hermes_cli.config` orphans that module's lazy
 `hermes_yaml`/`ruamel` import. `run_agent` is imported first, inside the runner, every time.
 
+
+## Adviser mode (per-turn side channel)
+
+The dialectic layer is slow and window-scoped: it corrects the long-term user/AI cards after a
+base refresh. Adviser mode is the fast loop: it watches the current turn and nudges the main
+agent before its next model request. The two share the `auxiliary.adviser` route, the
+`adviser_session_search` toolset, the `advisories` ledger and severity/dedupe rules, but not
+write authority:
+
+| | dialectic layer | adviser mode |
+| --- | --- | --- |
+| Trigger | base refresh / compression boundary | tool cadence, tool error, mutation, final answer |
+| Input | base artifact + window history | user goal, assistant intent, tool results, final answer |
+| Output | six corrected cards + `advices` | `silent` or 1–3 lightweight advices |
+| Writes | `base_refreshes`, `base_revisions`, `layer_state`, `advisories` | `advisories` only |
+| Delivery | `pre_llm_call` (once per turn) | `pre_llm_call` + `llm_request` (mid-tool-loop) |
+| Lifetime | durable audit | current turn, expires |
+
+Enable per session:
+
+```text
+/adviser on
+/adviser status
+/adviser cadence 3
+/adviser mode watch        # or adviser_only
+/adviser log
+/adviser off
+```
+
+Optional config (under `memory.minir`):
+
+```yaml
+adviser_mode:
+  enabled: false            # /adviser on overrides per session
+  mode: watch               # watch | adviser_only
+  cadence: 3                # tool calls between reviews
+  severity_floor: concern   # nit | concern | blocker
+  max_reviews_per_turn: 6
+  max_advices: 3
+  max_chars: 900
+  toolsets: [adviser]      # read-only by default; never inherits the base/dialectic route
+```
+
+The reviewer runs on the same `auxiliary.adviser` route with a three-iteration tool budget. Its
+input is a bounded in-memory event ring (no transcript is written): `pre_llm_call` records the
+user goal, `on_interim_message`/`post_api_request` record the assistant's intent, `post_tool_call`
+records the tool outcome, and `post_llm_call` records the final answer. It may call
+`adviser_session_search` to ground a claim.
+
+Delivery has two stages because Hermes's `pre_llm_call` fires only once per turn:
+
+1. Turn boundary — `pre_llm_call` drains pending **dialectic** advice (plus the `adviser_only`
+   brief). Adviser-mode advice is deliberately not drained here: marking it injected before the
+   request is sent would break the at-least-once staging contract.
+2. Mid-loop — `llm_request` middleware appends pending `source='adviser_mode'` advice to the next
+   provider request (after the last tool result, or as a synthetic user message), then stages the
+   rows. `post_api_request` marks them delivered; `api_request_error` returns them to pending.
+
+`adviser_only` is enforced, not just prompted: `pre_llm_call` injects the advisory brief and
+`pre_tool_call` blocks mutating tools (`write_file`, `patch`, `terminal`, code execution,
+`delegate_task`, `cronjob`) with a message asking for a proposed change. The policy is checked
+independently of the review/compression gate, so a compression cannot briefly re-enable writes.
+The main agent still sees the schemas; the gate is the policy, so a blocked call costs one tool
+iteration.
+
+The block is bounded and tagged (`[adviser — advisory only]`). A blocker is the highest-priority
+next request, not a preemption: plugins cannot interrupt a running tool or wake a finished turn.
+The middleware skips a block already present in the request tail, so the host loading the same
+plugin directory twice cannot inject it twice.
+
+Adviser mode never writes base cards. It may use a compact dialectic digest (user path, peer
+constraints, latest review) as context; dialectic input filters adviser injections so ephemeral
+advice cannot become a "fact" in the long-term model. Compression clears the event ring and
+expires pending adviser advice; the compression gate pauses new reviews until the summary is
+committed.
 
 ## The context engine (audited summary compression)
 

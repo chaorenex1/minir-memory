@@ -10,8 +10,9 @@ Two host details matter for correctness:
 * only ``active = 1`` rows are current; compaction marks superseded rows inactive;
 * ``role = 'user'`` also contains host-synthesized rows — ``[Assistant Rules]`` skill prompts,
   background-process notices, ``[System: …]`` switches and compaction handoffs. This plugin's
-  own ``[minir summary …]`` and ``[minir memory notice]`` rows are filtered role-agnostically;
-  they are derived context, never evidence for a later layer window.
+  own ``[minir summary …]``, ``[minir memory notice]`` and adviser-mode blocks are filtered
+  role-agnostically; they are derived context, never evidence for a later layer window. The
+  adviser filter also strips a block appended to a tool result, not just a whole row.
 """
 
 from __future__ import annotations
@@ -40,7 +41,36 @@ SYNTHETIC_PREFIXES = (
 MINIR_SYNTHETIC_PREFIXES = (
     "[minir summary",
     "[minir memory notice",
+    "[minir adviser",
+    "[adviser — advisory only]",
+    "[adviser-only mode",
 )
+
+# Adviser mode injects a block into the request (and, on some hosts, the persisted api_content).
+# It is advice, not evidence; strip it even when it was appended to a tool result rather than
+# written as its own row.
+_ADVISER_BLOCKS = (
+    ("[minir adviser review", "[end minir adviser review]"),
+    ("[minir adviser — advisory only]", "[end minir adviser]"),
+    ("[adviser — advisory only]", "[end adviser]"),
+    ("[adviser-only mode", "[end adviser-only mode]"),
+)
+
+
+def strip_adviser_blocks(text: str) -> str:
+    """Remove adviser-mode/review blocks from message content before it becomes layer evidence."""
+    cleaned = text or ""
+    for start_marker, end_marker in _ADVISER_BLOCKS:
+        while start_marker in cleaned:
+            start = cleaned.find(start_marker)
+            end = cleaned.find(end_marker, start)
+            if end < 0:
+                cleaned = cleaned[:start].rstrip()
+                break
+            cleaned = (cleaned[:start] + cleaned[end + len(end_marker):]).strip()
+    return cleaned
+
+
 _PROFILE_RE = re.compile(r"[^A-Za-z0-9._-]+")
 
 
@@ -127,7 +157,7 @@ def read_messages(state_db: Any, session_id: str, from_ts: float, to_ts: float,
     messages: list[dict[str, Any]] = []
     for row in rows:
         role = str(row["role"] or "")
-        text = str(row["content"] or "").strip()
+        text = strip_adviser_blocks(str(row["content"] or "").strip())
         if not text:
             continue
         if role == "user" and is_synthetic_user_text(text):
@@ -169,7 +199,9 @@ def latest_ts(state_db: Any, session_id: str) -> float:
             "SELECT role, content, timestamp FROM messages WHERE " + " AND ".join(clauses)
             + " ORDER BY id DESC LIMIT 100", (str(session_id),)).fetchall()
         for row in rows:
-            text = str(row["content"] or "")
+            text = strip_adviser_blocks(str(row["content"] or ""))
+            if not text:
+                continue
             if row["role"] == "user" and is_synthetic_user_text(text):
                 continue
             if is_minir_synthetic_text(text):

@@ -177,6 +177,7 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_base_revisions_latest
 CREATE TABLE IF NOT EXISTS advisories (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     revision_id INTEGER NOT NULL DEFAULT 0,
+    review_id INTEGER NOT NULL DEFAULT 0,
     session_id TEXT NOT NULL DEFAULT '',
     source TEXT NOT NULL DEFAULT 'dialectic',
     severity TEXT NOT NULL DEFAULT 'concern',
@@ -188,12 +189,38 @@ CREATE TABLE IF NOT EXISTS advisories (
     status TEXT NOT NULL DEFAULT 'pending',
     created_at REAL NOT NULL,
     injected_at REAL,
+    delivered_at REAL,
+    request_id TEXT NOT NULL DEFAULT '',
+    expires_at REAL,
     turn_id TEXT NOT NULL DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS idx_advisories_pending
     ON advisories(session_id, status, id);
 CREATE UNIQUE INDEX IF NOT EXISTS idx_advisories_fingerprint
     ON advisories(session_id, fingerprint);
+CREATE TABLE IF NOT EXISTS adviser_sessions (
+    session_id TEXT PRIMARY KEY,
+    enabled INTEGER NOT NULL DEFAULT 0,
+    mode TEXT NOT NULL DEFAULT 'watch',
+    cadence INTEGER NOT NULL DEFAULT 3,
+    updated_at REAL NOT NULL
+);
+CREATE TABLE IF NOT EXISTS adviser_reviews (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id TEXT NOT NULL DEFAULT '',
+    turn_id TEXT NOT NULL DEFAULT '',
+    trigger TEXT NOT NULL DEFAULT '',
+    status TEXT NOT NULL DEFAULT 'running',
+    from_seq INTEGER NOT NULL DEFAULT 0,
+    to_seq INTEGER NOT NULL DEFAULT 0,
+    model TEXT NOT NULL DEFAULT '',
+    api_calls INTEGER NOT NULL DEFAULT 0,
+    latency_ms REAL NOT NULL DEFAULT 0,
+    error TEXT NOT NULL DEFAULT '',
+    created_at REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_adviser_reviews_session
+    ON adviser_reviews(session_id, created_at DESC);
 CREATE TABLE IF NOT EXISTS metrics (
     tool TEXT PRIMARY KEY,
     count INTEGER NOT NULL DEFAULT 0,
@@ -213,6 +240,10 @@ _ADDED_COLUMNS: dict[str, tuple[tuple[str, str], ...]] = {
     "conclusions": (("from_ts", "REAL"), ("to_ts", "REAL"),
                     ("from_turn", "INTEGER"), ("to_turn", "INTEGER")),
     "base_refreshes": (("value_markers", "TEXT NOT NULL DEFAULT ''"),),
+    "advisories": (("review_id", "INTEGER NOT NULL DEFAULT 0"),
+                   ("delivered_at", "REAL"),
+                   ("request_id", "TEXT NOT NULL DEFAULT ''"),
+                   ("expires_at", "REAL")),
 }
 
 # Tables a previous release wrote that this one must not keep: earlier versions persisted every
@@ -372,6 +403,11 @@ class MinirStore:
             for name, declaration in columns:
                 if name not in present:
                     self._conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {declaration}")
+        # After the ALTER loop: an old ``advisories`` table has no ``request_id`` yet. A request
+        # staged by a process that died was never confirmed delivered; make it pending again so
+        # the next request can carry it.
+        self._conn.execute(
+            "UPDATE advisories SET status = 'pending', request_id = '' WHERE status = 'staged'")
         # An older release flagged the row written last. Restore the invariant now that
         # ``is_latest`` means the greatest window: clear, then promote one row per subject.
         self._conn.execute("UPDATE base_refreshes SET is_latest = 0")
@@ -1344,7 +1380,8 @@ class MinirStore:
     # -- advice delivery ------------------------------------------------------
 
     def add_advisories(self, session_id: str, advices: list[dict[str, Any]], *,
-                       revision_id: int = 0, source: str = "dialectic") -> list[int]:
+                       revision_id: int = 0, source: str = "dialectic",
+                       review_id: int = 0, expires_at: float = 0.0) -> list[int]:
         """Insert normalized advices, deduped by session + normalized text fingerprint."""
         inserted: list[int] = []
         with self._lock:
@@ -1355,25 +1392,38 @@ class MinirStore:
                 fingerprint = hashlib.sha256(
                     f"{session_id}\0{content.lower()}".encode("utf-8")).hexdigest()[:32]
                 cur = self._conn.execute(
-                    "INSERT OR IGNORE INTO advisories (revision_id, session_id, source, "
-                    "severity, target, content, decision, evidence, fingerprint, status, "
-                    "created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?)",
-                    (int(revision_id), session_id, str(source),
+                    "INSERT OR IGNORE INTO advisories (revision_id, review_id, session_id, "
+                    "source, severity, target, content, decision, evidence, fingerprint, status, "
+                    "created_at, expires_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)",
+                    (int(revision_id), int(review_id), session_id, str(source),
                      str(item.get("severity") or "concern"), str(item.get("target") or ""),
                      content, str(item.get("decision") or ""),
-                     json.dumps(item.get("evidence") or []), fingerprint, time.time()))
+                     json.dumps(item.get("evidence") or []), fingerprint, time.time(),
+                     float(expires_at or 0.0) or None))
                 if cur.rowcount:
                     inserted.append(int(cur.lastrowid))
             self._conn.commit()
         return inserted
 
-    def pending_advisories(self, session_id: str, limit: int = 8) -> list[dict[str, Any]]:
-        """Undelivered advices, blockers first, then concerns, then nits."""
+    def pending_advisories(self, session_id: str, limit: int = 8, *,
+                           source: str = "") -> list[dict[str, Any]]:
+        """Undelivered advices, blockers first, then concerns, then nits.
+
+        ``source`` narrows the ledger to one producer (adviser mode mid-turn delivery uses it
+        so it never re-injects a turn-boundary dialectic advice). Expired rows are excluded.
+        """
+        clauses = ["session_id = ?", "status = 'pending'",
+                   "(expires_at IS NULL OR expires_at > ?)"]
+        params: list[Any] = [session_id, time.time()]
+        if source:
+            clauses.append("source = ?")
+            params.append(str(source))
+        params.append(max(1, min(int(limit), 32)))
         with self._lock:
             rows = self._conn.execute(
-                "SELECT * FROM advisories WHERE session_id = ? AND status = 'pending' "
+                "SELECT * FROM advisories WHERE " + " AND ".join(clauses) + " "
                 "ORDER BY CASE severity WHEN 'blocker' THEN 0 WHEN 'concern' THEN 1 ELSE 2 END, "
-                "id LIMIT ?", (session_id, max(1, min(int(limit), 32)))).fetchall()
+                "id LIMIT ?", params).fetchall()
         return [dict(row) for row in rows]
 
     def mark_advisories_injected(self, ids: list[int], turn_id: str = "") -> int:
@@ -1388,10 +1438,137 @@ class MinirStore:
             self._conn.commit()
             return int(cur.rowcount)
 
-    def has_advisories(self, session_id: str) -> bool:
+    def stage_advisories(self, ids: list[int], request_id: str) -> int:
+        """Mark a request's injected advice as staged; ``post_api_request`` confirms delivery."""
+        if not ids:
+            return 0
+        marks = ",".join("?" * len(ids))
+        with self._lock:
+            cur = self._conn.execute(
+                f"UPDATE advisories SET status = 'staged', request_id = ? "
+                f"WHERE id IN ({marks}) AND status IN ('pending', 'staged')",
+                (str(request_id or ""), *[int(item) for item in ids]))
+            self._conn.commit()
+            return int(cur.rowcount)
+
+    def staged_advisories(self, request_id: str) -> list[dict[str, Any]]:
+        """Advice already staged for this request (a retry re-injects the same block)."""
+        if not request_id:
+            return []
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT * FROM advisories WHERE status = 'staged' AND request_id = ? "
+                "ORDER BY CASE severity WHEN 'blocker' THEN 0 WHEN 'concern' THEN 1 ELSE 2 END, "
+                "id", (str(request_id),)).fetchall()
+        return [dict(row) for row in rows]
+
+    def mark_advisories_delivered(self, ids: list[int]) -> int:
+        if not ids:
+            return 0
+        marks = ",".join("?" * len(ids))
+        with self._lock:
+            cur = self._conn.execute(
+                f"UPDATE advisories SET status = 'delivered', delivered_at = ? "
+                f"WHERE id IN ({marks}) AND status IN ('pending', 'staged')",
+                (time.time(), *[int(item) for item in ids]))
+            self._conn.commit()
+            return int(cur.rowcount)
+
+    def reset_staged(self, ids: list[int]) -> int:
+        """A failed provider attempt did not deliver the advice; make it pending again."""
+        if not ids:
+            return 0
+        marks = ",".join("?" * len(ids))
+        with self._lock:
+            cur = self._conn.execute(
+                f"UPDATE advisories SET status = 'pending', request_id = '' "
+                f"WHERE id IN ({marks}) AND status = 'staged'",
+                (*[int(item) for item in ids],))
+            self._conn.commit()
+            return int(cur.rowcount)
+
+    def expire_adviser_advices(self, session_id: str) -> int:
+        """Drop adviser-mode advice when its session/mode ends; dialectic audit rows stay."""
+        with self._lock:
+            cur = self._conn.execute(
+                "UPDATE advisories SET status = 'expired' "
+                "WHERE session_id = ? AND source = 'adviser_mode' "
+                "AND status IN ('pending', 'staged')", (session_id,))
+            self._conn.commit()
+            return int(cur.rowcount)
+
+    # -- adviser mode state ---------------------------------------------------
+
+    def adviser_session(self, session_id: str) -> Optional[dict[str, Any]]:
         with self._lock:
             row = self._conn.execute(
-                "SELECT 1 FROM advisories WHERE session_id = ? LIMIT 1", (session_id,)).fetchone()
+                "SELECT * FROM adviser_sessions WHERE session_id = ?", (session_id,)).fetchone()
+        return dict(row) if row is not None else None
+
+    def set_adviser_session(self, session_id: str, *, enabled: Optional[bool] = None,
+                            mode: Optional[str] = None, cadence: Optional[int] = None) -> dict[str, Any]:
+        current = self.adviser_session(session_id)
+        if enabled is None:
+            if current is not None:
+                enabled = bool(current.get("enabled"))
+            else:
+                # Configuring mode/cadence is an explicit opt-in when no session row exists;
+                # otherwise ``/adviser mode adviser_only`` would silently disable the mode.
+                enabled = bool(mode is not None or cadence is not None)
+        current = current or {"mode": "watch", "cadence": 3}
+        if mode is None:
+            mode = str(current.get("mode") or "watch")
+        if cadence is None:
+            cadence = int(current.get("cadence") or 3)
+        with self._lock:
+            self._conn.execute(
+                "INSERT INTO adviser_sessions (session_id, enabled, mode, cadence, updated_at) "
+                "VALUES (?, ?, ?, ?, ?) ON CONFLICT(session_id) DO UPDATE SET "
+                "enabled = excluded.enabled, mode = excluded.mode, "
+                "cadence = excluded.cadence, updated_at = excluded.updated_at",
+                (session_id, int(bool(enabled)), str(mode), max(1, min(20, int(cadence))),
+                 time.time()))
+            self._conn.commit()
+        return {"enabled": int(bool(enabled)), "mode": str(mode),
+                "cadence": max(1, min(20, int(cadence)))}
+
+    def start_adviser_review(self, session_id: str, turn_id: str, trigger: str,
+                             from_seq: int, to_seq: int) -> int:
+        with self._lock:
+            cur = self._conn.execute(
+                "INSERT INTO adviser_reviews (session_id, turn_id, trigger, status, "
+                "from_seq, to_seq, created_at) VALUES (?, ?, ?, 'running', ?, ?, ?)",
+                (session_id, turn_id or "", trigger or "", int(from_seq), int(to_seq),
+                 time.time()))
+            self._conn.commit()
+            return int(cur.lastrowid)
+
+    def finish_adviser_review(self, review_id: int, *, status: str, model: str = "",
+                              api_calls: int = 0, latency_ms: float = 0.0,
+                              error: str = "") -> None:
+        with self._lock:
+            self._conn.execute(
+                "UPDATE adviser_reviews SET status = ?, model = ?, api_calls = ?, "
+                "latency_ms = ?, error = ? WHERE id = ?",
+                (status, model or "", int(api_calls or 0), float(latency_ms or 0.0),
+                 (error or "")[:500], int(review_id)))
+            self._conn.commit()
+
+    def adviser_reviews(self, session_id: str, limit: int = 10) -> list[dict[str, Any]]:
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT * FROM adviser_reviews WHERE session_id = ? "
+                "ORDER BY created_at DESC, id DESC LIMIT ?",
+                (session_id, max(1, min(50, int(limit or 10))))).fetchall()
+        return [dict(row) for row in rows]
+
+    def has_advisories(self, session_id: str) -> bool:
+        """Whether a non-expired advice ledger exists (expired adviser rows must not suppress
+        the legacy review forever after the mode is switched off)."""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT 1 FROM advisories WHERE session_id = ? AND status <> 'expired' LIMIT 1",
+                (session_id,)).fetchone()
         return row is not None
 
     def search_base_refreshes(self, query: str, limit: int = 5, *, session_id: str = "",
@@ -1568,6 +1745,7 @@ class MinirStore:
             refreshes = self._conn.execute("SELECT COUNT(*) AS n FROM base_refreshes").fetchone()["n"]
             revisions = self._conn.execute("SELECT COUNT(*) AS n FROM base_revisions").fetchone()["n"]
             advices = self._conn.execute("SELECT COUNT(*) AS n FROM advisories").fetchone()["n"]
+            reviews = self._conn.execute("SELECT COUNT(*) AS n FROM adviser_reviews").fetchone()["n"]
             conclusions = self._conn.execute("SELECT COUNT(*) AS n FROM conclusions").fetchone()["n"]
             metrics = self._conn.execute("SELECT COUNT(*) AS n FROM metrics").fetchone()["n"]
         try:
@@ -1578,6 +1756,7 @@ class MinirStore:
                 "jobs": int(jobs), "pending_jobs": int(pending), "failed_jobs": int(failed),
                 "layer_states": int(states), "base_refreshes": int(refreshes),
                 "base_revisions": int(revisions), "advisories": int(advices),
+                "adviser_reviews": int(reviews),
                 "conclusions": int(conclusions),
                 "metrics": int(metrics), "fts": bool(self._fts),
                 "db_path": str(self.path), "db_bytes": size}
