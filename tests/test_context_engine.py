@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import sqlite3
 import time
 
@@ -538,14 +539,16 @@ def test_should_compress_stamps_the_decision_time(plugin_package, state_db):
     assert engine._compress_requested_at > 0
 
 
-def test_compress_indexes_the_handoff_and_queues_dialectic(plugin_package, state_db, tmp_path,
-                                                           monkeypatch):
+def test_compress_indexes_the_handoff_and_queues_the_base_refresh(
+        plugin_package, state_db, tmp_path, monkeypatch):
     monkeypatch.setenv("MINIR_REASONING_ENABLED", "true")
     monkeypatch.setattr(plugin_package.handoff, "summarize", lambda *a, **k: HANDOFF)
     engine = _engine(plugin_package, state_db, interval=1, hermes_home=str(tmp_path))
     engine.threshold_tokens = 10
     engine.last_prompt_tokens = 20
     assert engine.should_compress() is True
+    assert engine._memory_store().pending_jobs() == [], \
+        "the decision must not queue layer jobs before the fold"
 
     folded = engine.compress(_conversation(10))
     carrier = next(message for message in folded
@@ -562,9 +565,46 @@ def test_compress_indexes_the_handoff_and_queues_dialectic(plugin_package, state
     handoff = store.newest_conclusion("session_summary", session_id=SESSION)
     assert handoff is not None and "## Stop Condition" in handoff["content"]
     jobs = store.pending_jobs()
-    assert {(job["layer"], job["session_id"]) for job in jobs} == {
-        ("base", SESSION), ("dialectic", SESSION)}
-    assert jobs[0]["to_ts"] >= engine._compress_requested_at or jobs[0]["to_ts"] > 0
+    assert {(job["layer"], job["session_id"]) for job in jobs} == {("base", SESSION)}, \
+        "the dependent review is queued by the base worker, never directly by the engine"
+    assert jobs[0]["to_ts"] > 0
+
+
+def test_a_threshold_fold_includes_the_slice_and_queues_only_base(
+        plugin_package, state_db, tmp_path, monkeypatch):
+    seen: dict = {}
+    monkeypatch.setenv("MINIR_REASONING_ENABLED", "true")
+    monkeypatch.setattr(plugin_package.handoff, "summarize",
+                        lambda *a, **k: seen.update(k) or HANDOFF)
+    engine = _engine(plugin_package, state_db, interval=10, hermes_home=str(tmp_path))
+    engine.threshold_tokens = 10
+    engine.last_prompt_tokens = 20
+    assert engine.should_compress() is True
+    assert engine._memory_store().pending_jobs() == []
+
+    engine.compress(_conversation(20))
+    assert seen["include_turns"] is True, \
+        "a threshold fold must summarise the overflowing slice, not the previous chain"
+    jobs = engine._memory_store().pending_jobs()
+    assert [job["layer"] for job in jobs] == ["base"], \
+        "the dependent review follows the base job; the engine never queues it directly"
+
+
+def test_a_threshold_refresh_follows_an_open_base_job_edge(
+        plugin_package, state_db, tmp_path):
+    engine = _engine(plugin_package, state_db, interval=10, hermes_home=str(tmp_path))
+    store = engine._memory_store()
+    edge = time.time() - 50
+    store.record_job("base", SESSION, 0.0, edge, turns=1)
+    engine.threshold_tokens = 10
+    engine.last_prompt_tokens = 20
+    assert engine.should_compress() is True
+
+    engine.compress(_conversation(20))
+    base_jobs = [job for job in store.pending_jobs() if job["layer"] == "base"]
+    assert len(base_jobs) == 2, "the open job must not swallow the threshold window"
+    assert max(job["from_ts"] for job in base_jobs) >= edge
+    assert not [job for job in store.pending_jobs() if job["layer"] == "dialectic"]
 
 
 def test_handoff_serialization_keeps_the_newest_turns(plugin_package):
@@ -602,6 +642,8 @@ def test_compression_input_contains_historical_and_tail_dialectic_conclusions(
                          session_id=SESSION, subject="agent:minir")
     store.put_conclusion("base.user_representation", "focus:session-ctx", "- [goal] ship",
                          session_id=SESSION, subject="user:default")
+    store.put_conclusion("base.ai_self_representation", "focus:session-ctx",
+                         "- [blocked] tests fail", session_id=SESSION, subject="user:default")
     store.add_chunk_summary(SESSION, 1.0, 2.0, "local chunk fact")
 
     seen: dict[str, str] = {}
@@ -623,6 +665,8 @@ def test_compression_input_contains_historical_and_tail_dialectic_conclusions(
     assert "careful operator" in seen["historical"]
     assert "tail review" in seen["tail"]
     assert "[goal] ship" in seen["tail"]
+    assert "[blocked] tests fail" in seen["tail"], \
+        "the base AI action state is no longer duplicated by the dialectic artifact"
 
 
 def test_update_from_response_accepts_nested_and_canonical_usage(plugin_package):
@@ -655,8 +699,13 @@ def test_handoff_prompt_uses_conclusions_and_falls_back_to_turns(plugin_package,
     assert "TURNS TO SUMMARIZE" in captured["prompt"]
     assert "raw turn detail" in captured["prompt"], "raw turns are the cold-start fallback"
 
+    plugin_package.handoff.summarize(messages, historical="historical conclusion",
+                                     tail="tail conclusion", include_turns=True)
+    assert "raw turn detail" in captured["prompt"], \
+        "a threshold/manual fold forces the overflowing slice into the prompt"
 
-def test_an_old_carrier_does_not_seal_a_new_chunk_chain(plugin_package, state_db, tmp_path):
+
+def test_a_fold_never_seals_the_base_chunk_chain(plugin_package, state_db, tmp_path):
     engine = _engine(plugin_package, state_db, interval=10, hermes_home=str(tmp_path))
     store = engine._memory_store()
     store.add_chunk_summary(SESSION, 1.0, 2.0, "new active chunk")
@@ -664,9 +713,14 @@ def test_an_old_carrier_does_not_seal_a_new_chunk_chain(plugin_package, state_db
         1, 2, [_msg("user", "old", uid="u1")], gist="old carrier")
 
     engine.on_turn_complete([carrier])
-    assert store.chunk_summaries(SESSION), "an old carrier must not supersede a live chain"
+    assert store.chunk_summaries(SESSION), "the base chain is not compression-owned"
 
     store.put_conclusion("session_summary", "summary:" + SESSION, "## Goal\n- done",
-                         session_id=SESSION, subject="session", status="pending")
+                         session_id=SESSION, subject="session", status="pending",
+                         evidence=json.dumps(["u1"]))
     engine.on_turn_complete([carrier])
-    assert store.chunk_summaries(SESSION) == []
+    assert store.get_conclusion("session_summary", "summary:" + SESSION)["status"] == "active", \
+        "the observed carrier must actually promote its handoff"
+    assert store.chunk_summaries(SESSION), \
+        "promoting a handoff must not supersede the base layer's canonical chain"
+    assert store.latest_chunk_summary(SESSION)

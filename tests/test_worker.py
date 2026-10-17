@@ -759,6 +759,28 @@ def test_a_base_job_queues_the_dependent_dialectic_window(plugin_package, store,
     assert store.pending_advisories(SESSION)
 
 
+def test_a_review_reads_its_window_after_an_earlier_review_advanced_the_watermark(
+        plugin_package, store, transcript):
+    prompts: list[str] = []
+
+    def complete(task, system, prompt, **kwargs):
+        prompts.append(prompt)
+        return _dialectic_json()
+
+    transcript.add(SESSION, "user", "early evidence", created_at=10.0)
+    transcript.add(SESSION, "user", "late evidence", created_at=30.0)
+    # A previous review already consumed through timestamp 20. A dependent review for the
+    # base window 0..30 must still read the window's raw turns; clamping its start to the
+    # watermark would leave only "late evidence" and make the review circular.
+    prior = store.record_job(DIALECTIC, SESSION, 0.0, 20.0)
+    store.complete_job(prior, 20.0)
+    store.record_job(DIALECTIC, SESSION, 0.0, 30.0)
+
+    instance = plugin_package.worker.LayerWorker(store, transcript, complete=complete)
+    assert instance.run_once() == 1
+    assert "early evidence" in prompts[-1] and "late evidence" in prompts[-1]
+
+
 def test_dialectic_revision_snapshots_the_old_base_and_applies_the_change(
         plugin_package, store, transcript):
     def complete(task, system, prompt, **kwargs):

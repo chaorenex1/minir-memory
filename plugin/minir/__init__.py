@@ -507,8 +507,9 @@ class MinirMemoryProvider(MemoryProvider):
         self._authors[session] = {"id": author_id, "name": author_name}
 
     def on_pre_compress(self, messages: Optional[list[dict[str, Any]]] = None) -> str:
-        """Compression is a reasoning boundary: drain both layers before the history they
-        cover is summarized away. The queue is the return channel, so this returns ``""`` —
+        """Compression is a reasoning boundary: queue the base job that owns the history being
+        summarized away. The dependent dialectic review follows that base job; a boundary never
+        queues a review directly. The queue is the return channel, so this returns ``""`` —
         compression insights are not this layer's job."""
         try:
             self._flush_boundary(self._session_id)

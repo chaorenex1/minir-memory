@@ -145,10 +145,13 @@ def test_newer_and_open_job_queries(store):
     second = store.record_job("base", "s1", 10.0, 20.0)
     assert store.has_newer_job("base", "s1", first) is True
     assert store.has_newer_job("base", "other", first) is False
+    assert store.open_job_end("base", "s1") == 20.0
+    assert store.open_job_end("base", "other") is None
     store.claim_jobs(limit=2)
     store.complete_job(first, 10.0)
     store.complete_job(second, 20.0)
     assert store.has_open_job("base", "s1") is False
+    assert store.open_job_end("base", "s1") is None
 
 
 def test_expire_closes_only_jobs_from_before_the_process(store):
@@ -225,6 +228,28 @@ def test_conclusions_are_indexed_and_session_scoped(store):
     assert peer and peer[0]["kind"] == "base.user_peer_card", "durable conclusions are cross-session"
 
     assert store.search("plugin", session_id="") == [], "no session means no session-bound kinds"
+
+
+def test_promotion_only_touches_the_observed_carriers_handoff(store):
+    store.put_conclusion("session_summary", "first", "## Goal\n- first",
+                         session_id="s1", subject="session", status="pending",
+                         evidence=json.dumps(["u1"]))
+    store.put_conclusion("session_summary", "second", "## Goal\n- second",
+                         session_id="s1", subject="session", status="pending",
+                         evidence=json.dumps(["u2"]))
+    store.put_conclusion("session_summary", "overlap", "## Goal\n- overlap",
+                         session_id="s1", subject="session", status="pending",
+                         evidence=json.dumps(["u1", "u9"]))
+    assert store.promote_pending_handoffs("s1", uids=["u1"]) == 1
+    assert store.get_conclusion("session_summary", "first")["status"] == "active"
+    assert store.get_conclusion("session_summary", "second")["status"] == "pending", \
+        "an unobserved fold must not ride the first carrier's promotion"
+    assert store.get_conclusion("session_summary", "overlap")["status"] == "pending", \
+        "a partially overlapping pending fold is not yet observed"
+
+    assert store.promote_pending_handoffs("s1", uids=["u1", "u9"]) == 1
+    assert store.get_conclusion("session_summary", "overlap")["status"] == "active"
+    assert store.get_conclusion("session_summary", "second")["status"] == "pending"
 
 
 def test_remember_and_forget_update_the_index(store):

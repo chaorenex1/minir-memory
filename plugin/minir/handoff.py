@@ -112,12 +112,14 @@ def gist(summary: str) -> str:
 def summarize(messages: Iterable[dict[str, Any]], *, previous: str = "",
               historical: str = "", tail: str = "", chunks: str = "",
               focus_topic: str = "", memory_context: str = "",
-              timeout: float = 60.0) -> str:
+              include_turns: bool = False, timeout: float = 60.0) -> str:
     """One auxiliary summary call; returns a validated handoff or ``""`` (never raises).
 
     The user prompt is the compression input: the canonical local chunk chain, durable/historical
     dialectic conclusions, and the tail window's dialectic conclusions. Raw turns are included
-    only when neither the chain nor a tail conclusion exists, as a cold-start fallback.
+    when neither the chain nor a tail conclusion exists (cold start), and always when
+    ``include_turns`` is set — a threshold/manual fold's base chunk does not exist yet, so the
+    overflowing slice must not be replaced by the model's own earlier conclusions.
     """
     try:
         from .worker import call_model
@@ -133,9 +135,9 @@ def summarize(messages: Iterable[dict[str, Any]], *, previous: str = "",
         if tail.strip():
             parts.append("TAIL-WINDOW DIALECTIC CONCLUSIONS:\n"
                          f"{tail.strip()[:4_000]}")
-        # The contract input is the chain + conclusions. Raw turns are only a fallback when
-        # neither a chunk chain nor a tail conclusion exists yet.
-        if not tail.strip() and not chunks.strip():
+        # The contract input is the chain + conclusions. Raw turns are the cold-start fallback,
+        # and are mandatory on a threshold/manual fold whose base chunk cannot exist yet.
+        if include_turns or (not tail.strip() and not chunks.strip()):
             parts.append(f"TURNS TO SUMMARIZE:\n{serialize(messages)}")
         if memory_context.strip():
             parts.append(f"PROVIDER MEMORY CONTEXT:\n{memory_context.strip()[:4_000]}")

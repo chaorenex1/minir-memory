@@ -24,7 +24,8 @@ inherited jobs expired.
 The same directory also ships a **context engine** for progressive, lossless context management:
 on every dialectic beat it moves the oldest unprotected slice of the window into a compact carrier
 row, restores the original text on demand from the host's own `state.db`, writes an optional
-Task Handoff summary for the folded range, and queues the dialectic refresh.
+Task Handoff summary for the folded range, and queues a base refresh for that window (the
+dependent dialectic review follows the base job).
 
 No external binaries, stdlib only. Layer calls go through the host's auxiliary client, so there is
 no key to configure; set `reasoning_enabled: false` to keep the provider a pure note store, and
@@ -134,7 +135,9 @@ through `minir_search`. Pending advices are the actionable channel and are injec
 | dialectic | the latest base artifact + history up to the window; reviews drift in all six fields and emits advices | `## Adviser Review` only (base cards stay on the base layer) | `agent:<agent_identity \| minir>` |
 
 The dialectic job is **dependent**: a successful base refresh queues the matching review with the
-same `(from_ts, to_ts]`, so the reviewer always sees a published base row. It runs an eight-key JSON
+same `(from_ts, to_ts]`, so the reviewer always sees a published base row. The review re-reads that
+window's raw turns even when a previous review already advanced the dialectic watermark; the
+context engine never queues an independent review. It runs an eight-key JSON
 contract: the six base fields, `advices`, `value_markers`, and `base_changed`
 (`{changed, fields}`). The pass count is adaptive — short windows get one synthesis, longer ones add
 a self-audit and a reconcile, capped by `dialectic_depth`. A failed or malformed pass falls back to
@@ -193,8 +196,8 @@ The base layer's `## Session Summary` is **not an independent summary**: every b
 one `session_chunk_summary` (session + time range + turn range) to the canonical local-compression
 chain, and the artifact's section projects **only the newest active chunk** — the current window
 record. Older chunks stay as independent rows with their turn range and remain searchable by
-`minir_search` inside their own session, even after a final summary supersedes them; they are not
-re-projected into the live artifact. The previous projection is deliberately omitted from the next
+`minir_search` inside their own session, unless an explicit session-final summary supersedes them
+(a compression fold never does); they are not re-projected into the live artifact. The previous projection is deliberately omitted from the next
 base merge prompt (only the other five sections carry forward), so chunks do not recursively copy
 the whole chain. The dialectic worker reads the active chain up to its review window and is
 instructed to reconcile
@@ -452,6 +455,13 @@ path rarely fires:
 | how much one fold may move | whole turns only, starting at the first turn after `protect_first_n`, stopping before `protect_last_n`, at most `_MAX_FOLD_MESSAGES` (24) messages — incremental by construction |
 | when it fires anyway | the token threshold (`threshold_percent`, default 0.75) — the safety net is kept |
 
+The threshold only decides that the fold must happen now. Layer work is queued **after** the fold:
+the base refresh for the folded window, then the dependent dialectic review it produces. A
+pre-compression boundary may already have queued a base job; if its window ends before the fold
+decision, the engine records a follow-up starting at that edge instead of letting `has_open_job`
+swallow the threshold content. The handoff on this path includes the folded slice's raw turns,
+because the base chunk for the overflowing window cannot exist yet.
+
 Folded messages are replaced by one **carrier** row: a user-role message that names the turn range
 it covers, lists the `message_uid`s that went with it and carries a one-line gist (at most 200
 characters, so it orients the model without becoming a second copy of the slice). It is written
@@ -476,17 +486,21 @@ no cache at all. The carriers are the durable index.
 
 On a fold, `compress()` may make one bounded auxiliary call using the Task Handoff template
 (`prompts/session_handoff.md`, override with `MINIR_SUMMARY_TEMPLATE`). Its input is the
-**historical dialectic conclusions** (durable user/AI cards, plus any legacy
-constraints/preferences/second-brain rows, previous summary) plus the **tail window's dialectic
-conclusions** (current review and current-focus representation). Raw turns are used only as a
-cold-start fallback when no tail conclusion exists. The validated output is this session's summary conclusion, written to
-`conclusions` as `pending` (kind `session_summary`, session-scoped); a bounded copy (900 chars)
+**historical conclusions** (durable user/AI cards, plus any legacy
+constraints/preferences/second-brain rows and the previous summary) plus the **tail window's
+conclusions** (current review, current-focus representation, AI action state and value markers).
+Raw turns are the cold-start fallback, and are always included on a threshold/manual fold whose
+base chunk cannot exist yet. The validated output is this session's summary conclusion, written
+to `conclusions` as `pending` (kind `session_summary`, session-scoped); a bounded copy (900 chars)
 rides in the returned carrier, while the full text stays in the store;
-`on_turn_complete` promotes it to `active` only when the carrier is actually in the persisted
-messages, so a pass the host discarded never becomes recallable. The full template output stays
-available to `minir_search` after promotion. The fold also queues the dialectic window ending at
-the `should_compress()` decision. `reasoning_enabled: false` disables the summary call as well as
-the layer worker. This is the same shape as the host's
+`on_turn_complete` promotes only a handoff whose folded message ids are fully present in the
+persisted messages (a non-empty subset of the observed carrier), so a pass the host discarded never
+becomes recallable. The full template output stays
+available to `minir_search` after promotion. After the carrier is built, the fold queues a **base**
+refresh for the folded window; the base worker then queues the dependent dialectic review for the
+same window. The engine never queues the review directly, and a fold never supersedes the
+base-owned `session_chunk_summary` chain. `reasoning_enabled: false` disables the summary call as
+well as the layer worker. This is the same shape as the host's
 built-in compressor: a pass can be discarded on timeout, so the carrier the host commits remains
 authoritative and a pending summary row expires without polluting recall.
 

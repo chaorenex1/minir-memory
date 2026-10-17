@@ -1037,18 +1037,22 @@ class LayerWorker:
         layer = str(job["layer"])
         session = str(job["session_id"])
         job_id = int(job["id"])
-        start = max(float(job["from_ts"]), self._store.last_processed_ts(layer, session))
         if layer == DIALECTIC_LAYER:
-            # A dialectic job is queued with the exact window its base job just published.
-            # It must not drain past that window: unbased content belongs to the next pair.
+            # A dependent review owns the exact window its base job published, including turns
+            # an earlier review already advanced past. Clamping by the dialectic watermark would
+            # leave ``rows`` empty and make the review audit the base artifact against the
+            # model's own chunk summary — no raw-turn evidence, no drift check.
+            start = float(job["from_ts"])
             end = float(job["to_ts"])
-        elif self._store.has_newer_job(layer, session, job_id):
-            end = float(job["to_ts"])  # a later job owns the open end of this layer's windows
         else:
-            # The newest job drains everything in the host store and the local buffer: the
-            # window's own ``to_ts`` is a dispatch stamp that can sit behind the last message.
-            end = max(float(job["to_ts"]), time.time(), self._transcript.latest_ts(session),
-                      host_history.latest_ts(self._state_db, session))
+            start = max(float(job["from_ts"]), self._store.last_processed_ts(layer, session))
+            if self._store.has_newer_job(layer, session, job_id):
+                end = float(job["to_ts"])  # a later job owns the open end of this layer's windows
+            else:
+                # The newest job drains everything in the host store and the local buffer: the
+                # window's own ``to_ts`` is a dispatch stamp that can sit behind the last message.
+                end = max(float(job["to_ts"]), time.time(), self._transcript.latest_ts(session),
+                          host_history.latest_ts(self._state_db, session))
         # ``end`` becomes this layer's content watermark, so it is also the next window's edge.
         self._transcript.mark_edge(session, end)
         rows = self._window(session, start, end,
@@ -1217,9 +1221,9 @@ class LayerWorker:
         changes: dict[str, str] = {}
         changed_fields: list[str] = []
         revision_id = 0
-        # Only the row this review was queued for may be corrected. A dialectic job that did
-        # not follow a base refresh (the context engine can queue one) still reviews the latest
-        # artifact, but must not overwrite an unrelated window.
+        # Only the row this review was queued for may be corrected. A legacy/independent
+        # dialectic job still reviews the latest artifact, but must not overwrite an unrelated
+        # window.
         if base_row is not None:
             for field in requested:
                 value = values.get(field)

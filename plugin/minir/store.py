@@ -57,7 +57,7 @@ import sqlite3
 import threading
 import time
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Iterable, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -667,19 +667,43 @@ class MinirStore:
             self._conn.commit()
             return cur.rowcount > 0
 
-    def promote_pending_handoffs(self, session_id: str) -> int:
-        """Mark a session's pending handoffs active after their carrier was observed.
+    def promote_pending_handoffs(self, session_id: str, *,
+                                 uids: Optional[Iterable[str]] = None) -> int:
+        """Mark pending handoffs active once the carrier they belong to was observed.
 
         ``compress()`` can be discarded on a host timeout; writing the handoff as pending and
         promoting it only when the returned carrier shows up in the persisted messages keeps a
-        discarded pass out of ``newest_conclusion`` and FTS recall.
+        discarded pass out of ``newest_conclusion`` and FTS recall. When *uids* is given, only
+        rows whose evidence is a **non-empty subset** of the observed uids are promoted — a later
+        pending fold must not ride an earlier carrier's observation just because it shares an
+        overlapping message. An empty uid list keeps the legacy all-pending behavior for rows
+        written without message ids.
         """
+        wanted = {str(uid) for uid in (uids or ()) if str(uid).strip()} \
+            if uids is not None else None
         with self._lock:
-            cur = self._conn.execute(
-                "UPDATE conclusions SET status = 'active', updated_at = ? "
+            rows = self._conn.execute(
+                "SELECT id, evidence FROM conclusions "
                 "WHERE kind IN ('session_summary', 'handoff') "
-                "AND session_id = ? AND status = 'pending'",
-                (time.time(), session_id))
+                "AND session_id = ? AND status = 'pending'", (session_id,),
+            ).fetchall()
+            chosen: list[int] = []
+            for row in rows:
+                if wanted is None or not wanted:
+                    chosen.append(int(row["id"]))
+                    continue
+                try:
+                    evidence = {str(uid) for uid in json.loads(row["evidence"] or "[]")}
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    evidence = set()
+                if evidence and evidence <= wanted:
+                    chosen.append(int(row["id"]))
+            if not chosen:
+                return 0
+            marks = ",".join("?" * len(chosen))
+            cur = self._conn.execute(
+                f"UPDATE conclusions SET status = 'active', updated_at = ? "
+                f"WHERE id IN ({marks})", (time.time(), *chosen))
             self._conn.commit()
             return int(cur.rowcount)
 
@@ -956,6 +980,21 @@ class MinirStore:
                 "LIMIT 1", (layer, session_id),
             ).fetchone()
         return row is not None
+
+    def open_job_end(self, layer: str, session_id: str) -> Optional[float]:
+        """Furthest ``to_ts`` among this layer's queued/running jobs, or ``None``.
+
+        A compression fold uses this to start its follow-up base job at the open job's edge:
+        ``has_open_job`` alone would skip a window whose end already sits behind the content
+        the fold just moved out.
+        """
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT MAX(to_ts) AS ts FROM jobs WHERE layer = ? AND session_id = ? "
+                "AND status IN ('pending', 'running')", (layer, session_id),
+            ).fetchone()
+        value = row["ts"] if row is not None else None
+        return float(value) if value is not None else None
 
     # -- layer state ----------------------------------------------------------
 
