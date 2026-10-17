@@ -40,7 +40,8 @@ plugin/minir/          the deployable plugin directory (copy this to plugins/min
   cadence.py           the dialectic beat, shared by the provider and the engine
   context_engine.py    progressive lossless context management (context.engine: minir)
   agent_loop.py        one-shot in-process AIAgent runs — sync + async (Feishu-shaped)
-  adviser.py           optional adviser route + its two handlers (adviser_consult)
+  adviser.py           optional adviser route + the adviser toolset (adviser_consult)
+  session_search.py    read-only multi-shape search over the host's session store (state.db)
   prompts/             operator-supplied Task Handoff template
 tests/                 pytest suite: contract, store, transcript, provider, counting, worker, engine
 scripts/verify_against_host.py   end-to-end check against the real Hermes install
@@ -114,14 +115,16 @@ back to the process-wide active provider, since the host can construct the plugi
 "reason over session X's history in `(from_ts, to_ts]`". A job is one row in the store's `jobs`
 table; `worker.py` drains it from the host's `state.db` (plus the uncommitted buffer), calls the
 auxiliary model, and publishes a merged artifact into `layer_state` and its sections into the
-FTS-indexed `conclusions` table. `prefetch()` injects only the newest dialectic (agent) artifact
+FTS-indexed `conclusions` table. Each base refresh also appends one structured row to
+`base_refreshes` (session, time window, turn window, the five outputs, `is_latest`).
+`prefetch()` injects only the newest dialectic (agent) artifact
 ahead of recall, so the next turn sees how this agent should work — without the conversations it
 was derived from. Base-layer artifacts are deliberately **not injected**; their cards remain
 recallable through `minir_search`.
 
 | Layer | Models | Artifact sections | Subject key |
 | --- | --- | --- | --- |
-| base | one participant's session + durable user card + AI self/identity | `## Session Summary`, `## User Representation`, `## User Peer Card`, `## AI Self Representation`, `## AI Identity Card` | `user:<author_id \| author \| user_id>` |
+| base | one participant: first message + window + previous user/AI cards, three staged passes on `auxiliary.adviser` | `## Session Summary`, `## User Representation`, `## User Peer Card`, `## AI Self Representation`, `## AI Identity Card` | `user:<author_id \| author \| user_id>` |
 | dialectic | this AI's adviser review, constraints/preferences, second brain | `## Adviser Review`, `## Constraints`, `## Preferences`, `## Second Brain` | `agent:<agent_identity \| minir>` |
 
 Each refresh is a **merge**: the model receives the previous artifact plus the window and returns
@@ -130,6 +133,27 @@ piling up. The dialectic layer runs `dialectic_depth` passes: d1 synthesizes, d2
 draft against the window, d3 reconciles the two. A failed or malformed audit falls back to the last
 valid pass. `layer_state.version` counts the refreshes; the newest version is what gets injected
 (bounded to 1200 chars) next to the recall block (bounded to 2000).
+
+A base refresh runs **three ordered passes** per participant on the `auxiliary.adviser` route
+(the adviser toolset is always attached, so a pass can use `adviser_session_search`):
+
+1. **user cards** — the session's first user message (intent anchor) + previous
+   `## User Representation`/`## User Peer Card` + this window → the user's need path and durable
+   preferences;
+2. **AI cards** — the user cards just derived + previous `## AI Self Representation`/
+   `## AI Identity Card` + operator identity/preference files + this window → the AI's action
+   state on that need path (`[done]`/`[in-progress]`/`[blocked]`/`[next]`), the value it produced
+   (`[entity]`/`[trajectory]`/`[experience]`/`[tool]`/`[project]`) and its stable identity;
+3. **local summary** — the user/AI cards + this window → `## Session Summary`, the local
+   compression record appended to the chunk chain.
+
+First refresh means no previous artifact for that subject: it bootstraps from the first message and
+the window instead of merging. Later refreshes merge the previous cards, so the durable peer and
+identity cards accumulate while the current-focus/self sections track the latest state. The five
+outputs are stored together in `base_refreshes`; `is_latest=1` marks the active row per
+`(session_id, subject)`, older windows stay queryable as history (`base_refreshes()` /
+`latest_base_refresh()` in `store.py`). A `(session, subject, from_ts, to_ts)` retry updates the
+same row rather than duplicating it.
 
 The base layer's `## Session Summary` is **not an independent summary**: every base refresh writes
 one `session_chunk_summary` (session + time range + turn range) to the canonical local-compression
@@ -202,8 +226,21 @@ job of that layer re-covers the same content (the content watermark never moved)
 
 ### Where the model call comes from
 
-`worker.call_model` imports `agent.auxiliary_client.call_llm` lazily and passes a task key
-(`minir_base_layer` / `minir_dialectic_layer`), so the layers can be pinned independently:
+Base-layer passes run through `agent_loop.run` on the `auxiliary.adviser` route and always attach
+the `adviser` toolset, so the configured provider/model/toolsets there are what a refresh uses:
+
+```yaml
+auxiliary:
+  adviser:
+    provider: deepseek
+    model: deepseek-v4-flash
+    toolsets: [file]        # 'adviser' is appended automatically
+```
+
+If the adviser route cannot run (host module absent, bad config, provider outage), the pass falls
+back to `worker.call_model`, which imports `agent.auxiliary_client.call_llm` lazily and passes the
+`minir_base_layer` task key. The dialectic layer always uses that one-shot client with
+`minir_dialectic_layer`, so the two layers can still be pinned independently:
 
 ```yaml
 auxiliary:
@@ -220,8 +257,9 @@ thread, a layer refresh never raises into a turn, and `reasoning_enabled: false`
 
 `adviser.py` puts a second-opinion agent inside this plugin: an `auxiliary.adviser` model route
 plus one `adviser_consult` tool that runs a **real agent loop** (its own LLM + tools) rather than a
-one-shot completion. The loop is not adviser-specific — it lives in `agent_loop.py` and can be
-reused for any one-shot peer run (a review, a summary, a critic):
+one-shot completion. The base layer's three refresh passes reuse the same route and toolset
+(`worker._adviser_consult`); the loop is not adviser-specific — it lives in `agent_loop.py` and can
+be reused for any one-shot peer run (a review, a summary, a critic):
 
 ```python
 from . import agent_loop
@@ -273,8 +311,36 @@ auxiliary:
 ```
 
 `register()` adds both surfaces next to the memory provider — `ctx.register_auxiliary_task("adviser")`
-for the config block/picker entry and `ctx.register_tool(...)` for `adviser_consult` — and the tool is
+for the config block/picker entry and `ctx.register_tool(...)` for `adviser_consult` — and the tools are
 declared under `provides_tools:` in `plugin.yaml`, which is what `hermes plugins validate` checks.
+
+### Session search (`adviser_session_search`)
+
+The same `adviser` toolset also exposes `adviser_session_search`: read-only, stdlib-only recall over
+the host's own `$HERMES_HOME/state.db` (`session_search.py`). Nothing is copied; every answer is the
+host's rows, bounded per message. Five shapes, selected by `mode` or inferred from the arguments:
+
+| `mode` | What it answers | Main arguments |
+| --- | --- | --- |
+| `search` | FTS5 over message content (`messages_fts`; `messages_fts_trigram` for CJK substrings), `LIKE` fallback; returns snippets + session context | `query`, `match` (all/any/phrase/raw), `role`, `source`, `after`/`before`, `limit`/`offset` |
+| `sessions` | Browse/filter session metadata: id/title substring, source, time window, archived/hidden | `query`, `source`, `sort`, `after`/`before` |
+| `messages` | Read one session's transcript, paged from either end | `session_id`, `role`, `order`, `limit`/`offset` |
+| `around` | A window of messages on both sides of one message id | `session_id`, `message_id`, `window` |
+| `stats` | Counts, roles/sources, FTS availability, DB size, oldest/newest row | — |
+
+Defaults mirror the host's own recall: live (`active`) rows only, compaction summaries excluded,
+`user`/`assistant` for `search`, all roles for a transcript read, and host-synthesized user rows
+(`[Assistant Rules]`, `[System: …]`, `[minir fold …]`) hidden. Hidden session sources
+(`kanban`, `subagent`, `tool`) and archived/hidden sessions are excluded unless `include_hidden` /
+`include_archived` says otherwise; `include_inactive`, `include_compacted` and `include_synthetic`
+open the other filters. `profile: work` reads `$HERMES_HOME/profiles/work/state.db` instead of the
+active profile. Time bounds accept epoch seconds, ISO date/datetime, or `7d`/`24h`/`2w`; results
+report `total`, `has_more` and `next_offset` so a caller can page without guessing.
+
+The handler is synchronous (`is_async=False`): one bounded SQLite read with no model call. It returns
+the same `{"success": true, "data": …}` / `{"success": false, "error": {"type", "message"}}` envelope
+as `adviser_consult`, and never raises into the tool loop.
+
 Registration is deliberately *optional*: if the host refuses the auxiliary key (another plugin owns
 it), the warning is logged and the memory provider still loads, because the provider is why the
 directory is imported at all. The key is process-wide, so a standalone `adviser` plugin cannot stay

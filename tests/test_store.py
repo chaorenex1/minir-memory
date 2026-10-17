@@ -29,7 +29,7 @@ def test_creates_parent_directories(plugin_package, tmp_path):
 def test_schema_holds_no_transcript(store):
     tables = {row[0] for row in store._conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'")}
     assert "turns" not in tables
-    assert {"notes", "jobs", "layer_state", "conclusions", "metrics"} <= tables
+    assert {"notes", "jobs", "layer_state", "base_refreshes", "conclusions", "metrics"} <= tables
     assert "conclusions_fts" in tables
 
 
@@ -230,3 +230,50 @@ def test_remember_and_forget_update_the_index(store):
     assert store.search("indexed conclusion")
     assert store.forget(note_id) is True
     assert store.search("indexed conclusion") == []
+
+
+# -- base refresh history -----------------------------------------------------
+
+def _refresh(store, session="s1", subject="user:ada", *, from_ts, to_ts,
+             from_turn=None, to_turn=None, summary="window", peer="terse"):
+    return store.add_base_refresh(
+        session, subject, window_from_ts=from_ts, window_to_ts=to_ts,
+        window_from_turn=from_turn, window_to_turn=to_turn,
+        user_representation=f"[goal] need at {from_ts}",
+        user_peer_card=peer, ai_self_representation=f"[done] window {from_ts}",
+        ai_identity_card="direct", session_chunk_summary=summary)
+
+
+def test_base_refreshes_keep_history_and_exactly_one_latest(store):
+    first = _refresh(store, from_ts=0.0, to_ts=10.0, from_turn=1, to_turn=2)
+    second = _refresh(store, from_ts=10.0, to_ts=20.0, from_turn=3, to_turn=4,
+                      summary="second window", peer="terse, no emoji")
+
+    latest = store.latest_base_refresh("s1", "user:ada")
+    assert latest["id"] == second and latest["is_latest"] == 1
+    assert (latest["window_from_ts"], latest["window_to_ts"]) == (10.0, 20.0)
+    assert (latest["window_from_turn"], latest["window_to_turn"]) == (3, 4)
+    assert latest["session_chunk_summary"] == "second window"
+    assert latest["user_peer_card"] == "terse, no emoji"
+
+    history = store.base_refreshes("s1", "user:ada")
+    assert [row["id"] for row in history] == [second, first]
+    assert [row["is_latest"] for row in history] == [1, 0]
+    assert store.latest_base_refresh("s1", "user:bo") is None
+    assert store.stats()["base_refreshes"] == 2
+
+
+def test_the_same_refresh_window_updates_in_place(store):
+    first = _refresh(store, from_ts=0.0, to_ts=10.0, summary="first attempt")
+    again = _refresh(store, from_ts=0.0, to_ts=10.0, summary="retried attempt")
+    assert again == first
+    assert len(store.base_refreshes("s1")) == 1
+    assert store.latest_base_refresh("s1")["session_chunk_summary"] == "retried attempt"
+
+
+def test_latest_refresh_is_scoped_to_the_session(store):
+    _refresh(store, session="s1", from_ts=0.0, to_ts=10.0)
+    _refresh(store, session="s2", from_ts=0.0, to_ts=10.0, peer="other session")
+    assert store.latest_base_refresh("s1")["user_peer_card"] == "terse"
+    assert store.latest_base_refresh("s2")["user_peer_card"] == "other session"
+    assert store.base_refreshes("s2")[0]["user_peer_card"] == "other session"

@@ -11,6 +11,7 @@ import asyncio
 import json
 import sys
 import types
+from pathlib import Path
 
 import pytest
 
@@ -226,12 +227,12 @@ def test_the_schema_offers_only_caller_owned_knobs(adviser):
 
 # -- registration -------------------------------------------------------------
 
-def test_register_declares_the_route_and_the_async_tool(adviser):
+def test_register_declares_the_route_and_both_tools(adviser):
     ctx = FakeCtx()
 
     adviser.register(ctx)
 
-    (kind, entry), (tool_kind, tool) = ctx.calls
+    (kind, entry), (tool_kind, tool), (search_kind, search) = ctx.calls
     assert (kind, entry["key"]) == ("auxiliary_task", "adviser")
     assert entry["display_name"] == "Adviser"
     assert entry["defaults"] == {"toolsets": []}
@@ -241,6 +242,37 @@ def test_register_declares_the_route_and_the_async_tool(adviser):
     # the host bridges async handlers (tools.registry.dispatch -> _run_async).
     assert tool["handler"] is adviser.handle_async
     assert tool["is_async"] is True
+    assert (search_kind, search["name"], search["toolset"]) == (
+        "tool", "adviser_session_search", "adviser")
+    assert search["schema"]["name"] == "adviser_session_search"
+    assert search["handler"] is adviser.session_search.handle
+    assert search["is_async"] is False
+    assert search["schema"]["parameters"]["properties"]["mode"]["enum"] == [
+        "search", "sessions", "messages", "around", "stats"]
+
+
+def test_manifest_declares_every_registered_adviser_tool(adviser):
+    """``hermes plugins validate`` fails the manifest for an undeclared registered tool."""
+    ctx = FakeCtx()
+    adviser.register(ctx)
+    registered = {call[1]["name"] for call in ctx.calls if call[0] == "tool"}
+
+    declared = []
+    in_block = False
+    manifest = (Path(__file__).resolve().parents[1] / "plugin" / "minir"
+                / "plugin.yaml").read_text(encoding="utf-8-sig")
+    for line in manifest.splitlines():
+        if line.startswith("provides_tools:"):
+            in_block = True
+            continue
+        if in_block:
+            if line.startswith("  - "):
+                declared.append(line[4:].strip())
+            elif line.strip() and not line.startswith(" "):
+                break
+
+    assert registered == {"adviser_consult", "adviser_session_search"}
+    assert set(declared) == registered
 
 
 def test_provider_registration_survives_a_refused_auxiliary_key(plugin_package):

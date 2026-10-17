@@ -15,6 +15,11 @@
   expires it (``expire_open_jobs``) instead of pretending to reason over it.
 * ``layer_state`` — the merged artifact each layer publishes, one row per ``(layer, subject)``
   with a monotonically increasing ``version`` (see ``worker.py``).
+* ``base_refreshes`` — one row per base-layer refresh *window*: the five structured outputs
+  (user representation, user peer card, AI self representation, AI identity card, local window
+  summary) plus the session, time range and turn range they cover. ``is_latest`` marks the
+  current row per ``(session_id, subject)``, so history is append-only while the live row is a
+  single indexed lookup.
 * ``conclusions`` — every durable result split into individually searchable rows: notes, the
   five base-layer sections, the dialectic review/constraints/preferences/second-brain, local
   compression chunks, and final session summaries. ``conclusions_fts`` is an FTS5 trigram index
@@ -102,6 +107,28 @@ CREATE TABLE IF NOT EXISTS conclusions (
 );
 CREATE INDEX IF NOT EXISTS idx_conclusions_session ON conclusions(session_id, kind);
 CREATE INDEX IF NOT EXISTS idx_conclusions_kind ON conclusions(kind, updated_at DESC);
+CREATE TABLE IF NOT EXISTS base_refreshes (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id TEXT NOT NULL DEFAULT '',
+    subject TEXT NOT NULL DEFAULT '',
+    window_from_ts REAL NOT NULL,
+    window_to_ts REAL NOT NULL,
+    window_from_turn INTEGER,
+    window_to_turn INTEGER,
+    user_representation TEXT NOT NULL DEFAULT '',
+    user_peer_card TEXT NOT NULL DEFAULT '',
+    ai_self_representation TEXT NOT NULL DEFAULT '',
+    ai_identity_card TEXT NOT NULL DEFAULT '',
+    session_chunk_summary TEXT NOT NULL DEFAULT '',
+    is_latest INTEGER NOT NULL DEFAULT 1,
+    created_at REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_base_refreshes_session
+    ON base_refreshes(session_id, subject, created_at DESC);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_base_refreshes_window
+    ON base_refreshes(session_id, subject, window_from_ts);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_base_refreshes_latest
+    ON base_refreshes(session_id, subject) WHERE is_latest = 1;
 CREATE TABLE IF NOT EXISTS metrics (
     tool TEXT PRIMARY KEY,
     count INTEGER NOT NULL DEFAULT 0,
@@ -745,6 +772,84 @@ class MinirStore:
                 "ORDER BY layer, updated_at DESC").fetchall()
         return [dict(row) for row in rows]
 
+    # -- base refresh history -------------------------------------------------
+
+    def add_base_refresh(self, session_id: str, subject: str, *, window_from_ts: float,
+                         window_to_ts: float, window_from_turn: Optional[int],
+                         window_to_turn: Optional[int], user_representation: str,
+                         user_peer_card: str, ai_self_representation: str,
+                         ai_identity_card: str, session_chunk_summary: str) -> int:
+        """Record one base-layer refresh window and make it the session's latest row.
+
+        A refresh is identified by ``(session_id, subject, window_from_ts)`` — windows are
+        edge-to-edge, so the start edge is unique per participant. Re-processing a re-queued job
+        updates the same row instead of appending a duplicate, while a new window appends and
+        moves ``is_latest``. The partial unique index guarantees at most one latest row per
+        participant.
+        """
+        now = time.time()
+        values = (session_id or "", subject or "", float(window_from_ts), float(window_to_ts),
+                  window_from_turn, window_to_turn, user_representation or "",
+                  user_peer_card or "", ai_self_representation or "", ai_identity_card or "",
+                  session_chunk_summary or "", now)
+        with self._lock:
+            self._conn.execute(
+                "UPDATE base_refreshes SET is_latest = 0 "
+                "WHERE session_id = ? AND subject = ? AND is_latest = 1",
+                (session_id or "", subject or ""))
+            self._conn.execute(
+                "INSERT INTO base_refreshes (session_id, subject, window_from_ts, window_to_ts, "
+                "window_from_turn, window_to_turn, user_representation, user_peer_card, "
+                "ai_self_representation, ai_identity_card, session_chunk_summary, is_latest, "
+                "created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?) "
+                "ON CONFLICT(session_id, subject, window_from_ts) DO UPDATE SET "
+                "window_from_turn = excluded.window_from_turn, "
+                "window_to_turn = excluded.window_to_turn, "
+                "user_representation = excluded.user_representation, "
+                "user_peer_card = excluded.user_peer_card, "
+                "ai_self_representation = excluded.ai_self_representation, "
+                "ai_identity_card = excluded.ai_identity_card, "
+                "session_chunk_summary = excluded.session_chunk_summary, "
+                "is_latest = 1, created_at = excluded.created_at",
+                values)
+            row = self._conn.execute(
+                "SELECT id FROM base_refreshes WHERE session_id = ? AND subject = ? "
+                "AND window_from_ts = ?",
+                values[:3]).fetchone()
+            self._conn.commit()
+            return int(row["id"]) if row is not None else 0
+
+    def latest_base_refresh(self, session_id: str,
+                            subject: str = "") -> Optional[dict[str, Any]]:
+        """The active refresh row for a session (optionally one participant)."""
+        with self._lock:
+            if subject:
+                row = self._conn.execute(
+                    "SELECT * FROM base_refreshes WHERE session_id = ? AND subject = ? "
+                    "AND is_latest = 1 LIMIT 1", (session_id, subject)).fetchone()
+            else:
+                row = self._conn.execute(
+                    "SELECT * FROM base_refreshes WHERE session_id = ? AND is_latest = 1 "
+                    "ORDER BY created_at DESC, id DESC LIMIT 1", (session_id,)).fetchone()
+        return dict(row) if row is not None else None
+
+    def base_refreshes(self, session_id: str, subject: str = "",
+                       limit: int = 20) -> list[dict[str, Any]]:
+        """The session's refresh history, newest first (latest flags preserved)."""
+        limit = max(1, min(200, int(limit or 20)))
+        with self._lock:
+            if subject:
+                rows = self._conn.execute(
+                    "SELECT * FROM base_refreshes WHERE session_id = ? AND subject = ? "
+                    "ORDER BY window_to_ts DESC, id DESC LIMIT ?",
+                    (session_id, subject, limit)).fetchall()
+            else:
+                rows = self._conn.execute(
+                    "SELECT * FROM base_refreshes WHERE session_id = ? "
+                    "ORDER BY window_to_ts DESC, id DESC LIMIT ?",
+                    (session_id, limit)).fetchall()
+        return [dict(row) for row in rows]
+
     # -- reads ----------------------------------------------------------------
 
     @staticmethod
@@ -849,6 +954,7 @@ class MinirStore:
             failed = self._conn.execute(
                 "SELECT COUNT(*) AS n FROM jobs WHERE status = 'failed'").fetchone()["n"]
             states = self._conn.execute("SELECT COUNT(*) AS n FROM layer_state").fetchone()["n"]
+            refreshes = self._conn.execute("SELECT COUNT(*) AS n FROM base_refreshes").fetchone()["n"]
             conclusions = self._conn.execute("SELECT COUNT(*) AS n FROM conclusions").fetchone()["n"]
             metrics = self._conn.execute("SELECT COUNT(*) AS n FROM metrics").fetchone()["n"]
         try:
@@ -857,7 +963,8 @@ class MinirStore:
             size = 0
         return {"notes": int(notes), "sessions": int(sessions),
                 "jobs": int(jobs), "pending_jobs": int(pending), "failed_jobs": int(failed),
-                "layer_states": int(states), "conclusions": int(conclusions),
+                "layer_states": int(states), "base_refreshes": int(refreshes),
+                "conclusions": int(conclusions),
                 "metrics": int(metrics), "fts": bool(self._fts),
                 "db_path": str(self.path), "db_bytes": size}
 

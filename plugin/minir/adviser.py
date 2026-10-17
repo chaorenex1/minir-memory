@@ -4,7 +4,9 @@ Two surfaces ride one route (``auxiliary.adviser``):
 
 * ``ctx.register_auxiliary_task("adviser")`` — the ``auxiliary.adviser`` config block, its
   model-picker entry and the ``AUXILIARY_ADVISER_*`` env bridge are owned by this plugin.
-* the ``adviser_consult`` tool — an in-process agent loop the main agent can consult.
+* the ``adviser_consult`` tool — an in-process agent loop the main agent can consult;
+* the ``adviser_session_search`` tool — read-only, multi-shape recall over the host's own
+  ``state.db`` (see :mod:`session_search`), in the same ``adviser`` toolset.
 
 The loop itself is :mod:`agent_loop` (one implementation, sync + async); this module owns the
 route's configuration, the prompt, the tool schema and the two handlers:
@@ -28,7 +30,7 @@ import json
 import logging
 from typing import Any
 
-from . import agent_loop
+from . import agent_loop, session_search
 
 logger = logging.getLogger(__name__)
 
@@ -46,7 +48,8 @@ _CFG_DEFAULTS: dict[str, Any] = {"toolsets": []}
 _ADVISER_BRIEF = (
     "You are a senior adviser giving a second opinion. Lead with the recommendation, then the "
     "reasoning, the main risks, and what you would verify. Disagree when the evidence says so; "
-    "never agree just to be agreeable. Be concise."
+    "never agree just to be agreeable. When past sessions are relevant and the adviser toolset is "
+    "enabled, use adviser_session_search to ground the advice in the host's own record. Be concise."
 )
 
 SCHEMA = {
@@ -179,4 +182,16 @@ def register(ctx) -> None:
         is_async=True,
         description="Ask an independent adviser (separate agent loop) for a second opinion.",
         emoji="🧭",
+    )
+    # Read-only, stdlib-only store access. The handler is synchronous on purpose: one bounded
+    # SQLite read with no model call, so the host needs no thread bridge.
+    ctx.register_tool(
+        name=session_search.TOOL_NAME,
+        toolset=TOOLSET,
+        schema=session_search.SCHEMA,
+        handler=session_search.handle,
+        is_async=False,
+        description=("Search/read the host's durable session store (state.db): FTS5 message "
+                     "search, session browse, transcript read, message window, stats."),
+        emoji="🗂️",
     )

@@ -76,7 +76,9 @@ def test_content_is_never_reasoned_over_twice(store, transcript, worker):
     transcript.add(SESSION, "user", "second window", created_at=150.0)
     _dispatch(store, transcript, SESSION, BASE, 100.0, 140.0)
     assert worker.run_once() == 2
-    first, second = (call["prompt"] for call in worker.calls)
+    assert len(worker.calls) == 6, "three staged passes per base refresh"
+    first = worker.calls[0]["prompt"]
+    second = worker.calls[3]["prompt"]
     assert "first window" in first and "second window" not in first
     assert "second window" in second and "first window" not in second
 
@@ -105,10 +107,10 @@ def test_a_window_already_drained_is_skipped(store, transcript, worker):
     transcript.add(SESSION, "user", "already seen", created_at=10.0)
     _dispatch(store, transcript, SESSION, BASE, 0.0, 20.0)
     worker.run_once()
-    assert len(worker.calls) == 1
+    assert len(worker.calls) == 3, "one staged refresh = three passes"
     _dispatch(store, transcript, SESSION, BASE, 0.0, 20.0)  # same window queued again
     assert worker.run_once() == 1
-    assert len(worker.calls) == 1, "no second model call for content already reasoned over"
+    assert len(worker.calls) == 3, "no second model call for content already reasoned over"
     assert store.last_processed_ts(BASE, SESSION) >= 10.0
 
 
@@ -186,14 +188,14 @@ def test_dialectic_layer_publishes_constraints_preferences_review(plugin_package
 
 def test_an_unusable_artifact_fails_the_job_and_keeps_the_previous_version(plugin_package, store,
                                                                            transcript):
-    replies = ["## Session Summary\n- keeps this\n\n## User Representation\n- [fact] this\n\n"
-               "## User Peer Card\n- terse\n\n## AI Self Representation\n- direct\n\n"
-               "## AI Identity Card\n- careful", "no headings at all"]
+    good_reply = ("## Session Summary\n- keeps this\n\n## User Representation\n- [fact] this\n\n"
+                  "## User Peer Card\n- terse\n\n## AI Self Representation\n- direct\n\n"
+                  "## AI Identity Card\n- careful")
     seen: list[str] = []
 
     def complete(task, system, prompt, **kwargs):
         seen.append(prompt)
-        return replies[min(len(seen) - 1, len(replies) - 1)]
+        return "no headings at all" if "second" in prompt else good_reply
 
     instance = plugin_package.worker.LayerWorker(store, transcript, complete=complete)
     transcript.add(SESSION, "user", "first")
@@ -521,3 +523,110 @@ def test_a_dialectic_job_can_run_from_the_chunk_chain_alone(plugin_package, stor
     store.record_job(DIALECTIC, SESSION, 0.0, 20.0)
     assert instance.run_once() == 1, "chunks alone must drive the dialectic pass"
     assert "chunk-only evidence" in calls[0]
+
+
+# -- the structured base refresh record ---------------------------------------
+
+def test_base_refresh_persists_the_five_fields_and_window_metadata(store, transcript, worker):
+    transcript.add(SESSION, "user", "I need a plugin", created_at=10.0)
+    transcript.add(SESSION, "assistant", "starting", created_at=11.0)
+    _dispatch(store, transcript, SESSION, BASE, 0.0, 20.0, turns=2)
+    assert worker.run_once() == 1
+
+    row = store.latest_base_refresh(SESSION, "user:default")
+    assert row is not None and row["is_latest"] == 1
+    assert row["user_representation"] == "- [goal] ship the plugin"
+    assert row["user_peer_card"] == "- Wants terse answers."
+    assert row["ai_self_representation"] == "- direct"
+    assert row["ai_identity_card"] == "- careful with user files"
+    assert row["session_chunk_summary"] == "- Ships a Hermes memory plugin from Windows."
+    assert row["window_from_ts"] == 0.0
+    assert row["window_to_ts"] == store.last_processed_ts(BASE, SESSION)
+    assert row["window_to_ts"] >= 20.0, "the newest job drains to the newest message"
+    assert (row["window_from_turn"], row["window_to_turn"]) == (1, 2)
+
+    transcript.add(SESSION, "user", "next window", created_at=30.0)
+    _dispatch(store, transcript, SESSION, BASE, 20.0, 40.0, turns=4)
+    assert worker.run_once() == 1
+    history = store.base_refreshes(SESSION, "user:default")
+    assert len(history) == 2 and [item["is_latest"] for item in history] == [1, 0]
+    assert history[0]["window_from_ts"] == history[1]["window_to_ts"], \
+        "windows are edge-to-edge in the stored history"
+    assert history[0]["window_from_ts"] >= 20.0
+    assert history[0]["window_to_ts"] == store.last_processed_ts(BASE, SESSION)
+
+
+def test_first_refresh_bootstraps_and_later_refreshes_merge(plugin_package, store, transcript,
+                                                            monkeypatch):
+    def query(args, **kwargs):
+        assert args["mode"] == "messages" and args["order"] == "oldest"
+        return {"messages": [{"content": "anchor: build the memory plugin"}]}
+
+    monkeypatch.setattr(plugin_package.session_search, "query", query)
+    calls: list[str] = []
+
+    def complete(task, system, prompt, **kwargs):
+        calls.append(prompt)
+        return ("## Session Summary\n- [goal] build\n\n## User Representation\n- [goal] build\n\n"
+                "## User Peer Card\n- terse\n\n## AI Self Representation\n- direct\n\n"
+                "## AI Identity Card\n- careful")
+
+    instance = plugin_package.worker.LayerWorker(store, transcript, complete=complete)
+    transcript.add(SESSION, "user", "first turn", created_at=10.0)
+    _dispatch(store, transcript, SESSION, BASE, 0.0, 20.0)
+    assert instance.run_once() == 1
+    assert "first base refresh (bootstrap)" in calls[0]
+    assert "anchor: build the memory plugin" in calls[0]
+    assert "Previous user cards: none" in calls[0]
+
+    transcript.add(SESSION, "user", "second turn", created_at=30.0)
+    _dispatch(store, transcript, SESSION, BASE, 20.0, 40.0)
+    assert instance.run_once() == 1
+    second = calls[3]
+    assert "subsequent base refresh (merge previous cards)" in second
+    assert "Previous user cards:" in second and "terse" in second
+    assert "first turn" not in second, "the previous window is not re-fed as evidence"
+    assert "anchor: build the memory plugin" not in second, \
+        "the first-message anchor is bootstrap-only; later output comes from prior cards + window"
+
+
+def test_base_refresh_runs_on_the_adviser_route_with_the_adviser_toolset(
+        plugin_package, store, transcript, monkeypatch):
+    reply = ("## Session Summary\n- [goal] build\n\n## User Representation\n- [goal] build\n\n"
+             "## User Peer Card\n- terse\n\n## AI Self Representation\n- direct\n\n"
+             "## AI Identity Card\n- careful")
+    requests: list[dict] = []
+
+    monkeypatch.setattr(plugin_package.adviser, "load_config",
+                        lambda: {"provider": "deepseek", "model": "deepseek-v4-flash",
+                                 "toolsets": ["file"]})
+
+    def run(message, **kwargs):
+        requests.append({"message": message, **kwargs})
+        return type("Run", (), {"answer": reply})()
+
+    monkeypatch.setattr(plugin_package.agent_loop, "run", run)
+    instance = plugin_package.worker.LayerWorker(store, transcript)  # no injection -> adviser route
+    transcript.add(SESSION, "user", "grounded by session search", created_at=10.0)
+    _dispatch(store, transcript, SESSION, BASE, 0.0, 20.0)
+    assert instance.run_once() == 1
+    assert len(requests) == 3, "user cards, AI cards, then the window summary"
+    for request in requests:
+        assert request["provider"] == "deepseek"
+        assert request["model"] == "deepseek-v4-flash"
+        assert "file" in request["toolsets"] and "adviser" in request["toolsets"]
+    assert "You maintain the user model" in requests[0]["system_message"]
+    assert "You maintain the AI half" in requests[1]["system_message"]
+    assert "local compression record" in requests[2]["system_message"]
+    assert store.latest_base_refresh(SESSION, "user:default") is not None
+
+
+def test_a_verbose_section_cannot_truncate_a_later_heading(plugin_package):
+    normalize = plugin_package.worker._normalize_sections
+    text = ("## User Representation\n- " + "x" * 2_000 + "\n\n"
+            "## User Peer Card\n- durable preference")
+    out = normalize(text, plugin_package.worker.BASE_USER_SECTIONS)
+    assert out.startswith("## User Representation")
+    assert "## User Peer Card" in out and "durable preference" in out, \
+        "the second heading survives because each section has its own budget"
+    assert len(out.split("## User Peer Card")[0]) <= 520

@@ -21,3 +21,4 @@ provides_hooks:
 # manifest with "undeclared tools registered".
 provides_tools:
   - adviser_consult
+  - adviser_session_search

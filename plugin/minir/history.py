@@ -25,7 +25,7 @@ logger = logging.getLogger(__name__)
 
 _MAX_MESSAGES = 400
 _MAX_IDENTITY_CHARS = 4_000
-_SYNTHETIC_PREFIXES = (
+SYNTHETIC_PREFIXES = (
     "[Assistant Rules]",
     "[CONTEXT COMPACTION",
     "[IMPORTANT: Background process",
@@ -64,7 +64,7 @@ def _columns(connection: sqlite3.Connection, table: str) -> set[str]:
 def is_synthetic_user_text(text: str) -> bool:
     """True for host-authored rows that merely ride in the ``user`` role."""
     head = (text or "").lstrip()
-    return any(head.startswith(prefix) for prefix in _SYNTHETIC_PREFIXES)
+    return any(head.startswith(prefix) for prefix in SYNTHETIC_PREFIXES)
 
 
 def read_messages(state_db: Any, session_id: str, from_ts: float, to_ts: float,
