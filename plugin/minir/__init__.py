@@ -754,9 +754,11 @@ class MinirMemoryProvider(MemoryProvider):
                          "text": _excerpt(row["text"])}
                 if row.get("marker_type"):
                     entry["marker_type"] = row["marker_type"]
-                # Only a note has a forgettable id. Never expose a conclusion id under ``id``:
-                # minir_forget deletes notes, and a colliding number would delete the wrong row.
-                if row["kind"] == "note" and row.get("note_id") is not None:
+                # Only a typed marker has a forgettable id. Never expose a conclusion id under
+                # ``id``, and never advertise an untyped note (host mirror/legacy row) that
+                # ``minir_forget`` cannot delete: the type check would reject it.
+                if (row["kind"] == "note" and row.get("marker_type")
+                        and row.get("note_id") is not None):
                     entry["note_id"] = row["note_id"]
                     entry["id"] = row["note_id"]
                 results.append(entry)
@@ -1028,7 +1030,7 @@ _TOOL_SEARCH = _tool_schema(
     "Search Minir's long-term memory for stored value markers and derived conclusions — "
     "user/AI cards, adviser reviews, session summaries and notes. Minir keeps no "
     "transcripts; this searches the conclusions derived from them. The default scope is the "
-    "current session plus durable cards; set scope='all' to search across sessions.",
+    "current session plus durable cards and notes; set scope='all' to search across sessions.",
     {"query": _prop("What to search for."),
      "limit": _prop("Maximum results to return (default: the provider's prefetch limit).", "integer"),
      "scope": _prop("Recall scope: 'session' (default) or 'all' for cross-session search.",

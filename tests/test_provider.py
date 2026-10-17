@@ -248,6 +248,17 @@ def test_tools_roundtrip(provider):
     assert stats["notes"] == 0 and stats["markers"] == {} and "db_path" in stats
 
 
+def test_search_does_not_advertise_untyped_notes_as_forgettable(provider):
+    note_id = provider._store.remember("untyped durable note")
+    payload = json.loads(provider.handle_tool_call(
+        "minir_search", {"query": "untyped durable note"}))
+    note = next(row for row in payload["results"] if row["kind"] == "note")
+    assert "marker_type" not in note
+    assert "note_id" not in note and "id" not in note
+    assert json.loads(provider.handle_tool_call(
+        "minir_forget", {"type": "tools", "note_id": note_id}))["deleted"] is False
+
+
 def test_tool_argument_validation(provider):
     assert "error" in json.loads(provider.handle_tool_call("minir_search", {"query": "  "}))
     assert "error" in json.loads(provider.handle_tool_call(
