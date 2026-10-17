@@ -57,7 +57,7 @@ import sqlite3
 import threading
 import time
 from pathlib import Path
-from typing import Any, Iterable, Optional
+from typing import Any, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -91,6 +91,11 @@ CREATE TABLE IF NOT EXISTS jobs (
 );
 CREATE INDEX IF NOT EXISTS idx_jobs_status ON jobs(status, id);
 CREATE INDEX IF NOT EXISTS idx_jobs_session ON jobs(session_id);
+CREATE TABLE IF NOT EXISTS compression_gates (
+    session_id TEXT PRIMARY KEY,
+    run_id TEXT NOT NULL DEFAULT '',
+    expires_at REAL NOT NULL DEFAULT 0
+);
 CREATE TABLE IF NOT EXISTS layer_state (
     layer TEXT NOT NULL,
     subject TEXT NOT NULL,
@@ -667,43 +672,14 @@ class MinirStore:
             self._conn.commit()
             return cur.rowcount > 0
 
-    def promote_pending_handoffs(self, session_id: str, *,
-                                 uids: Optional[Iterable[str]] = None) -> int:
-        """Mark pending handoffs active once the carrier they belong to was observed.
-
-        ``compress()`` can be discarded on a host timeout; writing the handoff as pending and
-        promoting it only when the returned carrier shows up in the persisted messages keeps a
-        discarded pass out of ``newest_conclusion`` and FTS recall. When *uids* is given, only
-        rows whose evidence is a **non-empty subset** of the observed uids are promoted — a later
-        pending fold must not ride an earlier carrier's observation just because it shares an
-        overlapping message. An empty uid list keeps the legacy all-pending behavior for rows
-        written without message ids.
-        """
-        wanted = {str(uid) for uid in (uids or ()) if str(uid).strip()} \
-            if uids is not None else None
+    def promote_summary_run(self, session_id: str, run_id: str) -> int:
+        """Promote the pending compression summary identified by its marker run id."""
+        key = f"session_summary:{session_id}:{run_id}"
         with self._lock:
-            rows = self._conn.execute(
-                "SELECT id, evidence FROM conclusions "
-                "WHERE kind IN ('session_summary', 'handoff') "
-                "AND session_id = ? AND status = 'pending'", (session_id,),
-            ).fetchall()
-            chosen: list[int] = []
-            for row in rows:
-                if wanted is None or not wanted:
-                    chosen.append(int(row["id"]))
-                    continue
-                try:
-                    evidence = {str(uid) for uid in json.loads(row["evidence"] or "[]")}
-                except (TypeError, ValueError, json.JSONDecodeError):
-                    evidence = set()
-                if evidence and evidence <= wanted:
-                    chosen.append(int(row["id"]))
-            if not chosen:
-                return 0
-            marks = ",".join("?" * len(chosen))
             cur = self._conn.execute(
-                f"UPDATE conclusions SET status = 'active', updated_at = ? "
-                f"WHERE id IN ({marks})", (time.time(), *chosen))
+                "UPDATE conclusions SET status = 'active', updated_at = ? "
+                "WHERE kind = 'session_summary' AND session_id = ? AND key = ? "
+                "AND status = 'pending'", (time.time(), session_id, key))
             self._conn.commit()
             return int(cur.rowcount)
 
@@ -829,7 +805,7 @@ class MinirStore:
             return int(cur.rowcount)
 
     def expire_pending_handoffs(self, session_id: str, *, before: float) -> int:
-        """Drop pending handoffs whose carrier never became durable (TTL sweep)."""
+        """Drop pending summaries whose committed message never appeared (TTL sweep)."""
         with self._lock:
             cur = self._conn.execute(
                 "UPDATE conclusions SET status = 'expired', updated_at = ? "
@@ -875,20 +851,27 @@ class MinirStore:
             ).fetchall()
         return [dict(row) for row in rows]
 
-    def claim_jobs(self, limit: int = 2) -> list[dict[str, Any]]:
+    def claim_jobs(self, limit: int = 2, *, session_id: str = "") -> list[dict[str, Any]]:
         """Mark the oldest *limit* pending jobs ``running`` and return them.
 
         One UPDATE round-trips the claim, so two workers (or a restarted process racing its
         own predecessor) can never process the same row twice. ``attempts`` counts claims.
+        A non-empty *session_id* scopes the claim to one session, which is what the
+        pre-compression synchronous drain needs.
         """
         with self._lock:
             # A review is queued only after its base job published, and it owns the window
             # that base just produced. Claim it before any later base job so the review sees
             # the live artifact and its correction can carry into the next base merge.
             order = ("ORDER BY CASE layer WHEN 'dialectic' THEN 0 ELSE 1 END, id")
+            where = "WHERE status = 'pending'"
+            params: list[Any] = []
+            if session_id:
+                where += " AND session_id = ?"
+                params.append(session_id)
             ids = [row["id"] for row in self._conn.execute(
-                f"SELECT id FROM jobs WHERE status = 'pending' {order} LIMIT ?",
-                (max(1, min(int(limit), 50)),),
+                f"SELECT id FROM jobs {where} {order} LIMIT ?",
+                (*params, max(1, min(int(limit), 50))),
             ).fetchall()]
             if not ids:
                 return []
@@ -980,6 +963,48 @@ class MinirStore:
                 "LIMIT 1", (layer, session_id),
             ).fetchone()
         return row is not None
+
+    def pending_job_count(self, session_id: str) -> int:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT COUNT(*) AS n FROM jobs WHERE session_id = ? AND status = 'pending'",
+                (session_id,)).fetchone()
+        return int(row["n"] or 0) if row is not None else 0
+
+    def open_job_count(self, session_id: str) -> int:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT COUNT(*) AS n FROM jobs WHERE session_id = ? "
+                "AND status IN ('pending', 'running')", (session_id,)).fetchone()
+        return int(row["n"] or 0) if row is not None else 0
+
+    # -- compression gate -----------------------------------------------------
+
+    def set_compression_gate(self, session_id: str, *, expires_at: float,
+                             run_id: str = "") -> None:
+        """Pause periodic layer scheduling for one session while compression runs."""
+        with self._lock:
+            self._conn.execute(
+                "INSERT INTO compression_gates (session_id, run_id, expires_at) "
+                "VALUES (?, ?, ?) ON CONFLICT(session_id) DO UPDATE SET "
+                "run_id = excluded.run_id, expires_at = excluded.expires_at",
+                (session_id, str(run_id or ""), float(expires_at)))
+            self._conn.commit()
+
+    def clear_compression_gate(self, session_id: str) -> None:
+        with self._lock:
+            self._conn.execute(
+                "DELETE FROM compression_gates WHERE session_id = ?", (session_id,))
+            self._conn.commit()
+
+    def compression_gate_active(self, session_id: str, *, now: Optional[float] = None) -> bool:
+        """True while a live gate exists; an expired gate is treated as resumed."""
+        stamp = time.time() if now is None else float(now)
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT expires_at FROM compression_gates WHERE session_id = ?",
+                (session_id,)).fetchone()
+        return row is not None and float(row["expires_at"] or 0.0) > stamp
 
     def open_job_end(self, layer: str, session_id: str) -> Optional[float]:
         """Furthest ``to_ts`` among this layer's queued/running jobs, or ``None``.

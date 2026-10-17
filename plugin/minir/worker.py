@@ -1003,17 +1003,18 @@ class LayerWorker:
 
     # -- the drain ------------------------------------------------------------
 
-    def run_once(self) -> int:
+    def run_once(self, *, session_id: str = "") -> int:
         """Process up to ``_MAX_JOBS_PER_RUN`` jobs oldest-first; returns how many ran.
 
         Stops at the first failure: a re-queued job would otherwise be retried immediately,
-        burning its remaining attempt against the same broken condition.
+        burning its remaining attempt against the same broken condition. A non-empty
+        *session_id* scopes the claim to one session for the synchronous pre-compression drain.
         """
         if not self._enabled:
             return 0
         processed = 0
         while processed < _MAX_JOBS_PER_RUN:
-            jobs = self._store.claim_jobs(limit=1)
+            jobs = self._store.claim_jobs(limit=1, session_id=session_id)
             if not jobs:
                 break
             job = jobs[0]
@@ -1025,6 +1026,28 @@ class LayerWorker:
                 processed += 1
                 break
             processed += 1
+        return processed
+
+    def drain_session(self, session_id: str, *, timeout: float = 120.0) -> int:
+        """Drain one session's pending layer jobs synchronously, up to *timeout* seconds.
+
+        Pre-compression needs the published chunk and its dependent review before the summary
+        agent runs. Scoping the claim to the session keeps this drain from touching another
+        conversation's queue; a job already running on the background worker is waited for
+        rather than duplicated.
+        """
+        if not self._enabled or not session_id:
+            return 0
+        deadline = time.monotonic() + max(0.1, float(timeout))
+        processed = 0
+        while time.monotonic() < deadline:
+            if self._store.pending_job_count(session_id):
+                processed += self.run_once(session_id=session_id)
+                continue
+            if self._store.open_job_count(session_id):
+                time.sleep(0.02)
+                continue
+            break
         return processed
 
     def _process(self, job: dict[str, Any]) -> None:

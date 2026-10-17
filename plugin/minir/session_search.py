@@ -20,9 +20,9 @@ Two host details matter for correctness:
 * only ``active = 1`` rows are current; compaction marks superseded rows inactive (``compacted``
   distinguishes archived display history from rewind/undo rows);
 * ``role = 'user'`` also contains host-synthesized rows — ``[Assistant Rules]`` skill prompts,
-  background-process notices, ``[System: …]`` switches, compaction handoffs and this plugin's own
-  ``[minir fold …]`` carriers. They are hidden by default and can be included with
-  ``include_synthetic``.
+  background-process notices, ``[System: …]`` switches and compaction handoffs. This plugin's own
+  ``[minir summary …]`` and ``[minir memory notice]`` rows are hidden role-agnostically by
+  default; ``include_synthetic`` exposes them explicitly.
 
 Schema drift is handled per column: old stores without ``sessions``, ``active``, ``compacted``,
 ``message_uid`` or FTS tables still answer, and searches fall back to ``LIKE`` when FTS5 is not
@@ -41,7 +41,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable, Optional
 
-from .history import SYNTHETIC_PREFIXES
+from .history import MINIR_SYNTHETIC_PREFIXES, SYNTHETIC_PREFIXES
 
 logger = logging.getLogger(__name__)
 
@@ -370,6 +370,13 @@ def _visibility_clauses(mcols: set[str], scols: set[str], *,
         for prefix in SYNTHETIC_PREFIXES:
             clauses.append(
                 "NOT (m.role = 'user' AND LTRIM(COALESCE(m.content, '')) LIKE ? ESCAPE '\\')")
+            params.append(_like_escape(prefix) + "%")
+    if not include_synthetic:
+        # The compression summary is an assistant row; filtering it by role would let a later
+        # review summarize the model's own summary. Markers are role-agnostic on purpose.
+        for prefix in MINIR_SYNTHETIC_PREFIXES:
+            clauses.append(
+                "NOT (LTRIM(COALESCE(m.content, '')) LIKE ? ESCAPE '\\')")
             params.append(_like_escape(prefix) + "%")
     if has_sessions and "source" in scols:
         if sources:

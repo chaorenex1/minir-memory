@@ -85,6 +85,8 @@ _MAX_TOOL_EXCERPT = 600           # text excerpt returned by the minir_search to
 _MAX_ADVICE_ITEMS = 6             # pending advices drained into one injection
 _MAX_ADVICE_CHARS = 900           # injected advice block, markers included
 _MAX_AUTHOR_CACHE = 64            # per-session last-seen author, bounded like the turn counter
+_COMPRESSION_GATE_TTL = 300.0     # seconds a crashed compression may pause periodic scheduling
+_PRE_COMPRESS_TIMEOUT = 120.0     # synchronous base -> dialectic budget before compress()
 # Durable base cards are explicit-recall only: prefetch must not inject them, even when an
 # FTS query happens to match. ``minir_search`` still returns them.
 _PREFETCH_EXCLUDED_KINDS = frozenset({"base.user_peer_card", "base.ai_identity_card"})
@@ -286,7 +288,7 @@ class MinirMemoryProvider(MemoryProvider):
              "type": "integer", "default": str(DEFAULT_BASE_INTERVAL),
              "minimum": 1, "env_var": "MINIR_CONTEXT_CADENCE"},
             {"key": "dialectic_cadence",
-             "description": "Context-engine fold beat; the dialectic review follows each base refresh",
+             "description": "Periodic dialectic counter; adversarial reviews still follow each base refresh",
              "type": "integer", "default": str(DEFAULT_DIALECTIC_INTERVAL),
              "minimum": 1, "env_var": "MINIR_DIALECTIC_CADENCE"},
             {"key": "dialectic_depth",
@@ -491,6 +493,8 @@ class MinirMemoryProvider(MemoryProvider):
             return
         try:
             self._cache_author(kwargs)
+            if self._store.compression_gate_active(self._session_id):
+                return  # compression owns this window; periodic dispatch resumes afterwards
             self._dispatch(TRACKER.tick(self._session_id, turn_number))
         except Exception as exc:  # counting must never break a turn
             logger.warning("Minir on_turn_start failed: %s", exc)
@@ -507,15 +511,41 @@ class MinirMemoryProvider(MemoryProvider):
         self._authors[session] = {"id": author_id, "name": author_name}
 
     def on_pre_compress(self, messages: Optional[list[dict[str, Any]]] = None) -> str:
-        """Compression is a reasoning boundary: queue the base job that owns the history being
-        summarized away. The dependent dialectic review follows that base job; a boundary never
-        queues a review directly. The queue is the return channel, so this returns ``""`` —
-        compression insights are not this layer's job."""
+        """Compression boundary: pause periodic scheduling and refresh both layers synchronously.
+
+        The base job is queued for the unreasoned window, drained inline, and its dependent
+        dialectic review follows before returning. The counters are moved to the current turn so
+        the next periodic tick does not immediately repeat the same window. The context engine
+        clears the gate after it has produced the summary.
+        """
         try:
-            self._flush_boundary(self._session_id)
+            self._prepare_compression(self._session_id)
         except Exception as exc:
             logger.warning("Minir on_pre_compress failed: %s", exc)
         return ""
+
+    def _prepare_compression(self, session_id: str) -> None:
+        if self._store is None or not session_id or self._agent_context not in ("", "primary"):
+            return
+        if not self._reasoning or self._worker is None or not self._worker.enabled:
+            return  # reasoning disabled: there is no worker that could drain a job
+        now = time.time()
+        self._store.set_compression_gate(
+            session_id, expires_at=now + _COMPRESSION_GATE_TTL)
+        try:
+            start = max(self._store.last_processed_ts(BASE_LAYER, session_id),
+                        self._store.latest_chunk_end(session_id))
+            snapshot = TRACKER.snapshot(session_id) or {}
+            turns = int((snapshot.get("layers") or {}).get(BASE_LAYER, {}).get("turns", 0))
+            if now > start:
+                self._store.record_job(BASE_LAYER, session_id, start, now, turns=turns)
+            if self._worker is not None:
+                self._worker.drain_session(session_id, timeout=_PRE_COMPRESS_TIMEOUT)
+                self._kick_worker()  # let a timed-out drain finish in the background
+            TRACKER.reset_layers(session_id)
+        except Exception as exc:
+            self._store.clear_compression_gate(session_id)
+            logger.warning("Minir pre-compression layer refresh failed: %s", exc)
 
     def on_session_end(self, messages: Optional[list[dict[str, Any]]] = None) -> None:
         """Real session boundary: flush the un-reasoned tail once, then stop counting.

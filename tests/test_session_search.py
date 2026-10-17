@@ -147,6 +147,24 @@ def test_search_roles_sources_and_visibility_flags(search, db):
     assert [match["message_id"] for match in synthetic["matches"]] == [4]
 
 
+def test_minir_summary_marker_is_hidden_unless_synthetic_rows_are_requested(search, db):
+    connection = sqlite3.connect(str(db))
+    try:
+        connection.execute(
+            "INSERT INTO messages (id, session_id, role, content, timestamp, active, compacted, "
+            "_compressed_summary, message_uid) VALUES (20, 's1', 'assistant', "
+            "'[minir summary #r1] compressed deploy record', 120.0, 1, 0, 0, 's1a')")
+        connection.commit()
+    finally:
+        connection.close()
+
+    default = _query(search, db, mode="search", query="compressed deploy")
+    assert default["matches"] == [], "the derived summary must not feed a later search"
+    explicit = _query(search, db, mode="search", query="compressed deploy",
+                      include_synthetic=True)
+    assert [match["message_id"] for match in explicit["matches"]] == [20]
+
+
 def test_search_time_bounds_and_paging(search, db):
     data = _query(search, db, mode="search", query="deploy", after=102,
                   before=300, sort="newest", limit=1)

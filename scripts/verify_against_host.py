@@ -111,7 +111,7 @@ try:
     assert layers["dialectic"]["last_trigger_turn"] == 3, layers  # tail flushed by the boundary
 
     # One directory, two surfaces: the engine must load by name through its own loader and
-    # resolve to a ContextEngine — and the lossless recall must work against a real store.
+    # resolve to a ContextEngine — and its summary fold must work against a real store.
     from agent.context_engine import ContextEngine
     from plugins.context_engine import find_engine_dir, load_context_engine
 
@@ -141,20 +141,22 @@ try:
     connection.commit()
     connection.close()
 
+    os.environ["MINIR_REASONING_ENABLED"] = "false"  # deterministic: use the prepared fallback
     engine.on_session_start("engine-session", hermes_home=os.environ["HERMES_HOME"])
     folded = engine.compress(history)
-    assert len(folded) < len(history), "the engine did not fold anything"
-    carrier = [message for message in folded
-               if str(message.get("content", "")).startswith("[minir fold")]
-    assert carrier, "no fold carrier was produced"
-    restored = engine.select_context(
-        folded, incoming_message={"role": "user", "content": "what did the kubernetes deploy say?"})
-    assert restored is not None, "recall did not fire for a message that matches folded content"
-    assert any("kubernetes deploy step" in str(message.get("content")) for message in restored), \
-        "the folded text was not restored from the store"
+    assert len(folded) < len(history), "the engine did not compress anything"
+    summaries = [message for message in folded
+                 if message.get("role") == "assistant"
+                 and "[minir summary #" in str(message.get("content", ""))]
+    assert len(summaries) == 1, "exactly one assistant summary message is required"
+    notices = [message for message in folded
+               if "[minir memory notice]" in str(message.get("content", ""))]
+    assert len(notices) == 1, "the first-compression notice was not inserted"
+    assert not any(str(message.get("content", "")).startswith("[minir fold")
+                   for message in folded), "the old carrier format must be gone"
 
     # Nothing about the fold may have been written by the engine itself: the transcript is the
-    # host's, and the carriers only become durable when the host commits the returned list.
+    # host's, and the summary message only becomes durable when the host commits the list.
     connection = sqlite3.connect(state_path)
     store_rows = connection.execute("SELECT COUNT(*) FROM messages").fetchone()[0]
     connection.close()
@@ -294,8 +296,8 @@ def main() -> int:
         print("result      : " + result.stdout.strip().splitlines()[-1])
         print("PASS: discovery, provider loading, ABC conformance, a note round-trip, the "
               "no-transcript guarantee, a config.yaml-driven layer cadence, the counting loop's "
-              "job queue, live plugin-hook delivery, and the context engine's load + lossless "
-              "recall path all verified")
+              "job queue, live plugin-hook delivery, and the context engine's load + audited "
+              "summary fold all verified")
         return 0
     finally:
         if args.keep:

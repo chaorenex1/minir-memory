@@ -9,8 +9,9 @@ Two host details matter for correctness:
 
 * only ``active = 1`` rows are current; compaction marks superseded rows inactive;
 * ``role = 'user'`` also contains host-synthesized rows — ``[Assistant Rules]`` skill prompts,
-  background-process notices, ``[System: …]`` switches, compaction handoffs and this plugin's
-  own ``[minir fold …]`` carriers. They are not user intent and must not reach the base layer.
+  background-process notices, ``[System: …]`` switches and compaction handoffs. This plugin's
+  own ``[minir summary …]`` and ``[minir memory notice]`` rows are filtered role-agnostically;
+  they are derived context, never evidence for a later layer window.
 """
 
 from __future__ import annotations
@@ -33,6 +34,12 @@ SYNTHETIC_PREFIXES = (
     "[Your active task list",
     "[minir fold",
     "[WARN]",
+)
+# Our own derived rows: the compression summary is an assistant message by design, so the
+# role-specific host filter above would let it recurse into the next layer window.
+MINIR_SYNTHETIC_PREFIXES = (
+    "[minir summary",
+    "[minir memory notice",
 )
 _PROFILE_RE = re.compile(r"[^A-Za-z0-9._-]+")
 
@@ -65,6 +72,12 @@ def is_synthetic_user_text(text: str) -> bool:
     """True for host-authored rows that merely ride in the ``user`` role."""
     head = (text or "").lstrip()
     return any(head.startswith(prefix) for prefix in SYNTHETIC_PREFIXES)
+
+
+def is_minir_synthetic_text(text: str) -> bool:
+    """True for rows this plugin wrote as derived context (summary / first-fold notice)."""
+    head = (text or "").lstrip()
+    return any(head.startswith(prefix) for prefix in MINIR_SYNTHETIC_PREFIXES)
 
 
 def read_messages(state_db: Any, session_id: str, from_ts: float, to_ts: float,
@@ -119,6 +132,8 @@ def read_messages(state_db: Any, session_id: str, from_ts: float, to_ts: float,
             continue
         if role == "user" and is_synthetic_user_text(text):
             continue
+        if is_minir_synthetic_text(text):
+            continue
         messages.append({
             "role": role,
             "content": text,
@@ -154,7 +169,10 @@ def latest_ts(state_db: Any, session_id: str) -> float:
             "SELECT role, content, timestamp FROM messages WHERE " + " AND ".join(clauses)
             + " ORDER BY id DESC LIMIT 100", (str(session_id),)).fetchall()
         for row in rows:
-            if row["role"] == "user" and is_synthetic_user_text(str(row["content"] or "")):
+            text = str(row["content"] or "")
+            if row["role"] == "user" and is_synthetic_user_text(text):
+                continue
+            if is_minir_synthetic_text(text):
                 continue
             return float(row["timestamp"] or 0.0)
         return 0.0

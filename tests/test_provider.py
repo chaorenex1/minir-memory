@@ -338,16 +338,59 @@ def test_session_end_on_a_multiple_queues_no_extra_job(make_provider):
     assert _jobs(provider) == [("base", 3)]
 
 
-def test_pre_compress_flushes_tail_without_ending_the_session(make_provider):
+def test_pre_compress_without_reasoning_does_not_queue_a_job(make_provider):
     provider = make_provider({"base_interval": 50, "dialectic_interval": 2})
     for turn in range(1, 4):
         provider.on_turn_start(turn, "m")
     provider._transcript.add_turn("session-test", "tail", "noted")
     assert provider.on_pre_compress([]) == ""
-    assert _jobs(provider) == [("base", 3)]  # the boundary drain owns the unbased tail
+    assert _jobs(provider) == [], "no worker means no layer refresh job"
     for turn in (4, 5):
-        provider.on_turn_start(turn, "m")               # counting continues after compression
-    assert _jobs(provider) == [("base", 3)]
+        provider.on_turn_start(turn, "m")
+    assert _jobs(provider) == []
+
+
+def test_pre_compress_pauses_scheduling_and_resets_both_layers(plugin_package, make_provider,
+                                                               monkeypatch):
+    monkeypatch.setenv("MINIR_REASONING_ENABLED", "true")
+    monkeypatch.setattr(plugin_package.worker, "call_model", lambda task, *args, **kwargs: (
+        _dialectic_json() if task == plugin_package.worker.DIALECTIC_LAYER_TASK
+        else _base_json()))
+    provider = make_provider({"base_interval": 2, "dialectic_interval": 2})
+    for turn in range(1, 4):
+        provider.on_turn_start(turn, "m")
+    provider.on_pre_compress([])
+
+    snapshot = plugin_package.turn_counter.TRACKER.snapshot("session-test")
+    assert snapshot["layers"]["base"]["last_trigger_turn"] == 3
+    assert snapshot["layers"]["dialectic"]["last_trigger_turn"] == 3
+    assert provider._store.compression_gate_active("session-test") is True
+
+    for turn in (4, 5):
+        provider.on_turn_start(turn, "m")
+    assert _jobs(provider) == [], "periodic scheduling is paused"
+
+    provider._store.clear_compression_gate("session-test")
+    provider.on_turn_start(6, "m")
+    assert len(provider._store.pending_jobs()) >= 1, "scheduling resumes after the gate"
+
+
+def test_pre_compress_drains_base_and_dependent_dialectic(plugin_package, make_provider,
+                                                          monkeypatch):
+    monkeypatch.setenv("MINIR_REASONING_ENABLED", "true")
+    monkeypatch.setattr(plugin_package.worker, "call_model", lambda task, *args, **kwargs: (
+        _dialectic_json() if task == plugin_package.worker.DIALECTIC_LAYER_TASK
+        else _base_json()))
+
+    provider = make_provider({"base_interval": 50, "dialectic_interval": 10})
+    for turn in range(1, 4):
+        provider.on_turn_start(turn, "m")
+    provider._transcript.add_turn("session-test", "tail evidence", "noted")
+    assert provider.on_pre_compress([]) == ""
+
+    assert provider._store.pending_jobs() == [], "the sync drain finished both layers"
+    assert provider._store.layer_state("base", "user:default") is not None
+    assert provider._store.layer_state("dialectic", "agent:minir") is not None
 
 
 def test_session_reset_flushes_old_tail_and_opens_new_session(plugin_package, make_provider):

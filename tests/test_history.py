@@ -54,6 +54,37 @@ def test_reads_only_active_real_user_and_assistant_rows_in_the_window(plugin_pac
     assert rows[0]["message_uid"] == "u1" and rows[0]["created_at"] == 10.0
 
 
+def test_assistant_summary_and_notice_never_enter_a_layer_window(plugin_package, tmp_path):
+    path = tmp_path / "state.db"
+    _state_db(path)
+    connection = sqlite3.connect(str(path))
+    connection.executemany(
+        "INSERT INTO messages (session_id, role, content, timestamp, message_uid) "
+        "VALUES ('s1', ?, ?, ?, ?)",
+        [("assistant", "[minir summary #r1]\n## Goal\n- derived", 30.0, "s1a"),
+         ("assistant", "[minir memory notice] derived context", 30.1, "s1b"),
+         ("assistant", "real follow-up", 13.2, "s1c")])
+    connection.commit()
+    connection.close()
+
+    rows = plugin_package.history.read_messages(path, "s1", 12.9, 14.0)
+    assert [row["content"] for row in rows] == ["real follow-up"]
+    assert plugin_package.history.latest_ts(path, "s1") == 13.2, \
+        "the newer synthetic assistant rows are skipped"
+
+
+def test_latest_timestamp_skips_a_newest_summary_row(plugin_package, tmp_path):
+    path = tmp_path / "state.db"
+    _state_db(path)
+    connection = sqlite3.connect(str(path))
+    connection.execute(
+        "INSERT INTO messages (session_id, role, content, timestamp, message_uid) "
+        "VALUES ('s1', 'assistant', '[minir summary #r1] derived', 30.0, 's1a')")
+    connection.commit()
+    connection.close()
+    assert plugin_package.history.latest_ts(path, "s1") == 20.0
+
+
 def test_role_filter_can_include_tool_rows_for_the_dialectic_review(plugin_package, tmp_path):
     path = tmp_path / "state.db"
     _state_db(path)

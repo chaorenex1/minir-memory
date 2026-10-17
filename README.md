@@ -21,11 +21,11 @@ one — but the provider never copies the conversation itself. Because the host 
 of truth, a job queued before a restart can still be completed; only when no `state.db` exists are
 inherited jobs expired.
 
-The same directory also ships a **context engine** for progressive, lossless context management:
-on every dialectic beat it moves the oldest unprotected slice of the window into a compact carrier
-row, restores the original text on demand from the host's own `state.db`, writes an optional
-Task Handoff summary for the folded range, and queues a base refresh for that window (the
-dependent dialectic review follows the base job).
+The same directory also ships a **context engine** for audited summary compression: at 95% of the
+configured threshold the provider pauses periodic scheduling, refreshes the base and dialectic
+layers synchronously, and the engine replaces the unprotected middle of the window with one
+assistant `session_summary` produced by a tool-using adviser agent. The summary is stored and
+FTS-indexed; the head and tail stay verbatim.
 
 No external binaries, stdlib only. Layer calls go through the host's auxiliary client, so there is
 no key to configure; set `reasoning_enabled: false` to keep the provider a pure note store, and
@@ -41,9 +41,9 @@ plugin/minir/          the deployable plugin directory (copy this to plugins/min
   transcript.py        in-memory, bounded window of the session's messages (never persisted)
   turn_counter.py      base / dialectic layer turn counters + job windows
   worker.py            drains base jobs, then the dependent dialectic review (base corrections + advices)
-  handoff.py           Task Handoff compression prompt + validation
-  cadence.py           the dialectic beat, shared by the provider and the engine
-  context_engine.py    progressive lossless context management (context.engine: minir)
+  handoff.py           Task Handoff template, summary-agent prompt + validation
+  cadence.py           config/store-path helpers shared by the provider and the engine
+  context_engine.py    audited summary compression (context.engine: minir)
   agent_loop.py        one-shot in-process AIAgent runs — sync + async (Feishu-shaped)
   adviser.py           optional adviser route + the adviser toolset (adviser_consult)
   session_search.py    read-only multi-shape search over the host's session store (state.db)
@@ -80,7 +80,7 @@ Hermes loads memory providers by **name**, one at a time:
 | `get_config_schema()` | `hermes memory setup` | env-var-only fields keep it simple (see below) |
 | `on_turn_start(turn_number, message, **kw)` | before each user turn | **the counting tick** — the host's own per-session turn number; never fires for a subagent/cron turn |
 | `on_session_end(messages)` | real session boundary | freeze the session + drain the base layer (counted tail *and* any content no job covered); the dialectic review follows the base job |
-| `on_pre_compress(messages)` | before compression | same drain, without freezing; must return a string (this one returns `""`) |
+| `on_pre_compress(messages)` | before compression | pause periodic scheduling, synchronously refresh base → dialectic, reset counters; must return a string (this one returns `""`) |
 | `on_delegation`, `backup_paths` | optional | not implemented here — read the ABC before opting in |
 
 The ABC lives in the Hermes install at `agent/memory_provider.py`; treat that file
@@ -117,9 +117,9 @@ back to the process-wide active provider, since the host can construct the plugi
 ## The two layers (base / dialectic)
 
 `turn_counter.py` keeps two counters per session. The base counter turns its cadence into *jobs*
-("reason over session X's history in `(from_ts, to_ts]`"); the dialectic counter still advances
-(the context engine reads its beat), but its tick triggers are filtered — the worker queues the
-review itself, with the exact window the base job just published. A job is one row in the store's
+("reason over session X's history in `(from_ts, to_ts]`"); the dialectic counter still advances,
+but its tick triggers are filtered — the worker queues the review itself, with the exact window
+the base job just published. A job is one row in the store's
 `jobs` table; `worker.py` drains it from the host's `state.db` (plus the uncommitted buffer),
 calls the auxiliary model, and publishes into `layer_state`/`conclusions`. Each base refresh also
 appends one structured row to `base_refreshes` (session, time window, actual turn range, the six
@@ -267,15 +267,15 @@ moved).
   the newest `state.db` row, so the newest job always drains everything available. The next job or the boundary drain
   therefore covers the trigger turn, exactly once, and a re-queued window reads the same content
   again.
-* **Boundaries** — `on_session_end` (and `on_pre_compress`) do two things: flush the base layer's
-  counted tail (the spec's "no trigger on a multiple": when the counter already sits on a
-  dispatched watermark the flush is a no-op, so a `/new` — which fires `on_session_finalize`, the
-  queued `on_session_end` *and* `on_session_reset` for one boundary — queues that window exactly
-  once) and then queue the base layer whose *content* no job has covered. That second half is what
-  keeps short sessions useful: with `base_interval: 20`, a 4-turn session would otherwise never
-  reach the user model at all. The dialectic review is never queued here: it follows a successful
-  base job with the same window. A stop never swallows a tail that arrives after it (the CLI
-  freezes the session before the queued flush lands); only `tick` treats a stop as final.
+* **Boundaries** — `on_session_end` flushes the base layer's counted tail (the spec's "no trigger
+  on a multiple": when the counter already sits on a dispatched watermark the flush is a no-op, so
+  a `/new` — which fires `on_session_finalize`, the queued `on_session_end` *and*
+  `on_session_reset` for one boundary — queues that window exactly once) and then queues the base
+  layer whose *content* no job has covered. The dialectic review always follows a successful base
+  job; it is never queued directly. `on_pre_compress` is different: it sets the compression gate,
+  queues and synchronously drains the base → dialectic pair, then moves both layer watermarks to
+  the current turn. A stop never swallows a tail that arrives after it (the CLI freezes the
+  session before the queued flush lands); only `tick` treats a stop as final.
 * **Nothing to observe costs nothing** — a window whose messages are already covered, or empty,
   completes as `done` without a model call, and a session that only ever greets never pays.
 * **Restart** — the window is read from `$HERMES_HOME/state.db`, so a job that was open when the
@@ -400,8 +400,8 @@ host's rows, bounded per message. Five shapes, selected by `mode` or inferred fr
 | `stats` | Counts, roles/sources, FTS availability, DB size, oldest/newest row | — |
 
 Defaults mirror the host's own recall: live (`active`) rows only, compaction summaries excluded,
-`user`/`assistant` for `search`, all roles for a transcript read, and host-synthesized user rows
-(`[Assistant Rules]`, `[System: …]`, `[minir fold …]`) hidden. Hidden session sources
+`user`/`assistant` for `search`, all roles for a transcript read, and synthetic rows
+(`[Assistant Rules]`, `[System: …]`, `[minir summary …]`, `[minir memory notice]`) hidden. Hidden session sources
 (`kanban`, `subagent`, `tool`) and archived/hidden sessions are excluded unless `include_hidden` /
 `include_archived` says otherwise; `include_inactive`, `include_compacted` and `include_synthetic`
 open the other filters. `profile: work` reads `$HERMES_HOME/profiles/work/state.db` instead of the
@@ -428,7 +428,7 @@ One ordering trap, documented in `agent_loop.run`: `run_agent` bootstraps the ma
 `hermes_yaml`/`ruamel` import. `run_agent` is imported first, inside the runner, every time.
 
 
-## The context engine (progressive lossless context)
+## The context engine (audited summary compression)
 
 One directory, two surfaces: the same plugin is a **memory provider** (`memory.provider: minir`)
 and a **context engine** (`context.engine: minir`). Only one context engine can be active, and the
@@ -441,68 +441,65 @@ context:
   engine: minir        # replaces the built-in ContextCompressor for this profile
 ```
 
-### Progressive, not one big compaction
+### One trigger, one synchronous pipeline
 
-The built-in compressor waits for the token threshold and then folds the window in one destructive
-pass. This engine instead moves the **oldest unprotected slice out on every dialectic-beat fold**
-(the `dialectic_cadence` interval, which the engine and the provider both resolve) — the
-provider's review itself follows each base refresh — so pressure never builds and the emergency
-path rarely fires:
+The engine no longer folds progressively on the dialectic beat. It has a single trigger: the
+window has consumed **95% of the configured threshold** (`last_prompt_tokens >=
+0.95 * threshold_tokens`). At that point the host calls `on_pre_compress` and then `compress()`:
 
-| Knob | Where it comes from |
-| --- | --- |
-| how often a fold may happen | the dialectic interval, resolved exactly as the provider resolves it (`MINIR_DIALECTIC_INTERVAL` → `memory.minir.dialectic_interval` → 10) and compared against the beat: the newest dialectic job's turn stamp (queued after a base refresh), the window's own turn count otherwise |
-| how much one fold may move | whole turns only, starting at the first turn after `protect_first_n`, stopping before `protect_last_n`, at most `_MAX_FOLD_MESSAGES` (24) messages — incremental by construction |
-| when it fires anyway | the token threshold (`threshold_percent`, default 0.75) — the safety net is kept |
+1. `on_pre_compress` sets a per-session **compression gate**, queues the base job for the
+   unreasoned window, drains the base and dependent dialectic jobs **synchronously**, resets both
+   layer counters to the current turn, and leaves the gate in place.
+2. `compress()` reads the prepared chunk and dialectic review, runs a real **summary agent** on
+   the `auxiliary.adviser` route with the `adviser` toolset, and produces the final
+   `session_summary`. The agent may call `adviser_session_search` with `before=<window end>`,
+   `include_inactive=True` and `include_compacted=True`; it never reads later turns. Its system
+   prompt is the operator Task Handoff template (`prompts/session_handoff.md`, override with
+   `MINIR_SUMMARY_TEMPLATE`) plus the audit rules.
+3. The returned message list is:
 
-The threshold only decides that the fold must happen now. Layer work is queued **after** the fold:
-the base refresh for the folded window, then the dependent dialectic review it produces. A
-pre-compression boundary may already have queued a base job; if its window ends before the fold
-decision, the engine records a follow-up starting at that edge instead of letting `has_open_job`
-swallow the threshold content. The handoff on this path includes the folded slice's raw turns,
-because the base chunk for the overflowing window cannot exist yet.
+```text
+[system prompt]
+[first-compression notice]     # once, inserted after the system prompt
+[protected head messages]
+[assistant summary message]    # full final summary, [minir summary #<run_id>]
+[protected tail messages]      # unmodified, opens on a user turn
+```
 
-Folded messages are replaced by one **carrier** row: a user-role message that names the turn range
-it covers, lists the `message_uid`s that went with it and carries a one-line gist (at most 200
-characters, so it orients the model without becoming a second copy of the slice). It is written
-with an engine-minted `message_uid`, which the host writes through the commit, so a carrier is
-recognisable after a restart and a later fold absorbs its id list instead of nesting. A carrier
-deliberately does **not** imitate the host's `[CONTEXT COMPACTION …]` handoff: that text tells the
-model the compacted work is dead reference material, while a fold means the opposite — the work is
-live and only some turns moved out of the window.
+The summary message is an **assistant** row and carries no folded-uid list. Recovery is through
+`minir_search` and `adviser_session_search`; the old carrier/`select_context()` /
+`minir_context_recall` path is gone.
 
-### Where "lossless" comes from
+### Gate, counters, and resume
 
-Nothing is copied. Every folded message is still verbatim in the host's own
-`$HERMES_HOME/state.db`, where each row carries a stable `message_uid`:
+Periodic base/dialectic dispatch is paused while the gate is active. `on_turn_start` skips the
+tick, so the explicit pre-compression jobs cannot race a periodic job. The engine clears the gate
+after `compress()` (or on `on_turn_complete` when it sees the summary marker); a ten-minute lease
+also expires the gate if compression crashes before it can resume. `reset_layers()` moves both
+`last_trigger_turn` watermarks to the current turn, so the next periodic tick starts a fresh
+interval instead of immediately repeating the same window.
 
-* **`select_context()`** re-injects folded originals into a request when the incoming message really
-  matches them (stopwords never count, and a match is required), and
-* the **`minir_context_recall` tool** lets the model pull them on demand.
+### Summary storage and FTS
 
-The injection only *appends* to the last user message, so every byte before it still matches the
-provider's prompt cache; a request that does not match is returned untouched (`None`), which costs
-no cache at all. The carriers are the durable index.
+The summary is written to `conclusions` as `session_summary`, session-scoped and keyed by
+`session_summary:<session>:<run_id>`. It starts `pending`; `on_turn_complete` promotes exactly the
+run named by the `[minir summary #<run_id>]` marker when the host commits the returned list, so a
+discarded compression never becomes recallable. The full summary text is stored (the assistant
+message is not a 900-character excerpt) and `conclusions_fts` already indexes it with the trigram
+tokenizer; `minir_search` can recall it inside its own session. There is no separate FTS table to
+build. A subsequent compression replaces the previous summary message rather than accumulating a
+second one in the head.
 
-On a fold, `compress()` may make one bounded auxiliary call using the Task Handoff template
-(`prompts/session_handoff.md`, override with `MINIR_SUMMARY_TEMPLATE`). Its input is the
-**historical conclusions** (durable user/AI cards, plus any legacy
-constraints/preferences/second-brain rows and the previous summary) plus the **tail window's
-conclusions** (current review, current-focus representation, AI action state and value markers).
-Raw turns are the cold-start fallback, and are always included on a threshold/manual fold whose
-base chunk cannot exist yet. The validated output is this session's summary conclusion, written
-to `conclusions` as `pending` (kind `session_summary`, session-scoped); a bounded copy (900 chars)
-rides in the returned carrier, while the full text stays in the store;
-`on_turn_complete` promotes only a handoff whose folded message ids are fully present in the
-persisted messages (a non-empty subset of the observed carrier), so a pass the host discarded never
-becomes recallable. The full template output stays
-available to `minir_search` after promotion. After the carrier is built, the fold queues a **base**
-refresh for the folded window; the base worker then queues the dependent dialectic review for the
-same window. The engine never queues the review directly, and a fold never supersedes the
-base-owned `session_chunk_summary` chain. `reasoning_enabled: false` disables the summary call as
-well as the layer worker. This is the same shape as the host's
-built-in compressor: a pass can be discarded on timeout, so the carrier the host commits remains
-authoritative and a pending summary row expires without polluting recall.
+### Synthetic rows do not recurse
+
+The assistant summary and the first-compression notice are derived rows. `history.read_messages`,
+`latest_ts`, and `adviser_session_search` filter the `[minir summary` and
+`[minir memory notice` prefixes role-agnostically, so a later base/dialectic window cannot treat
+the model's own summary as real assistant evidence and summarize it again. With
+`include_synthetic=True`, `adviser_session_search` can still expose those rows explicitly.
+
+`reasoning_enabled: false` skips the summary agent and the layer worker; `compress()` then folds
+to the prepared chunk/review (or the previous summary) so the window still shrinks.
 
 ### Safety
 
@@ -538,11 +535,11 @@ directory install for that surface. Use exactly one install visible on the disco
 memory:
   provider: minir
   minir:                       # the provider's own block: memory.<provider name>
-    context_cadence: 20        # turns per base-layer job (alias: base_interval)
-    dialectic_cadence: 10      # context-engine fold beat (alias: dialectic_interval); reviews follow base
+    context_cadence: 20        # turns per periodic base-layer job (alias: base_interval)
+    dialectic_cadence: 10      # periodic dialectic counter; reviews still follow each base job
     dialectic_depth: 2         # upper bound: 1 synthesize, 2 audit, 3 reconcile (adaptive by window size)
     reasoning_enabled: true    # run the layer reasoning passes (auxiliary model, no key needed)
-    handoff_enabled: true      # let compression call the Task Handoff summary model
+    handoff_enabled: true      # let compression call the summary agent
     session_mode: default      # mode stamped on each newly opened session
     prefetch_limit: 5          # memory items injected per turn
 ```
@@ -556,7 +553,7 @@ hand-edited config.yaml are equivalent. Every key also has an env override —
 when both are set. Layer intervals, depth and `reasoning_enabled` are read when a session opens.
 
 Every published conclusion is searchable: `notes`, the six base sections, the dialectic review,
-local compression chunks (including superseded history), and compression handoffs. The index uses
+local compression chunks, and the final `session_summary` of each compression. The index uses
 FTS5 `trigram` so Chinese queries work; if the SQLite build lacks FTS5, `minir_search` falls back
 to a token scan. Base revisions are a separate audit surface (`search_base_revisions`, trigram
 over the six pre-overwrite fields plus advices); pending advices live in `advisories` and are
@@ -589,7 +586,7 @@ HERMES_WORKSPACE=/path/to/hermes/workspace python -m pytest tests -q
 #    (or simply run pytest with the Hermes venv python, where the real modules already import)
 
 # 3. end-to-end against the live install, in a throwaway HERMES_HOME — discovery, the provider,
-#    the counting loop, the plugin hooks, and the context engine's load + lossless recall
+#    the counting loop, the plugin hooks, and the context engine's load + summary fold
 python scripts/verify_against_host.py
 
 # 4. Hermes' own registration validator / discovery doctor

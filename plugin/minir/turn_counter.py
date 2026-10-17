@@ -237,6 +237,24 @@ class TurnTracker:
         with self._lock:
             self._sessions.clear()
 
+    def reset_layers(self, session_id: str, *, layers: tuple[str, ...] = (BASE_LAYER, DIALECTIC_LAYER),
+                     now: Optional[float] = None) -> None:
+        """Move a session's layer watermarks to its current count.
+
+        Compression has just refreshed both layers explicitly. Without this, the next periodic
+        tick sees the interval elapsed and immediately dispatches the same window again.
+        """
+        with self._lock:
+            state = self._sessions.get(session_id)
+            if state is None:
+                return
+            stamp = time.time() if now is None else now
+            for name in layers:
+                counter = state.layers.get(name)
+                if counter is not None:
+                    counter.last_trigger_turn = counter.turns
+                    counter.last_trigger_ts = stamp
+
     # -- internals ------------------------------------------------------------
 
     def _open(self, session_id: str, *, mode: Optional[str], now: Optional[float],

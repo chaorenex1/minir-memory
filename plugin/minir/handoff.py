@@ -11,12 +11,11 @@ from __future__ import annotations
 
 import os
 import re
+import threading
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Callable
 
-_MAX_PROMPT_CHARS = 24_000
 _MAX_SUMMARY_CHARS = 8_000
-_MAX_SERIALIZED_MESSAGE = 1_500
 _REQUIRED_HEADINGS = ("## Goal", "## Current State", "## Next Steps", "## Critical Context")
 _FENCE_RE = re.compile(r"^\s*```[a-zA-Z]*\s*|\s*```\s*$")
 
@@ -34,6 +33,16 @@ Output only the handoff body, with the template's headings, in order. Do not add
 greeting, explanation, or code fence. Required headings: Goal, Current State, Next Steps,
 Critical Context."""
 
+_SUMMARY_AGENT_RULES = """You are the audit stage of compression. You are given the base layer's chunk record and the
+dialectic review for one window. Audit that record against the session history, then write the
+final Task Handoff.
+
+Use adviser_session_search with session_id and before set to the supplied window end whenever
+history is needed. Pass include_inactive=True and include_compacted=True so rows the host archived
+during compression are still evidence. Never read turns after the window. Treat the chunk and
+review as drafts: correct omissions, contradictions and stale claims, but do not invent facts.
+Output only the handoff body; never include a [minir summary] marker or any preamble."""
+
 
 def load_template() -> str:
     """The template asset, or the path in ``MINIR_SUMMARY_TEMPLATE`` when set."""
@@ -50,40 +59,6 @@ def system_prompt() -> str:
     return f"{_RULES}\n\nTEMPLATE:\n{load_template()}"
 
 
-def _text_of(message: Any) -> str:
-    content = message.get("content") if isinstance(message, dict) else message
-    if isinstance(content, str):
-        return content
-    if isinstance(content, list):
-        return "\n".join(str(part.get("text") or "") for part in content
-                         if isinstance(part, dict))
-    return ""
-
-
-def serialize(messages: Iterable[dict[str, Any]]) -> str:
-    """Turn rows into a bounded, role-labelled transcript for the summarizer."""
-    lines: list[str] = []
-    size = 0
-    # Newest first while the budget lasts; a compression handoff must preserve the latest
-    # state, not the oldest turns. Reverse back before returning.
-    for message in reversed(list(messages or ())):
-        if not isinstance(message, dict):
-            continue
-        role = str(message.get("role") or "unknown")
-        text = " ".join(_text_of(message).split())
-        if not text:
-            continue
-        if len(text) > _MAX_SERIALIZED_MESSAGE:
-            text = text[:_MAX_SERIALIZED_MESSAGE] + " …[truncated]"
-        line = f"{role}: {text}"
-        if size + len(line) + 1 > _MAX_PROMPT_CHARS:
-            lines.append("[…earlier messages omitted]")
-            break
-        lines.append(line)
-        size += len(line) + 1
-    return "\n".join(reversed(lines))
-
-
 def normalize(text: str) -> str:
     """Accept only a handoff with the required headings; strip fences and thinking blocks."""
     candidate = re.sub(r"<think\b[^>]*>.*?</think\s*>", "", text or "",
@@ -97,56 +72,72 @@ def normalize(text: str) -> str:
     return candidate[:_MAX_SUMMARY_CHARS].rstrip()
 
 
-def gist(summary: str) -> str:
-    """A one-line orientation for the carrier; the full handoff stays in the conclusions store."""
-    for heading in ("## Goal", "## Current State"):
-        if heading in summary:
-            body = summary.split(heading, 1)[1].split("\n## ", 1)[0]
-            for line in body.splitlines():
-                text = line.strip().lstrip("-").strip()
-                if text and not text.startswith("["):
-                    return " ".join(text.split())[:200]
-    return ""
+def _run_with_timeout(run: Callable[[], Any], timeout: float) -> Any:
+    """Run *run* on a daemon thread and stop waiting after *timeout* (``None`` on timeout)."""
+    box: dict[str, Any] = {}
+
+    def target() -> None:
+        try:
+            box["result"] = run()
+        except BaseException as exc:  # never let a background failure escape the thread
+            box["error"] = exc
+
+    thread = threading.Thread(target=target, name="minir-summary-agent", daemon=True)
+    thread.start()
+    thread.join(max(0.1, float(timeout)))
+    if thread.is_alive():
+        return None
+    if "error" in box:
+        raise box["error"]
+    return box.get("result")
 
 
-def summarize(messages: Iterable[dict[str, Any]], *, previous: str = "",
-              historical: str = "", tail: str = "", chunks: str = "",
-              focus_topic: str = "", memory_context: str = "",
-              include_turns: bool = False, timeout: float = 60.0) -> str:
-    """One auxiliary summary call; returns a validated handoff or ``""`` (never raises).
+def summarize_agent(chunk: str, review: str, *, previous: str = "", session_id: str = "",
+                    before: float = 0.0, focus_topic: str = "", memory_context: str = "",
+                    timeout: float = 120.0) -> str:
+    """Audit the prepared chunk/review against history and return the final handoff.
 
-    The user prompt is the compression input: the canonical local chunk chain, durable/historical
-    dialectic conclusions, and the tail window's dialectic conclusions. Raw turns are included
-    when neither the chain nor a tail conclusion exists (cold start), and always when
-    ``include_turns`` is set — a threshold/manual fold's base chunk does not exist yet, so the
-    overflowing slice must not be replaced by the model's own earlier conclusions.
+    Runs a real adviser agent loop so ``adviser_session_search`` is available; when the route is
+    unavailable or the run times out, returns ``""`` and the engine falls back to the prepared
+    layer artifacts. Never raises.
     """
+    before_text = f"{float(before):.6f}" if before else "the supplied window end"
+    parts = [
+        f"SESSION: {session_id or '-'}",
+        f"WINDOW END (never read after): {before_text}",
+        "PREPARED CHUNK (base layer, already dialectic-corrected):\n"
+        f"{(chunk or '(none)').strip()[:8_000]}",
+        "DIALECTIC REVIEW (advices for the same window):\n"
+        f"{(review or '(none)').strip()[:4_000]}",
+    ]
+    if previous.strip():
+        parts.append(f"PREVIOUS SESSION SUMMARY:\n{previous.strip()[:_MAX_SUMMARY_CHARS]}")
+    if memory_context.strip():
+        parts.append(f"PROVIDER MEMORY CONTEXT:\n{memory_context.strip()[:4_000]}")
+    if focus_topic.strip():
+        parts.append(f"FOCUS TOPIC: {focus_topic.strip()}")
+    parts.append(
+        "Audit the prepared chunk/review against the session history up to the window end. "
+        "Use adviser_session_search with mode=\"messages\" or \"search\", session_id, "
+        f"before={before_text}, include_inactive=True and include_compacted=True. "
+        "Then write the final Task Handoff.")
+    prompt = "\n\n".join(parts)
+
+    def run() -> str:
+        from . import adviser, agent_loop, session_search
+
+        cfg = adviser.load_config()
+        toolsets = [str(tool) for tool in (cfg.get("toolsets") or []) if str(tool).strip()]
+        if session_search.TOOLSET not in toolsets:
+            toolsets.append(session_search.TOOLSET)
+        result = agent_loop.run(
+            prompt, model=str(cfg.get("model") or ""),
+            provider=str(cfg.get("provider") or ""), toolsets=toolsets,
+            system_message=f"{system_prompt()}\n\n{_SUMMARY_AGENT_RULES}")
+        return str(result.answer or "")
+
     try:
-        from .worker import call_model
-        parts: list[str] = []
-        if previous.strip():
-            parts.append(f"PREVIOUS SESSION SUMMARY:\n{previous[:_MAX_SUMMARY_CHARS]}")
-        if chunks.strip():
-            parts.append("LOCAL CHUNK SUMMARIES (canonical chain, oldest first):\n"
-                         f"{chunks.strip()[:8_000]}")
-        if historical.strip():
-            parts.append("HISTORICAL DIALECTIC CONCLUSIONS:\n"
-                         f"{historical.strip()[:4_000]}")
-        if tail.strip():
-            parts.append("TAIL-WINDOW DIALECTIC CONCLUSIONS:\n"
-                         f"{tail.strip()[:4_000]}")
-        # The contract input is the chain + conclusions. Raw turns are the cold-start fallback,
-        # and are mandatory on a threshold/manual fold whose base chunk cannot exist yet.
-        if include_turns or (not tail.strip() and not chunks.strip()):
-            parts.append(f"TURNS TO SUMMARIZE:\n{serialize(messages)}")
-        if memory_context.strip():
-            parts.append(f"PROVIDER MEMORY CONTEXT:\n{memory_context.strip()[:4_000]}")
-        if focus_topic.strip():
-            parts.append(f"FOCUS TOPIC: {focus_topic.strip()}\n"
-                         "Prioritise evidence related to this topic; summarise the rest briefly.")
-        prompt = "\n\n".join(parts)
-        text = call_model("minir_handoff", system_prompt(), prompt,
-                          timeout=timeout, max_tokens=1_200)
-        return normalize(text)
+        text = _run_with_timeout(run, timeout)
+        return normalize(text or "")
     except Exception:
         return ""

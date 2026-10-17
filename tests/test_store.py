@@ -230,26 +230,23 @@ def test_conclusions_are_indexed_and_session_scoped(store):
     assert store.search("plugin", session_id="") == [], "no session means no session-bound kinds"
 
 
-def test_promotion_only_touches_the_observed_carriers_handoff(store):
-    store.put_conclusion("session_summary", "first", "## Goal\n- first",
-                         session_id="s1", subject="session", status="pending",
-                         evidence=json.dumps(["u1"]))
-    store.put_conclusion("session_summary", "second", "## Goal\n- second",
-                         session_id="s1", subject="session", status="pending",
-                         evidence=json.dumps(["u2"]))
-    store.put_conclusion("session_summary", "overlap", "## Goal\n- overlap",
-                         session_id="s1", subject="session", status="pending",
-                         evidence=json.dumps(["u1", "u9"]))
-    assert store.promote_pending_handoffs("s1", uids=["u1"]) == 1
-    assert store.get_conclusion("session_summary", "first")["status"] == "active"
-    assert store.get_conclusion("session_summary", "second")["status"] == "pending", \
-        "an unobserved fold must not ride the first carrier's promotion"
-    assert store.get_conclusion("session_summary", "overlap")["status"] == "pending", \
-        "a partially overlapping pending fold is not yet observed"
+def test_compression_gate_pauses_until_cleared_or_expired(store):
+    now = time.time()
+    store.set_compression_gate("s1", expires_at=now + 60, run_id="r1")
+    assert store.compression_gate_active("s1", now=now) is True
+    assert store.compression_gate_active("s1", now=now + 61) is False
+    store.clear_compression_gate("s1")
+    assert store.compression_gate_active("s1") is False
 
-    assert store.promote_pending_handoffs("s1", uids=["u1", "u9"]) == 1
-    assert store.get_conclusion("session_summary", "overlap")["status"] == "active"
-    assert store.get_conclusion("session_summary", "second")["status"] == "pending"
+
+def test_promote_summary_run_only_touches_the_matching_marker(store):
+    store.put_conclusion("session_summary", "session_summary:s1:r1", "one",
+                         session_id="s1", subject="session", status="pending")
+    store.put_conclusion("session_summary", "session_summary:s1:r2", "two",
+                         session_id="s1", subject="session", status="pending")
+    assert store.promote_summary_run("s1", "r1") == 1
+    assert store.get_conclusion("session_summary", "session_summary:s1:r1")["status"] == "active"
+    assert store.get_conclusion("session_summary", "session_summary:s1:r2")["status"] == "pending"
 
 
 def test_remember_and_forget_update_the_index(store):
