@@ -689,6 +689,7 @@ def test_first_refresh_bootstraps_and_later_refreshes_merge(plugin_package, stor
         "value markers merge the previous window's inventory"
 
 
+@pytest.mark.real_adviser_route
 def test_base_refresh_runs_on_the_adviser_route_with_the_adviser_toolset(
         plugin_package, store, transcript, monkeypatch):
     reply = _base_json(summary=["[goal] build"], user=["[goal] build"], peer=["terse"],
@@ -883,6 +884,7 @@ def test_dialectic_reviews_the_base_row_for_its_own_window(
         "a catch-up review must read its own base window, not the live one"
 
 
+@pytest.mark.real_adviser_route
 def test_dialectic_route_appends_the_adviser_toolset_explicitly(
         plugin_package, store, transcript, monkeypatch):
     requests: list[dict] = []

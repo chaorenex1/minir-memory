@@ -346,6 +346,25 @@ def _no_layer_reasoning(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _no_real_adviser_route(plugin_package, monkeypatch, request):
+    """Unit tests must never launch the host's real adviser agent loop.
+
+    The host registers the adviser auxiliary route in host mode, so ``LayerWorker`` would call
+    ``agent_loop.run`` even when a test patched ``worker.call_model``. Route consult calls
+    through the worker's injected ``_complete`` instead. Tests marked ``real_adviser_route``
+    stub ``agent_loop.run`` themselves and keep the production route.
+    """
+    if request.node.get_closest_marker("real_adviser_route"):
+        return
+    worker = plugin_package.worker
+
+    def _consult(self, system, prompt, task_key=worker.BASE_LAYER_TASK, tool_hint=""):
+        return self._complete(task_key, system, prompt)
+
+    monkeypatch.setattr(worker.LayerWorker, "_adviser_consult", _consult)
+
+
+@pytest.fixture(autouse=True)
 def _clean_minir_env(monkeypatch):
     """Config written by tests must not be shadowed by the developer's environment."""
     for key in ("MINIR_PREFETCH_LIMIT", "MINIR_BASE_INTERVAL", "MINIR_CONTEXT_CADENCE",

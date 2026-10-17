@@ -56,3 +56,6 @@ minir = ["__pycache__/*", "*.py[cod]"]
 minversion = "8.0"
 testpaths = ["tests"]
 addopts = "-q"
+markers = [
+    "real_adviser_route: exercise LayerWorker._adviser_consult against a stubbed host route",
+]
