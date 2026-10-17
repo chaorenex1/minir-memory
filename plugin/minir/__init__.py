@@ -101,8 +101,17 @@ process-wide pointer lets them reach the live store/session when that is the oth
 """
 
 _PROCESS_STARTED_AT = time.time()
-"""When this process began. A job queued before it can never be drained: its window's messages
-lived in the memory of a process that is gone (see ``initialize``)."""
+"""When this process began. Without a host ``state.db`` a job queued before it can never be
+drained: its window's messages lived in the memory of a process that is gone (see
+``initialize``)."""
+
+_STALE_CLAIM_SECONDS = 600.0
+"""Age at which a ``running`` job is assumed to belong to a dead process.
+
+Cannot key solely on this process's start time: a gateway and a CLI can share one
+``$HERMES_HOME``, and a live gateway claim predates the later CLI process. Ten minutes is far
+beyond any single layer job's model budget (observed well under a minute), so a fresh claim is
+never stolen."""
 
 _BOOL_WORDS = {**dict.fromkeys(("1", "true", "yes", "on"), True),
                **dict.fromkeys(("0", "false", "no", "off"), False)}
@@ -258,11 +267,19 @@ class MinirMemoryProvider(MemoryProvider):
         TRACKER.begin(self._session_id, mode=self._session_mode)
         with self._lock:
             self._cached = None
-        # Only expire inherited jobs when there is no durable history to read them from. With a
-        # host state.db, a job queued before this process can still be completed after restart.
-        if not Path(self._state_db).exists():
-            if self._worker.expire_orphans(before=_PROCESS_STARTED_AT):
-                logger.info("Minir expired layer jobs left open by a previous process")
+        # A job left *pending* by a previous process is still readable from host history, so it
+        # is kept and drained normally. A job left *running* is not: its owner thread died with
+        # that process. Re-queue those (retry, or fail once attempts are spent) instead of
+        # leaving status='running' forever. Without a state.db the window's content is gone, so
+        # expire both kinds there.
+        if Path(self._state_db).exists():
+            # Age, not this process's start: another live process (the gateway) can hold a
+            # claim older than this CLI. Only a claim past the job budget is certainly dead.
+            stale_before = time.time() - _STALE_CLAIM_SECONDS
+            if self._worker.reclaim_orphans(before=stale_before):
+                logger.info("Minir reclaimed layer jobs left running by a dead process")
+        elif self._worker.expire_orphans(before=_PROCESS_STARTED_AT):
+            logger.info("Minir expired layer jobs left open by a previous process")
         # The plugin hook only runs when the host rebuilds the system prompt; a cached-prompt
         # session would never enqueue its initial dialectic pass. Do it here too; has_open_job
         # makes the hook's later attempt a no-op.
@@ -1030,49 +1047,31 @@ def register(ctx) -> None:
     # The hooks close over the provider instance: only it knows the bound session, the agent
     # context (primary vs subagent) and the cached review. Module-level handlers with no state
     # would inject another session's review or start a model job for every subagent.
-    ctx.register_hook("on_session_start",
-                      lambda **kwargs: _on_session_start(provider=provider, **kwargs))
-    ctx.register_hook("on_session_reset",
-                      lambda **kwargs: _on_session_reset(provider=provider, **kwargs))
-    ctx.register_hook("on_session_finalize",
-                      lambda **kwargs: _on_session_finalize(provider=provider, **kwargs))
-    ctx.register_hook("pre_llm_call",
-                      lambda **kwargs: _on_pre_llm_call(provider=provider, **kwargs))
-    ctx.register_hook("post_llm_call",
-                      lambda **kwargs: _on_post_llm_call(provider=provider, **kwargs))
-    ctx.register_hook("post_tool_call",
-                      lambda **kwargs: _on_post_tool_call(provider=provider, **kwargs))
+    ctx.register_hook("on_session_start", _hook(_on_session_start, provider))
+    ctx.register_hook("on_session_reset", _hook(_on_session_reset, provider))
+    ctx.register_hook("on_session_finalize", _hook(_on_session_finalize, provider))
+    ctx.register_hook("pre_llm_call", _hook(_on_pre_llm_call, provider))
+    ctx.register_hook("post_llm_call", _hook(_on_post_llm_call, provider))
+    ctx.register_hook("post_tool_call", _hook(_on_post_tool_call, provider))
     # ``adviser_only`` is enforced before execution; returning action=block wins the gate.
-    ctx.register_hook("pre_tool_call",
-                      lambda **kwargs: _on_pre_tool_call(provider=provider, **kwargs))
+    ctx.register_hook("pre_tool_call", _hook(_on_pre_tool_call, provider))
     # Adviser mode observers: the event ring needs the assistant's intent (interim text and
     # successful API responses with tool calls), the tool outcome, and the final answer.
-    ctx.register_hook("on_interim_message",
-                      lambda **kwargs: _on_interim_message(provider=provider, **kwargs))
-    ctx.register_hook("post_api_request",
-                      lambda **kwargs: _on_post_api_request(provider=provider, **kwargs))
-    ctx.register_hook("api_request_error",
-                      lambda **kwargs: _on_api_request_error(provider=provider, **kwargs))
+    ctx.register_hook("on_interim_message", _hook(_on_interim_message, provider))
+    ctx.register_hook("post_api_request", _hook(_on_post_api_request, provider))
+    ctx.register_hook("api_request_error", _hook(_on_api_request_error, provider))
     # Adviser mode's mid-loop delivery seam. The memory-provider context forwards register_* to
     # a real PluginContext; a bare test/older host may not expose it, so registration is optional.
     register_middleware = getattr(ctx, "register_middleware", None)
     if callable(register_middleware):
         try:
-            register_middleware(
-                "llm_request",
-                lambda **kwargs: _on_llm_request(provider=provider, **kwargs))
+            register_middleware("llm_request", _hook(_on_llm_request, provider))
         except Exception as exc:
             logger.warning("Minir adviser-mode middleware registration failed: %s", exc)
-    register_command = getattr(ctx, "register_command", None)
-    if callable(register_command):
-        try:
-            register_command(
-                "adviser",
-                lambda raw_args="": _adviser_command(provider=provider, raw_args=raw_args),
-                description="Toggle the per-turn adviser mode (on/off/status/log/cadence/mode).",
-                args_hint="[on|off|status|log|cadence N|mode watch|adviser_only]")
-        except Exception as exc:
-            logger.warning("Minir /adviser command registration failed: %s", exc)
+    # The engine loader also calls register() with a Noop collector. That collector has no
+    # auxiliary-task API; the adviser surface belongs to the memory-plugin collector only.
+    if not hasattr(ctx, "register_auxiliary_task"):
+        return
     # Second surface of the same directory: the auxiliary ``adviser`` route + its in-process
     # agent loop (``adviser_consult``). Optional by design — a host without the auxiliary-task
     # API (or a config that refuses the key) must still get the memory provider, so a failure
@@ -1089,10 +1088,25 @@ def register(ctx) -> None:
 
 def _resolve_provider(provider: Optional[MinirMemoryProvider]) -> Optional[MinirMemoryProvider]:
     """Prefer the initialized instance the host is driving over a hook's own construction."""
-    if provider is not None and provider._store is not None:
+    if provider is not None and getattr(provider, "_store", None) is not None:
         return provider
     active = _ACTIVE_PROVIDER
     return active if active is not None and active._store is not None else provider
+
+
+def _hook(handler, provider: MinirMemoryProvider):
+    """Bind a plugin hook/middleware handler to this provider.
+
+    Some host payloads (``llm_request``, ``post_api_request``) carry their own ``provider``
+    key. Passing it through together with the closure's provider raises ``TypeError: got
+    multiple values for keyword argument 'provider'``, and the host then drops the callback —
+    adviser advice is never injected and post-request intent is never recorded. The host's
+    object is not the memory provider this plugin binds to, so discard it.
+    """
+    def callback(**kwargs):
+        kwargs.pop("provider", None)
+        return handler(provider=provider, **kwargs)
+    return callback
 
 
 def _on_session_start(session_id: str = "", model: str = "", platform: str = "",
@@ -1275,10 +1289,3 @@ def _on_llm_request(request: Any = None, provider: Optional[MinirMemoryProvider]
     if resolved is None:
         return None
     return resolved._adviser_mode.handle_llm_request(request=request, **kwargs)
-
-
-def _adviser_command(raw_args: str = "", provider: Optional[MinirMemoryProvider] = None) -> str:
-    resolved = _resolve_provider(provider)
-    if resolved is None:
-        return "adviser: the memory provider is not initialized."
-    return resolved._adviser_mode.command(raw_args)

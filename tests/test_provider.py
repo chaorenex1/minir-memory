@@ -658,7 +658,42 @@ def test_register_wires_the_provider_and_its_hooks(plugin_package):
     # the chat (on_session_finalize), so every handler must return None.
     for callback in ctx.hooks.values():
         assert callback(session_id="s", old_session_id="o", reason="new_session", turn_id="t",
-                        model="m", platform="cli", tool_name="terminal", duration_ms=3) is None
+                        model="m", platform="cli", tool_name="terminal", duration_ms=3,
+                        provider=object()) is None
+
+
+def test_registered_middleware_accepts_the_host_provider_payload(plugin_package):
+    """``llm_request`` carries the host's own provider; the callback must bind this plugin's
+    provider instead of raising ``TypeError: got multiple values for keyword argument``."""
+    class Ctx:
+        def __init__(self):
+            self.hooks = {}
+            self.middleware = {}
+
+        def register_memory_provider(self, provider):
+            self.provider = provider
+
+        def register_hook(self, name, callback):
+            self.hooks[name] = callback
+
+        def register_middleware(self, kind, callback):
+            self.middleware[kind] = callback
+
+        def register_auxiliary_task(self, *args, **kwargs):
+            pass
+
+        def register_tool(self, **kwargs):
+            pass
+
+        def register_command(self, *args, **kwargs):
+            pass
+
+    ctx = Ctx()
+    plugin_package.register(ctx)
+    host_provider = object()
+    assert ctx.hooks["post_api_request"](session_id="s", provider=host_provider) is None
+    assert ctx.middleware["llm_request"](
+        request={}, session_id="s", provider=host_provider) is None
 
 
 # -- cold start, review injection, metrics ------------------------------------

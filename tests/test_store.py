@@ -168,6 +168,22 @@ def test_expire_closes_only_jobs_from_before_the_process(store):
     assert rows[claimed] == "running" and len(rows) == 3
 
 
+def test_reclaim_requeues_running_jobs_left_by_a_previous_process(store):
+    job = store.record_job("base", "s1", 0.0, 10.0)
+    store.claim_jobs(limit=1)
+    assert store.reclaim_open_jobs(before=time.time() - 1.0, max_attempts=2) == 0, \
+        "a job claimed by this process must be left running"
+    cutoff = time.time() + 0.001  # a later process starts
+    assert store.reclaim_open_jobs(before=cutoff, max_attempts=2) == 1
+    row = store._conn.execute("SELECT status, attempts, claimed_at, error FROM jobs WHERE id = ?",
+                              (job,)).fetchone()
+    assert (row["status"], row["attempts"], row["claimed_at"], row["error"]) == ("pending", 1, None, "")
+    store.claim_jobs(limit=1)  # second claim: attempts now 2
+    assert store.reclaim_open_jobs(before=time.time() + 0.001, max_attempts=2) == 1
+    row = store._conn.execute("SELECT status, error FROM jobs WHERE id = ?", (job,)).fetchone()
+    assert row["status"] == "failed" and "process" in row["error"]
+
+
 def test_migration_drops_a_legacy_transcript_table(plugin_package, tmp_path):
     """A database written by the version that captured every turn is migrated on open."""
     path = tmp_path / "legacy" / "memory.db"

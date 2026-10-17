@@ -17,8 +17,8 @@ It also ships an optional **adviser mode**: a fast, per-turn side channel that w
 tool loop (user goal, assistant intent, tool results), asks the same auxiliary reviewer for
 actionable advice, and injects it before the next model request through the host's `llm_request`
 middleware. Unlike the dialectic layer it never writes base cards or revisions; it only appends
-to the shared advice ledger with `source='adviser_mode'`. Turn it on per session with
-`/adviser on`.
+to the shared advice ledger with `source='adviser_mode'`. It is controlled by configuration
+only (`memory.minir.adviser_mode.enabled`; there is no `/adviser` command).
 
 **It stores no transcripts.** The worker reads `(from_ts, to_ts]` messages from
 `$HERMES_HOME/state.db` read-only (plus the in-process buffer for turns not yet committed) and
@@ -458,22 +458,11 @@ write authority:
 | Delivery | `pre_llm_call` (once per turn) | `pre_llm_call` + `llm_request` (mid-tool-loop) |
 | Lifetime | durable audit | current turn, expires |
 
-Enable per session:
-
-```text
-/adviser on
-/adviser status
-/adviser cadence 3
-/adviser mode watch        # or adviser_only
-/adviser log
-/adviser off
-```
-
-Optional config (under `memory.minir`):
+Config (under `memory.minir`) is the only switch — there is no `/adviser` command:
 
 ```yaml
 adviser_mode:
-  enabled: false            # /adviser on overrides per session
+  enabled: false            # config controls the mode; no per-session toggle
   mode: watch               # watch | adviser_only
   cadence: 3                # tool calls between reviews
   severity_floor: concern   # nit | concern | blocker
@@ -482,6 +471,8 @@ adviser_mode:
   max_chars: 900
   toolsets: [adviser]      # read-only by default; never inherits the base/dialectic route
 ```
+
+Changes are read when the provider opens a session; restart Hermes to apply them to a running one.
 
 The reviewer runs on the same `auxiliary.adviser` route with a three-iteration tool budget. Its
 input is a bounded in-memory event ring (no transcript is written): `pre_llm_call` records the

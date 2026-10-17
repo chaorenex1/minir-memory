@@ -122,7 +122,7 @@ def test_run_frames_the_message_and_forwards_the_route(adviser, host):
     assert data == RUN
     (call,) = host["sync_calls"]
     assert call == {"message": "Ship it?", "context": "tests pass", "model": "some/other",
-                    "provider": "openrouter", "toolsets": ["file"],
+                    "provider": "openrouter", "api_mode": "", "toolsets": ["file"],
                     "system_message": adviser._ADVISER_BRIEF}
 
 
@@ -139,7 +139,17 @@ def test_empty_config_passes_empty_route_overrides(adviser, host):
     adviser.run("q")
 
     call = host["sync_calls"][0]
-    assert (call["model"], call["provider"]) == ("", "")
+    assert (call["model"], call["provider"], call["api_mode"]) == ("", "", "")
+
+
+def test_the_api_mode_pin_reaches_the_loop(adviser, host):
+    host["config"]["auxiliary"][ADVISER] = {"provider": "custom:siliconflow",
+                                            "model": "Qwen/Qwen3.5-4B",
+                                            "api_mode": "chat_completions"}
+
+    adviser.run("q")
+
+    assert host["sync_calls"][0]["api_mode"] == "chat_completions"
 
 
 def test_run_async_awaits_the_async_loop(adviser, host):

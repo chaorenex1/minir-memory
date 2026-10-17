@@ -92,7 +92,7 @@ def load_config() -> dict[str, Any]:
 def _route(cfg: dict[str, Any]) -> dict[str, Any]:
     """Only the knobs the adviser owns; credentials/budget are resolved inside the loop."""
     return {"model": str(cfg.get("model") or ""), "provider": str(cfg.get("provider") or ""),
-            "toolsets": cfg.get("toolsets")}
+            "api_mode": str(cfg.get("api_mode") or ""), "toolsets": cfg.get("toolsets")}
 
 
 def run(question: str, context: str = "", toolsets: Any = None) -> dict[str, Any]:
@@ -100,6 +100,7 @@ def run(question: str, context: str = "", toolsets: Any = None) -> dict[str, Any
     route = _route(load_config())
     return agent_loop.run(
         question, context=context, model=route["model"], provider=route["provider"],
+        api_mode=route["api_mode"],
         toolsets=toolsets if toolsets is not None else route["toolsets"],
         system_message=_ADVISER_BRIEF,
     ).as_dict()
@@ -110,6 +111,7 @@ async def run_async(question: str, context: str = "", toolsets: Any = None) -> d
     route = _route(load_config())
     result = await agent_loop.run_async(
         question, context=context, model=route["model"], provider=route["provider"],
+        api_mode=route["api_mode"],
         toolsets=toolsets if toolsets is not None else route["toolsets"],
         system_message=_ADVISER_BRIEF,
     )

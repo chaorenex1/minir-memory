@@ -24,9 +24,10 @@ def _advice(text: str = "check stderr before retrying", severity: str = "concern
         "evidence": ["#1"], "confidence": 0.8}]})
 
 
-def _mode_provider(make_provider, *, cadence: int = 2, floor: str = "nit"):
+def _mode_provider(make_provider, *, cadence: int = 2, floor: str = "nit",
+                   mode: str = "watch"):
     return make_provider({"adviser_mode": {
-        "enabled": True, "cadence": cadence, "severity_floor": floor,
+        "enabled": True, "mode": mode, "cadence": cadence, "severity_floor": floor,
         "max_reviews_per_turn": 4, "max_advices": 3, "max_chars": 900,
     }})
 
@@ -122,8 +123,7 @@ def test_session_end_drops_a_late_review(plugin_package, make_provider, monkeypa
 
 
 def test_adviser_only_policy_survives_the_compression_gate(plugin_package, make_provider):
-    provider = _mode_provider(make_provider)
-    provider._store.set_adviser_session("session-test", mode="adviser_only")
+    provider = _mode_provider(make_provider, mode="adviser_only")
     provider._store.set_compression_gate("session-test", expires_at=time.time() + 60)
     try:
         assert provider._adviser_mode.active("session-test") is False
@@ -194,7 +194,7 @@ def test_middleware_injects_and_confirms_delivery(plugin_package, make_provider)
     assert provider._store.staged_advisories("req-1") == []
 
 
-def test_middleware_and_command_fall_back_to_the_active_provider(plugin_package, make_provider):
+def test_middleware_falls_back_to_the_active_provider(plugin_package, make_provider):
     active = _mode_provider(make_provider)
     active._store.add_advisories("session-test", [{
         "severity": "concern", "target": "current_step", "text": "active provider advice",
@@ -206,7 +206,6 @@ def test_middleware_and_command_fall_back_to_the_active_provider(plugin_package,
         request=request, provider=shadow, session_id="session-test",
         api_request_id="req-shadow")
     assert "active provider advice" in request["messages"][-1]["content"]
-    assert "adviser:" in plugin_package._adviser_command("status", provider=shadow)
 
 
 def test_duplicate_middleware_callback_does_not_append_twice(plugin_package, make_provider):
@@ -308,8 +307,7 @@ def test_block_rendering_is_bounded(plugin_package):
 
 
 def test_adviser_only_injects_brief_and_blocks_mutations(plugin_package, make_provider):
-    provider = _mode_provider(make_provider)
-    provider._store.set_adviser_session("session-test", mode="adviser_only")
+    provider = _mode_provider(make_provider, mode="adviser_only")
 
     brief = plugin_package._on_pre_llm_call(
         session_id="session-test", turn_id="t1", provider=provider,
@@ -322,19 +320,23 @@ def test_adviser_only_injects_brief_and_blocks_mutations(plugin_package, make_pr
     assert plugin_package._on_pre_tool_call(
         tool_name="read_file", session_id="session-test", provider=provider) is None
 
-    provider._store.set_adviser_session("session-test", mode="watch")
+    watch = _mode_provider(make_provider, mode="watch")
     assert plugin_package._on_pre_tool_call(
-        tool_name="write_file", session_id="session-test", provider=provider) is None
+        tool_name="write_file", session_id="session-test", provider=watch) is None
 
 
-def test_command_toggles_session_state(plugin_package, make_provider):
-    provider = _mode_provider(make_provider)
-    assert "on" in provider._adviser_mode.command("on")
-    assert provider._store.adviser_session("session-test")["enabled"] == 1
-    assert "cadence" in provider._adviser_mode.command("cadence 5")
-    assert provider._store.adviser_session("session-test")["cadence"] == 5
-    assert "off" in provider._adviser_mode.command("off")
-    assert provider._store.adviser_session("session-test")["enabled"] == 0
+def test_enabled_mode_and_cadence_come_only_from_config(plugin_package, make_provider):
+    """No slash command, no per-session ledger: ``memory.minir.adviser_mode`` is the switch."""
+    off = make_provider({"adviser_mode": {"enabled": False, "mode": "watch", "cadence": 7}})
+    assert off._adviser_mode.enabled("session-test") is False
+    assert off._adviser_mode.mode("session-test") == "watch"
+    assert off._adviser_mode.cadence("session-test") == 7
+
+    on = make_provider({"adviser_mode": {"enabled": True, "mode": "adviser_only",
+                                         "cadence": 2}})
+    assert on._adviser_mode.enabled("session-test") is True
+    assert on._adviser_mode.mode("session-test") == "adviser_only"
+    assert on._adviser_mode.cadence("session-test") == 2
 
 
 # -- migration ----------------------------------------------------------------

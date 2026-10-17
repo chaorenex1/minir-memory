@@ -198,13 +198,6 @@ CREATE INDEX IF NOT EXISTS idx_advisories_pending
     ON advisories(session_id, status, id);
 CREATE UNIQUE INDEX IF NOT EXISTS idx_advisories_fingerprint
     ON advisories(session_id, fingerprint);
-CREATE TABLE IF NOT EXISTS adviser_sessions (
-    session_id TEXT PRIMARY KEY,
-    enabled INTEGER NOT NULL DEFAULT 0,
-    mode TEXT NOT NULL DEFAULT 'watch',
-    cadence INTEGER NOT NULL DEFAULT 3,
-    updated_at REAL NOT NULL
-);
 CREATE TABLE IF NOT EXISTS adviser_reviews (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     session_id TEXT NOT NULL DEFAULT '',
@@ -968,6 +961,28 @@ class MinirStore:
             self._conn.commit()
             return int(cur.rowcount)
 
+    def reclaim_open_jobs(self, *, before: float, max_attempts: int = 2) -> int:
+        """Re-queue jobs a dead process left ``running``; returns the count.
+
+        A claimed job's owner is a thread in one process: if that process ended, nothing will
+        ever finish the row. Unlike ``expire_open_jobs`` this is safe when host history exists
+        — the window is still readable — so the next drain retries it (and marks it failed once
+        its attempts are spent). Jobs claimed by *this* process (``claimed_at >= before``) and
+        jobs that were merely queued are left alone.
+        """
+        with self._lock:
+            cur = self._conn.execute(
+                "UPDATE jobs SET status = CASE WHEN attempts < ? THEN 'pending' ELSE 'failed' END,"
+                " claimed_at = NULL,"
+                " error = CASE WHEN attempts < ? THEN '' ELSE 'abandoned: the process that claimed it ended' END,"
+                " finished_at = CASE WHEN attempts < ? THEN NULL ELSE ? END"
+                " WHERE status = 'running' AND COALESCE(claimed_at, created_at) < ?",
+                (max(1, int(max_attempts)), max(1, int(max_attempts)),
+                 max(1, int(max_attempts)), time.time(), float(before)),
+            )
+            self._conn.commit()
+            return int(cur.rowcount)
+
     def last_processed_ts(self, layer: str, session_id: str) -> float:
         """Content watermark for one layer/session: how far its completed jobs have reasoned."""
         with self._lock:
@@ -1496,41 +1511,6 @@ class MinirStore:
                 "AND status IN ('pending', 'staged')", (session_id,))
             self._conn.commit()
             return int(cur.rowcount)
-
-    # -- adviser mode state ---------------------------------------------------
-
-    def adviser_session(self, session_id: str) -> Optional[dict[str, Any]]:
-        with self._lock:
-            row = self._conn.execute(
-                "SELECT * FROM adviser_sessions WHERE session_id = ?", (session_id,)).fetchone()
-        return dict(row) if row is not None else None
-
-    def set_adviser_session(self, session_id: str, *, enabled: Optional[bool] = None,
-                            mode: Optional[str] = None, cadence: Optional[int] = None) -> dict[str, Any]:
-        current = self.adviser_session(session_id)
-        if enabled is None:
-            if current is not None:
-                enabled = bool(current.get("enabled"))
-            else:
-                # Configuring mode/cadence is an explicit opt-in when no session row exists;
-                # otherwise ``/adviser mode adviser_only`` would silently disable the mode.
-                enabled = bool(mode is not None or cadence is not None)
-        current = current or {"mode": "watch", "cadence": 3}
-        if mode is None:
-            mode = str(current.get("mode") or "watch")
-        if cadence is None:
-            cadence = int(current.get("cadence") or 3)
-        with self._lock:
-            self._conn.execute(
-                "INSERT INTO adviser_sessions (session_id, enabled, mode, cadence, updated_at) "
-                "VALUES (?, ?, ?, ?, ?) ON CONFLICT(session_id) DO UPDATE SET "
-                "enabled = excluded.enabled, mode = excluded.mode, "
-                "cadence = excluded.cadence, updated_at = excluded.updated_at",
-                (session_id, int(bool(enabled)), str(mode), max(1, min(20, int(cadence))),
-                 time.time()))
-            self._conn.commit()
-        return {"enabled": int(bool(enabled)), "mode": str(mode),
-                "cadence": max(1, min(20, int(cadence)))}
 
     def start_adviser_review(self, session_id: str, turn_id: str, trigger: str,
                              from_seq: int, to_seq: int) -> int:

@@ -304,20 +304,8 @@ class AdviserMode:
             return ""
         return session
 
-    def _state(self, session: str) -> Optional[dict[str, Any]]:
-        store = self._store()
-        if store is None or not session:
-            return None
-        try:
-            return store.adviser_session(session)
-        except Exception:
-            logger.debug("adviser mode: state read failed", exc_info=True)
-            return None
-
     def enabled(self, session: str) -> bool:
-        row = self._state(session)
-        if row is not None:
-            return bool(row.get("enabled"))
+        """Config-only switch: ``memory.minir.adviser_mode.enabled``."""
         return bool(self._cfg().get("enabled"))
 
     def policy_active(self, session: str) -> bool:
@@ -341,15 +329,15 @@ class AdviserMode:
         return True
 
     def cadence(self, session: str) -> int:
-        row = self._state(session)
+        """Config-only cadence: ``memory.minir.adviser_mode.cadence``."""
         try:
-            return max(1, min(20, int((row or {}).get("cadence") or self._cfg()["cadence"])))
+            return max(1, min(20, int(self._cfg()["cadence"])))
         except (TypeError, ValueError):
             return 3
 
     def mode(self, session: str) -> str:
-        row = self._state(session)
-        value = str((row or {}).get("mode") or self._cfg().get("mode") or "watch").lower()
+        """Config-only mode: ``memory.minir.adviser_mode.mode`` (watch|adviser_only)."""
+        value = str(self._cfg().get("mode") or "watch").lower()
         return value if value in {"watch", "adviser_only"} else "watch"
 
     def mode_brief(self, session: str) -> str:
@@ -800,51 +788,3 @@ class AdviserMode:
             self._dirty.clear()
             self._ended.clear()
             self._staged.clear()
-
-    def command(self, raw_args: str = "") -> str:
-        session = self._primary("")
-        if not session:
-            return "adviser: the memory provider is not initialized for a primary session."
-        store = self._store()
-        if store is None:
-            return "adviser: the memory store is not open."
-        parts = (raw_args or "").strip().split()
-        op = parts[0].lower() if parts else "status"
-        try:
-            if op in {"on", "off"}:
-                store.set_adviser_session(session, enabled=(op == "on"))
-                if op == "on":
-                    self.session_started(session)
-                else:
-                    self.session_reset(session)
-                return f"adviser: {op} (session={session})."
-            if op == "cadence":
-                if len(parts) < 2:
-                    return "adviser: usage: /adviser cadence <n>"
-                value = max(1, min(20, int(parts[1])))
-                store.set_adviser_session(session, cadence=value)
-                return f"adviser: cadence={value}."
-            if op == "mode":
-                if len(parts) < 2 or parts[1].lower() not in {"watch", "adviser_only"}:
-                    return "adviser: usage: /adviser mode watch|adviser_only"
-                store.set_adviser_session(session, mode=parts[1].lower())
-                return f"adviser: mode={parts[1].lower()}."
-            if op == "log":
-                rows = store.adviser_reviews(session, 5)
-                if not rows:
-                    return "adviser: no reviews yet."
-                lines = ["adviser: recent reviews"]
-                for row in rows:
-                    lines.append(
-                        f"- {row['created_at']:.0f} {row['trigger']} {row['status']} "
-                        f"{row['from_seq']}..{row['to_seq']} "
-                        f"{row['api_calls']} calls {row['latency_ms']:.0f}ms"
-                        + (f" error={row['error'][:80]}" if row.get("error") else ""))
-                return "\n".join(lines)
-            row = self._state(session) or {}
-            pending = len(store.pending_advisories(session, 32, source=SOURCE))
-            return (f"adviser: {'on' if self.enabled(session) else 'off'} "
-                    f"mode={row.get('mode') or 'watch'} "
-                    f"cadence={self.cadence(session)} pending={pending}")
-        except Exception as exc:
-            return f"adviser: command failed: {exc}"

@@ -874,7 +874,8 @@ class LayerWorker:
                 toolsets.append(session_search.TOOLSET)
             result = agent_loop.run(
                 prompt, model=str(cfg.get("model") or ""),
-                provider=str(cfg.get("provider") or ""), toolsets=toolsets,
+                provider=str(cfg.get("provider") or ""),
+                api_mode=str(cfg.get("api_mode") or ""), toolsets=toolsets,
                 system_message=f"{system}\n\n{tool_hint}")
             return str(result.answer or "")
         except Exception as exc:
@@ -928,7 +929,10 @@ class LayerWorker:
         user_obj = _json_object(user_text)
         user_items = _json_items(user_obj.get("user_representation"))
         peer_items = _json_items(user_obj.get("user_peer_card"))
-        if not user_items or not peer_items:
+        # A sparse window can legitimately have no peer-card entries; only the primary list
+        # proves the pass produced content. An empty *both* is still a failed pass.
+        if not user_items:
+            logger.debug("Minir base user pass raw output for %s: %s", subject, user_text[:4000])
             raise LayerMergeError(f"base user pass for {subject} returned invalid JSON cards")
         user_cards = "\n\n".join((
             _render_section("## User Representation", user_items, _MAX_CARD_SECTION_CHARS),
@@ -941,7 +945,10 @@ class LayerWorker:
         ai_obj = _json_object(ai_text)
         self_items = _json_items(ai_obj.get("ai_self_representation"))
         identity_items = _json_items(ai_obj.get("ai_identity_card"))
-        if not self_items or not identity_items:
+        # Same rule as the user pass: the self-representation carries the content; an empty
+        # identity card is a valid sparse-window result, not a malformed response.
+        if not self_items:
+            logger.debug("Minir base AI pass raw output for %s: %s", subject, ai_text[:4000])
             raise LayerMergeError(f"base AI pass for {subject} returned invalid JSON cards")
         ai_cards = "\n\n".join((
             _render_section("## AI Self Representation", self_items, _MAX_CARD_SECTION_CHARS),
@@ -955,6 +962,7 @@ class LayerWorker:
         summary_items = _json_items(summary_obj.get("session_chunk_summary"))
         markers = _marker_items(summary_obj.get("value_markers"))
         if not summary_items:
+            logger.debug("Minir base summary pass raw output for %s: %s", subject, summary_text[:4000])
             raise LayerMergeError(f"base summary pass for {subject} returned invalid JSON summary")
         summary = _render_section("## Session Summary", summary_items, _MAX_SUMMARY_CHARS)
         marker_body = _render_marker_body(markers)
@@ -999,6 +1007,18 @@ class LayerWorker:
                 "content unavailable: the process that queued it ended", before=before)
         except Exception as exc:
             logger.debug("Minir orphan expiry failed: %s", exc)
+            return 0
+
+    def reclaim_orphans(self, *, before: float, max_attempts: int = _MAX_ATTEMPTS) -> int:
+        """Re-queue jobs a previous process claimed but never finished.
+
+        The window is still readable from host history, so the retry is meaningful (unlike
+        ``expire_orphans``, which is for processes whose content only lived in memory).
+        """
+        try:
+            return self._store.reclaim_open_jobs(before=before, max_attempts=max_attempts)
+        except Exception as exc:
+            logger.debug("Minir orphan reclaim failed: %s", exc)
             return 0
 
     # -- the drain ------------------------------------------------------------

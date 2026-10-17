@@ -91,7 +91,8 @@ def _resolve_model_and_runtime() -> tuple[str, dict[str, Any]]:
     return model, runtime
 
 
-def _agent_kwargs(provider: str, model: str, runtime: dict[str, Any]) -> dict[str, Any]:
+def _agent_kwargs(provider: str, model: str, runtime: dict[str, Any],
+                  api_mode: str = "") -> dict[str, Any]:
     """Credential/provider kwargs for the final route, plus its reasoning config.
 
     The gateway's runtime is the default route. A pinned provider that differs from it is
@@ -112,6 +113,11 @@ def _agent_kwargs(provider: str, model: str, runtime: dict[str, Any]) -> dict[st
     else:
         knobs = {key: runtime.get(key) for key in _RUNTIME_KEYS}
     knobs["provider"] = final_provider
+    # ``model.openai_runtime: codex_app_server`` rewrites a named custom provider's api_mode
+    # to the codex subprocess. Its own ``api_mode`` (e.g. an OpenAI-compatible endpoint) is
+    # lost, and the subprocess may not be runnable from this worker; an explicit route pin wins.
+    if str(api_mode or "").strip():
+        knobs["api_mode"] = str(api_mode).strip()
     knobs["reasoning_config"] = resolve_reasoning_config(_load_gateway_config(), model)
     return knobs
 
@@ -121,8 +127,8 @@ def _prompt(message: str, context: str = "") -> str:
 
 
 def run(message: str, *, context: str = "", model: str = "", provider: str = "",
-        toolsets: Optional[Sequence[str]] = None, system_message: str = "",
-        max_iterations: int = MAX_ITERATIONS) -> AgentRun:
+        api_mode: str = "", toolsets: Optional[Sequence[str]] = None,
+        system_message: str = "", max_iterations: int = MAX_ITERATIONS) -> AgentRun:
     """Run one agent loop on *message* and return its answer. Never leaves an agent open.
 
     ``max_iterations`` is the tool-call budget for this peer run. The default is the Feishu
@@ -137,7 +143,7 @@ def run(message: str, *, context: str = "", model: str = "", provider: str = "",
 
     agent = AIAgent(
         model=final_model,
-        **_agent_kwargs(final_provider, final_model, runtime),
+        **_agent_kwargs(final_provider, final_model, runtime, api_mode),
         enabled_toolsets=tools or None,
         max_iterations=max(1, int(max_iterations or MAX_ITERATIONS)),
         # A peer run brings its own instructions and evidence: no project context files, no host
@@ -167,11 +173,11 @@ def run(message: str, *, context: str = "", model: str = "", provider: str = "",
 
 
 async def run_async(message: str, *, context: str = "", model: str = "", provider: str = "",
-                    toolsets: Optional[Sequence[str]] = None,
+                    api_mode: str = "", toolsets: Optional[Sequence[str]] = None,
                     system_message: str = "",
                     max_iterations: int = MAX_ITERATIONS) -> AgentRun:
     """Await :func:`run` off the event loop (see the module docstring for why a thread)."""
     return await asyncio.to_thread(run, message, context=context, model=model,
-                                   provider=provider, toolsets=toolsets,
+                                   provider=provider, api_mode=api_mode, toolsets=toolsets,
                                    system_message=system_message,
                                    max_iterations=max_iterations)

@@ -138,6 +138,16 @@ def test_defaults_come_from_the_gateway_resolution(loop, host):
     assert host["reasoning_calls"] == ["gateway-model"]
 
 
+def test_an_explicit_api_mode_wins_over_the_resolved_runtime(loop, host):
+    """``model.openai_runtime: codex_app_server`` rewrites a named custom provider's api_mode;
+    the adviser route can pin its own wire protocol instead."""
+    loop.run("q", provider="custom:siliconflow", model="Qwen/Qwen3.5-4B",
+             api_mode="chat_completions")
+
+    (agent,) = FakeAgent.instances
+    assert agent.kwargs["api_mode"] == "chat_completions"
+
+
 def test_the_agent_is_built_like_the_feishu_comment_agent(loop, host):
     loop.run("q")
 

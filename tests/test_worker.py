@@ -300,6 +300,24 @@ def test_a_failed_window_is_recovered_by_the_next_job(plugin_package, store, tra
     assert store.layer_state(BASE, "user:default")["content"].startswith("## Session Summary")
 
 
+def test_an_empty_peer_card_is_a_valid_sparse_result(plugin_package, store, transcript):
+    """A short window legitimately yields no peer-card entries; the JSON contract still holds."""
+    def complete(task, system, prompt, **kwargs):
+        if "You maintain the user model" in system:
+            return json.dumps({"user_representation": ["[goal] ship"],
+                               "user_peer_card": []})
+        return _base_json()
+
+    instance = plugin_package.worker.LayerWorker(
+        store, transcript, complete=complete, enqueue_dialectic=False)
+    transcript.add(SESSION, "user", "ship it", created_at=10.0)
+    _dispatch(store, transcript, SESSION, BASE, 0.0, 20.0)
+
+    assert instance.run_once() == 1
+    state = store.layer_state(BASE, "user:default")
+    assert state is not None and "## User Peer Card" in state["content"]
+
+
 # -- lifecycle ----------------------------------------------------------------
 
 def test_disabled_worker_touches_nothing(plugin_package, store, transcript):
