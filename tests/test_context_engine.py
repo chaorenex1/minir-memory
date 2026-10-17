@@ -256,6 +256,22 @@ def test_has_content_to_compress_reports_honestly(plugin_package, state_db):
 
 # -- cadence ------------------------------------------------------------------
 
+def test_handoff_inputs_include_the_value_markers(plugin_package, tmp_path):
+    store = plugin_package.store.MinirStore(tmp_path / "minir-memory" / "memory.db")
+    try:
+        store.put_layer_state(
+            "base", "user:default",
+            "## Session Summary\n- window\n\n## User Representation\n- [goal] ship\n\n"
+            "## User Peer Card\n- terse\n\n## AI Self Representation\n- [done] shipped\n\n"
+            "## AI Identity Card\n- careful\n\n## Value Markers\n- [tool] pytest\n"
+            "- [project] minir-memory", session_id=SESSION)
+        _, tail = plugin_package.MinirContextEngine._dialectic_inputs(store, SESSION)
+        assert "Tail-window value markers" in tail
+        assert "[tool] pytest" in tail
+    finally:
+        store.close()
+
+
 def test_no_fold_before_the_first_beat(plugin_package, state_db):
     engine = _engine(plugin_package, state_db, interval=10)
     assert engine.should_compress(0) is False

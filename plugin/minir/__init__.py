@@ -64,7 +64,7 @@ from .turn_counter import (
     TRACKER,
     Trigger,
 )
-from .worker import LayerWorker, previous_content
+from .worker import LayerWorker, previous_content, project_artifact
 # Imported (not just defined) so the engine loader's subclass scan finds it on this module: the
 # engine surface is resolved by ``issubclass(ContextEngine)`` against the package's attributes.
 from .context_engine import MinirContextEngine
@@ -82,6 +82,8 @@ _DEFAULT_PREFETCH_LIMIT = 5
 _MAX_BLOCK_CHARS = 2000           # recall block injected into the prompt is truncated to this
 _MAX_LAYER_CHARS = 1200           # layer artifacts injected next to it are capped separately
 _MAX_TOOL_EXCERPT = 600           # text excerpt returned by the minir_search tool
+_MAX_ADVICE_ITEMS = 6             # pending advices drained into one injection
+_MAX_ADVICE_CHARS = 900           # injected advice block, markers included
 _MAX_AUTHOR_CACHE = 64            # per-session last-seen author, bounded like the turn counter
 # Durable base cards are explicit-recall only: prefetch must not inject them, even when an
 # FTS query happens to match. ``minir_search`` still returns them.
@@ -284,7 +286,7 @@ class MinirMemoryProvider(MemoryProvider):
              "type": "integer", "default": str(DEFAULT_BASE_INTERVAL),
              "minimum": 1, "env_var": "MINIR_CONTEXT_CADENCE"},
             {"key": "dialectic_cadence",
-             "description": "Turns the dialectic-reasoning layer accumulates before it reasons",
+             "description": "Context-engine fold beat; the dialectic review follows each base refresh",
              "type": "integer", "default": str(DEFAULT_DIALECTIC_INTERVAL),
              "minimum": 1, "env_var": "MINIR_DIALECTIC_CADENCE"},
             {"key": "dialectic_depth",
@@ -311,7 +313,8 @@ class MinirMemoryProvider(MemoryProvider):
         return (
             "# Minir Memory\n"
             f"Long-term memory lives in {_PROVIDER_LABEL}'s local store, which holds notes and "
-            "derived conclusions — no transcripts.\n"
+            "derived conclusions — no transcripts. Derived text may quote or reference the "
+            "messages it reasoned over.\n"
             "Use minir_search to look up stored notes and conclusions, minir_remember to store "
             "facts worth keeping across sessions, minir_forget to delete a note by id, "
             "and minir_stats to inspect the store."
@@ -394,7 +397,7 @@ class MinirMemoryProvider(MemoryProvider):
                 # An artifact published by another session keeps its durable constraints and
                 # preferences but loses the previous session's review, or the next turn would
                 # follow stale advice.
-                body = previous_content(layer, state, session).strip()
+                body = project_artifact(layer, previous_content(layer, state, session)).strip()
                 if not body:
                     continue
                 chunk = f"### {title} (v{(state or {}).get('version', 0)})\n{body}"
@@ -428,9 +431,9 @@ class MinirMemoryProvider(MemoryProvider):
 
         Nothing is written to disk: the turn goes into the in-memory transcript, and only what
         the layers *derive* from it is persisted. ``turn_author`` (``{"id", "name", "is_bot"}``)
-        is who wrote the user side — a shared session carries several participants, so the id
-        keys the base layer's per-participant artifact. The tick's cached author is the fallback
-        for a host that does not pass it here.
+        is retained as evidence metadata for the user side; the base layer always models this
+        profile's single user, not a per-author artifact. The tick's cached author is the
+        fallback for a host that does not pass it here.
         """
         if self._store is None or self._agent_context not in ("", "primary"):
             return  # host contract: non-primary contexts (subagent/cron/flush) do not write memory
@@ -574,6 +577,10 @@ class MinirMemoryProvider(MemoryProvider):
         if not triggers:
             return
         for trigger in triggers:
+            if trigger.layer == DIALECTIC_LAYER:
+                # Dialectic is a dependent job: the worker queues it with the exact window its
+                # base job published. A tick/tail trigger here would race that base artifact.
+                continue
             job_id: Optional[int] = None
             # Tell the transcript where the next window will start: a message stamped at or
             # before this edge would fall outside both this window and the next one.
@@ -745,9 +752,62 @@ class MinirMemoryProvider(MemoryProvider):
             self._review_turns[session] = turn
             return True
 
-    def cold_start(self, session_id: str = "") -> bool:
-        """Queue one depth-1 dialectic job for a freshly opened primary session.
+    def advisory_block(self, session_id: str = "", turn_id: str = "") -> str:
+        """Drain pending dialectic advices into one bounded injection block.
 
+        The advices are the actionable half of the dialectic review; the six corrected cards
+        stay on the base layer and are never injected here. Marking them injected happens
+        after the block is built, so a tool loop does not receive the same advice twice.
+        """
+        if self._store is None:
+            return ""
+        session = session_id or self._session_id
+        if not session:
+            return ""
+        rows = self._store.pending_advisories(session, limit=_MAX_ADVICE_ITEMS)
+        if not rows:
+            return ""
+        header, footer = "[minir adviser — advisory only]", "[end minir adviser]"
+        budget = _MAX_ADVICE_CHARS - len(header) - len(footer) - 2
+        if budget <= 0:
+            return ""
+        lines: list[str] = []
+        included: list[int] = []
+        for row in rows:
+            severity = str(row.get("severity") or "concern")
+            target = str(row.get("target") or "")
+            label = f"[{severity} · {target}]" if target else f"[{severity}]"
+            line = f"- {label} {str(row.get('content') or '').strip()}"
+            decision = str(row.get("decision") or "").strip()
+            if decision:
+                line += f" — decide: {decision}"
+            candidate = "\n".join((*lines, line))
+            if len(candidate) <= budget:
+                lines.append(line)
+                included.append(int(row["id"]))
+                continue
+            if not lines:  # one oversized advice: deliver a bounded prefix, not nothing
+                lines.append(line[:budget].rstrip())
+                included.append(int(row["id"]))
+            break  # the rest stay pending for the next LLM request
+        if not lines:
+            return ""
+        block = f"{header}\n" + "\n".join(lines) + f"\n{footer}"
+        self._store.mark_advisories_injected(included, turn_id or "")
+        return block[:_MAX_ADVICE_CHARS]
+
+    def has_advisories(self, session_id: str = "") -> bool:
+        """Whether this session has a dialectic delivery ledger at all."""
+        if self._store is None:
+            return False
+        session = session_id or self._session_id
+        return bool(session and self._store.has_advisories(session))
+
+    def cold_start(self, session_id: str = "") -> bool:
+        """Queue the first *base* refresh for a freshly opened primary session.
+
+        The dialectic review depends on a published base artifact, so this never queues it
+        directly: the worker queues the matching dialectic job after the base job succeeds.
         The plugin hook fires for subagent/cron sessions too, so callers must gate on the
         provider's bound session and ``agent_context``. Returns True when a job was queued.
         """
@@ -763,17 +823,16 @@ class MinirMemoryProvider(MemoryProvider):
         snapshot = TRACKER.snapshot(session) or {}
         if not snapshot or snapshot.get("closed"):
             return False
-        if self._store.has_open_job(DIALECTIC_LAYER, session):
+        if self._store.has_open_job(BASE_LAYER, session):
             return False
         try:
             started = float(snapshot.get("started_at") or time.time())
-            has_context = bool(self._identity.strip() or self._preference.strip())
-            if not has_context:
-                has_context = host_history.latest_ts(self._state_db, session) > 0
-            if not has_context:
-                return False  # no identity and no history: nothing to reason over
-            job_id = self._store.record_job(DIALECTIC_LAYER, session, started, time.time(), turns=0)
-            logger.info("Minir cold-start dialectic job queued (#%s) for session=%s", job_id, session)
+            # Without host history there is nothing for the base cards to model; identity files
+            # alone are consumed by the dialectic prompt only when a base artifact exists.
+            if host_history.latest_ts(self._state_db, session) <= 0:
+                return False
+            job_id = self._store.record_job(BASE_LAYER, session, started, time.time(), turns=0)
+            logger.info("Minir cold-start base job queued (#%s) for session=%s", job_id, session)
             self._kick_worker()
             return True
         except Exception as exc:
@@ -1008,11 +1067,11 @@ def _on_session_finalize(session_id: str = "", provider: Optional[MinirMemoryPro
 def _on_pre_llm_call(session_id: str = "", turn_id: str = "",
                      provider: Optional[MinirMemoryProvider] = None,
                      **kwargs) -> Optional[str]:
-    """Inject the latest adviser review into the user message, once per turn.
+    """Inject pending dialectic advices, then fall back to the legacy adviser review.
 
-    Returning a string is the host's injection channel. A review is session-scoped: it is
-    skipped for a child session, for a provider bound elsewhere, and when the same turn has
-    already received it (tool loops issue several requests under one turn id).
+    Returning a string is the host's injection channel. Both channels are session-scoped and
+    skipped for a child session or a provider bound elsewhere. Advices dedupe by advice id
+    (the ledger marks them injected); the legacy review dedupes once per turn id.
     """
     logger.info("Minir pre_llm_call: session=%s turn=%s", session_id or "-", turn_id or "-")
     provider = _resolve_provider(provider)
@@ -1022,6 +1081,13 @@ def _on_pre_llm_call(session_id: str = "", turn_id: str = "",
         if kwargs.get("parent_session_id"):
             return None
         if session_id and provider._session_id and session_id != provider._session_id:
+            return None
+        # The dialectic advices are the actionable channel. When the ledger exists, the review
+        # summary already rides ``prefetch``; do not inject it a second time through this hook.
+        advices = provider.advisory_block(session_id, turn_id)
+        if advices:
+            return advices
+        if provider.has_advisories(session_id):
             return None
         history = kwargs.get("conversation_history") or []
         if any("[minir adviser review" in str(

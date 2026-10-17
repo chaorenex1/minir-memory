@@ -6,6 +6,7 @@ conclusions built from them, and aggregated tool metrics.
 
 from __future__ import annotations
 
+import json
 import sqlite3
 import time
 
@@ -202,7 +203,8 @@ def test_conclusions_are_indexed_and_session_scoped(store):
             "## User Representation\n- [goal] finish the plugin\n\n"
             "## User Peer Card\n- prefers terse answers\n\n"
             "## AI Self Representation\n- direct\n\n"
-            "## AI Identity Card\n- never edits outside the repo")
+            "## AI Identity Card\n- never edits outside the repo\n\n"
+            "## Value Markers\n- [tool] pytest")
     store.put_layer_state("base", "user:ada", base, session_id="s1", ai_subject="agent:minir")
     dialectic = ("## Adviser Review\n- skipped the smoke test\n\n"
                  "## Constraints\n- never delete user files\n\n"
@@ -235,13 +237,15 @@ def test_remember_and_forget_update_the_index(store):
 # -- base refresh history -----------------------------------------------------
 
 def _refresh(store, session="s1", subject="user:ada", *, from_ts, to_ts,
-             from_turn=None, to_turn=None, summary="window", peer="terse"):
+             from_turn=None, to_turn=None, summary="window", peer="terse",
+             markers="- [tool] pytest"):
     return store.add_base_refresh(
         session, subject, window_from_ts=from_ts, window_to_ts=to_ts,
         window_from_turn=from_turn, window_to_turn=to_turn,
         user_representation=f"[goal] need at {from_ts}",
         user_peer_card=peer, ai_self_representation=f"[done] window {from_ts}",
-        ai_identity_card="direct", session_chunk_summary=summary)
+        ai_identity_card="direct", session_chunk_summary=summary,
+        value_markers=markers)
 
 
 def test_base_refreshes_keep_history_and_exactly_one_latest(store):
@@ -263,12 +267,180 @@ def test_base_refreshes_keep_history_and_exactly_one_latest(store):
     assert store.stats()["base_refreshes"] == 2
 
 
+def test_latest_refresh_follows_window_order_not_write_order(store):
+    newer = _refresh(store, from_ts=10.0, to_ts=20.0, from_turn=3, to_turn=4)
+    older = _refresh(store, from_ts=0.0, to_ts=10.0, from_turn=1, to_turn=2,
+                     summary="late older window")
+    latest = store.latest_base_refresh("s1", "user:ada")
+    assert latest["id"] == newer, "a late completion of an older window must not become latest"
+    history = store.base_refreshes("s1", "user:ada")
+    flags = {row["id"]: row["is_latest"] for row in history}
+    assert flags == {newer: 1, older: 0}
+
+
 def test_the_same_refresh_window_updates_in_place(store):
     first = _refresh(store, from_ts=0.0, to_ts=10.0, summary="first attempt")
     again = _refresh(store, from_ts=0.0, to_ts=10.0, summary="retried attempt")
     assert again == first
     assert len(store.base_refreshes("s1")) == 1
     assert store.latest_base_refresh("s1")["session_chunk_summary"] == "retried attempt"
+
+
+def test_a_dependent_dialectic_job_is_claimed_before_a_later_base_job(store):
+    base_one = store.record_job("base", "s1", 0.0, 10.0)
+    base_two = store.record_job("base", "s1", 10.0, 20.0)
+    review = store.record_job("dialectic", "s1", 0.0, 10.0)
+    assert store.claim_jobs(limit=1)[0]["id"] == review
+    assert store.claim_jobs(limit=1)[0]["id"] == base_one
+    assert store.claim_jobs(limit=1)[0]["id"] == base_two
+
+
+def test_advisories_are_deduped_and_blockers_come_first(store):
+    first = store.add_advisories("s1", [
+        {"severity": "nit", "target": "general", "content": "polish the wording"},
+        {"severity": "blocker", "target": "general", "content": "verify the path"},
+    ])
+    assert len(first) == 2
+    assert store.add_advisories("s1", [
+        {"severity": "nit", "target": "general", "content": "polish the wording"}]) == []
+    pending = store.pending_advisories("s1")
+    assert [row["severity"] for row in pending] == ["blocker", "nit"]
+    assert store.mark_advisories_injected([row["id"] for row in pending], "turn-1") == 2
+    assert store.pending_advisories("s1") == []
+    assert store.has_advisories("s1") is True
+
+
+def test_apply_base_revision_snapshots_then_updates_atomically(store):
+    refresh_id = _refresh(store, from_ts=0.0, to_ts=10.0, peer="old peer")
+    content = ("## Session Summary\n- window\n\n## User Representation\n- [goal] need at 0.0\n\n"
+               "## User Peer Card\n- new peer\n\n## AI Self Representation\n- [done] window 0.0\n\n"
+               "## AI Identity Card\n- direct\n\n## Value Markers\n- [tool] pytest")
+    advices = json.dumps([{"severity": "concern", "target": "user_peer_card",
+                           "content": "the peer card is stale", "decision": "update it",
+                           "evidence": ["m1"]}])
+    revision_id = store.apply_base_revision(
+        "s1", "user:ada", window_from_ts=0.0,
+        changes={"user_peer_card": json.dumps(["new peer"])},
+        advices=advices, changed_fields=["user_peer_card"], content=content)
+
+    assert revision_id
+    latest = store.latest_base_refresh("s1", "user:ada")
+    assert latest["id"] == refresh_id
+    assert json.loads(latest["user_peer_card"]) == ["new peer"]
+    assert latest["is_latest"] == 1
+    revisions = store.base_revisions("s1", "user:ada")
+    assert len(revisions) == 1
+    revision = revisions[0]
+    assert revision["base_refresh_id"] == refresh_id
+    assert revision["user_peer_card"] == "old peer"
+    assert json.loads(revision["changed_fields"]) == ["user_peer_card"]
+    assert "stale" in revision["advices"]
+    state = store.layer_state("base", "user:ada")
+    assert state["version"] == 1 and "new peer" in state["content"]
+    hits = store.search_base_revisions("stale", session_id="s1")
+    assert hits and hits[0]["id"] == revision_id
+
+
+def test_an_older_window_revision_does_not_replace_the_live_artifact(store):
+    older = _refresh(store, from_ts=0.0, to_ts=10.0, peer="old peer")
+    newer = _refresh(store, from_ts=10.0, to_ts=20.0, peer="new peer")
+    live = ("## Session Summary\n- new window\n\n## User Representation\n- [goal] new\n\n"
+            "## User Peer Card\n- new peer\n\n## AI Self Representation\n- [done] new\n\n"
+            "## AI Identity Card\n- direct\n\n## Value Markers\n- [tool] pytest")
+    store.put_layer_state("base", "user:ada", live, session_id="s1", ai_subject="agent:minir")
+
+    revision = store.apply_base_revision(
+        "s1", "user:ada", window_from_ts=0.0,
+        changes={"user_peer_card": json.dumps(["corrected old peer"])},
+        advices="[]", changed_fields=["user_peer_card"],
+        content="## User Peer Card\n- corrected old peer")
+
+    assert revision
+    assert store.layer_state("base", "user:ada")["content"] == live, \
+        "a late review of an older window must not replace the live artifact"
+    history = store.base_refreshes("s1", "user:ada")
+    flags = {row["id"]: row["is_latest"] for row in history}
+    assert flags == {newer: 1, older: 0}
+    assert json.loads(history[-1]["user_peer_card"]) == ["corrected old peer"]
+
+
+def test_legacy_base_refreshes_gain_value_markers_and_fts(plugin_package, tmp_path):
+    path = tmp_path / "mem" / "memory.db"
+    path.parent.mkdir(parents=True)
+    connection = sqlite3.connect(str(path))
+    try:
+        connection.executescript(
+            "CREATE TABLE base_refreshes ("
+            " id INTEGER PRIMARY KEY AUTOINCREMENT,"
+            " session_id TEXT NOT NULL DEFAULT '', subject TEXT NOT NULL DEFAULT '',"
+            " window_from_ts REAL NOT NULL, window_to_ts REAL NOT NULL,"
+            " window_from_turn INTEGER, window_to_turn INTEGER,"
+            " user_representation TEXT NOT NULL DEFAULT '',"
+            " user_peer_card TEXT NOT NULL DEFAULT '',"
+            " ai_self_representation TEXT NOT NULL DEFAULT '',"
+            " ai_identity_card TEXT NOT NULL DEFAULT '',"
+            " session_chunk_summary TEXT NOT NULL DEFAULT '',"
+            " is_latest INTEGER NOT NULL DEFAULT 1, created_at REAL NOT NULL);")
+        connection.execute(
+            "INSERT INTO base_refreshes (session_id, subject, window_from_ts, window_to_ts,"
+            " user_representation, user_peer_card, ai_self_representation, ai_identity_card,"
+            " session_chunk_summary, is_latest, created_at)"
+            " VALUES ('s1', 'user:ada', 0, 10, '- old goal', '- legacy tool',"
+            " '- old self', '- old identity', '- old summary', 1, 1.0)")
+        connection.commit()
+    finally:
+        connection.close()
+
+    reopened = plugin_package.store.MinirStore(path)
+    try:
+        row = reopened.latest_base_refresh("s1", "user:ada")
+        assert row["value_markers"] == ""
+        hits = reopened.search_base_refreshes("legacy")
+        assert hits and hits[0]["user_peer_card"] == "- legacy tool"
+    finally:
+        reopened.close()
+
+
+def test_base_refresh_fts_indexes_six_fields_and_short_cjk_queries(store):
+    _refresh(store, from_ts=0.0, to_ts=10.0, summary="deploy 插件",
+             peer="喜欢工具", markers="- [tool] pytest")
+    _refresh(store, from_ts=10.0, to_ts=20.0, summary="second 插件",
+             peer="后续偏好", markers="- [project] minir")
+
+    # Two characters: trigram cannot match, so this must take the LIKE fallback.
+    hits = store.search_base_refreshes("工具")
+    assert hits and hits[0]["user_peer_card"] == "喜欢工具"
+    # Three+ characters can use the FTS index.
+    hits = store.search_base_refreshes("pytest")
+    assert hits and "- [tool] pytest" in hits[0]["value_markers"]
+    # Latest-only and session filters apply to both paths.
+    latest = store.search_base_refreshes("插件", latest_only=True)
+    assert [row["window_to_ts"] for row in latest] == [20.0]
+    assert store.search_base_refreshes("插件", session_id="other") == []
+
+
+def test_reopening_normalizes_latest_to_the_newest_window(plugin_package, tmp_path):
+    path = tmp_path / "mem" / "memory.db"
+    first = plugin_package.store.MinirStore(path)
+    try:
+        _refresh(first, from_ts=10.0, to_ts=20.0, summary="newer")
+        _refresh(first, from_ts=0.0, to_ts=10.0, summary="older")
+        # Simulate the previous release: the last write was flagged latest.
+        first._conn.execute("UPDATE base_refreshes SET is_latest = 0")
+        first._conn.execute("UPDATE base_refreshes SET is_latest = 1 WHERE window_to_ts = 10.0")
+        first._conn.commit()
+    finally:
+        first.close()
+
+    reopened = plugin_package.store.MinirStore(path)
+    try:
+        latest = reopened.latest_base_refresh("s1", "user:ada")
+        assert latest["window_to_ts"] == 20.0
+        flags = {row["window_to_ts"]: row["is_latest"]
+                 for row in reopened.base_refreshes("s1", "user:ada")}
+        assert flags == {20.0: 1, 10.0: 0}
+    finally:
+        reopened.close()
 
 
 def test_latest_refresh_is_scoped_to_the_session(store):

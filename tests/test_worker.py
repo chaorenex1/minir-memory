@@ -6,6 +6,7 @@ persists no conversation content.
 
 from __future__ import annotations
 
+import json
 import time
 
 import pytest
@@ -13,6 +14,48 @@ import pytest
 BASE = "base"
 DIALECTIC = "dialectic"
 SESSION = "session-1"
+
+
+def _base_json(*, summary=None, user=None, peer=None, ai_self=None, identity=None,
+               markers=None):
+    """A full six-key base reply; each staged pass reads only its own keys."""
+    return json.dumps({
+        "session_chunk_summary": summary or ["Ships a Hermes memory plugin from Windows."],
+        "user_representation": user or ["[goal] ship the plugin"],
+        "user_peer_card": peer or ["Wants terse answers."],
+        "ai_self_representation": ai_self or ["direct"],
+        "ai_identity_card": identity or ["careful with user files"],
+        "value_markers": markers or {
+            "entities": ["Hermes memory plugin"],
+            "trajectories": [],
+            "experiences": [],
+            "tools": ["pytest"],
+            "projects": ["minir-memory"],
+        },
+    })
+
+
+def _dialectic_json(*, user=None, peer=None, ai_self=None, identity=None, summary=None,
+                    advices=None, markers=None, changed=False, fields=None):
+    """A full eight-key dialectic reply; the default carries one actionable concern."""
+    return json.dumps({
+        "user_representation": user or ["[goal] ship the plugin"],
+        "user_peer_card": peer or ["Wants terse answers."],
+        "ai_self_representation": ai_self or ["[done] ran the smoke test"],
+        "ai_identity_card": identity or ["careful with user files"],
+        "session_chunk_summary": summary or ["[done] ships a Hermes memory plugin"],
+        "advices": advices if advices is not None else [{
+            "severity": "concern", "target": "user_peer_card",
+            "text": "run a smoke test before shipping",
+            "decision": "adopt the smoke test as a standing check",
+            "evidence": ["msg-1"],
+        }],
+        "value_markers": markers or {
+            "entities": ["Hermes memory plugin"], "trajectories": [],
+            "experiences": [], "tools": ["pytest"], "projects": ["minir-memory"],
+        },
+        "base_changed": {"changed": bool(changed), "fields": list(fields or [])},
+    })
 
 
 @pytest.fixture()
@@ -35,17 +78,11 @@ def worker(plugin_package, store, transcript):
     def complete(task, system, prompt, **kwargs):
         calls.append({"task": task, "system": system, "prompt": prompt})
         if task == plugin_package.worker.DIALECTIC_LAYER_TASK:
-            return ("## Adviser Review\n- ran the smoke test\n\n"
-                    "## Constraints\n- never edit outside the repo\n\n"
-                    "## Preferences\n- act first\n\n"
-                    "## Second Brain\n- [tool] pytest -q")
-        return ("## Session Summary\n- Ships a Hermes memory plugin from Windows.\n\n"
-                "## User Representation\n- [goal] ship the plugin\n\n"
-                "## User Peer Card\n- Wants terse answers.\n\n"
-                "## AI Self Representation\n- direct\n\n"
-                "## AI Identity Card\n- careful with user files")
+            return _dialectic_json()
+        return _base_json()
 
-    instance = plugin_package.worker.LayerWorker(store, transcript, complete=complete)
+    instance = plugin_package.worker.LayerWorker(
+        store, transcript, complete=complete, enqueue_dialectic=False)
     instance.calls = calls
     return instance
 
@@ -68,6 +105,9 @@ def test_a_turn_buffered_after_the_dispatch_stamp_is_still_reasoned_over(store, 
     assert worker.run_once() == 1
     assert worker.calls, "the window content must reach the model despite the stale stamp"
     assert "deploy on Windows" in worker.calls[0]["prompt"]
+    row = store.latest_base_refresh(SESSION, "user:default")
+    assert (row["window_from_turn"], row["window_to_turn"]) == (1, 1), \
+        "the turn range follows the content the job actually drained, not the dispatch turn"
 
 
 def test_content_is_never_reasoned_over_twice(store, transcript, worker):
@@ -105,13 +145,27 @@ def test_empty_window_costs_no_model_call(store, worker):
 def test_a_window_already_drained_is_skipped(store, transcript, worker):
     """The content watermark, not the window's own bounds, decides what a job reads."""
     transcript.add(SESSION, "user", "already seen", created_at=10.0)
-    _dispatch(store, transcript, SESSION, BASE, 0.0, 20.0)
+    first = _dispatch(store, transcript, SESSION, BASE, 0.0, 20.0)
     worker.run_once()
     assert len(worker.calls) == 3, "one staged refresh = three passes"
-    _dispatch(store, transcript, SESSION, BASE, 0.0, 20.0)  # same window queued again
-    assert worker.run_once() == 1
+    assert _dispatch(store, transcript, SESSION, BASE, 0.0, 20.0) == first, \
+        "one base window has one job"
+    assert worker.run_once() == 0
     assert len(worker.calls) == 3, "no second model call for content already reasoned over"
     assert store.last_processed_ts(BASE, SESSION) >= 10.0
+
+
+def test_one_base_job_per_window(store):
+    first = store.record_job("base", SESSION, 0.0, 10.0)
+    assert store.record_job("base", SESSION, 0.0, 10.0) == first
+    assert len(store.pending_jobs()) == 1
+
+    job = store.claim_jobs(limit=1)[0]
+    store.complete_job(job["id"], 10.0)
+    assert store.record_job("base", SESSION, 0.0, 10.0) == first
+    assert store.pending_jobs() == []
+    assert store.record_job("base", SESSION, 10.0, 20.0) != first
+    assert len(store.pending_jobs()) == 1
 
 
 def test_oldest_job_first_and_one_claim_each(store):
@@ -123,28 +177,33 @@ def test_oldest_job_first_and_one_claim_each(store):
 
 # -- publication --------------------------------------------------------------
 
-def test_base_layer_publishes_one_artifact_per_participant(store, transcript, worker):
+def test_base_layer_publishes_one_artifact_for_the_profile_user(store, transcript, worker):
     transcript.add(SESSION, "user", "I prefer terse answers", author="Ada", author_id="u-1",
                    created_at=10.0)
     transcript.add(SESSION, "user", "ship it", author="Bo", author_id="u-2", created_at=11.0)
     _dispatch(store, transcript, SESSION, BASE, 0.0, 20.0)
     assert worker.run_once() == 1
-    assert sorted(state["subject"] for state in store.all_layer_states()) == ["user:u-1", "user:u-2"]
-    ada = store.layer_state(BASE, "user:u-1")
-    assert ada["version"] == 1 and ada["content"].startswith("## Session Summary")
-    assert "user:u-1" in worker.calls[0]["prompt"]
+    states = store.all_layer_states()
+    assert [state["subject"] for state in states] == ["user:default"]
+    state = store.layer_state(BASE, "user:default")
+    assert state["version"] == 1 and state["content"].startswith("## Session Summary")
+    assert "user:default" in worker.calls[0]["prompt"]
+    assert "user (Ada)" in worker.calls[0]["prompt"]
+    assert "user (Bo)" in worker.calls[0]["prompt"]
 
 
 def test_an_anonymous_turn_falls_back_to_the_profile_user(plugin_package, store, transcript):
     def complete(task, system, prompt, **kwargs):
-        return ("## Session Summary\n- anonymous\n\n## User Representation\n- [fact] anonymous\n\n"
-                "## User Peer Card\n- none\n\n## AI Self Representation\n- none\n\n"
-                "## AI Identity Card\n- none")
+        return _base_json(summary=["anonymous"], user=["[fact] anonymous"], peer=["none"],
+                          ai_self=["none"], identity=["none"],
+                          markers={"entities": [], "trajectories": [], "experiences": [],
+                                   "tools": [], "projects": []})
 
     transcript.add(SESSION, "user", "no author fields", created_at=10.0)
     _dispatch(store, transcript, SESSION, BASE, 0.0, 20.0)
     instance = plugin_package.worker.LayerWorker(store, transcript, complete=complete,
-                                                user_id="profile-user")
+                                                user_id="profile-user",
+                                                enqueue_dialectic=False)
     assert instance.run_once() == 1
     assert store.layer_state(BASE, "user:profile-user") is not None
 
@@ -169,12 +228,9 @@ def test_merge_bumps_the_version_and_feeds_the_previous_artifact_forward(store, 
         "the latest-chunk projection must be recomputed, not fed back"
 
 
-def test_dialectic_layer_publishes_constraints_preferences_review(plugin_package, store, transcript):
+def test_dialectic_layer_publishes_advices_without_base_cards(plugin_package, store, transcript):
     def complete(task, system, prompt, **kwargs):
-        return ("## Adviser Review\n- the last window skipped a smoke test: run one next time\n\n"
-                "## Constraints\n- never edit files outside the repo\n\n"
-                "## Preferences\n- act first, report briefly\n\n"
-                "## Second Brain\n- [tool] pytest -q")
+        return _dialectic_json()
 
     transcript.add(SESSION, "user", "review this", created_at=10.0)
     _dispatch(store, transcript, SESSION, DIALECTIC, 0.0, 20.0)
@@ -183,21 +239,26 @@ def test_dialectic_layer_publishes_constraints_preferences_review(plugin_package
     assert instance.run_once() == 1
     state = store.layer_state(DIALECTIC, "agent:Masía")
     assert state["version"] == 1
-    assert state["content"].startswith("## Adviser Review") and "## Second Brain" in state["content"]
+    assert state["content"].startswith("## Adviser Review")
+    assert "run a smoke test" in state["content"]
+    assert "## User Peer Card" not in state["content"]
+    assert "## Constraints" not in state["content"]
+    pending = store.pending_advisories(SESSION)
+    assert [row["severity"] for row in pending] == ["concern"]
 
 
 def test_an_unusable_artifact_fails_the_job_and_keeps_the_previous_version(plugin_package, store,
                                                                            transcript):
-    good_reply = ("## Session Summary\n- keeps this\n\n## User Representation\n- [fact] this\n\n"
-                  "## User Peer Card\n- terse\n\n## AI Self Representation\n- direct\n\n"
-                  "## AI Identity Card\n- careful")
+    good_reply = _base_json(summary=["keeps this"], user=["[fact] this"], peer=["terse"],
+                            ai_self=["direct"], identity=["careful"])
     seen: list[str] = []
 
     def complete(task, system, prompt, **kwargs):
         seen.append(prompt)
         return "no headings at all" if "second" in prompt else good_reply
 
-    instance = plugin_package.worker.LayerWorker(store, transcript, complete=complete)
+    instance = plugin_package.worker.LayerWorker(
+        store, transcript, complete=complete, enqueue_dialectic=False)
     transcript.add(SESSION, "user", "first")
     _dispatch(store, transcript, SESSION, BASE, 0.0, time.time())
     instance.run_once()
@@ -220,12 +281,13 @@ def test_an_unusable_artifact_fails_the_job_and_keeps_the_previous_version(plugi
 
 def test_a_failed_window_is_recovered_by_the_next_job(plugin_package, store, transcript):
     def complete(task, system, prompt, **kwargs):
-        return "" if "unusable" in prompt else (
-            "## Session Summary\n- ok\n\n## User Representation\n- [fact] ok\n\n"
-            "## User Peer Card\n- ok\n\n## AI Self Representation\n- ok\n\n"
-            "## AI Identity Card\n- ok")
+        return "" if "unusable" in prompt else _base_json(
+            summary=["ok"], user=["[fact] ok"], peer=["ok"], ai_self=["ok"], identity=["ok"],
+            markers={"entities": [], "trajectories": [], "experiences": [],
+                     "tools": [], "projects": []})
 
-    instance = plugin_package.worker.LayerWorker(store, transcript, complete=complete)
+    instance = plugin_package.worker.LayerWorker(
+        store, transcript, complete=complete, enqueue_dialectic=False)
     transcript.add(SESSION, "user", "unusable evidence", created_at=10.0)
     _dispatch(store, transcript, SESSION, BASE, 0.0, 20.0)
     instance.run_once()
@@ -286,7 +348,7 @@ def test_sections_are_validated_in_order(plugin_package):
     normalize = plugin_package.worker._normalize_state
     base = ("## Session Summary\n- a\n\n## User Representation\n- [goal] a\n\n"
             "## User Peer Card\n- a\n\n## AI Self Representation\n- a\n\n"
-            "## AI Identity Card\n- a")
+            "## AI Identity Card\n- a\n\n## Value Markers\n- [entity] a")
     assert normalize(BASE, "## User Peer Card\n- a\n\n## Session Summary\n- a") == ""  # wrong order
     assert normalize(BASE, "## Session Summary\n\n## User Representation") == ""  # no items
     assert normalize(BASE, "") == ""
@@ -369,22 +431,22 @@ def test_call_model_without_the_host_module_returns_empty(plugin_package, monkey
 
 # -- dialectic depth and cold start ------------------------------------------
 
-def test_dialectic_depth_runs_three_passes(plugin_package, store, transcript):
+def test_dialectic_depth_adapts_and_runs_three_passes_for_long_windows(
+        plugin_package, store, transcript):
     calls: list[str] = []
 
     def complete(task, system, prompt, **kwargs):
         calls.append(system)
-        return ("## Adviser Review\n- review\n\n## Constraints\n- c\n\n"
-                "## Preferences\n- p\n\n## Second Brain\n- [tool] t")
+        return _dialectic_json()
 
-    store.put_layer_state("dialectic", "agent:minir",
-                          "## Adviser Review\n- prior\n\n## Constraints\n- c\n\n"
-                          "## Preferences\n- p\n\n## Second Brain\n- [tool] t")
-    transcript.add(SESSION, "user", "review this", created_at=10.0)
+    store.put_layer_state("dialectic", "agent:minir", "## Adviser Review\n- prior")
+    for index in range(4):
+        transcript.add(SESSION, "user", f"long evidence {index} " + "z" * 3500,
+                       created_at=10.0 + index)
     _dispatch(store, transcript, SESSION, DIALECTIC, 0.0, 20.0)
     instance = plugin_package.worker.LayerWorker(store, transcript, depth=3, complete=complete)
     assert instance.run_once() == 1
-    assert len(calls) == 3, "d1 synthesize, d2 self-audit, d3 reconcile"
+    assert len(calls) == 3, "a long window earns d1 synthesize, d2 self-audit, d3 reconcile"
     assert "auditing" in calls[1].lower() and "reconciling" in calls[2].lower()
     assert store.layer_state(DIALECTIC, "agent:minir") is not None
 
@@ -394,32 +456,31 @@ def test_cold_start_uses_identity_files_without_messages(plugin_package, store, 
 
     def complete(task, system, prompt, **kwargs):
         seen.append(system)
-        return ("## Adviser Review\n- no evidence yet\n\n## Constraints\n- unknown\n\n"
-                "## Preferences\n- unknown\n\n## Second Brain\n- unknown")
+        return _dialectic_json(advices=[])
 
     instance = plugin_package.worker.LayerWorker(
         store, transcript, identity="I am Masía.", preference="Be terse.",
         depth=1, complete=complete)
     store.record_job(DIALECTIC, SESSION, 0.0, 20.0, turns=0)
     assert instance.run_once() == 1
-    assert "no prior dialectic" in seen[0].lower()
+    assert "no previous dialectic" in seen[0].lower()
     assert store.layer_state(DIALECTIC, "agent:minir") is not None
 
 
 def test_a_dialectic_audit_failure_keeps_the_initial_draft(plugin_package, store, transcript):
-    replies = [
-        "## Adviser Review\n- review\n\n## Constraints\n- c\n\n## Preferences\n- p\n\n## Second Brain\n- [tool] t",
-        "not a valid artifact",
-    ]
+    replies = [_dialectic_json(), "not a valid artifact"]
+    seen: list[int] = []
 
     def complete(task, system, prompt, **kwargs):
-        return replies[min(len(replies) - 1, 0)] if len(replies) else ""
+        index = min(len(seen), len(replies) - 1)
+        seen.append(index)
+        return replies[index]
 
     instance = plugin_package.worker.LayerWorker(store, transcript, depth=2, complete=complete)
-    transcript.add(SESSION, "user", "review this", created_at=10.0)
+    transcript.add(SESSION, "user", "review this " + "z" * 5000, created_at=10.0)
     _dispatch(store, transcript, SESSION, DIALECTIC, 0.0, 20.0)
     assert instance.run_once() == 1
-    assert "review" in store.layer_state(DIALECTIC, "agent:minir")["content"]
+    assert "run a smoke test" in store.layer_state(DIALECTIC, "agent:minir")["content"]
 
 
 # -- canonical chunk chain ----------------------------------------------------
@@ -450,14 +511,16 @@ def test_base_refresh_appends_a_chunk_and_projects_only_the_newest(store, transc
     assert artifact.count("Local chunk") == 1
 
 
-def test_each_chunk_records_the_turn_range_it_covers(store, transcript, worker):
+def test_each_chunk_records_the_turn_range_it_actually_covers(store, transcript, worker):
+    # Three host turns were counted, but this window only stored the last one's message.
     transcript.add(SESSION, "user", "first window", created_at=10.0)
     _dispatch(store, transcript, SESSION, BASE, 0.0, 20.0, turns=3)
     assert worker.run_once() == 1
     chunk = store.chunk_summaries(SESSION)[0]
-    assert (chunk["from_turn"], chunk["to_turn"]) == (1, 3)
+    assert (chunk["from_turn"], chunk["to_turn"]) == (3, 3)
 
     transcript.add(SESSION, "user", "second window", created_at=30.0)
+    transcript.add(SESSION, "user", "third window", created_at=31.0)
     _dispatch(store, transcript, SESSION, BASE, 20.0, 40.0, turns=5)
     assert worker.run_once() == 1
     chunk = store.chunk_summaries(SESSION)[-1]
@@ -493,7 +556,6 @@ def test_dialectic_prompt_consumes_the_chunk_chain(store, transcript, worker):
     prompt = worker.calls[0]["prompt"]
     assert "LOCAL CHUNK SUMMARIES" in prompt
     assert "chunk one: tests pass" in prompt and "chunk two: tests fail" in prompt
-    assert "Reconcile contradictions" in prompt
 
 
 def test_base_prompt_does_not_feed_the_previous_projection_back(store, transcript, worker):
@@ -501,13 +563,13 @@ def test_base_prompt_does_not_feed_the_previous_projection_back(store, transcrip
         "base", "user:default",
         "## Session Summary\n- OLD PROJECTION\n\n## User Representation\n- [goal] old\n\n"
         "## User Peer Card\n- durable peer\n\n## AI Self Representation\n- self\n\n"
-        "## AI Identity Card\n- identity")
+        "## AI Identity Card\n- identity\n\n## Value Markers\n- [tool] old")
     transcript.add(SESSION, "user", "new delta", created_at=10.0)
     _dispatch(store, transcript, SESSION, BASE, 0.0, 20.0)
     assert worker.run_once() == 1
     prompt = worker.calls[0]["prompt"]
     assert "OLD PROJECTION" not in prompt, "the latest-chunk projection must not be fed back"
-    assert "durable peer" in prompt, "the other four sections still carry forward"
+    assert "durable peer" in prompt, "the other five sections still carry forward"
 
 
 def test_a_dialectic_job_can_run_from_the_chunk_chain_alone(plugin_package, store, transcript):
@@ -527,7 +589,7 @@ def test_a_dialectic_job_can_run_from_the_chunk_chain_alone(plugin_package, stor
 
 # -- the structured base refresh record ---------------------------------------
 
-def test_base_refresh_persists_the_five_fields_and_window_metadata(store, transcript, worker):
+def test_base_refresh_persists_the_six_fields_and_window_metadata(store, transcript, worker):
     transcript.add(SESSION, "user", "I need a plugin", created_at=10.0)
     transcript.add(SESSION, "assistant", "starting", created_at=11.0)
     _dispatch(store, transcript, SESSION, BASE, 0.0, 20.0, turns=2)
@@ -535,15 +597,25 @@ def test_base_refresh_persists_the_five_fields_and_window_metadata(store, transc
 
     row = store.latest_base_refresh(SESSION, "user:default")
     assert row is not None and row["is_latest"] == 1
-    assert row["user_representation"] == "- [goal] ship the plugin"
-    assert row["user_peer_card"] == "- Wants terse answers."
-    assert row["ai_self_representation"] == "- direct"
-    assert row["ai_identity_card"] == "- careful with user files"
-    assert row["session_chunk_summary"] == "- Ships a Hermes memory plugin from Windows."
+    assert json.loads(row["user_representation"]) == ["[goal] ship the plugin"]
+    assert json.loads(row["user_peer_card"]) == ["Wants terse answers."]
+    assert json.loads(row["ai_self_representation"]) == ["direct"]
+    assert json.loads(row["ai_identity_card"]) == ["careful with user files"]
+    assert json.loads(row["session_chunk_summary"]) == [
+        "Ships a Hermes memory plugin from Windows."]
+    assert json.loads(row["value_markers"]) == {
+        "entities": ["Hermes memory plugin"],
+        "trajectories": [],
+        "experiences": [],
+        "tools": ["pytest"],
+        "projects": ["minir-memory"],
+    }
+    hits = store.search_base_refreshes("pytest")
+    assert hits and json.loads(hits[0]["value_markers"])["tools"] == ["pytest"]
     assert row["window_from_ts"] == 0.0
     assert row["window_to_ts"] == store.last_processed_ts(BASE, SESSION)
     assert row["window_to_ts"] >= 20.0, "the newest job drains to the newest message"
-    assert (row["window_from_turn"], row["window_to_turn"]) == (1, 2)
+    assert (row["window_from_turn"], row["window_to_turn"]) == (2, 2)
 
     transcript.add(SESSION, "user", "next window", created_at=30.0)
     _dispatch(store, transcript, SESSION, BASE, 20.0, 40.0, turns=4)
@@ -554,30 +626,34 @@ def test_base_refresh_persists_the_five_fields_and_window_metadata(store, transc
         "windows are edge-to-edge in the stored history"
     assert history[0]["window_from_ts"] >= 20.0
     assert history[0]["window_to_ts"] == store.last_processed_ts(BASE, SESSION)
+    assert (history[1]["window_from_turn"], history[1]["window_to_turn"]) == (2, 2)
+    assert (history[0]["window_from_turn"], history[0]["window_to_turn"]) == (4, 4)
 
 
 def test_first_refresh_bootstraps_and_later_refreshes_merge(plugin_package, store, transcript,
                                                             monkeypatch):
-    def query(args, **kwargs):
-        assert args["mode"] == "messages" and args["order"] == "oldest"
-        return {"messages": [{"content": "anchor: build the memory plugin"}]}
-
-    monkeypatch.setattr(plugin_package.session_search, "query", query)
     calls: list[str] = []
+
+    monkeypatch.setattr(plugin_package.session_search, "query", lambda args, **kwargs: {
+        "messages": [{"content": "anchor: build the memory plugin"}]})
 
     def complete(task, system, prompt, **kwargs):
         calls.append(prompt)
-        return ("## Session Summary\n- [goal] build\n\n## User Representation\n- [goal] build\n\n"
-                "## User Peer Card\n- terse\n\n## AI Self Representation\n- direct\n\n"
-                "## AI Identity Card\n- careful")
+        return _base_json(summary=["[goal] build"], user=["[goal] build"], peer=["terse"],
+                          ai_self=["direct"], identity=["careful"])
 
-    instance = plugin_package.worker.LayerWorker(store, transcript, complete=complete)
+    instance = plugin_package.worker.LayerWorker(
+        store, transcript, complete=complete, state_db="test-state.db",
+        enqueue_dialectic=False)
     transcript.add(SESSION, "user", "first turn", created_at=10.0)
     _dispatch(store, transcript, SESSION, BASE, 0.0, 20.0)
     assert instance.run_once() == 1
     assert "first base refresh (bootstrap)" in calls[0]
-    assert "anchor: build the memory plugin" in calls[0]
     assert "Previous user cards: none" in calls[0]
+    assert "Session: session-1" in calls[0]
+    assert "Window: (0.0, " in calls[0]
+    assert "anchor: build the memory plugin" in calls[0]
+    assert "first turn" in calls[0]
 
     transcript.add(SESSION, "user", "second turn", created_at=30.0)
     _dispatch(store, transcript, SESSION, BASE, 20.0, 40.0)
@@ -586,15 +662,19 @@ def test_first_refresh_bootstraps_and_later_refreshes_merge(plugin_package, stor
     assert "subsequent base refresh (merge previous cards)" in second
     assert "Previous user cards:" in second and "terse" in second
     assert "first turn" not in second, "the previous window is not re-fed as evidence"
+    assert "second turn" in second
+    assert "Session: session-1" in second
     assert "anchor: build the memory plugin" not in second, \
-        "the first-message anchor is bootstrap-only; later output comes from prior cards + window"
+        "the first-message anchor belongs to the first refresh only"
+    assert "Previous value markers:" in calls[5]
+    assert "- [entity] Hermes memory plugin" in calls[5], \
+        "value markers merge the previous window's inventory"
 
 
 def test_base_refresh_runs_on_the_adviser_route_with_the_adviser_toolset(
         plugin_package, store, transcript, monkeypatch):
-    reply = ("## Session Summary\n- [goal] build\n\n## User Representation\n- [goal] build\n\n"
-             "## User Peer Card\n- terse\n\n## AI Self Representation\n- direct\n\n"
-             "## AI Identity Card\n- careful")
+    reply = _base_json(summary=["[goal] build"], user=["[goal] build"], peer=["terse"],
+                       ai_self=["direct"], identity=["careful"])
     requests: list[dict] = []
 
     monkeypatch.setattr(plugin_package.adviser, "load_config",
@@ -606,7 +686,8 @@ def test_base_refresh_runs_on_the_adviser_route_with_the_adviser_toolset(
         return type("Run", (), {"answer": reply})()
 
     monkeypatch.setattr(plugin_package.agent_loop, "run", run)
-    instance = plugin_package.worker.LayerWorker(store, transcript)  # no injection -> adviser route
+    instance = plugin_package.worker.LayerWorker(
+        store, transcript, enqueue_dialectic=False)  # no injection -> adviser route
     transcript.add(SESSION, "user", "grounded by session search", created_at=10.0)
     _dispatch(store, transcript, SESSION, BASE, 0.0, 20.0)
     assert instance.run_once() == 1
@@ -618,15 +699,170 @@ def test_base_refresh_runs_on_the_adviser_route_with_the_adviser_toolset(
     assert "You maintain the user model" in requests[0]["system_message"]
     assert "You maintain the AI half" in requests[1]["system_message"]
     assert "local compression record" in requests[2]["system_message"]
+    for request in requests:
+        assert "adviser_session_search" in request["system_message"]
+        assert "Session: session-1" in request["message"]
+        assert "JSON object" in request["system_message"]
+    assert '"user_representation"' in requests[0]["system_message"]
+    assert '"value_markers"' in requests[2]["system_message"]
     assert store.latest_base_refresh(SESSION, "user:default") is not None
 
 
-def test_a_verbose_section_cannot_truncate_a_later_heading(plugin_package):
-    normalize = plugin_package.worker._normalize_sections
-    text = ("## User Representation\n- " + "x" * 2_000 + "\n\n"
-            "## User Peer Card\n- durable preference")
-    out = normalize(text, plugin_package.worker.BASE_USER_SECTIONS)
-    assert out.startswith("## User Representation")
-    assert "## User Peer Card" in out and "durable preference" in out, \
-        "the second heading survives because each section has its own budget"
-    assert len(out.split("## User Peer Card")[0]) <= 520
+def test_one_shot_fallback_prompt_does_not_mention_unavailable_tools(store, transcript, worker):
+    transcript.add(SESSION, "user", "fallback path", created_at=10.0)
+    _dispatch(store, transcript, SESSION, BASE, 0.0, 20.0)
+    assert worker.run_once() == 1
+    assert worker.calls
+    for call in worker.calls:
+        assert "adviser_session_search" not in call["system"], \
+            "a one-shot fallback has no adviser tool and must not be told to call it"
+        assert "JSON object" in call["system"]
+
+
+def test_retry_reuses_the_chunk_turn_range(store, transcript, worker):
+    transcript.add(SESSION, "user", "retry this window", created_at=10.0)
+    store.add_chunk_summary(SESSION, 0.0, 20.0, "- previous attempt", from_turn=1, to_turn=5)
+    _dispatch(store, transcript, SESSION, BASE, 0.0, 20.0, turns=5)
+    assert worker.run_once() == 1
+    row = store.latest_base_refresh(SESSION, "user:default")
+    assert (row["window_from_turn"], row["window_to_turn"]) == (1, 5), \
+        "a retry must reuse the chunk range, not treat its own chunk as the previous window"
+
+
+def test_json_items_are_bounded(plugin_package):
+    items = plugin_package.worker._json_items(
+        ["x" * 2_000, 5, "", "durable preference"], max_items=2, max_chars=10)
+    assert items == ["x" * 10, "durable pr"], \
+        "non-strings/empties are dropped; each item and the count are bounded"
+
+
+# -- dependent dialectic + base revision --------------------------------------
+
+def test_a_base_job_queues_the_dependent_dialectic_window(plugin_package, store, transcript):
+    calls: list[str] = []
+
+    def complete(task, system, prompt, **kwargs):
+        calls.append(task)
+        return (_dialectic_json() if task == plugin_package.worker.DIALECTIC_LAYER_TASK
+                else _base_json())
+
+    transcript.add(SESSION, "user", "ship it", created_at=10.0)
+    _dispatch(store, transcript, SESSION, BASE, 0.0, 20.0)
+    instance = plugin_package.worker.LayerWorker(store, transcript, complete=complete)
+
+    assert instance.run_once() == 2, "the base job and the dialectic job it queues"
+    assert calls == [plugin_package.worker.BASE_LAYER_TASK] * 3 + [
+        plugin_package.worker.DIALECTIC_LAYER_TASK]
+    assert store.pending_jobs() == []
+    assert store.layer_state(BASE, "user:default") is not None
+    assert store.layer_state(DIALECTIC, "agent:minir") is not None
+    assert store.pending_advisories(SESSION)
+
+
+def test_dialectic_revision_snapshots_the_old_base_and_applies_the_change(
+        plugin_package, store, transcript):
+    def complete(task, system, prompt, **kwargs):
+        if task == plugin_package.worker.DIALECTIC_LAYER_TASK:
+            return _dialectic_json(peer=["Wants terse answers.", "No emoji."],
+                                   changed=True, fields=["user_peer_card"])
+        return _base_json()
+
+    transcript.add(SESSION, "user", "ship it", created_at=10.0)
+    _dispatch(store, transcript, SESSION, BASE, 0.0, 20.0)
+    instance = plugin_package.worker.LayerWorker(store, transcript, complete=complete)
+    assert instance.run_once() == 2
+
+    latest = store.latest_base_refresh(SESSION, "user:default")
+    assert json.loads(latest["user_peer_card"]) == ["Wants terse answers.", "No emoji."]
+    revisions = store.base_revisions(SESSION, "user:default")
+    assert len(revisions) == 1
+    revision = revisions[0]
+    assert revision["base_refresh_id"] == latest["id"]
+    assert json.loads(revision["user_peer_card"]) == ["Wants terse answers."]
+    assert json.loads(revision["changed_fields"]) == ["user_peer_card"]
+    assert "smoke test" in revision["advices"]
+    assert "No emoji." in store.layer_state(BASE, "user:default")["content"]
+    assert store.search_base_revisions("smoke test", session_id=SESSION)
+    assert store.stats()["base_revisions"] == 1
+
+
+def test_a_dialectic_job_without_its_base_window_does_not_correct_another_window(
+        plugin_package, store, transcript):
+    def complete(task, system, prompt, **kwargs):
+        if task == plugin_package.worker.DIALECTIC_LAYER_TASK:
+            return _dialectic_json(peer=["mutated"], changed=True, fields=["user_peer_card"])
+        return _base_json()
+
+    transcript.add(SESSION, "user", "ship it", created_at=10.0)
+    _dispatch(store, transcript, SESSION, BASE, 0.0, 20.0)
+    base_worker = plugin_package.worker.LayerWorker(
+        store, transcript, complete=complete, enqueue_dialectic=False)
+    base_worker.run_once()
+    before = store.latest_base_refresh(SESSION, "user:default")
+
+    # A job that did not follow this base window (the context engine can queue one) may still
+    # emit advice, but must not overwrite an unrelated base row.
+    store.record_job(DIALECTIC, SESSION, -1.0, 100.0)
+    dialectic_worker = plugin_package.worker.LayerWorker(store, transcript, complete=complete)
+    assert dialectic_worker.run_once() == 1
+
+    after = store.latest_base_refresh(SESSION, "user:default")
+    assert after["user_peer_card"] == before["user_peer_card"]
+    assert store.base_revisions(SESSION) == []
+    assert store.pending_advisories(SESSION)
+
+
+def test_dialectic_reviews_the_base_row_for_its_own_window(
+        plugin_package, store, transcript):
+    common = dict(
+        window_from_turn=None, window_to_turn=None,
+        user_representation=json.dumps(["[goal] window"]),
+        user_peer_card=json.dumps(["window-1 peer"]),
+        ai_self_representation=json.dumps(["[done] window"]),
+        ai_identity_card=json.dumps(["careful"]),
+        session_chunk_summary=json.dumps(["[done] window"]),
+        value_markers=json.dumps({"entities": [], "trajectories": [], "experiences": [],
+                                  "tools": [], "projects": []}))
+    store.add_base_refresh(SESSION, "user:default", window_from_ts=0.0, window_to_ts=10.0,
+                           **common)
+    store.add_base_refresh(SESSION, "user:default", window_from_ts=10.0, window_to_ts=20.0,
+                           **{**common, "user_peer_card": json.dumps(["window-2 peer"])})
+    prompts: list[str] = []
+
+    def complete(task, system, prompt, **kwargs):
+        prompts.append(prompt)
+        return _dialectic_json(changed=False)
+
+    instance = plugin_package.worker.LayerWorker(store, transcript, complete=complete)
+    rows = [{"role": "user", "content": "window one", "created_at": 5.0,
+             "message_uid": "m1"}]
+    instance._merge_dialectic(rows, session=SESSION, from_ts=0.0, to_ts=10.0)
+
+    assert "window-1 peer" in prompts[0]
+    assert "window-2 peer" not in prompts[0], \
+        "a catch-up review must read its own base window, not the live one"
+
+
+def test_dialectic_route_appends_the_adviser_toolset_explicitly(
+        plugin_package, store, transcript, monkeypatch):
+    requests: list[dict] = []
+
+    def run(message, **kwargs):
+        requests.append({"message": message, **kwargs})
+        reply = (_dialectic_json() if "dialectic reviewer" in kwargs.get("system_message", "")
+                 else _base_json())
+        return type("Run", (), {"answer": reply})()
+
+    monkeypatch.setattr(plugin_package.adviser, "load_config",
+                        lambda: {"provider": "deepseek", "model": "m", "toolsets": []})
+    monkeypatch.setattr(plugin_package.agent_loop, "run", run)
+    transcript.add(SESSION, "user", "grounded by history", created_at=10.0)
+    _dispatch(store, transcript, SESSION, BASE, 0.0, 20.0)
+    instance = plugin_package.worker.LayerWorker(store, transcript)
+    assert instance.run_once() == 2
+
+    assert len(requests) == 4, "three base passes then one dialectic pass"
+    dialectic = requests[-1]
+    assert "adviser" in dialectic["toolsets"]
+    assert "dialectic reviewer" in dialectic["system_message"]
+    assert "Base-layer artifact for this window" in dialectic["message"]

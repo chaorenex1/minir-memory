@@ -14,6 +14,43 @@ def _no_model_call(*args, **kwargs):
     raise AssertionError("the layer worker must not call the model in this test")
 
 
+def _base_json(*, summary=None, user=None, peer=None, ai_self=None, identity=None,
+               markers=None):
+    """A full six-key base reply for the one-shot fallback."""
+    return json.dumps({
+        "session_chunk_summary": summary or ["deploy on Windows"],
+        "user_representation": user or ["[goal] ship"],
+        "user_peer_card": peer or ["wants evidence"],
+        "ai_self_representation": ai_self or ["direct"],
+        "ai_identity_card": identity or ["careful"],
+        "value_markers": markers or {
+            "entities": ["Windows"],
+            "trajectories": [],
+            "experiences": [],
+            "tools": ["pytest"],
+            "projects": ["minir-memory"],
+        },
+    })
+
+
+def _dialectic_json(*, text="run a smoke test", severity="concern", target="user_peer_card",
+                    advices=None, changed=False, fields=None):
+    return json.dumps({
+        "user_representation": ["[goal] ship"],
+        "user_peer_card": ["wants evidence"],
+        "ai_self_representation": ["[done] ran the smoke test"],
+        "ai_identity_card": ["careful"],
+        "session_chunk_summary": ["[done] deployed on Windows"],
+        "advices": advices if advices is not None else [{
+            "severity": severity, "target": target, "text": text,
+            "decision": "adopt it", "evidence": ["msg-1"],
+        }],
+        "value_markers": {"entities": ["Windows"], "trajectories": [], "experiences": [],
+                          "tools": ["pytest"], "projects": ["minir-memory"]},
+        "base_changed": {"changed": bool(changed), "fields": list(fields or [])},
+    })
+
+
 def test_initialize_creates_profile_scoped_store(provider, tmp_path):
     assert (tmp_path / "minir-memory" / "memory.db").exists()
 
@@ -33,12 +70,10 @@ def test_no_conversation_content_is_persisted_anywhere(plugin_package, make_prov
     """The provider's whole point of honour: turns are reasoned over in memory and dropped."""
     monkeypatch.setenv("MINIR_REASONING_ENABLED", "true")
     monkeypatch.setattr(plugin_package.worker, "call_model", lambda task, *args, **kwargs: (
-        "## Adviser Review\n- r\n\n## Constraints\n- c\n\n## Preferences\n- p\n\n"
-        "## Second Brain\n- [tool] t"
+        _dialectic_json()
         if task == plugin_package.worker.DIALECTIC_LAYER_TASK else
-        "## Session Summary\n- s\n\n## User Representation\n- [goal] x\n\n"
-        "## User Peer Card\n- y\n\n## AI Self Representation\n- direct\n\n"
-        "## AI Identity Card\n- careful"))
+        _base_json(summary=["s"], user=["[goal] x"], peer=["y"],
+                   ai_self=["direct"], identity=["careful"])))
     provider = make_provider({"base_interval": 1, "dialectic_interval": 1})
     provider.on_turn_start(1, "m")
     provider.sync_turn("the secret sauce is a staging cluster in Frankfurt", "noted")
@@ -258,15 +293,14 @@ def _jobs(provider):
     return [(job["layer"], job["turns"]) for job in provider._store.pending_jobs()]
 
 
-def test_turn_start_queues_layer_jobs(make_provider):
+def test_turn_start_queues_base_jobs_only(make_provider):
+    """Dialectic is dependent: the worker queues it after the base job publishes, not on a tick."""
     provider = make_provider({"base_interval": 3, "dialectic_interval": 2})
     for turn in range(1, 7):
         provider.on_turn_start(turn, f"message {turn}")
     jobs = provider._store.pending_jobs()
     assert [(job["layer"], job["turns"], job["session_id"]) for job in jobs] == [
-        ("dialectic", 2, "session-test"), ("base", 3, "session-test"),
-        ("dialectic", 4, "session-test"), ("base", 6, "session-test"),
-        ("dialectic", 6, "session-test")]
+        ("base", 3, "session-test"), ("base", 6, "session-test")]
     assert all(job["status"] == "pending" and job["from_ts"] <= job["to_ts"] for job in jobs)
 
 
@@ -276,20 +310,22 @@ def test_new_session_ordering_keeps_the_tail(plugin_package, make_provider):
     must not swallow it — and the later ``on_session_reset`` must not duplicate it."""
     provider = make_provider({"base_interval": 10, "dialectic_interval": 3})
     for turn in range(1, 5):
-        provider.on_turn_start(turn, "m")                    # dialectic job at turn 3
+        provider.on_turn_start(turn, "m")
+    provider._transcript.add_turn("session-test", "tail before /new", "noted")
     plugin_package._on_session_finalize(session_id="session-test")   # frozen first
     provider.on_session_end([])                              # ... tail arrives after
     plugin_package._on_session_reset(session_id="session-next", old_session_id="session-test")
-    assert _jobs(provider) == [("dialectic", 3), ("dialectic", 4)]
+    assert _jobs(provider) == [("base", 4)]
 
 
 def test_session_end_flushes_the_tail_once(make_provider):
     provider = make_provider({"base_interval": 10, "dialectic_interval": 3})
     for turn in range(1, 5):
         provider.on_turn_start(turn, "m")
+    provider._transcript.add_turn("session-test", "tail", "noted")
     provider.on_session_end([])
     provider.on_session_end([])  # a second boundary hook must not re-queue the window
-    assert _jobs(provider) == [("dialectic", 3), ("dialectic", 4)]
+    assert _jobs(provider) == [("base", 4)]
 
 
 def test_session_end_on_a_multiple_queues_no_extra_job(make_provider):
@@ -297,44 +333,47 @@ def test_session_end_on_a_multiple_queues_no_extra_job(make_provider):
     provider = make_provider({"base_interval": 10, "dialectic_interval": 3})
     for turn in range(1, 4):
         provider.on_turn_start(turn, "m")
+    provider._transcript.add_turn("session-test", "tail", "noted")
     provider.on_session_end([])
-    assert _jobs(provider) == [("dialectic", 3)]
+    assert _jobs(provider) == [("base", 3)]
 
 
 def test_pre_compress_flushes_tail_without_ending_the_session(make_provider):
     provider = make_provider({"base_interval": 50, "dialectic_interval": 2})
     for turn in range(1, 4):
-        provider.on_turn_start(turn, "m")               # dialectic job at turn 2
+        provider.on_turn_start(turn, "m")
+    provider._transcript.add_turn("session-test", "tail", "noted")
     assert provider.on_pre_compress([]) == ""
-    assert _jobs(provider) == [("dialectic", 2), ("dialectic", 3)]  # turn 3 flushed by the boundary
+    assert _jobs(provider) == [("base", 3)]  # the boundary drain owns the unbased tail
     for turn in (4, 5):
         provider.on_turn_start(turn, "m")               # counting continues after compression
-    assert _jobs(provider) == [("dialectic", 2), ("dialectic", 3), ("dialectic", 5)]
+    assert _jobs(provider) == [("base", 3)]
 
 
 def test_session_reset_flushes_old_tail_and_opens_new_session(plugin_package, make_provider):
     provider = make_provider({"base_interval": 10, "dialectic_interval": 3, "session_mode": "coding"})
     for turn in range(1, 5):
         provider.on_turn_start(turn, "m")
+    provider._transcript.add_turn("session-test", "tail", "noted")
     provider.on_session_switch("session-next", parent_session_id="session-test", reset=True)
     # The plugin hook fires after the provider switch for the same boundary: still one job.
     plugin_package._on_session_reset(session_id="session-next", old_session_id="session-test")
-    assert _jobs(provider) == [("dialectic", 3), ("dialectic", 4)]
+    assert _jobs(provider) == [("base", 4)]
     state = plugin_package.turn_counter.TRACKER.snapshot("session-next")
     assert (state["mode"], state["layers"]["base"]["turns"]) == ("coding", 0)
     assert plugin_package.turn_counter.TRACKER.tick("session-test", 5, now=1.0) == []
 
 
 def test_branch_inherits_parent_counters(make_provider):
-    provider = make_provider({"base_interval": 10, "dialectic_interval": 3})
+    provider = make_provider({"base_interval": 3, "dialectic_interval": 3})
     for turn in range(1, 5):
-        provider.on_turn_start(turn, "m")           # dialectic job at turn 3
+        provider.on_turn_start(turn, "m")           # base job at turn 3
     provider.on_session_switch("branch-1", parent_session_id="session-test", reset=False)
     assert provider._session_id == "branch-1"
     for turn in (5, 6):
         provider.on_turn_start(turn, "m")
     jobs = provider._store.pending_jobs()
-    assert [(job["layer"], job["turns"]) for job in jobs] == [("dialectic", 3), ("dialectic", 6)]
+    assert [(job["layer"], job["turns"]) for job in jobs] == [("base", 3), ("base", 6)]
     assert jobs[0]["to_ts"] == jobs[1]["from_ts"]   # the branch continues the parent's window
 
 
@@ -350,7 +389,7 @@ def test_layer_intervals_can_be_set_by_env(make_provider, monkeypatch):
     provider = make_provider({"base_interval": 99, "dialectic_interval": 99})
     for turn in (1, 2):
         provider.on_turn_start(turn, "m")
-    assert _jobs(provider) == [("dialectic", 1), ("base", 2), ("dialectic", 2)]
+    assert _jobs(provider) == [("base", 2)]
 
 
 def test_layer_settings_come_from_config_yaml(plugin_package, monkeypatch, tmp_path):
@@ -373,9 +412,9 @@ def test_layer_settings_come_from_config_yaml(plugin_package, monkeypatch, tmp_p
         tracker = plugin_package.turn_counter.TRACKER
         assert (tracker.base_interval, tracker.dialectic_interval) == (4, 2)
         assert tracker.snapshot("session-test")["mode"] == "from-config"
-        for turn in (1, 2):
-            provider.on_turn_start(turn, "m")  # dialectic interval 2; base needs 4
-        assert _jobs(provider) == [("dialectic", 2)]
+        for turn in range(1, 5):
+            provider.on_turn_start(turn, "m")  # base interval 4
+        assert _jobs(provider) == [("base", 4)]
     finally:
         provider.shutdown()
 
@@ -395,11 +434,11 @@ def test_subagent_session_start_does_not_disturb_the_bound_session(plugin_packag
 
 
 def test_stats_report_layer_counters_and_jobs(provider):
-    for turn in range(1, 11):
+    for turn in range(1, 21):
         provider.on_turn_start(turn, "m")
     stats = json.loads(provider.handle_tool_call("minir_stats", {}))
     assert (stats["jobs"], stats["pending_jobs"]) == (1, 1)
-    assert stats["layers"]["layers"]["dialectic"]["turns"] == 10
+    assert stats["layers"]["layers"]["dialectic"]["turns"] == 20
     assert stats["layers"]["layers"]["base"]["interval"] == 20
     assert stats["reasoning_enabled"] is False  # the test bootstrap disables the model calls
     assert stats["artifacts"] == []
@@ -420,7 +459,7 @@ def test_a_boundary_drains_content_the_cadence_already_flushed(plugin_package, m
 
     provider.on_session_end([])
     jobs = provider._store.pending_jobs()
-    assert [job["layer"] for job in jobs] == ["base", "dialectic"], "both layers owed that turn"
+    assert [job["layer"] for job in jobs] == ["base"], "the base layer owes that turn"
     # The queued window starts at the content watermark and reaches forward, so the next drain
     # actually sees the turn the cadence had already counted.
     for job in jobs:
@@ -444,7 +483,8 @@ def test_prefetch_injects_only_the_dialectic_artifact(provider):
                                     "## Session Summary\n- s\n\n## User Representation\n- [fact] f\n\n"
                                     "## User Peer Card\n- works on Windows\n\n"
                                     "## AI Self Representation\n- direct\n\n"
-                                    "## AI Identity Card\n- terse")
+                                    "## AI Identity Card\n- terse\n\n"
+                                    "## Value Markers\n- [tool] pytest")
     provider._store.put_layer_state("dialectic", "agent:minir",
                                     "## Adviser Review\n- run a smoke test\n\n"
                                     "## Constraints\n- never edit outside the repo\n\n"
@@ -454,9 +494,10 @@ def test_prefetch_injects_only_the_dialectic_artifact(provider):
     assert "### Agent model (v1)" in block
     assert "### User model" not in block
     assert "run a smoke test" in block
+    assert "never edit outside the repo" not in block
     assert "works on Windows" not in block and "## User Peer Card" not in block
     status = provider.recall_status()
-    assert status is not None and status.count == 4, "one item per injected dialectic bullet"
+    assert status is not None and status.count == 1, "only the current review is injected"
 
 
 def test_an_oversized_message_cannot_empty_or_own_the_budget(plugin_package):
@@ -520,12 +561,9 @@ def test_layer_reasoning_runs_end_to_end(plugin_package, make_provider, monkeypa
     """Reasoning enabled: a turn ends, both layers publish, and prefetch carries only the agent one."""
     monkeypatch.setenv("MINIR_REASONING_ENABLED", "true")
     monkeypatch.setattr(plugin_package.worker, "call_model", lambda task, system, prompt, **kw: (
-        "## Adviser Review\n- ran a smoke test\n\n## Constraints\n- keep answers terse\n\n"
-        "## Preferences\n- act first\n\n## Second Brain\n- [tool] pytest"
+        _dialectic_json(text="run a smoke test")
         if task == plugin_package.worker.DIALECTIC_LAYER_TASK else
-        "## Session Summary\n- deploy on Windows\n\n## User Representation\n- [goal] ship\n\n"
-        "## User Peer Card\n- wants evidence\n\n## AI Self Representation\n- direct\n\n"
-        "## AI Identity Card\n- careful"))
+        _base_json()))
 
     provider = make_provider({"base_interval": 1, "dialectic_interval": 1}, agent_identity="Masía")
     provider.on_turn_start(1, "m")
@@ -537,7 +575,7 @@ def test_layer_reasoning_runs_end_to_end(plugin_package, make_provider, monkeypa
     subjects = sorted(state["subject"] for state in provider._store.all_layer_states())
     assert subjects == ["agent:Masía", "user:default"]
     block = provider.prefetch("q")
-    assert "ran a smoke test" in block and "keep answers terse" in block
+    assert "run a smoke test" in block
     assert "wants evidence" not in block, "base cards are search-only"
 
 
@@ -550,7 +588,7 @@ def test_reasoning_disabled_never_calls_the_model(plugin_package, make_provider,
     provider.on_turn_start(1, "m")
     provider.sync_turn("deploy on Windows", "noted")
     provider.on_session_end([])
-    assert len(provider._store.pending_jobs()) == 2  # queued, never drained
+    assert len(provider._store.pending_jobs()) == 1  # the base job is queued, never drained
     assert provider._store.all_layer_states() == []
 
 
@@ -580,11 +618,23 @@ def test_register_wires_the_provider_and_its_hooks(plugin_package):
 
 # -- cold start, review injection, metrics ------------------------------------
 
-def test_cold_start_is_gated_to_the_primary_bound_session(plugin_package, make_provider, monkeypatch):
+def test_cold_start_is_gated_to_the_primary_bound_session(
+        plugin_package, make_provider, monkeypatch, tmp_path):
     monkeypatch.setenv("MINIR_REASONING_ENABLED", "true")
     provider = make_provider({"dialectic_depth": 1})
     provider._worker._enabled = False  # inspect the queue, do not race a background drain
     provider._identity = "I am Masía."  # the context that makes a cold start meaningful
+    connection = sqlite3.connect(str(tmp_path / "state.db"))
+    try:
+        connection.executescript(
+            "CREATE TABLE messages (id INTEGER PRIMARY KEY, session_id TEXT, role TEXT,"
+            " content TEXT, timestamp REAL);")
+        connection.execute(
+            "INSERT INTO messages (session_id, role, content, timestamp) VALUES (?, ?, ?, ?)",
+            ("session-test", "user", "existing history", time.time()))
+        connection.commit()
+    finally:
+        connection.close()
 
     plugin_package._on_session_start(session_id="child", provider=provider)
     assert provider._store.pending_jobs() == [], "a child session must not queue a model job"
@@ -592,7 +642,7 @@ def test_cold_start_is_gated_to_the_primary_bound_session(plugin_package, make_p
     plugin_package._on_session_start(session_id="session-test", provider=provider)
     jobs = provider._store.pending_jobs()
     assert [(job["layer"], job["turns"], job["session_id"]) for job in jobs] == [
-        ("dialectic", 0, "session-test")]
+        ("base", 0, "session-test")]
 
 
 def test_cold_start_rejects_a_non_primary_agent_context(plugin_package, make_provider, monkeypatch):
@@ -626,6 +676,50 @@ def test_review_is_injected_once_per_turn(plugin_package, make_provider):
         parent_session_id="parent") is None
 
 
+def test_pending_advices_are_injected_once(plugin_package, provider):
+    provider._store.add_advisories("session-test", [
+        {"severity": "nit", "target": "general", "content": "polish the wording",
+         "decision": "keep or trim", "evidence": ["m1"]},
+        {"severity": "blocker", "target": "user_peer_card",
+         "content": "verify the deploy target before deleting", "decision": "confirm the path",
+         "evidence": ["m2"]},
+    ])
+    block = plugin_package._on_pre_llm_call(
+        session_id="session-test", turn_id="turn-1", provider=provider)
+    assert block and "[minir adviser — advisory only]" in block
+    assert "verify the deploy target" in block and "polish the wording" in block
+    assert block.index("verify the deploy target") < block.index("polish the wording"), \
+        "blockers are delivered before nits"
+    assert provider._store.pending_advisories("session-test") == []
+    assert plugin_package._on_pre_llm_call(
+        session_id="session-test", turn_id="turn-2", provider=provider) is None, \
+        "an existing advice ledger suppresses the legacy review fallback"
+
+
+def test_advice_injection_leaves_overflow_pending(plugin_package, provider):
+    provider._store.add_advisories("session-test", [
+        {"severity": "concern", "target": "general",
+         "content": f"advice {index} " + "x" * 380, "decision": "d" * 180}
+        for index in range(6)
+    ])
+    first = provider.advisory_block("session-test", "turn-1")
+    assert first and len(first) <= 900
+    pending = provider._store.pending_advisories("session-test")
+    assert 0 < len(pending) < 6, "the budget must defer the overflow, not drop it"
+    delivered = first.count("- [")
+    assert delivered == 6 - len(pending), "only the lines actually injected may be marked"
+
+    second = provider.advisory_block("session-test", "turn-2")
+    assert second and len(second) <= 900
+    assert len(provider._store.pending_advisories("session-test")) < len(pending)
+
+    for turn in range(3, 10):
+        if not provider.advisory_block("session-test", f"turn-{turn}"):
+            break
+    assert provider._store.pending_advisories("session-test") == [], \
+        "draining repeatedly must eventually deliver every advice"
+
+
 def test_post_tool_call_aggregates_metrics(plugin_package, make_provider):
     provider = make_provider({})
     for duration in (10, 30):
@@ -646,12 +740,11 @@ def test_layers_reason_from_host_history_and_publish_searchable_sections(
     """The restart-durable path: a job reads state.db, not the in-process buffer."""
     monkeypatch.setenv("MINIR_REASONING_ENABLED", "true")
     monkeypatch.setattr(plugin_package.worker, "call_model", lambda task, system, prompt, **kw: (
-        "## Adviser Review\n- ran the deploy smoke test\n\n## Constraints\n- never edit outside the repo\n\n"
-        "## Preferences\n- act first\n\n## Second Brain\n- [project] kubernetes deploy"
+        _dialectic_json(text="ran the deploy smoke test")
         if task == plugin_package.worker.DIALECTIC_LAYER_TASK else
-        "## Session Summary\n- kubernetes deploy\n\n## User Representation\n- [goal] deploy the cluster\n\n"
-        "## User Peer Card\n- wants evidence\n\n## AI Self Representation\n- direct\n\n"
-        "## AI Identity Card\n- careful with user files"))
+        _base_json(summary=["kubernetes deploy"], user=["[goal] deploy the cluster"],
+                   peer=["wants evidence"], ai_self=["direct"],
+                   identity=["careful with user files"])))
     provider = make_provider({"base_interval": 1, "dialectic_interval": 1})
     state_path = tmp_path / "state.db"
     connection = sqlite3.connect(str(state_path))
@@ -689,7 +782,8 @@ def test_search_never_exposes_a_conclusion_as_a_forgettable_note(plugin_package,
         "base", "user:default",
         "## Session Summary\n- deploy\n\n## User Representation\n- [goal] deploy\n\n"
         "## User Peer Card\n- terse\n\n## AI Self Representation\n- direct\n\n"
-        "## AI Identity Card\n- careful", session_id="session-test")
+        "## AI Identity Card\n- careful\n\n## Value Markers\n- [tool] pytest",
+        session_id="session-test")
     payload = json.loads(provider.handle_tool_call("minir_search", {"query": "deploy"}))
     conclusion = next(row for row in payload["results"] if row["kind"].startswith("base."))
     assert "id" not in conclusion and "note_id" not in conclusion
@@ -720,8 +814,8 @@ def test_boundary_queues_a_state_db_tail_after_the_buffer_was_lost(
 
     provider.on_session_end([])
     jobs = provider._store.pending_jobs()
-    assert {(job["layer"], job["session_id"]) for job in jobs} >= {
-        ("base", "session-test"), ("dialectic", "session-test")}
+    assert {(job["layer"], job["session_id"]) for job in jobs} == {
+        ("base", "session-test")}
 
 
 def test_prefetch_does_not_inject_another_sessions_review_or_summary(provider):
@@ -729,7 +823,7 @@ def test_prefetch_does_not_inject_another_sessions_review_or_summary(provider):
         "base", "user:default",
         "## Session Summary\n- old session secret\n\n## User Representation\n- [goal] old goal\n\n"
         "## User Peer Card\n- durable trait\n\n## AI Self Representation\n- old stance\n\n"
-        "## AI Identity Card\n- durable identity",
+        "## AI Identity Card\n- durable identity\n\n## Value Markers\n- [tool] durable tool",
         session_id="other-session")
     provider._store.put_layer_state(
         "dialectic", "agent:minir",
@@ -737,11 +831,8 @@ def test_prefetch_does_not_inject_another_sessions_review_or_summary(provider):
         "## Preferences\n- durable preference\n\n## Second Brain\n- [project] durable project",
         session_id="other-session")
     block = provider.prefetch("q")
-    assert "durable constraint" in block and "durable project" in block
-    assert "old advice" not in block
-    assert "durable trait" not in block and "durable identity" not in block
-    assert "old session secret" not in block
-    assert "old goal" not in block and "old stance" not in block
+    assert block == "", "another session's review and base cards are not injectable"
+    assert "durable constraint" not in block and "durable project" not in block
 
 
 def test_prefetch_never_injects_durable_base_cards_from_fts(provider):
@@ -777,7 +868,7 @@ def test_prefetch_does_not_inject_any_base_artifact(provider):
         "base", "user:default",
         "## Session Summary\n- OLD PROJECTION\n\n## User Representation\n- [goal] current\n\n"
         "## User Peer Card\n- durable preference\n\n## AI Self Representation\n- direct\n\n"
-        "## AI Identity Card\n- careful")
+        "## AI Identity Card\n- careful\n\n## Value Markers\n- [tool] pytest")
     block = provider.prefetch("q")
     assert block == ""
     assert "durable preference" not in block

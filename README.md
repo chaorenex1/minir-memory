@@ -7,15 +7,19 @@ and grow into a real provider.
 It keeps explicit notes and every derived conclusion in a per-profile SQLite database, recalls
 them through an FTS5 trigram index (CJK-safe, with a token-scan fallback), and exposes four tools
 (`minir_search`, `minir_remember`, `minir_forget`, `minir_stats`). On top of that it runs the
-**base / dialectic reasoning layers**: the turn counter queues a job every *n* turns, a background
-worker reasons over that window from the host's own history with the auxiliary model, and the
-merged per-layer conclusion is injected into later turns.
+**base / dialectic reasoning layers**: the turn counter queues a base job every *n* turns, a
+background worker builds the user/AI cards from the host's own history, and a dependent dialectic
+pass reviews those cards against that history. The review can correct the base artifact (a
+pre-overwrite snapshot and an FTS index are kept) and emits severity-ranked advices, which are
+injected into later turns for the main session or the user to decide.
 
 **It stores no transcripts.** The worker reads `(from_ts, to_ts]` messages from
 `$HERMES_HOME/state.db` read-only (plus the in-process buffer for turns not yet committed) and
-persists only what the layers *derived* from them plus notes you asked to keep. Because the host
-store is the source of truth, a job queued before a restart can still be completed; only when no
-`state.db` exists are inherited jobs expired.
+persists only what the layers *derived* from them plus notes you asked to keep. Derived content
+may quote or reference the messages it reasoned over — it is a derived artifact, not a redacted
+one — but the provider never copies the conversation itself. Because the host store is the source
+of truth, a job queued before a restart can still be completed; only when no `state.db` exists are
+inherited jobs expired.
 
 The same directory also ships a **context engine** for progressive, lossless context management:
 on every dialectic beat it moves the oldest unprotected slice of the window into a compact carrier
@@ -31,11 +35,11 @@ pyproject.toml         package metadata, pytest config, pip entry point
 plugin/minir/          the deployable plugin directory (copy this to plugins/minir)
   plugin.yaml          manifest (name/version/description + metadata)
   __init__.py          register(ctx) + MinirMemoryProvider + the engine export
-  store.py             SQLite storage: notes, conclusions + FTS5, jobs, metrics
+  store.py             SQLite storage: notes, conclusions + FTS5, base revisions/advices, jobs, metrics
   history.py           read-only host history, profile resolution, identity files
   transcript.py        in-memory, bounded window of the session's messages (never persisted)
   turn_counter.py      base / dialectic layer turn counters + job windows
-  worker.py            drains jobs into five-section/dialectic artifacts at depth 1-3
+  worker.py            drains base jobs, then the dependent dialectic review (base corrections + advices)
   handoff.py           Task Handoff compression prompt + validation
   cadence.py           the dialectic beat, shared by the provider and the engine
   context_engine.py    progressive lossless context management (context.engine: minir)
@@ -74,7 +78,7 @@ Hermes loads memory providers by **name**, one at a time:
 | `on_session_switch(...)` | `/resume`, `/branch`, `/reset`, `/new`, compression | rebind per-session state; `reset=True` means a new conversation, a non-empty `parent_session_id` marks a branch |
 | `get_config_schema()` | `hermes memory setup` | env-var-only fields keep it simple (see below) |
 | `on_turn_start(turn_number, message, **kw)` | before each user turn | **the counting tick** — the host's own per-session turn number; never fires for a subagent/cron turn |
-| `on_session_end(messages)` | real session boundary | freeze the session + drain both layers (counted tail *and* any content no job covered) |
+| `on_session_end(messages)` | real session boundary | freeze the session + drain the base layer (counted tail *and* any content no job covered); the dialectic review follows the base job |
 | `on_pre_compress(messages)` | before compression | same drain, without freezing; must return a string (this one returns `""`) |
 | `on_delegation`, `backup_paths` | optional | not implemented here — read the ABC before opting in |
 
@@ -89,10 +93,10 @@ both surfaces:
 
 | Hook | Used for |
 | --- | --- |
-| `on_session_start(session_id=, model=, platform=)` | record the session; queue one cold-start dialectic job, gated to the bound primary session |
+| `on_session_start(session_id=, model=, platform=)` | record the session; queue one cold-start *base* job when history exists, gated to the bound primary session |
 | `on_session_reset(session_id=, old_session_id=, reason=)` | `/new`, `/reset`: stop the old counters, initialize the new session |
 | `on_session_finalize(session_id=)` | process teardown: stop counting, flush tool metrics |
-| `pre_llm_call` | inject the latest session-scoped Adviser Review into the user message, once per turn id |
+| `pre_llm_call` | inject pending dialectic advices into the user message; fall back to the legacy session review only when no advice ledger exists |
 | `post_llm_call` / `post_tool_call` | per-turn logging; `post_tool_call` also aggregates tool counters |
 
 Every hook `register()` subscribes to must also be listed under `provides_hooks:` in
@@ -111,49 +115,79 @@ back to the process-wide active provider, since the host can construct the plugi
 
 ## The two layers (base / dialectic)
 
-`turn_counter.py` keeps two counters per session — one per layer — and turns them into *jobs*:
-"reason over session X's history in `(from_ts, to_ts]`". A job is one row in the store's `jobs`
-table; `worker.py` drains it from the host's `state.db` (plus the uncommitted buffer), calls the
-auxiliary model, and publishes a merged artifact into `layer_state` and its sections into the
-FTS-indexed `conclusions` table. Each base refresh also appends one structured row to
-`base_refreshes` (session, time window, turn window, the five outputs, `is_latest`).
-`prefetch()` injects only the newest dialectic (agent) artifact
-ahead of recall, so the next turn sees how this agent should work — without the conversations it
-was derived from. Base-layer artifacts are deliberately **not injected**; their cards remain
-recallable through `minir_search`.
+`turn_counter.py` keeps two counters per session. The base counter turns its cadence into *jobs*
+("reason over session X's history in `(from_ts, to_ts]`"); the dialectic counter still advances
+(the context engine reads its beat), but its tick triggers are filtered — the worker queues the
+review itself, with the exact window the base job just published. A job is one row in the store's
+`jobs` table; `worker.py` drains it from the host's `state.db` (plus the uncommitted buffer),
+calls the auxiliary model, and publishes into `layer_state`/`conclusions`. Each base refresh also
+appends one structured row to `base_refreshes` (session, time window, actual turn range, the six
+outputs, `is_latest`); one base window has one job.
+`prefetch()` injects only the newest dialectic review (`## Adviser Review`, bounded to 1200 chars)
+ahead of recall. The six base cards are deliberately **not injected**; they remain recallable
+through `minir_search`. Pending advices are the actionable channel and are injected by
+`pre_llm_call` (bounded to 900 chars; blockers first), once per advice id.
 
 | Layer | Models | Artifact sections | Subject key |
 | --- | --- | --- | --- |
-| base | one participant: first message + window + previous user/AI cards, three staged passes on `auxiliary.adviser` | `## Session Summary`, `## User Representation`, `## User Peer Card`, `## AI Self Representation`, `## AI Identity Card` | `user:<author_id \| author \| user_id>` |
-| dialectic | this AI's adviser review, constraints/preferences, second brain | `## Adviser Review`, `## Constraints`, `## Preferences`, `## Second Brain` | `agent:<agent_identity \| minir>` |
+| base | this profile's user: window + previous user/AI cards, three staged JSON passes on `auxiliary.adviser` | `## Session Summary`, `## User Representation`, `## User Peer Card`, `## AI Self Representation`, `## AI Identity Card`, `## Value Markers` | `user:<user_id \| default>` |
+| dialectic | the latest base artifact + history up to the window; reviews drift in all six fields and emits advices | `## Adviser Review` only (base cards stay on the base layer) | `agent:<agent_identity \| minir>` |
 
-Each refresh is a **merge**: the model receives the previous artifact plus the window and returns
-the complete updated artifact, so contradictions are resolved and duplicates collapse instead of
-piling up. The dialectic layer runs `dialectic_depth` passes: d1 synthesizes, d2 audits its own
-draft against the window, d3 reconciles the two. A failed or malformed audit falls back to the last
-valid pass. `layer_state.version` counts the refreshes; the newest version is what gets injected
-(bounded to 1200 chars) next to the recall block (bounded to 2000).
+The dialectic job is **dependent**: a successful base refresh queues the matching review with the
+same `(from_ts, to_ts]`, so the reviewer always sees a published base row. It runs an eight-key JSON
+contract: the six base fields, `advices`, `value_markers`, and `base_changed`
+(`{changed, fields}`). The pass count is adaptive — short windows get one synthesis, longer ones add
+a self-audit and a reconcile, capped by `dialectic_depth`. A failed or malformed pass falls back to
+the last valid one. `layer_state.version` counts refreshes; the newest review is what `prefetch`
+injects.
 
-A base refresh runs **three ordered passes** per participant on the `auxiliary.adviser` route
-(the adviser toolset is always attached, so a pass can use `adviser_session_search`):
+A base refresh runs **three ordered passes** on the `auxiliary.adviser` route. Each pass returns
+**one JSON object** (no Markdown); the worker validates the keys/arrays and renders the six fixed
+sections for the artifact and the chunk chain. The adviser toolset is attached only on this route,
+and the tool hint carries the window bounds: a pass may call `adviser_session_search` with
+`after`/`before` for evidence inside `(from_ts, to_ts]`, but must not read later turns. The first
+user message is the only allowed outside-window evidence, and only on the first refresh.
 
-1. **user cards** — the session's first user message (intent anchor) + previous
-   `## User Representation`/`## User Peer Card` + this window → the user's need path and durable
-   preferences;
+1. **user cards** — previous `## User Representation`/`## User Peer Card` + this window (+ the
+   first user message as intent anchor on bootstrap) → JSON keys `user_representation`,
+   `user_peer_card`;
 2. **AI cards** — the user cards just derived + previous `## AI Self Representation`/
-   `## AI Identity Card` + operator identity/preference files + this window → the AI's action
-   state on that need path (`[done]`/`[in-progress]`/`[blocked]`/`[next]`), the value it produced
-   (`[entity]`/`[trajectory]`/`[experience]`/`[tool]`/`[project]`) and its stable identity;
-3. **local summary** — the user/AI cards + this window → `## Session Summary`, the local
-   compression record appended to the chunk chain.
+   `## AI Identity Card` + operator identity/preference files + this window → JSON keys
+   `ai_self_representation`, `ai_identity_card`; the self section carries the action state
+   (`[done]`/`[in-progress]`/`[blocked]`/`[next]`) and produced value
+   (`[entity]`/`[trajectory]`/`[experience]`/`[tool]`/`[project]`);
+3. **local summary + markers** — the user/AI cards + this window → JSON keys
+   `session_chunk_summary` (local compression record) and `value_markers`, a five-key object
+   (`entities`, `trajectories`, `experiences`, `tools`, `projects`). Markers record the
+   session information worth keeping long-term; all five keys are always present and an empty
+   array means “no item of this type”.
 
-First refresh means no previous artifact for that subject: it bootstraps from the first message and
-the window instead of merging. Later refreshes merge the previous cards, so the durable peer and
-identity cards accumulate while the current-focus/self sections track the latest state. The five
-outputs are stored together in `base_refreshes`; `is_latest=1` marks the active row per
-`(session_id, subject)`, older windows stay queryable as history (`base_refreshes()` /
-`latest_base_refresh()` in `store.py`). A `(session, subject, from_ts, to_ts)` retry updates the
-same row rather than duplicating it.
+First refresh means no previous artifact for this user subject: it bootstraps from the window
+(plus the first-message anchor) instead of merging. Later refreshes merge the previous cards, so
+the durable peer and identity cards accumulate while the current-focus/self sections track the
+latest state. `value_markers` are session-bound and cumulative: each pass receives the previous
+markers and merges this window into them; a new session starts empty. One base window has one
+job; an exact repeat dispatch returns the existing job instead of refreshing the same window
+twice.
+
+The six outputs are stored together in `base_refreshes` as JSON text (`value_markers` is a
+five-key JSON object; the other five are JSON string arrays). The `layer_state` artifact,
+`conclusions` sections and chunk chain render the same data as Markdown bullets for prompts and
+recall.
+`is_latest=1` marks the row with the greatest `window_to_ts` per `(session_id, subject)` — window
+order, not write order, so a slow older window that finishes late is history, never "latest".
+`window_from_turn`/`window_to_turn` record the session turns the window actually covered (one user
+message is one turn), extending past the dispatch stamp when the newest job drained newer messages.
+Older windows stay queryable as history (`base_refreshes()` / `latest_base_refresh()` in
+`store.py`). A `(session, subject, from_ts)` retry updates the same row/chunk; the retry reuses the
+chunk's turn range and never treats its own chunk as the previous window.
+
+`base_refreshes` also has its own external-content FTS5 table over the six outputs
+(`base_refreshes_fts`, trigram). `search_base_refreshes()` supports session/history filtering and
+`latest_only`; like `minir_search`, it falls back to `LIKE` when FTS5 is unavailable **and when all
+query terms are shorter than three characters** (common Chinese queries such as `工具`, which
+trigram cannot match). The `conclusions_fts` index remains the recall index for the rendered
+sections; `base.value_markers` is indexed there too.
 
 The base layer's `## Session Summary` is **not an independent summary**: every base refresh writes
 one `session_chunk_summary` (session + time range + turn range) to the canonical local-compression
@@ -161,22 +195,53 @@ chain, and the artifact's section projects **only the newest active chunk** — 
 record. Older chunks stay as independent rows with their turn range and remain searchable by
 `minir_search` inside their own session, even after a final summary supersedes them; they are not
 re-projected into the live artifact. The previous projection is deliberately omitted from the next
-base merge prompt (only the other four sections carry forward), so chunks do not recursively copy
-the whole chain. The dialectic worker reads the full active chain and is instructed to reconcile
+base merge prompt (only the other five sections carry forward), so chunks do not recursively copy
+the whole chain. The dialectic worker reads the active chain up to its review window and is
+instructed to reconcile
 contradictions across chunks (later evidence wins; stale claims and completed blockers are
 removed). `base.session_summary` is not written as a competing FTS conclusion.
 
+### Dialectic review, base corrections, and advices
+
+The dialectic prompt receives the base artifact for *its* review window (a catch-up drain may
+already have published a newer one), the previous review, the operator files, the chunk chain up
+to that window, and the window's messages (tool rows included). It may call `adviser_session_search` with
+`before=<window end>` to inspect earlier history for drift; it never reads later turns. The review
+logic is explicit per field: user representation drift, peer-card gaps/constraints, AI action state,
+and identity/preference conflicts that explain an underperforming action state. Advices are
+forward-looking decisions for the main session or the user — never a restatement of established
+facts — with `severity` (`nit`/`concern`/`blocker`), `target`, `evidence`, and `decision`.
+
+When `base_changed.fields` is non-empty, the six corrected values overwrite the base row **in one
+transaction**:
+
+1. the current six fields + advices are snapshotted into `base_revisions` (with the affected
+   `base_refresh_id`, window/turn ranges, `changed_fields`, `source_job_id`, `is_latest`);
+2. the changed columns of `base_refreshes` are updated in place (window order and `is_latest` are
+   unchanged);
+3. the base `layer_state` artifact is rewritten from the corrected fields, and its
+   `conclusions` sections are updated.
+
+`base_revisions_fts` is an external-content trigram index over the six snapshot fields plus
+`advices` (seven columns), so a previous model state and the advice that changed it are both
+recallable with `search_base_revisions()`. Advices also go to the `advisories` delivery ledger
+(severity/target/fingerprint/status); `pre_llm_call` drains pending rows, blockers first, and marks
+them injected. A base correction never changes which window is `is_latest`; an operator-authored
+identity still wins over any inference.
+
 The model may be told who the assistant is from
 `$HERMES_HOME/minir-memory/agents/<profile>/identity.md` and `preference.md`; the profile comes from
-`sessions.profile_name`. Operator-authored identity wins over inference. The session-init dialectic
-call is gated to the provider's bound primary session and is skipped for subagents/cron, which fire
-the same plugin hook.
+`sessions.profile_name`. Operator-authored identity wins over inference. Session init queues a
+**base** refresh when history exists (the dialectic review follows it); the call is gated to the
+provider's bound primary session and is skipped for subagents/cron, which fire the same plugin
+hook.
 
-The reasoning pass is strict on purpose: the model must return the layer's fixed headings, in
-order, with at least one bullet. Anything else **fails the job** and leaves the previous artifact
-in place — a malformed artifact would otherwise replace a good one in every later prompt. A
-failed job is retried once (the cached content is still there) and, if it fails again, the next
-job of that layer re-covers the same content (the content watermark never moved).
+Both layers are strict on purpose: base passes must return their staged JSON keys/arrays, and the
+dialectic pass must return all eight keys with non-empty cards. Anything else **fails the job** and
+leaves the previous artifact in place — a malformed artifact would otherwise replace a good one in
+every later prompt. A failed job is retried once (the cached content is still there) and, if it
+fails again, the next job of that layer re-covers the same content (the content watermark never
+moved).
 
 * **Tick** — `on_turn_start` advances both counters with the host's turn number
   (`max(local + 1, host)`, so a `/resume` that rehydrates the host count moves forward instead of
@@ -199,14 +264,15 @@ job of that layer re-covers the same content (the content watermark never moved)
   the newest `state.db` row, so the newest job always drains everything available. The next job or the boundary drain
   therefore covers the trigger turn, exactly once, and a re-queued window reads the same content
   again.
-* **Boundaries** — `on_session_end` (and `on_pre_compress`) do two things: flush the dialectic
-  layer's counted tail (the spec's "no trigger on a multiple": when the counter already sits on a
+* **Boundaries** — `on_session_end` (and `on_pre_compress`) do two things: flush the base layer's
+  counted tail (the spec's "no trigger on a multiple": when the counter already sits on a
   dispatched watermark the flush is a no-op, so a `/new` — which fires `on_session_finalize`, the
   queued `on_session_end` *and* `on_session_reset` for one boundary — queues that window exactly
-  once) and then queue any layer whose *content* no job has covered. That second half is what
+  once) and then queue the base layer whose *content* no job has covered. That second half is what
   keeps short sessions useful: with `base_interval: 20`, a 4-turn session would otherwise never
-  reach the user model at all. A stop never swallows a tail that arrives after it (the CLI freezes
-  the session before the queued flush lands); only `tick` treats a stop as final.
+  reach the user model at all. The dialectic review is never queued here: it follows a successful
+  base job with the same window. A stop never swallows a tail that arrives after it (the CLI
+  freezes the session before the queued flush lands); only `tick` treats a stop as final.
 * **Nothing to observe costs nothing** — a window whose messages are already covered, or empty,
   completes as `done` without a model call, and a session that only ever greets never pays.
 * **Restart** — the window is read from `$HERMES_HOME/state.db`, so a job that was open when the
@@ -226,8 +292,10 @@ job of that layer re-covers the same content (the content watermark never moved)
 
 ### Where the model call comes from
 
-Base-layer passes run through `agent_loop.run` on the `auxiliary.adviser` route and always attach
-the `adviser` toolset, so the configured provider/model/toolsets there are what a refresh uses:
+Base and dialectic passes run through `agent_loop.run` on the `auxiliary.adviser` route and always
+attach the `adviser` toolset explicitly (`adviser.run` does not append it). Each pass is prompted
+to call `adviser_session_search` with the session id and window from its prompt when it needs more
+evidence, so the configured provider/model/toolsets are what a refresh uses:
 
 ```yaml
 auxiliary:
@@ -238,9 +306,9 @@ auxiliary:
 ```
 
 If the adviser route cannot run (host module absent, bad config, provider outage), the pass falls
-back to `worker.call_model`, which imports `agent.auxiliary_client.call_llm` lazily and passes the
-`minir_base_layer` task key. The dialectic layer always uses that one-shot client with
-`minir_dialectic_layer`, so the two layers can still be pinned independently:
+back to `worker.call_model`, which imports `agent.auxiliary_client.call_llm` lazily. Each layer
+uses its own task key (`minir_base_layer` / `minir_dialectic_layer`), so the two can still be
+pinned independently:
 
 ```yaml
 auxiliary:
@@ -257,9 +325,9 @@ thread, a layer refresh never raises into a turn, and `reasoning_enabled: false`
 
 `adviser.py` puts a second-opinion agent inside this plugin: an `auxiliary.adviser` model route
 plus one `adviser_consult` tool that runs a **real agent loop** (its own LLM + tools) rather than a
-one-shot completion. The base layer's three refresh passes reuse the same route and toolset
-(`worker._adviser_consult`); the loop is not adviser-specific — it lives in `agent_loop.py` and can
-be reused for any one-shot peer run (a review, a summary, a critic):
+one-shot completion. The base layer's three passes and the dependent dialectic review reuse the
+same route and toolset (`worker._adviser_consult`); the loop is not adviser-specific — it lives in
+`agent_loop.py` and can be reused for any one-shot peer run (a review, a summary, a critic):
 
 ```python
 from . import agent_loop
@@ -373,13 +441,14 @@ context:
 ### Progressive, not one big compaction
 
 The built-in compressor waits for the token threshold and then folds the window in one destructive
-pass. This engine instead moves the **oldest unprotected slice out on every dialectic beat** — the
-same turn interval the memory provider refreshes its dialectic layer on — so pressure never builds
-and the emergency path rarely fires:
+pass. This engine instead moves the **oldest unprotected slice out on every dialectic-beat fold**
+(the `dialectic_cadence` interval, which the engine and the provider both resolve) — the
+provider's review itself follows each base refresh — so pressure never builds and the emergency
+path rarely fires:
 
 | Knob | Where it comes from |
 | --- | --- |
-| how often a fold may happen | the dialectic interval, resolved exactly as the provider resolves it (`MINIR_DIALECTIC_INTERVAL` → `memory.minir.dialectic_interval` → 10) and compared against the beat: the provider's dialectic dispatch when it runs, the window's own turn count otherwise |
+| how often a fold may happen | the dialectic interval, resolved exactly as the provider resolves it (`MINIR_DIALECTIC_INTERVAL` → `memory.minir.dialectic_interval` → 10) and compared against the beat: the newest dialectic job's turn stamp (queued after a base refresh), the window's own turn count otherwise |
 | how much one fold may move | whole turns only, starting at the first turn after `protect_first_n`, stopping before `protect_last_n`, at most `_MAX_FOLD_MESSAGES` (24) messages — incremental by construction |
 | when it fires anyway | the token threshold (`threshold_percent`, default 0.75) — the safety net is kept |
 
@@ -407,10 +476,10 @@ no cache at all. The carriers are the durable index.
 
 On a fold, `compress()` may make one bounded auxiliary call using the Task Handoff template
 (`prompts/session_handoff.md`, override with `MINIR_SUMMARY_TEMPLATE`). Its input is the
-**historical dialectic conclusions** (durable user/AI cards, constraints, preferences, second
-brain, previous summary) plus the **tail window's dialectic conclusions** (current review and
-current-focus representation). Raw turns are used only as a cold-start fallback when no tail
-conclusion exists. The validated output is this session's summary conclusion, written to
+**historical dialectic conclusions** (durable user/AI cards, plus any legacy
+constraints/preferences/second-brain rows, previous summary) plus the **tail window's dialectic
+conclusions** (current review and current-focus representation). Raw turns are used only as a
+cold-start fallback when no tail conclusion exists. The validated output is this session's summary conclusion, written to
 `conclusions` as `pending` (kind `session_summary`, session-scoped); a bounded copy (900 chars)
 rides in the returned carrier, while the full text stays in the store;
 `on_turn_complete` promotes it to `active` only when the carrier is actually in the persisted
@@ -456,8 +525,8 @@ memory:
   provider: minir
   minir:                       # the provider's own block: memory.<provider name>
     context_cadence: 20        # turns per base-layer job (alias: base_interval)
-    dialectic_cadence: 10      # turns per dialectic-reasoning job (alias: dialectic_interval)
-    dialectic_depth: 2         # 1 synthesize, 2 self-audit, 3 reconcile
+    dialectic_cadence: 10      # context-engine fold beat (alias: dialectic_interval); reviews follow base
+    dialectic_depth: 2         # upper bound: 1 synthesize, 2 audit, 3 reconcile (adaptive by window size)
     reasoning_enabled: true    # run the layer reasoning passes (auxiliary model, no key needed)
     handoff_enabled: true      # let compression call the Task Handoff summary model
     session_mode: default      # mode stamped on each newly opened session
@@ -472,12 +541,14 @@ hand-edited config.yaml are equivalent. Every key also has an env override —
 `MINIR_HANDOFF_ENABLED`, `MINIR_SESSION_MODE`, `MINIR_PREFETCH_LIMIT` — and **the env var wins**
 when both are set. Layer intervals, depth and `reasoning_enabled` are read when a session opens.
 
-Every published conclusion is searchable: `notes`, the five base sections, the dialectic
-review/constraints/preferences/second brain, local compression chunks (including superseded
-history), and compression handoffs. The index uses FTS5 `trigram` so Chinese queries work; if the
-SQLite build lacks FTS5, `minir_search` falls back to a token scan. Session summaries, reviews,
-handoffs and chunks only match their own `session_id`; user peer cards, AI identity, second-brain
-rows and notes recall across sessions.
+Every published conclusion is searchable: `notes`, the six base sections, the dialectic review,
+local compression chunks (including superseded history), and compression handoffs. The index uses
+FTS5 `trigram` so Chinese queries work; if the SQLite build lacks FTS5, `minir_search` falls back
+to a token scan. Base revisions are a separate audit surface (`search_base_revisions`, trigram
+over the six pre-overwrite fields plus advices); pending advices live in `advisories` and are
+delivered through `pre_llm_call`, not injected as durable recall. Session summaries, reviews,
+handoffs and chunks only match their own `session_id`; user peer cards, AI identity, value markers
+and notes recall across sessions.
 
 Restart Hermes (an already-running Gateway/TUI keeps the previous code in memory).
 Data lands in `$HERMES_HOME/minir-memory/memory.db`; delete that file to reset. A database

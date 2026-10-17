@@ -1,6 +1,6 @@
 name: minir
-version: 0.4.0
-description: "Minir — local-first memory plugin: base/dialectic layer artifacts in SQLite, FTS5 recall over every conclusion, five-section user/AI cards, depth-1-3 dialectic reasoning over host history, identity files, adviser-review injection, and a context engine that folds progressively and writes a Task Handoff summary. Stores no transcripts. Stdlib only; fork it."
+version: 0.5.0
+description: "Minir — local-first memory plugin: base/dialectic layer artifacts in SQLite, FTS5 recall over every conclusion, six-section user/AI cards with value markers, a dependent dialectic review that corrects the base artifact (snapshot + FTS) and emits severity-ranked advices, identity files, advice injection, and a context engine that folds progressively and writes a Task Handoff summary. Stores no transcripts (derived text may quote evidence). Stdlib only; fork it."
 author: chaorenex1
 license: MIT
 tags:

@@ -17,6 +17,7 @@ def _state_db(path: Path) -> None:
                 content TEXT,
                 timestamp REAL NOT NULL,
                 message_uid TEXT,
+                tool_name TEXT,
                 active INTEGER NOT NULL DEFAULT 1,
                 _compressed_summary INTEGER NOT NULL DEFAULT 0
             );
@@ -35,6 +36,10 @@ def _state_db(path: Path) -> None:
         connection.executemany(
             "INSERT INTO messages (session_id, role, content, timestamp, message_uid, active, "
             "_compressed_summary) VALUES (?, ?, ?, ?, ?, ?, ?)", rows)
+        connection.execute(
+            "INSERT INTO messages (session_id, role, content, timestamp, message_uid, tool_name,"
+            " active, _compressed_summary) VALUES ('s1', 'tool', 'pytest: 4 passed', 10.7,"
+            " 't1', 'terminal', 1, 0)")
         connection.execute("INSERT INTO sessions (id, profile_name) VALUES ('s1', 'work')")
         connection.commit()
     finally:
@@ -47,6 +52,17 @@ def test_reads_only_active_real_user_and_assistant_rows_in_the_window(plugin_pac
     rows = plugin_package.history.read_messages(path, "s1", 9.0, 13.0)
     assert [row["content"] for row in rows] == ["real question", "real answer"]
     assert rows[0]["message_uid"] == "u1" and rows[0]["created_at"] == 10.0
+
+
+def test_role_filter_can_include_tool_rows_for_the_dialectic_review(plugin_package, tmp_path):
+    path = tmp_path / "state.db"
+    _state_db(path)
+    default = plugin_package.history.read_messages(path, "s1", 9.0, 13.0)
+    assert [row["role"] for row in default] == ["user", "assistant"]
+    widened = plugin_package.history.read_messages(
+        path, "s1", 9.0, 13.0, roles=("user", "assistant", "tool"))
+    assert [row["role"] for row in widened] == ["user", "assistant", "tool"]
+    assert widened[-1]["tool_name"] == "terminal"
 
 
 def test_window_is_half_open(plugin_package, tmp_path):

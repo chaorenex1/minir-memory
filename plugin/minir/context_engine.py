@@ -665,7 +665,8 @@ class MinirContextEngine(ContextEngine):
         tail_parts: list[str] = []
         for kind, label in (
                 ("dialectic.review", "Tail-window adviser review"),
-                ("base.user_representation", "Tail-window user representation")):
+                ("base.user_representation", "Tail-window user representation"),
+                ("base.value_markers", "Tail-window value markers")):
             row = store.newest_conclusion(kind, session_id=session)
             body = str((row or {}).get("content") or "").strip()
             if body:

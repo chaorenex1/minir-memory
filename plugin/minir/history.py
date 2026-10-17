@@ -68,8 +68,13 @@ def is_synthetic_user_text(text: str) -> bool:
 
 
 def read_messages(state_db: Any, session_id: str, from_ts: float, to_ts: float,
-                  *, limit: int = _MAX_MESSAGES) -> list[dict[str, Any]]:
-    """Messages of *session_id* in ``(from_ts, to_ts]``, oldest first; ``[]`` on any problem."""
+                  *, limit: int = _MAX_MESSAGES,
+                  roles: tuple[str, ...] = ("user", "assistant")) -> list[dict[str, Any]]:
+    """Messages of *session_id* in ``(from_ts, to_ts]``, oldest first; ``[]`` on any problem.
+
+    ``roles`` lets the dialectic reviewer include tool calls/results; the base layer keeps the
+    default because its cards model the user/assistant exchange only.
+    """
     path = Path(str(state_db)) if state_db else None
     if path is None or not session_id:
         return []
@@ -80,8 +85,10 @@ def read_messages(state_db: Any, session_id: str, from_ts: float, to_ts: float,
         columns = _columns(connection, "messages")
         if not {"session_id", "role", "content", "timestamp"} <= columns:
             return []
+        wanted = tuple(str(role) for role in roles if str(role).strip()) or ("user", "assistant")
+        marks = ",".join("?" * len(wanted))
         clauses = ["session_id = ?", "timestamp > ?", "timestamp <= ?",
-                   "role IN ('user', 'assistant')",
+                   f"role IN ({marks})",
                    "content IS NOT NULL", "TRIM(content) <> ''"]
         if "active" in columns:
             clauses.append("COALESCE(active, 1) = 1")
@@ -91,10 +98,12 @@ def read_messages(state_db: Any, session_id: str, from_ts: float, to_ts: float,
         # which is what the layer is meant to model, not the oldest 400 rows.
         sql = ("SELECT role, content, timestamp, "
                + ("message_uid, " if "message_uid" in columns else "NULL AS message_uid, ")
+               + ("tool_name, " if "tool_name" in columns else "NULL AS tool_name, ")
                + "id FROM messages WHERE " + " AND ".join(clauses)
                + " ORDER BY id DESC LIMIT ?")
         rows = connection.execute(
-            sql, (str(session_id), float(from_ts), float(to_ts), max(1, int(limit)))).fetchall()
+            sql, (str(session_id), float(from_ts), float(to_ts), *wanted,
+                  max(1, int(limit)))).fetchall()
         rows = list(reversed(rows))
     except sqlite3.Error as exc:
         logger.debug("Minir history read failed: %s", exc)
@@ -115,6 +124,7 @@ def read_messages(state_db: Any, session_id: str, from_ts: float, to_ts: float,
             "content": text,
             "created_at": float(row["timestamp"] or 0.0),
             "message_uid": str(row["message_uid"] or ""),
+            "tool_name": str(row["tool_name"] or ""),
             "author": "",
             "author_id": "",
         })

@@ -15,13 +15,25 @@
   expires it (``expire_open_jobs``) instead of pretending to reason over it.
 * ``layer_state`` — the merged artifact each layer publishes, one row per ``(layer, subject)``
   with a monotonically increasing ``version`` (see ``worker.py``).
-* ``base_refreshes`` — one row per base-layer refresh *window*: the five structured outputs
-  (user representation, user peer card, AI self representation, AI identity card, local window
-  summary) plus the session, time range and turn range they cover. ``is_latest`` marks the
-  current row per ``(session_id, subject)``, so history is append-only while the live row is a
-  single indexed lookup.
+* ``base_refreshes`` — one row per base-layer refresh *window*: the six structured outputs as
+  JSON text (user representation, user peer card, AI self representation, AI identity card,
+  local window summary, value markers) plus the session, time range and the turn range actually
+  covered. ``is_latest`` marks the row with the greatest ``window_to_ts`` per
+  ``(session_id, subject)``, not the row written last, so an older window that finishes late
+  cannot become "latest"; the live row is a single indexed lookup while older windows stay
+  queryable as history. ``base_refreshes_fts`` is an external-content FTS5 trigram index over
+  the six outputs; short CJK queries fall back to a LIKE scan. The outputs are model-derived and
+  may quote the messages they reasoned over even though the provider never copies the
+  transcript itself.
+* ``base_revisions`` — the pre-overwrite snapshot of a base refresh when the dialectic layer
+  corrects it: the same six fields plus the advices that justified the correction, the changed
+  field list, the affected refresh id and an ``is_latest`` flag. ``base_revisions_fts`` indexes
+  the seven content fields (six snapshots + advices) with the same trigram design.
+* ``advisories`` — the delivery ledger: normalized, deduped advices with severity/target and
+  a ``pending``/``injected`` state. The revision table keeps the immutable audit copy; this
+  table is what ``pre_llm_call`` drains.
 * ``conclusions`` — every durable result split into individually searchable rows: notes, the
-  five base-layer sections, the dialectic review/constraints/preferences/second-brain, local
+  six base-layer sections, the dialectic review, local
   compression chunks, and final session summaries. ``conclusions_fts`` is an FTS5 trigram index
   over it (CJK-safe); when FTS5 is unavailable, ``search()`` falls back to the token scan.
   ``session_chunk_summary`` is the canonical local-compression chain; each row records the time
@@ -37,6 +49,8 @@ entries and notes are durable and recall across sessions.
 
 from __future__ import annotations
 
+import hashlib
+import json
 import logging
 import re
 import sqlite3
@@ -120,6 +134,7 @@ CREATE TABLE IF NOT EXISTS base_refreshes (
     ai_self_representation TEXT NOT NULL DEFAULT '',
     ai_identity_card TEXT NOT NULL DEFAULT '',
     session_chunk_summary TEXT NOT NULL DEFAULT '',
+    value_markers TEXT NOT NULL DEFAULT '',
     is_latest INTEGER NOT NULL DEFAULT 1,
     created_at REAL NOT NULL
 );
@@ -129,6 +144,51 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_base_refreshes_window
     ON base_refreshes(session_id, subject, window_from_ts);
 CREATE UNIQUE INDEX IF NOT EXISTS idx_base_refreshes_latest
     ON base_refreshes(session_id, subject) WHERE is_latest = 1;
+CREATE TABLE IF NOT EXISTS base_revisions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id TEXT NOT NULL DEFAULT '',
+    subject TEXT NOT NULL DEFAULT '',
+    base_refresh_id INTEGER NOT NULL DEFAULT 0,
+    window_from_ts REAL NOT NULL,
+    window_to_ts REAL NOT NULL,
+    window_from_turn INTEGER,
+    window_to_turn INTEGER,
+    user_representation TEXT NOT NULL DEFAULT '',
+    user_peer_card TEXT NOT NULL DEFAULT '',
+    ai_self_representation TEXT NOT NULL DEFAULT '',
+    ai_identity_card TEXT NOT NULL DEFAULT '',
+    session_chunk_summary TEXT NOT NULL DEFAULT '',
+    value_markers TEXT NOT NULL DEFAULT '',
+    advices TEXT NOT NULL DEFAULT '[]',
+    changed_fields TEXT NOT NULL DEFAULT '[]',
+    source_job_id INTEGER NOT NULL DEFAULT 0,
+    is_latest INTEGER NOT NULL DEFAULT 1,
+    created_at REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_base_revisions_session
+    ON base_revisions(session_id, subject, created_at DESC);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_base_revisions_latest
+    ON base_revisions(session_id, subject) WHERE is_latest = 1;
+CREATE TABLE IF NOT EXISTS advisories (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    revision_id INTEGER NOT NULL DEFAULT 0,
+    session_id TEXT NOT NULL DEFAULT '',
+    source TEXT NOT NULL DEFAULT 'dialectic',
+    severity TEXT NOT NULL DEFAULT 'concern',
+    target TEXT NOT NULL DEFAULT '',
+    content TEXT NOT NULL DEFAULT '',
+    decision TEXT NOT NULL DEFAULT '',
+    evidence TEXT NOT NULL DEFAULT '[]',
+    fingerprint TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'pending',
+    created_at REAL NOT NULL,
+    injected_at REAL,
+    turn_id TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_advisories_pending
+    ON advisories(session_id, status, id);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_advisories_fingerprint
+    ON advisories(session_id, fingerprint);
 CREATE TABLE IF NOT EXISTS metrics (
     tool TEXT PRIMARY KEY,
     count INTEGER NOT NULL DEFAULT 0,
@@ -147,6 +207,7 @@ _ADDED_COLUMNS: dict[str, tuple[tuple[str, str], ...]] = {
     "layer_state": (("session_id", "TEXT NOT NULL DEFAULT ''"),),
     "conclusions": (("from_ts", "REAL"), ("to_ts", "REAL"),
                     ("from_turn", "INTEGER"), ("to_turn", "INTEGER")),
+    "base_refreshes": (("value_markers", "TEXT NOT NULL DEFAULT ''"),),
 }
 
 # Tables a previous release wrote that this one must not keep: earlier versions persisted every
@@ -175,14 +236,21 @@ _ARTIFACT_SECTIONS: dict[str, tuple[tuple[str, str, str], ...]] = {
         ("## User Peer Card", "base.user_peer_card", "user"),
         ("## AI Self Representation", "base.ai_self_representation", "session"),
         ("## AI Identity Card", "base.ai_identity_card", "agent"),
+        ("## Value Markers", "base.value_markers", "session"),
     ),
     "dialectic": (
+        # The six corrected cards live on the base layer; the dialectic artifact owns only the
+        # review/advices so prefetch never leaks base cards into the prompt.
         ("## Adviser Review", "dialectic.review", "session"),
-        ("## Constraints", "dialectic.constraints", "agent"),
-        ("## Preferences", "dialectic.preferences", "agent"),
-        ("## Second Brain", "dialectic.second_brain", "agent"),
     ),
 }
+
+# Columns the dialectic layer may correct on a base refresh. The snapshot table stores these
+# plus ``advices``; the FTS index covers all seven.
+_BASE_REVISION_COLUMNS: tuple[str, ...] = (
+    "user_representation", "user_peer_card", "ai_self_representation",
+    "ai_identity_card", "session_chunk_summary", "value_markers",
+)
 
 _KIND_WEIGHT: dict[str, float] = {
     "base.ai_identity_card": 1.5,
@@ -190,6 +258,7 @@ _KIND_WEIGHT: dict[str, float] = {
     "dialectic.review": 1.4,
     "base.user_representation": 1.2,
     "base.ai_self_representation": 1.0,
+    "base.value_markers": 1.0,
     "dialectic.constraints": 1.0,
     "dialectic.preferences": 1.0,
     "dialectic.second_brain": 0.9,
@@ -266,6 +335,8 @@ class MinirStore:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._lock = threading.RLock()
         self._fts = False
+        self._base_fts = False
+        self._base_revisions_fts = False
         self._conn = sqlite3.connect(str(self.path), check_same_thread=False, timeout=5.0)
         self._conn.row_factory = sqlite3.Row
         with self._lock:
@@ -273,6 +344,8 @@ class MinirStore:
             self._conn.executescript(_SCHEMA)
             self._migrate()
             self._ensure_fts()
+            self._ensure_base_refreshes_fts()
+            self._ensure_base_revisions_fts()
             self._backfill_conclusions()
             self._conn.commit()
 
@@ -294,6 +367,15 @@ class MinirStore:
             for name, declaration in columns:
                 if name not in present:
                     self._conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {declaration}")
+        # An older release flagged the row written last. Restore the invariant now that
+        # ``is_latest`` means the greatest window: clear, then promote one row per subject.
+        self._conn.execute("UPDATE base_refreshes SET is_latest = 0")
+        self._conn.execute(
+            "UPDATE base_refreshes SET is_latest = 1 WHERE id IN ("
+            "SELECT b.id FROM base_refreshes AS b WHERE b.id = ("
+            "SELECT x.id FROM base_refreshes AS x "
+            "WHERE x.session_id = b.session_id AND x.subject = b.subject "
+            "ORDER BY x.window_to_ts DESC, x.window_from_ts DESC, x.id DESC LIMIT 1))")
 
     def _ensure_fts(self) -> None:
         """Create the trigram FTS index (fallback: no FTS, scan in ``search``).
@@ -341,6 +423,121 @@ class MinirStore:
             "VALUES ('delete', old.id, old.content); "
             "INSERT INTO conclusions_fts(rowid, content) VALUES (new.id, new.content); END")
         self._fts = True
+
+    def _ensure_base_refreshes_fts(self) -> None:
+        """Create/rebuild the FTS index over the six base-refresh outputs.
+
+        External-content FTS: the text lives once in ``base_refreshes``; the virtual table
+        indexes it. ``trigram`` matches CJK substrings, while queries whose terms are all
+        shorter than three characters fall back to a scan in ``search_base_refreshes``.
+        """
+        columns = ("user_representation", "user_peer_card", "ai_self_representation",
+                   "ai_identity_card", "session_chunk_summary", "value_markers")
+        row = self._conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'base_refreshes_fts'"
+        ).fetchone()
+        current = str(row["sql"] or "").lower() if row is not None else ""
+        existing = {item["name"] for item in self._conn.execute(
+            "PRAGMA table_info(base_refreshes_fts)")} if current else set()
+        if current and ("trigram" not in current or not set(columns) <= existing):
+            for trigger in ("base_refreshes_ai", "base_refreshes_ad", "base_refreshes_au"):
+                self._conn.execute(f"DROP TRIGGER IF EXISTS {trigger}")
+            self._conn.execute("DROP TABLE IF EXISTS base_refreshes_fts")
+            current = ""
+        if not current:
+            try:
+                self._conn.execute(
+                    "CREATE VIRTUAL TABLE base_refreshes_fts USING fts5("
+                    + ", ".join(columns)
+                    + ", content='base_refreshes', content_rowid='id', tokenize='trigram')")
+            except sqlite3.OperationalError:
+                try:
+                    self._conn.execute(
+                        "CREATE VIRTUAL TABLE base_refreshes_fts USING fts5("
+                        + ", ".join(columns)
+                        + ", content='base_refreshes', content_rowid='id')")
+                except sqlite3.OperationalError as exc:
+                    for trigger in ("base_refreshes_ai", "base_refreshes_ad",
+                                    "base_refreshes_au"):
+                        self._conn.execute(f"DROP TRIGGER IF EXISTS {trigger}")
+                    self._base_fts = False
+                    logger.debug("Minir base-refresh FTS unavailable, using scan: %s", exc)
+                    return
+        values = ", ".join(f"new.{name}" for name in columns)
+        old_values = ", ".join(f"old.{name}" for name in columns)
+        column_list = ", ".join(columns)
+        self._conn.execute(
+            "CREATE TRIGGER IF NOT EXISTS base_refreshes_ai AFTER INSERT ON base_refreshes BEGIN "
+            f"INSERT INTO base_refreshes_fts(rowid, {column_list}) VALUES (new.id, {values}); END")
+        self._conn.execute(
+            "CREATE TRIGGER IF NOT EXISTS base_refreshes_ad AFTER DELETE ON base_refreshes BEGIN "
+            "INSERT INTO base_refreshes_fts(base_refreshes_fts, rowid, "
+            f"{column_list}) VALUES ('delete', old.id, {old_values}); END")
+        self._conn.execute(
+            "CREATE TRIGGER IF NOT EXISTS base_refreshes_au AFTER UPDATE ON base_refreshes BEGIN "
+            "INSERT INTO base_refreshes_fts(base_refreshes_fts, rowid, "
+            f"{column_list}) VALUES ('delete', old.id, {old_values}); "
+            f"INSERT INTO base_refreshes_fts(rowid, {column_list}) VALUES (new.id, {values}); END")
+        self._conn.execute(
+            "INSERT INTO base_refreshes_fts(base_refreshes_fts) VALUES('rebuild')")
+        self._base_fts = True
+
+    def _ensure_base_revisions_fts(self) -> None:
+        """Create/rebuild the FTS index over the six snapshot fields plus advices.
+
+        Same external-content trigram design as ``base_refreshes_fts``: the revision row is the
+        immutable audit copy, so the index never needs a second text copy.
+        """
+        columns = ("user_representation", "user_peer_card", "ai_self_representation",
+                   "ai_identity_card", "session_chunk_summary", "value_markers", "advices")
+        row = self._conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'base_revisions_fts'"
+        ).fetchone()
+        current = str(row["sql"] or "").lower() if row is not None else ""
+        existing = {item["name"] for item in self._conn.execute(
+            "PRAGMA table_info(base_revisions_fts)")} if current else set()
+        if current and ("trigram" not in current or not set(columns) <= existing):
+            for trigger in ("base_revisions_ai", "base_revisions_ad", "base_revisions_au"):
+                self._conn.execute(f"DROP TRIGGER IF EXISTS {trigger}")
+            self._conn.execute("DROP TABLE IF EXISTS base_revisions_fts")
+            current = ""
+        if not current:
+            try:
+                self._conn.execute(
+                    "CREATE VIRTUAL TABLE base_revisions_fts USING fts5("
+                    + ", ".join(columns)
+                    + ", content='base_revisions', content_rowid='id', tokenize='trigram')")
+            except sqlite3.OperationalError:
+                try:
+                    self._conn.execute(
+                        "CREATE VIRTUAL TABLE base_revisions_fts USING fts5("
+                        + ", ".join(columns)
+                        + ", content='base_revisions', content_rowid='id')")
+                except sqlite3.OperationalError as exc:
+                    for trigger in ("base_revisions_ai", "base_revisions_ad",
+                                    "base_revisions_au"):
+                        self._conn.execute(f"DROP TRIGGER IF EXISTS {trigger}")
+                    self._base_revisions_fts = False
+                    logger.debug("Minir base-revision FTS unavailable, using scan: %s", exc)
+                    return
+        values = ", ".join(f"new.{name}" for name in columns)
+        old_values = ", ".join(f"old.{name}" for name in columns)
+        column_list = ", ".join(columns)
+        self._conn.execute(
+            "CREATE TRIGGER IF NOT EXISTS base_revisions_ai AFTER INSERT ON base_revisions BEGIN "
+            f"INSERT INTO base_revisions_fts(rowid, {column_list}) VALUES (new.id, {values}); END")
+        self._conn.execute(
+            "CREATE TRIGGER IF NOT EXISTS base_revisions_ad AFTER DELETE ON base_revisions BEGIN "
+            "INSERT INTO base_revisions_fts(base_revisions_fts, rowid, "
+            f"{column_list}) VALUES ('delete', old.id, {old_values}); END")
+        self._conn.execute(
+            "CREATE TRIGGER IF NOT EXISTS base_revisions_au AFTER UPDATE ON base_revisions BEGIN "
+            "INSERT INTO base_revisions_fts(base_revisions_fts, rowid, "
+            f"{column_list}) VALUES ('delete', old.id, {old_values}); "
+            f"INSERT INTO base_revisions_fts(rowid, {column_list}) VALUES (new.id, {values}); END")
+        self._conn.execute(
+            "INSERT INTO base_revisions_fts(base_revisions_fts) VALUES('rebuild')")
+        self._base_revisions_fts = True
 
     def _backfill_conclusions(self) -> None:
         """Index notes written before ``conclusions`` existed (idempotent, once)."""
@@ -493,17 +690,22 @@ class MinirStore:
                           to_turn: Optional[int] = None) -> int:
         """Append one local compression summary to the session's canonical chain.
 
-        Idempotent by ``(session, from_ts, to_ts)``. A window already superseded by a final
-        summary is not reopened. ``from_turn``/``to_turn`` are the session turn range this
-        local compression covers; timestamps alone cannot express it after a /resume.
+        Idempotent by ``(session, from_ts)``: windows are edge-to-edge, so the start edge
+        identifies a window even when a retry resolves a later ``to_ts`` (the newest job drains
+        to ``now``). Reusing the existing row is what keeps a failed publish from duplicating
+        the chunk or shifting its turn range. A window already superseded by a final summary is
+        not reopened. ``from_turn``/``to_turn`` are the session turn range this local
+        compression covers; timestamps alone cannot express it after a /resume.
         """
-        key = f"chunk:{session_id}:{float(from_ts):.6f}:{float(to_ts):.6f}"
         with self._lock:
             existing = self._conn.execute(
-                "SELECT status FROM conclusions WHERE kind = 'session_chunk_summary' "
-                "AND key = ?", (key,)).fetchone()
+                "SELECT key, status FROM conclusions WHERE kind = 'session_chunk_summary' "
+                "AND session_id = ? AND from_ts = ? ORDER BY id DESC LIMIT 1",
+                (session_id, float(from_ts))).fetchone()
             if existing is not None and existing["status"] == "superseded":
                 return 0
+            key = (str(existing["key"]) if existing is not None else
+                   f"chunk:{session_id}:{float(from_ts):.6f}:{float(to_ts):.6f}")
             version = self._put_conclusion_locked(
                 "session_chunk_summary", key, content, session_id=session_id,
                 subject="session", evidence=evidence, status="active",
@@ -539,6 +741,35 @@ class MinirStore:
                 "SELECT MAX(to_turn) AS turn FROM conclusions "
                 "WHERE kind = 'session_chunk_summary' AND session_id = ?",
                 (session_id,)).fetchone()
+        value = row["turn"] if row is not None else None
+        return int(value) if value is not None else 0
+
+    def chunk_turn_range(self, session_id: str,
+                         from_ts: float) -> tuple[Optional[int], Optional[int]]:
+        """The stored turn range for the window starting at *from_ts*, or ``(None, None)``.
+
+        Used by the retry path: the chunk is written before ``base_refreshes``, so a failed
+        refresh must reuse the range already attached to that window instead of treating it as
+        the previous window. The start edge is the window identity; a retry may resolve a
+        later ``to_ts`` when the newest job drains to ``now``.
+        """
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT from_turn, to_turn FROM conclusions "
+                "WHERE kind = 'session_chunk_summary' AND session_id = ? "
+                "AND from_ts = ? ORDER BY id DESC LIMIT 1",
+                (session_id, float(from_ts))).fetchone()
+        if row is None:
+            return None, None
+        return row["from_turn"], row["to_turn"]
+
+    def latest_chunk_turn_before(self, session_id: str, before_ts: float) -> int:
+        """Highest turn covered by a chunk that ends at or before *before_ts*."""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT MAX(to_turn) AS turn FROM conclusions "
+                "WHERE kind = 'session_chunk_summary' AND session_id = ? AND to_ts <= ?",
+                (session_id, float(before_ts))).fetchone()
         value = row["turn"] if row is not None else None
         return int(value) if value is not None else 0
 
@@ -586,12 +817,27 @@ class MinirStore:
 
     def record_job(self, layer: str, session_id: str, from_ts: float, to_ts: float,
                    turns: int = 0, *, status: str = "pending") -> int:
-        """Queue one layer job (session + reasoning window); returns its row id."""
+        """Queue one layer job (session + reasoning window); returns its row id.
+
+        Base-layer windows are unique: one window has one job. A second dispatch of the same
+        ``(session, from_ts, to_ts)`` returns the existing queued/running/done job instead of
+        appending a duplicate, so a boundary hook racing the tick cannot refresh one window
+        twice. A failed job is not reused: a fresh row lets the window be retried.
+        """
+        window = (float(from_ts), float(to_ts))
         with self._lock:
+            if layer in ("base", "dialectic"):
+                existing = self._conn.execute(
+                    "SELECT id FROM jobs WHERE layer = ? AND session_id = ? "
+                    "AND from_ts = ? AND to_ts = ? "
+                    "AND status IN ('pending', 'running', 'done') ORDER BY id LIMIT 1",
+                    (layer, session_id, *window)).fetchone()
+                if existing is not None:
+                    return int(existing["id"])
             cur = self._conn.execute(
                 "INSERT INTO jobs (layer, session_id, from_ts, to_ts, turns, status, created_at) "
                 "VALUES (?, ?, ?, ?, ?, ?, ?)",
-                (layer, session_id, float(from_ts), float(to_ts), int(turns), status, time.time()),
+                (layer, session_id, *window, int(turns), status, time.time()),
             )
             self._conn.commit()
             return int(cur.lastrowid)
@@ -612,8 +858,12 @@ class MinirStore:
         own predecessor) can never process the same row twice. ``attempts`` counts claims.
         """
         with self._lock:
+            # A review is queued only after its base job published, and it owns the window
+            # that base just produced. Claim it before any later base job so the review sees
+            # the live artifact and its correction can carry into the next base merge.
+            order = ("ORDER BY CASE layer WHEN 'dialectic' THEN 0 ELSE 1 END, id")
             ids = [row["id"] for row in self._conn.execute(
-                "SELECT id FROM jobs WHERE status = 'pending' ORDER BY id LIMIT ?",
+                f"SELECT id FROM jobs WHERE status = 'pending' {order} LIMIT ?",
                 (max(1, min(int(limit), 50)),),
             ).fetchall()]
             if not ids:
@@ -626,7 +876,7 @@ class MinirStore:
             self._conn.commit()
             rows = self._conn.execute(
                 f"SELECT id, layer, session_id, from_ts, to_ts, turns, status, attempts, created_at "
-                f"FROM jobs WHERE id IN ({marks}) ORDER BY id", ids,
+                f"FROM jobs WHERE id IN ({marks}) {order}", ids,
             ).fetchall()
         return [dict(row) for row in rows]
 
@@ -710,11 +960,14 @@ class MinirStore:
     # -- layer state ----------------------------------------------------------
 
     def put_layer_state(self, layer: str, subject: str, content: str, *,
-                        session_id: str = "", ai_subject: str = "") -> int:
+                        session_id: str = "", ai_subject: str = "",
+                        commit: bool = True) -> int:
         """Publish a layer artifact; returns the new version (1 for the first write).
 
         The artifact is also split into its fixed sections and each section is upserted as a
         conclusion, so ``search`` can recall a single section instead of a whole document.
+        ``commit=False`` lets ``apply_base_revision`` keep the snapshot, refresh row and
+        artifact in one ``BEGIN IMMEDIATE`` transaction.
         """
         with self._lock:
             self._conn.execute(
@@ -736,7 +989,8 @@ class MinirStore:
                 self._put_conclusion_locked(
                     kind, key, sections[heading], session_id=session_id if scope == "session" else "",
                     subject=subject, evidence="[]", status="active", version=version)
-            self._conn.commit()
+            if commit:
+                self._conn.commit()
         return version
 
     def layer_state(self, layer: str, subject: str) -> Optional[dict[str, Any]]:
@@ -778,50 +1032,84 @@ class MinirStore:
                          window_to_ts: float, window_from_turn: Optional[int],
                          window_to_turn: Optional[int], user_representation: str,
                          user_peer_card: str, ai_self_representation: str,
-                         ai_identity_card: str, session_chunk_summary: str) -> int:
-        """Record one base-layer refresh window and make it the session's latest row.
+                         ai_identity_card: str, session_chunk_summary: str,
+                         value_markers: str = "") -> int:
+        """Record one base-layer refresh window; ``is_latest`` follows window order.
 
         A refresh is identified by ``(session_id, subject, window_from_ts)`` — windows are
-        edge-to-edge, so the start edge is unique per participant. Re-processing a re-queued job
-        updates the same row instead of appending a duplicate, while a new window appends and
-        moves ``is_latest``. The partial unique index guarantees at most one latest row per
-        participant.
+        edge-to-edge, so the start edge is unique. Re-processing a re-queued job updates the
+        same row instead of appending a duplicate. ``is_latest`` is decided by
+        ``window_to_ts``, not by completion order: an older window that finishes after a newer
+        one is retained as history with ``is_latest = 0``. ``BEGIN IMMEDIATE`` serializes the
+        read-then-write across provider instances, so two workers cannot both promote a row.
         """
         now = time.time()
-        values = (session_id or "", subject or "", float(window_from_ts), float(window_to_ts),
+        session_key = session_id or ""
+        subject_key = subject or ""
+        values = (session_key, subject_key, float(window_from_ts), float(window_to_ts),
                   window_from_turn, window_to_turn, user_representation or "",
                   user_peer_card or "", ai_self_representation or "", ai_identity_card or "",
-                  session_chunk_summary or "", now)
+                  session_chunk_summary or "", value_markers or "", now)
         with self._lock:
-            self._conn.execute(
-                "UPDATE base_refreshes SET is_latest = 0 "
-                "WHERE session_id = ? AND subject = ? AND is_latest = 1",
-                (session_id or "", subject or ""))
-            self._conn.execute(
-                "INSERT INTO base_refreshes (session_id, subject, window_from_ts, window_to_ts, "
-                "window_from_turn, window_to_turn, user_representation, user_peer_card, "
-                "ai_self_representation, ai_identity_card, session_chunk_summary, is_latest, "
-                "created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?) "
-                "ON CONFLICT(session_id, subject, window_from_ts) DO UPDATE SET "
-                "window_from_turn = excluded.window_from_turn, "
-                "window_to_turn = excluded.window_to_turn, "
-                "user_representation = excluded.user_representation, "
-                "user_peer_card = excluded.user_peer_card, "
-                "ai_self_representation = excluded.ai_self_representation, "
-                "ai_identity_card = excluded.ai_identity_card, "
-                "session_chunk_summary = excluded.session_chunk_summary, "
-                "is_latest = 1, created_at = excluded.created_at",
-                values)
-            row = self._conn.execute(
-                "SELECT id FROM base_refreshes WHERE session_id = ? AND subject = ? "
-                "AND window_from_ts = ?",
-                values[:3]).fetchone()
-            self._conn.commit()
-            return int(row["id"]) if row is not None else 0
+            if not self._conn.in_transaction:
+                self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                current = self._conn.execute(
+                    "SELECT id, window_to_ts FROM base_refreshes "
+                    "WHERE session_id = ? AND subject = ? AND is_latest = 1 LIMIT 1",
+                    (session_key, subject_key)).fetchone()
+                existing = self._conn.execute(
+                    "SELECT id, is_latest, window_to_ts FROM base_refreshes "
+                    "WHERE session_id = ? AND subject = ? AND window_from_ts = ?",
+                    (session_key, subject_key, float(window_from_ts))).fetchone()
+                # A retry may extend the same window; never shrink it.
+                effective_to = float(window_to_ts)
+                if existing is not None:
+                    effective_to = max(effective_to, float(existing["window_to_ts"]))
+                current_to = float(current["window_to_ts"]) if current is not None else None
+                if existing is not None and int(existing["is_latest"]) == 1:
+                    is_latest = 1
+                elif current_to is None or effective_to > current_to:
+                    is_latest = 1
+                else:
+                    is_latest = 0
+                if is_latest:
+                    self._conn.execute(
+                        "UPDATE base_refreshes SET is_latest = 0 "
+                        "WHERE session_id = ? AND subject = ? AND is_latest = 1 "
+                        "AND window_from_ts <> ?",
+                        (session_key, subject_key, float(window_from_ts)))
+                self._conn.execute(
+                    "INSERT INTO base_refreshes (session_id, subject, window_from_ts, window_to_ts, "
+                    "window_from_turn, window_to_turn, user_representation, user_peer_card, "
+                    "ai_self_representation, ai_identity_card, session_chunk_summary, "
+                    "value_markers, is_latest, created_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
+                    "ON CONFLICT(session_id, subject, window_from_ts) DO UPDATE SET "
+                    "window_to_ts = MAX(base_refreshes.window_to_ts, excluded.window_to_ts), "
+                    "window_from_turn = excluded.window_from_turn, "
+                    "window_to_turn = excluded.window_to_turn, "
+                    "user_representation = excluded.user_representation, "
+                    "user_peer_card = excluded.user_peer_card, "
+                    "ai_self_representation = excluded.ai_self_representation, "
+                    "ai_identity_card = excluded.ai_identity_card, "
+                    "session_chunk_summary = excluded.session_chunk_summary, "
+                    "value_markers = excluded.value_markers, "
+                    "is_latest = excluded.is_latest, created_at = excluded.created_at",
+                    (*values[:12], is_latest, values[12]))
+                row = self._conn.execute(
+                    "SELECT id FROM base_refreshes WHERE session_id = ? AND subject = ? "
+                    "AND window_from_ts = ?",
+                    values[:3]).fetchone()
+                self._conn.commit()
+                return int(row["id"]) if row is not None else 0
+            except Exception:
+                self._conn.rollback()
+                raise
 
     def latest_base_refresh(self, session_id: str,
                             subject: str = "") -> Optional[dict[str, Any]]:
-        """The active refresh row for a session (optionally one participant)."""
+        """The active refresh row for a session (optionally pinned to one subject)."""
         with self._lock:
             if subject:
                 row = self._conn.execute(
@@ -830,7 +1118,8 @@ class MinirStore:
             else:
                 row = self._conn.execute(
                     "SELECT * FROM base_refreshes WHERE session_id = ? AND is_latest = 1 "
-                    "ORDER BY created_at DESC, id DESC LIMIT 1", (session_id,)).fetchone()
+                    "ORDER BY window_to_ts DESC, window_from_ts DESC, id DESC LIMIT 1",
+                    (session_id,)).fetchone()
         return dict(row) if row is not None else None
 
     def base_refreshes(self, session_id: str, subject: str = "",
@@ -849,6 +1138,264 @@ class MinirStore:
                     "ORDER BY window_to_ts DESC, id DESC LIMIT ?",
                     (session_id, limit)).fetchall()
         return [dict(row) for row in rows]
+
+    def base_refresh_for_window(self, session_id: str, subject: str,
+                                window_from_ts: float) -> Optional[dict[str, Any]]:
+        """The refresh row for one window (the row a dialectic correction targets)."""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM base_refreshes WHERE session_id = ? AND subject = ? "
+                "AND window_from_ts = ? LIMIT 1",
+                (session_id, subject, float(window_from_ts))).fetchone()
+        return dict(row) if row is not None else None
+
+    def apply_base_revision(self, session_id: str, subject: str, *, window_from_ts: float,
+                            changes: dict[str, str], advices: str, changed_fields: list[str],
+                            content: str, source_job_id: int = 0,
+                            ai_subject: str = "") -> Optional[int]:
+        """Snapshot the current base row, apply a dialectic correction, republish the artifact.
+
+        One ``BEGIN IMMEDIATE`` transaction covers the snapshot, the ``base_refreshes`` update
+        and the ``layer_state`` rewrite (via ``put_layer_state(..., commit=False)``), so a
+        failure cannot leave the audit row and the live artifact disagreeing. ``is_latest`` is
+        left alone: a correction never changes which window is current.
+        """
+        allowed = {name: value for name, value in changes.items() if name in _BASE_REVISION_COLUMNS}
+        with self._lock:
+            if not self._conn.in_transaction:
+                self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                row = self._conn.execute(
+                    "SELECT * FROM base_refreshes WHERE session_id = ? AND subject = ? "
+                    "AND window_from_ts = ? LIMIT 1",
+                    (session_id, subject, float(window_from_ts))).fetchone()
+                if row is None:
+                    self._conn.commit()
+                    return None
+                self._conn.execute(
+                    "UPDATE base_revisions SET is_latest = 0 "
+                    "WHERE session_id = ? AND subject = ? AND is_latest = 1",
+                    (session_id, subject))
+                cur = self._conn.execute(
+                    "INSERT INTO base_revisions (session_id, subject, base_refresh_id, "
+                    "window_from_ts, window_to_ts, window_from_turn, window_to_turn, "
+                    "user_representation, user_peer_card, ai_self_representation, "
+                    "ai_identity_card, session_chunk_summary, value_markers, advices, "
+                    "changed_fields, source_job_id, is_latest, created_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?)",
+                    (session_id, subject, int(row["id"]), float(row["window_from_ts"]),
+                     float(row["window_to_ts"]), row["window_from_turn"], row["window_to_turn"],
+                     row["user_representation"], row["user_peer_card"],
+                     row["ai_self_representation"], row["ai_identity_card"],
+                     row["session_chunk_summary"], row["value_markers"],
+                     advices or "[]", json.dumps(changed_fields), int(source_job_id),
+                     time.time()))
+                revision_id = int(cur.lastrowid)
+                if allowed:
+                    assignments = ", ".join(f"{name} = ?" for name in allowed)
+                    self._conn.execute(
+                        f"UPDATE base_refreshes SET {assignments} WHERE id = ?",
+                        (*allowed.values(), int(row["id"])))
+                # Only the live (greatest) window owns ``layer_state``. A late review of an
+                # older window still snapshots and updates its own row, but must not replace
+                # the artifact a newer base job already published.
+                if int(row["is_latest"] or 0) == 1:
+                    self.put_layer_state("base", subject, content, session_id=session_id,
+                                         ai_subject=ai_subject, commit=False)
+                self._conn.commit()
+                return revision_id
+            except Exception:
+                self._conn.rollback()
+                raise
+
+    def base_revisions(self, session_id: str, subject: str = "",
+                       limit: int = 20) -> list[dict[str, Any]]:
+        """Revision audit rows, newest first."""
+        limit = max(1, min(200, int(limit or 20)))
+        with self._lock:
+            if subject:
+                rows = self._conn.execute(
+                    "SELECT * FROM base_revisions WHERE session_id = ? AND subject = ? "
+                    "ORDER BY created_at DESC, id DESC LIMIT ?",
+                    (session_id, subject, limit)).fetchall()
+            else:
+                rows = self._conn.execute(
+                    "SELECT * FROM base_revisions WHERE session_id = ? "
+                    "ORDER BY created_at DESC, id DESC LIMIT ?",
+                    (session_id, limit)).fetchall()
+        return [dict(row) for row in rows]
+
+    def search_base_revisions(self, query: str, limit: int = 5, *,
+                              session_id: str = "") -> list[dict[str, Any]]:
+        """Search the six pre-overwrite fields plus advices (trigram FTS, LIKE fallback)."""
+        terms = _terms(query)
+        if not terms:
+            return []
+        capped = max(1, min(int(limit), 20))
+        columns = (*_BASE_REVISION_COLUMNS, "advices")
+        filters: list[str] = []
+        filter_params: list[Any] = []
+        if session_id:
+            filters.append("r.session_id = ?")
+            filter_params.append(session_id)
+        where = (" AND " + " AND ".join(filters)) if filters else ""
+        rows: list[dict[str, Any]] = []
+        fts_terms = [term for term in terms if len(term) >= 3]
+        if self._base_revisions_fts and fts_terms:
+            match = " OR ".join(f'"{term.replace(chr(34), chr(34) * 2)}"' for term in fts_terms)
+            sql = (
+                "SELECT r.*, bm25(base_revisions_fts) AS rank FROM base_revisions_fts "
+                "JOIN base_revisions r ON r.id = base_revisions_fts.rowid "
+                f"WHERE base_revisions_fts MATCH ?{where} ORDER BY rank LIMIT ?")
+            try:
+                with self._lock:
+                    found = self._conn.execute(
+                        sql, [match, *filter_params, _MAX_SCAN]).fetchall()
+                rows = [dict(row) for row in found]
+            except sqlite3.OperationalError as exc:
+                logger.debug("Minir base-revision FTS query failed, falling back: %s", exc)
+        if not rows:
+            clauses = []
+            for _term in terms:
+                clauses.append(" OR ".join(f"lower(r.{name}) LIKE ?" for name in columns))
+            sql = (
+                f"SELECT r.*, 0 AS rank FROM base_revisions r "
+                f"WHERE ({' OR '.join(clauses)}){where} "
+                "ORDER BY r.created_at DESC, r.id DESC LIMIT ?")
+            like_params = [f"%{term}%" for term in terms for _name in columns]
+            with self._lock:
+                found = self._conn.execute(
+                    sql, [*like_params, *filter_params, _MAX_SCAN]).fetchall()
+            rows = [dict(row) for row in found]
+        results: list[dict[str, Any]] = []
+        for row in rows:
+            text = " ".join(str(row.get(name) or "") for name in columns).lower()
+            if not any(term in text for term in terms):
+                continue
+            entry = dict(row)
+            entry["rank"] = float(row.get("rank") or 0)
+            results.append(entry)
+        return results[:capped]
+
+    # -- advice delivery ------------------------------------------------------
+
+    def add_advisories(self, session_id: str, advices: list[dict[str, Any]], *,
+                       revision_id: int = 0, source: str = "dialectic") -> list[int]:
+        """Insert normalized advices, deduped by session + normalized text fingerprint."""
+        inserted: list[int] = []
+        with self._lock:
+            for item in advices:
+                content = " ".join(str(item.get("content") or item.get("text") or "").split())
+                if not content:
+                    continue
+                fingerprint = hashlib.sha256(
+                    f"{session_id}\0{content.lower()}".encode("utf-8")).hexdigest()[:32]
+                cur = self._conn.execute(
+                    "INSERT OR IGNORE INTO advisories (revision_id, session_id, source, "
+                    "severity, target, content, decision, evidence, fingerprint, status, "
+                    "created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?)",
+                    (int(revision_id), session_id, str(source),
+                     str(item.get("severity") or "concern"), str(item.get("target") or ""),
+                     content, str(item.get("decision") or ""),
+                     json.dumps(item.get("evidence") or []), fingerprint, time.time()))
+                if cur.rowcount:
+                    inserted.append(int(cur.lastrowid))
+            self._conn.commit()
+        return inserted
+
+    def pending_advisories(self, session_id: str, limit: int = 8) -> list[dict[str, Any]]:
+        """Undelivered advices, blockers first, then concerns, then nits."""
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT * FROM advisories WHERE session_id = ? AND status = 'pending' "
+                "ORDER BY CASE severity WHEN 'blocker' THEN 0 WHEN 'concern' THEN 1 ELSE 2 END, "
+                "id LIMIT ?", (session_id, max(1, min(int(limit), 32)))).fetchall()
+        return [dict(row) for row in rows]
+
+    def mark_advisories_injected(self, ids: list[int], turn_id: str = "") -> int:
+        if not ids:
+            return 0
+        marks = ",".join("?" * len(ids))
+        with self._lock:
+            cur = self._conn.execute(
+                f"UPDATE advisories SET status = 'injected', injected_at = ?, turn_id = ? "
+                f"WHERE id IN ({marks}) AND status = 'pending'",
+                (time.time(), turn_id or "", *[int(item) for item in ids]))
+            self._conn.commit()
+            return int(cur.rowcount)
+
+    def has_advisories(self, session_id: str) -> bool:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT 1 FROM advisories WHERE session_id = ? LIMIT 1", (session_id,)).fetchone()
+        return row is not None
+
+    def search_base_refreshes(self, query: str, limit: int = 5, *, session_id: str = "",
+                              latest_only: bool = False) -> list[dict[str, Any]]:
+        """Search the six refresh outputs with the table-level FTS index.
+
+        Mirrors ``search``: trigram FTS is used only when at least one term is >= 3 chars;
+        a query made entirely of 1-2 char terms (common for Chinese, e.g. ``工具``) falls back
+        to a LIKE scan, as does a missing FTS5 build. ``latest_only`` narrows to the currently
+        active window; ``session_id`` keeps the history session-scoped.
+        """
+        terms = _terms(query)
+        if not terms:
+            return []
+        capped = max(1, min(int(limit), 20))
+        columns = ("user_representation", "user_peer_card", "ai_self_representation",
+                   "ai_identity_card", "session_chunk_summary", "value_markers")
+        filters: list[str] = []
+        filter_params: list[Any] = []
+        if session_id:
+            filters.append("b.session_id = ?")
+            filter_params.append(session_id)
+        if latest_only:
+            filters.append("b.is_latest = 1")
+        where = (" AND " + " AND ".join(filters)) if filters else ""
+        rows: list[dict[str, Any]] = []
+        fts_terms = [term for term in terms if len(term) >= 3]
+        if self._base_fts and fts_terms:
+            match = " OR ".join(f'"{term.replace(chr(34), chr(34) * 2)}"' for term in fts_terms)
+            sql = (
+                "SELECT b.*, bm25(base_refreshes_fts) AS rank FROM base_refreshes_fts "
+                "JOIN base_refreshes b ON b.id = base_refreshes_fts.rowid "
+                f"WHERE base_refreshes_fts MATCH ?{where} "
+                "ORDER BY rank LIMIT ?")
+            try:
+                with self._lock:
+                    found = self._conn.execute(
+                        sql, [match, *filter_params, _MAX_SCAN]).fetchall()
+                rows = [dict(row) for row in found]
+            except sqlite3.OperationalError as exc:
+                logger.debug("Minir base-refresh FTS query failed, falling back to scan: %s", exc)
+        if not rows:
+            clauses = []
+            for _term in terms:
+                clauses.append(" OR ".join(f"lower(b.{name}) LIKE ?" for name in columns))
+            sql = (
+                f"SELECT b.*, 0 AS rank FROM base_refreshes b WHERE ({' OR '.join(clauses)})"
+                f"{where} ORDER BY b.window_to_ts DESC, b.id DESC LIMIT ?")
+            like_params = [f"%{term}%" for term in terms for _name in columns]
+            with self._lock:
+                found = self._conn.execute(
+                    sql, [*like_params, *filter_params, _MAX_SCAN]).fetchall()
+            rows = [dict(row) for row in found]
+
+        results: list[dict[str, Any]] = []
+        for row in rows:
+            text = " ".join(str(row.get(name) or "") for name in columns).lower()
+            overlap = sum(1 for term in terms if term in text)
+            if not overlap:
+                continue
+            entry = dict(row)
+            entry["score"] = float(overlap) + (0.5 if row.get("is_latest") else 0.0)
+            entry["rank"] = float(row.get("rank") or 0)
+            results.append(entry)
+        results.sort(key=lambda item: (
+            item["score"], -item["rank"], float(item.get("window_to_ts") or 0),
+            int(item.get("id") or 0)), reverse=True)
+        return results[:capped]
 
     # -- reads ----------------------------------------------------------------
 
@@ -955,6 +1502,8 @@ class MinirStore:
                 "SELECT COUNT(*) AS n FROM jobs WHERE status = 'failed'").fetchone()["n"]
             states = self._conn.execute("SELECT COUNT(*) AS n FROM layer_state").fetchone()["n"]
             refreshes = self._conn.execute("SELECT COUNT(*) AS n FROM base_refreshes").fetchone()["n"]
+            revisions = self._conn.execute("SELECT COUNT(*) AS n FROM base_revisions").fetchone()["n"]
+            advices = self._conn.execute("SELECT COUNT(*) AS n FROM advisories").fetchone()["n"]
             conclusions = self._conn.execute("SELECT COUNT(*) AS n FROM conclusions").fetchone()["n"]
             metrics = self._conn.execute("SELECT COUNT(*) AS n FROM metrics").fetchone()["n"]
         try:
@@ -964,6 +1513,7 @@ class MinirStore:
         return {"notes": int(notes), "sessions": int(sessions),
                 "jobs": int(jobs), "pending_jobs": int(pending), "failed_jobs": int(failed),
                 "layer_states": int(states), "base_refreshes": int(refreshes),
+                "base_revisions": int(revisions), "advisories": int(advices),
                 "conclusions": int(conclusions),
                 "metrics": int(metrics), "fts": bool(self._fts),
                 "db_path": str(self.path), "db_bytes": size}
