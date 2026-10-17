@@ -534,16 +534,20 @@ def test_compress_indexes_the_handoff_and_queues_dialectic(plugin_package, state
     folded = engine.compress(_conversation(10))
     carrier = next(message for message in folded
                    if plugin_package.context_engine.is_carrier(message))
+    parsed = plugin_package.context_engine.parse_carrier(carrier)
     assert "ship the context engine" in carrier["content"]
+    assert parsed["summary"] and "## Goal" in parsed["summary"]
+    assert len(parsed["summary"]) <= plugin_package.context_engine._MAX_CARRIER_SUMMARY
 
     store = engine._memory_store()
-    assert store.newest_conclusion("handoff", session_id=SESSION) is None, \
+    assert store.newest_conclusion("session_summary", session_id=SESSION) is None, \
         "a pass is not recallable until its carrier is durable"
     engine.on_turn_complete(folded)
-    handoff = store.newest_conclusion("handoff", session_id=SESSION)
+    handoff = store.newest_conclusion("session_summary", session_id=SESSION)
     assert handoff is not None and "## Stop Condition" in handoff["content"]
     jobs = store.pending_jobs()
-    assert [(job["layer"], job["session_id"]) for job in jobs] == [("dialectic", SESSION)]
+    assert {(job["layer"], job["session_id"]) for job in jobs} == {
+        ("base", SESSION), ("dialectic", SESSION)}
     assert jobs[0]["to_ts"] >= engine._compress_requested_at or jobs[0]["to_ts"] > 0
 
 
@@ -568,3 +572,85 @@ def test_reasoning_disabled_skips_the_handoff_model(plugin_package, state_db, tm
     assert plugin_package.context_engine.is_carrier(
         next(message for message in folded
              if plugin_package.context_engine.is_carrier(message)))
+
+
+def test_compression_input_contains_historical_and_tail_dialectic_conclusions(
+        plugin_package, state_db, tmp_path, monkeypatch):
+    engine = _engine(plugin_package, state_db, interval=1, hermes_home=str(tmp_path))
+    store = engine._memory_store()
+    store.put_conclusion("dialectic.constraints", "agent:minir", "- never delete files",
+                         subject="agent:minir")
+    store.put_conclusion("base.ai_identity_card", "agent:minir", "- careful operator",
+                         subject="agent:minir")
+    store.put_conclusion("dialectic.review", "review:session-ctx", "- tail review",
+                         session_id=SESSION, subject="agent:minir")
+    store.put_conclusion("base.user_representation", "focus:session-ctx", "- [goal] ship",
+                         session_id=SESSION, subject="user:default")
+    store.add_chunk_summary(SESSION, 1.0, 2.0, "local chunk fact")
+
+    seen: dict[str, str] = {}
+
+    def summarize(*args, **kwargs):
+        seen.update(kwargs)
+        return HANDOFF
+
+    monkeypatch.setenv("MINIR_REASONING_ENABLED", "true")
+    monkeypatch.setattr(plugin_package.handoff, "summarize", summarize)
+    engine._summary_enabled = True
+    engine.threshold_tokens = 10
+    engine.last_prompt_tokens = 20
+    assert engine.should_compress() is True
+    engine.compress(_conversation(10))
+
+    assert "local chunk fact" in seen["chunks"]
+    assert "never delete files" in seen["historical"]
+    assert "careful operator" in seen["historical"]
+    assert "tail review" in seen["tail"]
+    assert "[goal] ship" in seen["tail"]
+
+
+def test_update_from_response_accepts_nested_and_canonical_usage(plugin_package):
+    engine = plugin_package.MinirContextEngine()
+    engine.update_from_response({"usage": {"input_tokens": 11, "output_tokens": 7}})
+    assert (engine.last_prompt_tokens, engine.last_completion_tokens,
+            engine.last_total_tokens) == (11, 7, 18)
+    engine.update_from_response({"prompt_tokens": 20, "completion_tokens": 5, "total_tokens": 25})
+    assert (engine.last_prompt_tokens, engine.last_completion_tokens,
+            engine.last_total_tokens) == (20, 5, 25)
+
+
+def test_handoff_prompt_uses_conclusions_and_falls_back_to_turns(plugin_package, monkeypatch):
+    captured: dict[str, str] = {}
+
+    def fake_call(task, system, prompt, **kwargs):
+        captured["prompt"] = prompt
+        return HANDOFF
+
+    monkeypatch.setattr(plugin_package.worker, "call_model", fake_call)
+    messages = [{"role": "user", "content": "raw turn detail"}]
+
+    plugin_package.handoff.summarize(messages, historical="historical conclusion",
+                                     tail="tail conclusion")
+    assert "HISTORICAL DIALECTIC CONCLUSIONS" in captured["prompt"]
+    assert "TAIL-WINDOW DIALECTIC CONCLUSIONS" in captured["prompt"]
+    assert "raw turn detail" not in captured["prompt"], "conclusions are the contract input"
+
+    plugin_package.handoff.summarize(messages, historical="historical conclusion", tail="")
+    assert "TURNS TO SUMMARIZE" in captured["prompt"]
+    assert "raw turn detail" in captured["prompt"], "raw turns are the cold-start fallback"
+
+
+def test_an_old_carrier_does_not_seal_a_new_chunk_chain(plugin_package, state_db, tmp_path):
+    engine = _engine(plugin_package, state_db, interval=10, hermes_home=str(tmp_path))
+    store = engine._memory_store()
+    store.add_chunk_summary(SESSION, 1.0, 2.0, "new active chunk")
+    carrier = plugin_package.context_engine.build_carrier(
+        1, 2, [_msg("user", "old", uid="u1")], gist="old carrier")
+
+    engine.on_turn_complete([carrier])
+    assert store.chunk_summaries(SESSION), "an old carrier must not supersede a live chain"
+
+    store.put_conclusion("session_summary", "summary:" + SESSION, "## Goal\n- done",
+                         session_id=SESSION, subject="session", status="pending")
+    engine.on_turn_complete([carrier])
+    assert store.chunk_summaries(SESSION) == []

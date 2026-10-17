@@ -26,11 +26,12 @@ Four properties matter for the host's contract:
 * **Fail-open.** Every hook returns "leave it alone" on any error: a broken engine must never be
   worse than no engine.
 * **Side effects are indexed, not authoritative.** On a fold the engine may call the auxiliary
-  model once with the operator's Task Handoff template, write that handoff to the plugin's own
-  conclusions index, and queue a dialectic job. The conversation itself is never copied: the
-  carrier in the returned list is what the host commits, and the folded originals remain in
-  ``state.db``. A discarded pass can leave one orphan handoff row; it is keyed by fold range and
-  superseded by the next fold.
+  model once with the operator's Task Handoff template, write the resulting session summary to
+  the plugin's own conclusions index as ``pending``, and queue a dialectic job. The conversation
+  itself is never copied: the carrier in the returned list is what the host commits, and the
+  folded originals remain in ``state.db``. A summary becomes ``active`` only when
+  ``on_turn_complete`` observes the carrier in the persisted messages; a discarded pass leaves a
+  ``pending`` row that expires on the TTL sweep and never reaches recall.
 * **Cache-stable.** ``select_context`` returns ``None`` unless the message genuinely matches folded
   content, and an injection only appends to the last user message, so every byte before it keeps
   matching the provider's prompt cache.
@@ -51,7 +52,8 @@ from typing import Any, Iterable, Optional
 from agent.context_engine import ContextEngine
 
 from . import cadence, handoff
-from .store import MinirStore
+from .store import MinirStore, format_when
+from .turn_counter import BASE_LAYER
 from .turn_counter import DEFAULT_DIALECTIC_INTERVAL as _DEFAULT_DIALECTIC_INTERVAL
 from .turn_counter import DIALECTIC_LAYER
 
@@ -68,13 +70,14 @@ CARRIER_MARKER = "[minir fold"
 _CARRIER_RE = re.compile(
     r"^\[minir fold · turns (?P<first>\d+)-(?P<last>\d+) · (?P<count>\d+) msgs\]\n"
     r"recover: (?P<uids>[^\n]*)\n"
-    r"gist: (?P<gist>.*)$",
+    r"gist: (?P<gist>[^\n]*)(?:\nsummary:\n(?P<summary>.*))?$",
     re.DOTALL)
 
 _DEFAULT_INTERVAL = _DEFAULT_DIALECTIC_INTERVAL  # the provider's own default, resolved in cadence
 _MAX_FOLD_MESSAGES = 24         # messages one fold may move (progressive: a slice per beat)
-_MAX_CARRIER_CHARS = 1200
+_MAX_CARRIER_CHARS = 2400
 _MAX_GIST_CHARS = 200
+_MAX_CARRIER_SUMMARY = 900      # bounded summary that rides in the returned message sequence
 _MAX_RECALL_CHARS = 1600        # injected per request
 _MAX_RECALL_MESSAGES = 4
 _MAX_FETCHED = 400              # originals read from state.db per recall
@@ -126,14 +129,15 @@ def is_carrier(message: Any) -> bool:
 
 
 def parse_carrier(message: Any) -> Optional[dict[str, Any]]:
-    """Carrier row -> ``{first, last, count, uids, gist}``, or ``None`` when it is not one."""
+    """Carrier row -> ``{first, last, count, uids, gist, summary}``, or ``None``."""
     match = _CARRIER_RE.match(_text_of(message).lstrip())
     if match is None:
         return None
     return {"first": int(match.group("first")), "last": int(match.group("last")),
             "count": int(match.group("count")),
             "uids": [uid for uid in match.group("uids").split(",") if uid],
-            "gist": match.group("gist").strip()}
+            "gist": match.group("gist").strip(),
+            "summary": (match.group("summary") or "").strip()}
 
 
 def carrier_turn(message: Any) -> Optional[int]:
@@ -143,12 +147,14 @@ def carrier_turn(message: Any) -> Optional[int]:
 
 
 def build_carrier(first_turn: int, last_turn: int, messages: list[dict[str, Any]],
-                  gist: str = "") -> dict[str, Any]:
+                  gist: str = "", summary: str = "") -> dict[str, Any]:
     """The row that replaces a folded slice.
 
     ``message_uid`` is minted here on purpose: the host writes an engine-set uid through the
     commit, so the carrier survives a restart as a row the engine recognises (and a later fold can
-    absorb its id list instead of nesting carriers).
+    absorb its id list instead of nesting carriers). ``summary`` is the bounded session-summary
+    conclusion that must travel with the OpenAI message sequence; the full text stays in the
+    conclusions store.
     """
     uids: list[str] = []
     for message in messages:
@@ -161,8 +167,11 @@ def build_carrier(first_turn: int, last_turn: int, messages: list[dict[str, Any]
             uids.append(uid)
     uids = list(dict.fromkeys(uids))
     gist = " ".join((gist or "").split())[:_MAX_GIST_CHARS]
+    summary = summary.strip()[:_MAX_CARRIER_SUMMARY]
     head = f"[minir fold · turns {first_turn}-{last_turn} · {len(messages)} msgs]\nrecover: "
     tail = f"\ngist: {gist or 'no gist recorded'}"
+    if summary:
+        tail += f"\nsummary:\n{summary}"
     # Room for the elision note too, so the finished carrier is within the cap as written.
     budget = max(0, _MAX_CARRIER_CHARS - len(head) - len(tail) - 16)
     listed: list[str] = []
@@ -307,7 +316,11 @@ class MinirContextEngine(ContextEngine):
             if self._session_id and any(is_carrier(message) for message in messages):
                 store = self._memory_store()
                 if store is not None:
-                    store.promote_pending_handoffs(self._session_id)
+                    # A carrier persists across turns. Seal the chunk chain only when this
+                    # observation actually promoted a pending summary; otherwise an old
+                    # carrier would supersede a chain that is still being built.
+                    if store.promote_pending_handoffs(self._session_id) > 0:
+                        store.supersede_chunk_summaries(self._session_id)
 
     def on_session_reset(self) -> None:
         """``/new`` and ``/reset``: fresh session state plus the base class's counter reset."""
@@ -322,12 +335,24 @@ class MinirContextEngine(ContextEngine):
         super().on_session_reset()
 
     def update_from_response(self, usage: dict[str, Any]) -> None:
-        """Track token usage after every LLM call (the host reads these fields directly)."""
-        if not isinstance(usage, dict):
+        """Track token usage after every LLM call (the host reads these fields directly).
+
+        Accepts the ABC's usage dict, a full response with a nested ``usage``, and the
+        canonical ``input_tokens``/``output_tokens`` buckets used by older hosts.
+        """
+        payload: Any = usage
+        if not isinstance(payload, dict):
+            payload = getattr(usage, "usage", None)
+        if isinstance(payload, dict) and isinstance(payload.get("usage"), dict):
+            payload = payload["usage"]
+        if not isinstance(payload, dict):
             return
-        self.last_prompt_tokens = int(usage.get("prompt_tokens") or 0)
-        self.last_completion_tokens = int(usage.get("completion_tokens") or 0)
-        self.last_total_tokens = int(usage.get("total_tokens") or 0)
+        prompt = int(payload.get("prompt_tokens", payload.get("input_tokens")) or 0)
+        completion = int(payload.get("completion_tokens", payload.get("output_tokens")) or 0)
+        total = int(payload.get("total_tokens") or (prompt + completion))
+        self.last_prompt_tokens = prompt
+        self.last_completion_tokens = completion
+        self.last_total_tokens = total
 
     # -- cadence --------------------------------------------------------------
 
@@ -358,19 +383,38 @@ class MinirContextEngine(ContextEngine):
     def should_compress(self, prompt_tokens: int | None = None) -> bool:
         """Fold on a dialectic beat, or when the window is genuinely near the limit.
 
-        When the answer is true, stamp the moment: ``compress()`` uses it as the end of the
-        dialectic window (the summary covers up to the decision, not to whenever the fold ran).
+        The threshold is the hard upper bound on the refresh interval: when it is crossed, a
+        final base-layer chunk refresh and a final dialectic refresh are queued before the fold.
         """
         tokens = self.last_prompt_tokens if prompt_tokens is None else int(prompt_tokens)
         if self.threshold_tokens and tokens >= self.threshold_tokens:
             with self._lock:
                 self._compress_requested_at = time.time()
+            self._queue_final_refresh()
             return True
         if self.current_beat() - self._beat >= self._interval:
             with self._lock:
                 self._compress_requested_at = time.time()
+            self._queue_final_refresh()
             return True
         return False
+
+    def _queue_final_refresh(self) -> None:
+        """Threshold is a hard cap: force one last base chunk + dialectic refresh."""
+        store = self._memory_store()
+        if store is None or not self._session_id:
+            return
+        requested = self._compress_requested_at or time.time()
+        beat = self.current_beat()
+        try:
+            if not store.has_open_job(BASE_LAYER, self._session_id):
+                start = store.latest_chunk_end(self._session_id)
+                if requested > start:
+                    store.record_job(BASE_LAYER, self._session_id, start, requested,
+                                     turns=int(beat))
+            self._enqueue_dialectic(store, requested, int(beat))
+        except Exception as exc:
+            logger.debug("Minir final refresh enqueue skipped: %s", exc)
 
     def should_defer_preflight_to_real_usage(self, rough_tokens: int) -> bool:
         """Defer to real usage whenever the last completed request fit under the threshold.
@@ -389,7 +433,11 @@ class MinirContextEngine(ContextEngine):
         self, messages: list[dict[str, Any]], current_tokens: Optional[int] = None,
         focus_topic: Optional[str] = None, force: bool = False, memory_context: str = "",
     ) -> list[dict[str, Any]]:
-        """Fold the oldest unprotected slice into one carrier. Never calls a model, never raises."""
+        """Fold the oldest unprotected slice into one carrier and queue the dialectic window.
+
+        Optionally makes one bounded handoff/summary call when ``reasoning_enabled`` and
+        ``handoff_enabled`` are on; always attempts the dialectic enqueue. Never raises.
+        """
         try:
             bounds = foldable_slice(messages, self.protect_first_n, self.protect_last_n,
                                     focus_topic=focus_topic)
@@ -400,18 +448,26 @@ class MinirContextEngine(ContextEngine):
             beat = self.current_beat(messages)
             store = self._memory_store()
             previous = ""
+            historical = ""
+            tail = ""
+            chunks = ""
             if store is not None and self._session_id:
-                row = store.newest_conclusion("handoff", session_id=self._session_id)
+                row = (store.newest_conclusion("session_summary", session_id=self._session_id)
+                       or store.newest_conclusion("handoff", session_id=self._session_id))
                 previous = str((row or {}).get("content") or "")
+                historical, tail = self._dialectic_inputs(store, self._session_id)
+                chunks = self._chunk_input(store, self._session_id)
             summary = ""
             if self._summary_enabled and folded:
                 summary = handoff.summarize(
-                    folded, previous=previous, focus_topic=focus_topic or "",
+                    folded, previous=previous, historical=historical, tail=tail,
+                    chunks=chunks, focus_topic=focus_topic or "",
                     memory_context=memory_context or "")
             gist = handoff.gist(summary) if summary else ""
             if not gist:
                 gist = self._gist_for(folded, memory_context)
-            carrier = build_carrier(self._first_turn(folded, beat), beat, folded, gist)
+            carrier = build_carrier(self._first_turn(folded, beat), beat, folded, gist,
+                                    summary=summary)
             result = [*messages[:start], carrier, *messages[end:]]
             requested_at = self._compress_requested_at or time.time()
             if store is not None and self._session_id:
@@ -419,9 +475,9 @@ class MinirContextEngine(ContextEngine):
                     if summary:
                         store.expire_pending_handoffs(self._session_id,
                                                       before=time.time() - 3_600)
-                        key = f"handoff:{self._session_id}:{start}:{end}"
+                        key = f"session_summary:{self._session_id}:{start}:{end}"
                         store.put_conclusion(
-                            "handoff", key, summary, session_id=self._session_id,
+                            "session_summary", key, summary, session_id=self._session_id,
                             subject="session", evidence=json.dumps(
                                 [uid for uid in folded_uids(folded)]), status="pending",
                             version=beat)
@@ -571,6 +627,50 @@ class MinirContextEngine(ContextEngine):
             if text and not is_carrier(message):
                 return text
         return ""
+
+    @staticmethod
+    def _chunk_input(store: MinirStore, session: str) -> str:
+        """The canonical local-compression chain, oldest first."""
+        parts: list[str] = []
+        for index, chunk in enumerate(store.chunk_summaries(session), start=1):
+            body = str(chunk.get("content") or "").strip()
+            if not body:
+                continue
+            window = ""
+            if chunk.get("from_ts") is not None and chunk.get("to_ts") is not None:
+                window = (f" · {format_when(float(chunk['from_ts']))}"
+                          f"–{format_when(float(chunk['to_ts']))}")
+            parts.append(f"### Local chunk {index}{window}\n{body}")
+        return "\n\n".join(parts)
+
+    @staticmethod
+    def _dialectic_inputs(store: MinirStore, session: str) -> tuple[str, str]:
+        """Historical conclusions + the tail window's conclusions.
+
+        Historical = durable cards and constraints accumulated across sessions. Tail = the
+        current session's latest review and current-focus representation. The canonical
+        ``session_chunk_summary`` chain is passed separately by ``compress()``.
+        """
+        historical_parts: list[str] = []
+        for kind, label in (
+                ("base.user_peer_card", "User peer card"),
+                ("base.ai_identity_card", "AI identity card"),
+                ("dialectic.constraints", "Constraints"),
+                ("dialectic.preferences", "Preferences"),
+                ("dialectic.second_brain", "Second brain")):
+            row = store.newest_conclusion(kind)
+            body = str((row or {}).get("content") or "").strip()
+            if body:
+                historical_parts.append(f"## {label}\n{body}")
+        tail_parts: list[str] = []
+        for kind, label in (
+                ("dialectic.review", "Tail-window adviser review"),
+                ("base.user_representation", "Tail-window user representation")):
+            row = store.newest_conclusion(kind, session_id=session)
+            body = str((row or {}).get("content") or "").strip()
+            if body:
+                tail_parts.append(f"## {label}\n{body}")
+        return "\n\n".join(historical_parts), "\n\n".join(tail_parts)
 
     def _memory_store(self) -> Optional[MinirStore]:
         """The plugin's own store, opened lazily (the engine can run without the provider)."""

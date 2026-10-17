@@ -161,7 +161,10 @@ def test_merge_bumps_the_version_and_feeds_the_previous_artifact_forward(store, 
     second = store.layer_state(BASE, "user:default")
 
     assert (first["version"], second["version"]) == (1, 2)
-    assert first["content"] in worker.calls[1]["prompt"], "the merge pass must see the previous model"
+    assert "Wants terse answers" in worker.calls[1]["prompt"], \
+        "the merge pass must see the durable previous sections"
+    assert "## Session Summary" not in worker.calls[1]["prompt"], \
+        "the rolling projection must be recomputed, not fed back"
 
 
 def test_dialectic_layer_publishes_constraints_preferences_review(plugin_package, store, transcript):
@@ -415,3 +418,84 @@ def test_a_dialectic_audit_failure_keeps_the_initial_draft(plugin_package, store
     _dispatch(store, transcript, SESSION, DIALECTIC, 0.0, 20.0)
     assert instance.run_once() == 1
     assert "review" in store.layer_state(DIALECTIC, "agent:minir")["content"]
+
+
+# -- canonical chunk chain ----------------------------------------------------
+
+def test_base_refresh_appends_a_chunk_and_projects_it_into_the_artifact(store, transcript, worker):
+    transcript.add(SESSION, "user", "first window", created_at=10.0)
+    _dispatch(store, transcript, SESSION, BASE, 0.0, 20.0)
+    assert worker.run_once() == 1
+
+    chunks = store.chunk_summaries(SESSION)
+    assert len(chunks) == 1
+    assert "Ships a Hermes memory plugin" in chunks[0]["content"]
+    assert store.newest_conclusion("base.session_summary") is None, \
+        "the rolling view must not be a second independent conclusion"
+
+    artifact = store.layer_state(BASE, "user:default")["content"]
+    assert "## Session Summary" in artifact
+    assert "Ships a Hermes memory plugin" in artifact
+    assert "Local chunk" in artifact, "the base section is the rolling chain projection"
+
+    transcript.add(SESSION, "user", "second window", created_at=30.0)
+    _dispatch(store, transcript, SESSION, BASE, 20.0, 40.0)
+    assert worker.run_once() == 1
+    assert len(store.chunk_summaries(SESSION)) == 2
+    projection = store.rolling_session_summary(SESSION)
+    assert projection.count("Local chunk") == 2
+
+
+def test_final_summary_supersedes_the_chunk_chain(store, transcript, worker):
+    transcript.add(SESSION, "user", "window", created_at=10.0)
+    _dispatch(store, transcript, SESSION, BASE, 0.0, 20.0)
+    worker.run_once()
+    assert len(store.chunk_summaries(SESSION)) == 1
+
+    store.put_conclusion("session_summary", "summary:" + SESSION, "## Goal\n- done",
+                         session_id=SESSION, subject="session", status="active")
+    assert store.supersede_chunk_summaries(SESSION) == 1
+    assert store.chunk_summaries(SESSION) == []
+    projection = store.rolling_session_summary(SESSION)
+    assert "Prior summarized context" in projection and "## Goal" in projection
+
+
+def test_dialectic_prompt_consumes_the_chunk_chain(store, transcript, worker):
+    store.add_chunk_summary(SESSION, 1.0, 2.0, "chunk one: tests pass")
+    store.add_chunk_summary(SESSION, 2.0, 3.0, "chunk two: tests fail")
+    transcript.add(SESSION, "user", "reconcile this", created_at=10.0)
+    _dispatch(store, transcript, SESSION, DIALECTIC, 0.0, 20.0)
+    assert worker.run_once() == 1
+    prompt = worker.calls[0]["prompt"]
+    assert "LOCAL CHUNK SUMMARIES" in prompt
+    assert "chunk one: tests pass" in prompt and "chunk two: tests fail" in prompt
+    assert "Reconcile contradictions" in prompt
+
+
+def test_base_prompt_does_not_feed_the_previous_projection_back(store, transcript, worker):
+    store.put_layer_state(
+        "base", "user:default",
+        "## Session Summary\n- OLD PROJECTION\n\n## User Representation\n- [goal] old\n\n"
+        "## User Peer Card\n- durable peer\n\n## AI Self Representation\n- self\n\n"
+        "## AI Identity Card\n- identity")
+    transcript.add(SESSION, "user", "new delta", created_at=10.0)
+    _dispatch(store, transcript, SESSION, BASE, 0.0, 20.0)
+    assert worker.run_once() == 1
+    prompt = worker.calls[0]["prompt"]
+    assert "OLD PROJECTION" not in prompt, "the rolling projection must not be fed back"
+    assert "durable peer" in prompt, "the other four sections still carry forward"
+
+
+def test_a_dialectic_job_can_run_from_the_chunk_chain_alone(plugin_package, store, transcript):
+    store.add_chunk_summary(SESSION, 1.0, 2.0, "chunk-only evidence")
+    calls: list[str] = []
+
+    def complete(task, system, prompt, **kwargs):
+        calls.append(prompt)
+        return ("## Adviser Review\n- reconciled\n\n## Constraints\n- c\n\n"
+                "## Preferences\n- p\n\n## Second Brain\n- [tool] t")
+
+    instance = plugin_package.worker.LayerWorker(store, transcript, depth=1, complete=complete)
+    store.record_job(DIALECTIC, SESSION, 0.0, 20.0)
+    assert instance.run_once() == 1, "chunks alone must drive the dialectic pass"
+    assert "chunk-only evidence" in calls[0]

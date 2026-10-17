@@ -112,7 +112,8 @@ table; `worker.py` drains it from the host's `state.db` (plus the uncommitted bu
 auxiliary model, and publishes a merged artifact into `layer_state` and its sections into the
 FTS-indexed `conclusions` table. `prefetch()` injects the newest base (user) and dialectic (agent)
 artifacts ahead of recall, so the next turn sees who the user is and how this agent should work —
-without the conversations it was derived from.
+without the conversations it was derived from. The base artifact's `## Session Summary` is a
+projection of the chunk chain and is **not injected**; only its durable cards are.
 
 | Layer | Models | Artifact sections | Subject key |
 | --- | --- | --- | --- |
@@ -125,6 +126,14 @@ piling up. The dialectic layer runs `dialectic_depth` passes: d1 synthesizes, d2
 draft against the window, d3 reconciles the two. A failed or malformed audit falls back to the last
 valid pass. `layer_state.version` counts the refreshes; the newest version is what gets injected
 (bounded to 1200 chars) next to the recall block (bounded to 2000).
+
+The base layer's `## Session Summary` is **not an independent summary**: every base refresh writes
+one `session_chunk_summary` (session + time range) to the canonical local-compression chain, and the
+artifact's section is the rolling projection of that chain. The previous projection is deliberately
+omitted from the next base merge prompt (only the other four sections carry forward), so chunks do
+not recursively copy the whole chain. The dialectic worker reads the chain and is instructed to
+reconcile contradictions across chunks (later evidence wins; stale claims and completed blockers
+are removed). `base.session_summary` is not written as a competing FTS conclusion.
 
 The model may be told who the assistant is from
 `$HERMES_HOME/minir-memory/agents/<profile>/identity.md` and `preference.md`; the profile comes from
@@ -249,15 +258,20 @@ provider's prompt cache; a request that does not match is returned untouched (`N
 no cache at all. The carriers are the durable index.
 
 On a fold, `compress()` may make one bounded auxiliary call using the Task Handoff template
-(`prompts/session_handoff.md`, override with `MINIR_SUMMARY_TEMPLATE`). The validated handoff is
-written to `conclusions` as `pending` (kind `handoff`, session-scoped) and reduced to a
-200-character carrier gist; `on_turn_complete` promotes it to `active` only when the carrier is
-actually in the persisted messages, so a pass the host discarded never becomes recallable. The
-full template output stays available to `minir_search` after promotion. The fold also queues the
-dialectic window ending at the `should_compress()` decision. `reasoning_enabled: false` disables
-the summary call as well as the layer worker. This is the same shape as the host's
+(`prompts/session_handoff.md`, override with `MINIR_SUMMARY_TEMPLATE`). Its input is the
+**historical dialectic conclusions** (durable user/AI cards, constraints, preferences, second
+brain, previous summary) plus the **tail window's dialectic conclusions** (current review and
+current-focus representation). Raw turns are used only as a cold-start fallback when no tail
+conclusion exists. The validated output is this session's summary conclusion, written to
+`conclusions` as `pending` (kind `session_summary`, session-scoped); a bounded copy (900 chars)
+rides in the returned carrier, while the full text stays in the store;
+`on_turn_complete` promotes it to `active` only when the carrier is actually in the persisted
+messages, so a pass the host discarded never becomes recallable. The full template output stays
+available to `minir_search` after promotion. The fold also queues the dialectic window ending at
+the `should_compress()` decision. `reasoning_enabled: false` disables the summary call as well as
+the layer worker. This is the same shape as the host's
 built-in compressor: a pass can be discarded on timeout, so the carrier the host commits remains
-authoritative and an orphan handoff row is harmless.
+authoritative and a pending summary row expires without polluting recall.
 
 ### Safety
 

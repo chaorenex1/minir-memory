@@ -38,6 +38,7 @@ a turn, and the worker is a daemon thread the provider coalesces.
 
 from __future__ import annotations
 
+import json
 import logging
 import re
 import threading
@@ -45,7 +46,7 @@ import time
 from typing import Any, Callable, Optional
 
 from . import history as host_history
-from .store import MinirStore
+from .store import MinirStore, format_when
 from .transcript import TranscriptBuffer
 from .turn_counter import BASE_LAYER, DIALECTIC_LAYER
 
@@ -92,7 +93,10 @@ summary of the window.
 
 Sections, in this exact order and with these exact headings:
 ## Session Summary
-- what this session is trying to achieve, current state, open decisions
+- local compression of THIS window only; the previous projection is context, not text to repeat
+- use structured bullets: [goal], [constraint], [done], [in-progress], [blocked],
+  [decision], [file], [next], [critical]
+- omit a bullet when this window has no evidence for it; never restate older chunks
 ## User Representation
 - what the user is currently focused on, one typed bullet per item:
   [fact], [goal], [task], [plan], [decision], [artifact], [runtime], [retrieved]
@@ -136,6 +140,9 @@ Sections, in this exact order and with these exact headings:
 Rules:
 - Constraints and Preferences accumulate across windows; Adviser Review describes the latest
   window only and replaces the previous review.
+- When LOCAL CHUNK SUMMARIES are present, compare them oldest to newest. Later evidence wins;
+  remove claims and blockers the later chunks contradict, and record the correction in
+  Adviser Review.
 - Base every bullet on what actually happened in the window or on a rule stated in it. Do not
   invent permissions, licences or capabilities.
 - Be specific and actionable: name the trigger, the action and the correction.
@@ -274,37 +281,92 @@ _SESSION_SECTIONS: dict[str, frozenset[str]] = {
 }
 
 
-def previous_content(layer: str, previous: Optional[dict[str, Any]], session: str) -> str:
-    """Previous artifact minus sections that belonged to a *different* session.
-
-    The durable cards (peer card, identity, constraints, preferences, second brain) carry
-    across sessions; the session summary, current-focus list, current self-presentation and
-    adviser review do not. Reusing another session's review would steer the model with stale
-    advice.
-    """
-    content = str((previous or {}).get("content") or "")
-    previous_session = str((previous or {}).get("session_id") or "")
-    if not content or not previous_session or previous_session == session:
+def _drop_sections(content: str, headings: frozenset[str] | set[str]) -> str:
+    if not content or not headings:
         return content
-    drop = _SESSION_SECTIONS.get(layer, frozenset())
     blocks = re.split(r"(?=^## )", content, flags=re.MULTILINE)
     kept = [block for block in blocks
-            if block.split("\n", 1)[0].strip() not in drop]
+            if block.split("\n", 1)[0].strip() not in headings]
     return "".join(kept).strip()
 
 
+def previous_content(layer: str, previous: Optional[dict[str, Any]], session: str, *,
+                     drop: tuple[str, ...] = ()) -> str:
+    """Previous artifact minus session-bound sections and explicitly dropped sections.
+
+    The durable cards (peer card, identity, constraints, preferences, second brain) carry
+    across sessions; the session summary, current-focus list, current self-presentation and
+    adviser review do not. ``drop`` lets a caller omit a projection that must be recomputed
+    rather than fed back (base ``## Session Summary``).
+    """
+    content = str((previous or {}).get("content") or "")
+    previous_session = str((previous or {}).get("session_id") or "")
+    if content and previous_session and previous_session != session:
+        content = _drop_sections(content, _SESSION_SECTIONS.get(layer, frozenset()))
+    return _drop_sections(content, frozenset(drop))
+
+
+def _section_body(content: str, heading: str) -> str:
+    """Body of one fixed section (up to the next top-level heading), or ``""``."""
+    start = content.find(heading)
+    if start < 0:
+        return ""
+    start += len(heading)
+    end = content.find("\n## ", start)
+    return content[start:end if end >= 0 else len(content)].strip()
+
+
+def _replace_section(content: str, heading: str, body: str) -> str:
+    """Replace one fixed section's body while keeping the heading order intact."""
+    start = content.find(heading)
+    if start < 0:
+        return content
+    body_start = start + len(heading)
+    end = content.find("\n## ", body_start)
+    suffix = content[end + 1:] if end >= 0 else ""
+    return f"{content[:start]}{heading}\n{body.strip()}" + (f"\n{suffix}" if suffix else "")
+
+
 def _prompt(layer: str, subject: str, previous: str, evidence: str, *,
-            identity: str = "", preference: str = "", extra: str = "") -> str:
+            identity: str = "", preference: str = "", chunks: str = "",
+            extra: str = "") -> str:
     parts = [f"Target: {subject}"]
     parts.append(f"Previous model:\n{previous}" if previous.strip() else "Previous model: none (first refresh)")
     if identity.strip():
         parts.append(f"Operator-authored AI identity:\n{identity.strip()}")
     if preference.strip():
         parts.append(f"Operator-authored AI preferences:\n{preference.strip()}")
+    if chunks.strip():
+        parts.append(
+            "LOCAL CHUNK SUMMARIES (canonical chain, oldest first):\n"
+            f"{chunks.strip()}\n\n"
+            "Reconcile contradictions across chunks: later evidence wins, stale claims and "
+            "completed blockers are removed, and the correction is recorded in Adviser Review.")
     if extra.strip():
         parts.append(extra.strip())
     parts.append(f"Conversation window:\n{evidence or '(no messages in this window)'}")
     return "\n\n".join(parts)[:_MAX_PROMPT_CHARS]
+
+
+def _chunk_prompt(chunks: list[dict[str, Any]], max_chars: int = 4_000) -> str:
+    """Format the canonical chain for the dialectic prompt, newest chunks first under budget."""
+    kept: list[str] = []
+    size = 0
+    for index, chunk in reversed(list(enumerate(chunks, start=1))):
+        body = str(chunk.get("content") or "").strip()
+        if not body:
+            continue
+        window = ""
+        if chunk.get("from_ts") is not None and chunk.get("to_ts") is not None:
+            window = (f" · {format_when(float(chunk['from_ts']))}"
+                      f"–{format_when(float(chunk['to_ts']))}")
+        block = f"### Chunk {index}{window}\n{body}"
+        if size + len(block) + 1 > max_chars and kept:
+            kept.append("### […older chunks omitted]")
+            break
+        kept.append(block)
+        size += len(block) + 1
+    return "\n\n".join(reversed(kept))
 
 
 class LayerWorker:
@@ -419,11 +481,14 @@ class LayerWorker:
         cold = (not rows and layer == DIALECTIC_LAYER
                 and bool(self._identity.strip() or self._preference.strip())
                 and int(job.get("turns") or 0) == 0)
-        if not rows and not cold:
+        has_chunks = (layer == DIALECTIC_LAYER
+                      and bool(self._store.chunk_summaries(session)))
+        if not rows and not cold and not has_chunks:
             self._store.complete_job(job_id, end, error="empty window")
             logger.debug("Minir %s-layer job #%s covered no messages", layer, job_id)
             return
-        publications = (self._merge_participants(rows, session) if layer == BASE_LAYER
+        publications = (self._merge_participants(rows, session, start, end)
+                        if layer == BASE_LAYER
                         else self._merge_dialectic(rows, cold=cold, session=session))
         for subject, content in publications:
             version = self._store.put_layer_state(layer, subject, content,
@@ -447,9 +512,14 @@ class LayerWorker:
         rows.sort(key=lambda row: (float(row.get("created_at") or 0), row.get("role") or ""))
         return rows
 
-    def _merge_participants(self, rows: list[dict[str, Any]],
-                            session: str = "") -> list[tuple[str, str]]:
-        """Base layer: one merged artifact per participant that spoke in the window."""
+    def _merge_participants(self, rows: list[dict[str, Any]], session: str = "",
+                            from_ts: float = 0.0, to_ts: float = 0.0) -> list[tuple[str, str]]:
+        """Base layer: one merged artifact per participant + one canonical chunk summary.
+
+        The artifact's ``## Session Summary`` is replaced with the rolling projection of the
+        session's chunk chain after the new chunk is appended. The model's fresh Session Summary
+        body is the local compression of this window, never an independent final summary.
+        """
         speakers: dict[str, int] = {}
         for row in rows:
             if row["role"] != "user":
@@ -457,14 +527,25 @@ class LayerWorker:
             key = str(row.get("author_id") or row.get("author") or self._user_id or "default")
             speakers[key] = speakers.get(key, 0) + 1
         publications: list[tuple[str, str]] = []
+        chunk_text = ""
         for key, _ in sorted(speakers.items(), key=lambda item: -item[1])[:_AUTHOR_MERGES_PER_JOB]:
             subject = self.user_subject(author_id=key)
             evidence = _evidence(rows, target_id=key)
             if not evidence.strip():
                 continue  # nothing this participant said survived the evidence budget
             previous = self._store.layer_state(BASE_LAYER, subject)
-            publications.append((subject, self._merge(BASE_LAYER, subject, evidence, previous,
-                                                      session=session)))
+            content = self._merge(BASE_LAYER, subject, evidence, previous, session=session)
+            publications.append((subject, content))
+            if not chunk_text:
+                chunk_text = _section_body(content, "## Session Summary")
+        if chunk_text.strip() and session:
+            self._store.add_chunk_summary(
+                session, from_ts, to_ts, chunk_text,
+                evidence=json.dumps([row.get("message_uid") for row in rows
+                                     if row.get("message_uid")]))
+            projection = self._store.rolling_session_summary(session)
+            publications = [(subject, _replace_section(content, "## Session Summary", projection))
+                            for subject, content in publications]
         return publications
 
     def _merge_dialectic(self, rows: list[dict[str, Any]], *, cold: bool = False,
@@ -481,12 +562,16 @@ class LayerWorker:
         if previous is not None:
             previous = {**previous,
                         "content": previous_content(DIALECTIC_LAYER, previous, session)}
-        if not evidence.strip() and not (cold and is_cold and (self._identity or self._preference)):
+        chunks = _chunk_prompt(self._store.chunk_summaries(session))
+        if (not evidence.strip() and not chunks.strip()
+                and not (cold and is_cold and (self._identity or self._preference))):
             return []
-        return [(subject, self._merge_dialectic_depth(subject, evidence, previous, cold=is_cold))]
+        return [(subject, self._merge_dialectic_depth(subject, evidence, previous,
+                                                      chunks=chunks, cold=is_cold))]
 
     def _merge_dialectic_depth(self, subject: str, evidence: str,
-                               previous: Optional[dict[str, Any]], *, cold: bool) -> str:
+                               previous: Optional[dict[str, Any]], *, chunks: str = "",
+                               cold: bool) -> str:
         """Sequential dialectic: synthesize, self-audit, reconcile; publish only a valid pass."""
         prior = (previous or {}).get("content", "")
         system = (DIALECTIC_COLD_SYSTEM_PROMPT if cold
@@ -494,7 +579,7 @@ class LayerWorker:
         draft = self._complete(
             _TASK_KEYS[DIALECTIC_LAYER], system,
             _prompt(DIALECTIC_LAYER, subject, prior, evidence,
-                    identity=self._identity, preference=self._preference,
+                    identity=self._identity, preference=self._preference, chunks=chunks,
                     extra="This is a cold start: no prior artifact exists." if cold else ""))
         candidates = [draft]
         depth = 1 if cold else self._depth  # the session-init call is one synthesis, not a debate
@@ -502,14 +587,14 @@ class LayerWorker:
             audit = self._complete(
                 _TASK_KEYS[DIALECTIC_LAYER], DIALECTIC_AUDIT_SYSTEM_PROMPT,
                 _prompt(DIALECTIC_LAYER, subject, prior, evidence,
-                        identity=self._identity, preference=self._preference,
+                        identity=self._identity, preference=self._preference, chunks=chunks,
                         extra=f"Draft to audit:\n{draft[:_MAX_STATE_CHARS]}"))
             candidates.append(audit)
         if depth >= 3:
             reconciled = self._complete(
                 _TASK_KEYS[DIALECTIC_LAYER], DIALECTIC_RECONCILE_SYSTEM_PROMPT,
                 _prompt(DIALECTIC_LAYER, subject, prior, evidence,
-                        identity=self._identity, preference=self._preference,
+                        identity=self._identity, preference=self._preference, chunks=chunks,
                         extra=(f"Initial draft:\n{draft[:_MAX_STATE_CHARS]}\n\n"
                                f"Self-audit correction:\n{candidates[-1][:_MAX_STATE_CHARS]}")))
             candidates.append(reconciled)
@@ -524,7 +609,8 @@ class LayerWorker:
     def _merge(self, layer: str, subject: str, evidence: str,
                previous: Optional[dict[str, Any]], *, session: str = "") -> str:
         """Run the base layer's merge pass; raises :class:`LayerMergeError` on unusable output."""
-        prior = previous_content(layer, previous, session)
+        drop = ("## Session Summary",) if layer == BASE_LAYER else ()
+        prior = previous_content(layer, previous, session, drop=drop)
         text = self._complete(_TASK_KEYS[layer], _SYSTEM_PROMPTS[layer],
                               _prompt(layer, subject, prior, evidence))
         content = _normalize_state(layer, text)

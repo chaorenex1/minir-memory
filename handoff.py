@@ -110,20 +110,39 @@ def gist(summary: str) -> str:
 
 
 def summarize(messages: Iterable[dict[str, Any]], *, previous: str = "",
+              historical: str = "", tail: str = "", chunks: str = "",
               focus_topic: str = "", memory_context: str = "",
               timeout: float = 60.0) -> str:
-    """One auxiliary summary call; returns a validated handoff or ``""`` (never raises)."""
+    """One auxiliary summary call; returns a validated handoff or ``""`` (never raises).
+
+    The user prompt is the compression input: the canonical local chunk chain, durable/historical
+    dialectic conclusions, and the tail window's dialectic conclusions. Raw turns are included
+    only when neither the chain nor a tail conclusion exists, as a cold-start fallback.
+    """
     try:
         from .worker import call_model
-        prompt = serialize(messages)
+        parts: list[str] = []
         if previous.strip():
-            prompt = (f"PREVIOUS HANDOFF:\n{previous[:_MAX_SUMMARY_CHARS]}\n\n"
-                      f"NEW TURNS TO INCORPORATE:\n{prompt}")
+            parts.append(f"PREVIOUS SESSION SUMMARY:\n{previous[:_MAX_SUMMARY_CHARS]}")
+        if chunks.strip():
+            parts.append("LOCAL CHUNK SUMMARIES (canonical chain, oldest first):\n"
+                         f"{chunks.strip()[:8_000]}")
+        if historical.strip():
+            parts.append("HISTORICAL DIALECTIC CONCLUSIONS:\n"
+                         f"{historical.strip()[:4_000]}")
+        if tail.strip():
+            parts.append("TAIL-WINDOW DIALECTIC CONCLUSIONS:\n"
+                         f"{tail.strip()[:4_000]}")
+        # The contract input is the chain + conclusions. Raw turns are only a fallback when
+        # neither a chunk chain nor a tail conclusion exists yet.
+        if not tail.strip() and not chunks.strip():
+            parts.append(f"TURNS TO SUMMARIZE:\n{serialize(messages)}")
         if memory_context.strip():
-            prompt += f"\n\nPROVIDER MEMORY CONTEXT:\n{memory_context.strip()[:4_000]}"
+            parts.append(f"PROVIDER MEMORY CONTEXT:\n{memory_context.strip()[:4_000]}")
         if focus_topic.strip():
-            prompt += (f"\n\nFOCUS TOPIC: {focus_topic.strip()}\n"
-                       "Prioritise evidence related to this topic; summarise the rest briefly.")
+            parts.append(f"FOCUS TOPIC: {focus_topic.strip()}\n"
+                         "Prioritise evidence related to this topic; summarise the rest briefly.")
+        prompt = "\n\n".join(parts)
         text = call_model("minir_handoff", system_prompt(), prompt,
                           timeout=timeout, max_tokens=1_200)
         return normalize(text)

@@ -454,19 +454,19 @@ def test_prefetch_injects_the_published_layer_artifacts(provider):
     assert "### User model (v1)" in block and "### Agent model (v1)" in block
     assert "works on Windows" in block and "run a smoke test" in block
     status = provider.recall_status()
-    assert status is not None and status.count == 9, "one item per injected bullet"
+    assert status is not None and status.count == 8, "one item per injected bullet"
 
 
 def test_layer_state_prefers_the_participants_own_model(plugin_package, make_provider):
     provider = make_provider({"base_interval": 50})
     provider._store.put_layer_state("base", "user:ada",
-                                    "## Session Summary\n- Ada\n\n## User Representation\n- [fact] Ada\n\n"
-                                    "## User Peer Card\n- a\n\n## AI Self Representation\n- a\n\n"
+                                    "## Session Summary\n- session a\n\n## User Representation\n- [fact] Ada\n\n"
+                                    "## User Peer Card\n- Ada\n\n## AI Self Representation\n- a\n\n"
                                     "## AI Identity Card\n- a")
     time.sleep(0.002)  # a later publish must be later, whatever the clock's resolution
     provider._store.put_layer_state("base", "user:zoë",
-                                    "## Session Summary\n- Zoë\n\n## User Representation\n- [fact] Zoë\n\n"
-                                    "## User Peer Card\n- z\n\n## AI Self Representation\n- z\n\n"
+                                    "## Session Summary\n- session z\n\n## User Representation\n- [fact] Zoë\n\n"
+                                    "## User Peer Card\n- Zoë\n\n## AI Self Representation\n- z\n\n"
                                     "## AI Identity Card\n- z")
     provider.on_turn_start(1, "m", author_id="ada", author_name="Ada")
     assert "Ada" in provider.prefetch("q")
@@ -555,7 +555,7 @@ def test_layer_reasoning_runs_end_to_end(plugin_package, make_provider, monkeypa
     subjects = sorted(state["subject"] for state in provider._store.all_layer_states())
     assert subjects == ["agent:Masía", "user:default"]
     block = provider.prefetch("q")
-    assert "deploy on Windows" in block and "ran a smoke test" in block
+    assert "wants evidence" in block and "ran a smoke test" in block
 
 
 def test_reasoning_disabled_never_calls_the_model(plugin_package, make_provider, monkeypatch):
@@ -758,3 +758,15 @@ def test_prefetch_does_not_inject_another_sessions_review_or_summary(provider):
     assert "durable constraint" in block and "durable project" in block
     assert "old session secret" not in block and "old advice" not in block
     assert "old goal" not in block and "old stance" not in block
+
+
+def test_prefetch_does_not_inject_the_session_summary_projection(provider):
+    provider._store.put_layer_state(
+        "base", "user:default",
+        "## Session Summary\n- OLD PROJECTION\n\n## User Representation\n- [goal] current\n\n"
+        "## User Peer Card\n- durable preference\n\n## AI Self Representation\n- direct\n\n"
+        "## AI Identity Card\n- careful")
+    block = provider.prefetch("q")
+    assert "durable preference" in block
+    assert "OLD PROJECTION" not in block
+    assert "## Session Summary" not in block

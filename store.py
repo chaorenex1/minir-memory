@@ -16,9 +16,11 @@
 * ``layer_state`` — the merged artifact each layer publishes, one row per ``(layer, subject)``
   with a monotonically increasing ``version`` (see ``worker.py``).
 * ``conclusions`` — every durable result split into individually searchable rows: notes, the
-  five base-layer sections, the dialectic review/constraints/preferences/second-brain, and
-  compression handoffs. ``conclusions_fts`` is an FTS5 trigram index over it (CJK-safe); when
-  FTS5 is unavailable, ``search()`` falls back to the token scan.
+  five base-layer sections, the dialectic review/constraints/preferences/second-brain, local
+  compression chunks, and final session summaries. ``conclusions_fts`` is an FTS5 trigram index
+  over it (CJK-safe); when FTS5 is unavailable, ``search()`` falls back to the token scan.
+  ``session_chunk_summary`` is the canonical local-compression chain; the base artifact's
+  ``## Session Summary`` is only its projection and is never written as a competing row.
 * ``metrics`` — aggregated tool counters, flushed in batches rather than per call.
 
 ``search()`` enforces session isolation: session summaries, reviews, current-focus statements
@@ -86,6 +88,8 @@ CREATE TABLE IF NOT EXISTS conclusions (
     subject TEXT NOT NULL DEFAULT '',
     content TEXT NOT NULL DEFAULT '',
     evidence TEXT NOT NULL DEFAULT '[]',
+    from_ts REAL,
+    to_ts REAL,
     version INTEGER NOT NULL DEFAULT 0,
     status TEXT NOT NULL DEFAULT 'active',
     created_at REAL NOT NULL,
@@ -110,6 +114,7 @@ _ADDED_COLUMNS: dict[str, tuple[tuple[str, str], ...]] = {
              ("finished_at", "REAL"), ("error", "TEXT NOT NULL DEFAULT ''"),
              ("processed_ts", "REAL")),
     "layer_state": (("session_id", "TEXT NOT NULL DEFAULT ''"),),
+    "conclusions": (("from_ts", "REAL"), ("to_ts", "REAL")),
 }
 
 # Tables a previous release wrote that this one must not keep: earlier versions persisted every
@@ -132,7 +137,8 @@ _LONG_TERM_KINDS: tuple[str, ...] = (
 # one artifact into individually searchable rows instead of one large document.
 _ARTIFACT_SECTIONS: dict[str, tuple[tuple[str, str, str], ...]] = {
     "base": (
-        ("## Session Summary", "base.session_summary", "session"),
+        # Derived projection of the session_chunk_summary chain; never an independent source.
+        ("## Session Summary", "base.session_summary", "projection"),
         ("## User Representation", "base.user_representation", "session"),
         ("## User Peer Card", "base.user_peer_card", "user"),
         ("## AI Self Representation", "base.ai_self_representation", "session"),
@@ -155,7 +161,9 @@ _KIND_WEIGHT: dict[str, float] = {
     "dialectic.constraints": 1.0,
     "dialectic.preferences": 1.0,
     "dialectic.second_brain": 0.9,
+    "session_summary": 0.8,
     "handoff": 0.8,
+    "session_chunk_summary": 0.6,
     "note": 0.7,
 }
 
@@ -245,6 +253,10 @@ class MinirStore:
         """
         for table in _DROPPED_TABLES:
             self._conn.execute(f"DROP TABLE IF EXISTS {table}")
+        # The rolling base Session Summary is a projection of the chunk chain now; an older
+        # independent conclusion must not compete with it in FTS recall.
+        self._conn.execute(
+            "UPDATE conclusions SET status = 'superseded' WHERE kind = 'base.session_summary'")
         for table, columns in _ADDED_COLUMNS.items():
             present = {row["name"] for row in self._conn.execute(f"PRAGMA table_info({table})")}
             for name, declaration in columns:
@@ -313,7 +325,7 @@ class MinirStore:
                 "SELECT layer, subject, version, content, session_id FROM layer_state").fetchall():
             sections = _split_sections(row["content"], _ARTIFACT_SECTIONS.get(row["layer"], ()))
             for heading, kind, scope in _ARTIFACT_SECTIONS.get(row["layer"], ()):
-                if heading not in sections:
+                if heading not in sections or scope == "projection":
                     continue
                 key = _scope_key(scope, row["subject"], row["session_id"])
                 self._put_conclusion_locked(
@@ -362,30 +374,36 @@ class MinirStore:
 
     def _put_conclusion_locked(self, kind: str, key: str, content: str, *, session_id: str = "",
                                subject: str = "", evidence: str = "[]", status: str = "active",
-                               created_at: Optional[float] = None, version: int = 0) -> int:
+                               created_at: Optional[float] = None, version: int = 0,
+                               from_ts: Optional[float] = None, to_ts: Optional[float] = None) -> int:
         """Upsert one conclusion under the caller's lock; returns the resulting version."""
         stamp = time.time()
         self._conn.execute(
-            "INSERT INTO conclusions (kind, key, session_id, subject, content, evidence, version, "
-            "status, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
+            "INSERT INTO conclusions (kind, key, session_id, subject, content, evidence, "
+            "from_ts, to_ts, version, status, created_at, updated_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
             "ON CONFLICT(kind, key) DO UPDATE SET content = excluded.content, "
             "session_id = excluded.session_id, subject = excluded.subject, "
-            "evidence = excluded.evidence, version = conclusions.version + 1, "
+            "evidence = excluded.evidence, from_ts = excluded.from_ts, "
+            "to_ts = excluded.to_ts, version = conclusions.version + 1, "
             "status = excluded.status, updated_at = excluded.updated_at",
             (kind, key, session_id or "", subject or "", (content or "")[:_MAX_CONTENT],
-             evidence or "[]", max(0, int(version)), status, created_at or stamp, stamp))
+             evidence or "[]", from_ts, to_ts, max(0, int(version)), status,
+             created_at or stamp, stamp))
         row = self._conn.execute(
             "SELECT version FROM conclusions WHERE kind = ? AND key = ?", (kind, key)).fetchone()
         return int(row["version"]) if row is not None else 0
 
     def put_conclusion(self, kind: str, key: str, content: str, *, session_id: str = "",
                        subject: str = "", evidence: str = "[]", status: str = "active",
-                       created_at: Optional[float] = None, version: int = 0) -> int:
+                       created_at: Optional[float] = None, version: int = 0,
+                       from_ts: Optional[float] = None, to_ts: Optional[float] = None) -> int:
         """Publish one conclusion and index it for FTS recall."""
         with self._lock:
             result = self._put_conclusion_locked(
                 kind, key, content, session_id=session_id, subject=subject, evidence=evidence,
-                status=status, created_at=created_at, version=version)
+                status=status, created_at=created_at, version=version,
+                from_ts=from_ts, to_ts=to_ts)
             self._conn.commit()
             return result
 
@@ -426,7 +444,91 @@ class MinirStore:
         with self._lock:
             cur = self._conn.execute(
                 "UPDATE conclusions SET status = 'active', updated_at = ? "
-                "WHERE kind = 'handoff' AND session_id = ? AND status = 'pending'",
+                "WHERE kind IN ('session_summary', 'handoff') "
+                "AND session_id = ? AND status = 'pending'",
+                (time.time(), session_id))
+            self._conn.commit()
+            return int(cur.rowcount)
+
+    # -- session chunk chain --------------------------------------------------
+
+    def add_chunk_summary(self, session_id: str, from_ts: float, to_ts: float, content: str,
+                          *, evidence: str = "[]") -> int:
+        """Append one local compression summary to the session's canonical chain.
+
+        Idempotent by ``(session, from_ts, to_ts)``. A window already superseded by a final
+        summary is not reopened.
+        """
+        key = f"chunk:{session_id}:{float(from_ts):.6f}:{float(to_ts):.6f}"
+        with self._lock:
+            existing = self._conn.execute(
+                "SELECT status FROM conclusions WHERE kind = 'session_chunk_summary' "
+                "AND key = ?", (key,)).fetchone()
+            if existing is not None and existing["status"] == "superseded":
+                return 0
+            version = self._put_conclusion_locked(
+                "session_chunk_summary", key, content, session_id=session_id,
+                subject="session", evidence=evidence, status="active",
+                from_ts=float(from_ts), to_ts=float(to_ts))
+            self._conn.commit()
+            return version
+
+    def chunk_summaries(self, session_id: str, *,
+                        statuses: tuple[str, ...] = ("active",)) -> list[dict[str, Any]]:
+        """The session's local compression chain, oldest first."""
+        marks = ",".join("?" * len(statuses))
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT * FROM conclusions WHERE kind = 'session_chunk_summary' "
+                f"AND session_id = ? AND status IN ({marks}) ORDER BY from_ts, id",
+                (session_id, *statuses)).fetchall()
+        return [dict(row) for row in rows]
+
+    def latest_chunk_end(self, session_id: str) -> float:
+        """Furthest end timestamp any chunk (including a superseded one) already covers."""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT MAX(to_ts) AS ts FROM conclusions "
+                "WHERE kind = 'session_chunk_summary' AND session_id = ?",
+                (session_id,)).fetchone()
+        return float(row["ts"]) if row is not None and row["ts"] is not None else 0.0
+
+    def rolling_session_summary(self, session_id: str, *, max_chars: int = 4_000) -> str:
+        """Derived projection for the base artifact's ``## Session Summary`` section.
+
+        Composed from the active chunk chain, seeded by the latest active final summary. It is
+        never persisted as an independent FTS conclusion.
+        """
+        parts: list[str] = []
+        final = self.newest_conclusion("session_summary", session_id=session_id)
+        final_body = str((final or {}).get("content") or "").strip()
+        if final_body:
+            parts.append(f"### Prior summarized context\n{final_body}")
+        chunks = self.chunk_summaries(session_id)
+        kept: list[str] = []
+        size = sum(len(part) + 1 for part in parts)
+        for chunk in reversed(chunks):
+            body = str(chunk.get("content") or "").strip()
+            if not body:
+                continue
+            when = ""
+            if chunk.get("from_ts") is not None and chunk.get("to_ts") is not None:
+                when = f" · {format_when(float(chunk['from_ts']))}–{format_when(float(chunk['to_ts']))}"
+            block = f"### Local chunk{when}\n{body}"
+            if size + len(block) + 1 > max_chars and kept:
+                kept.append("### […older local chunks omitted]")
+                break
+            kept.append(block)
+            size += len(block) + 1
+        parts.extend(reversed(kept))
+        return "\n\n".join(parts)[:max_chars].strip()
+
+    def supersede_chunk_summaries(self, session_id: str) -> int:
+        """Close the chain after a final summary has been adopted."""
+        with self._lock:
+            cur = self._conn.execute(
+                "UPDATE conclusions SET status = 'superseded', updated_at = ? "
+                "WHERE kind = 'session_chunk_summary' AND session_id = ? AND status = 'active'",
                 (time.time(), session_id))
             self._conn.commit()
             return int(cur.rowcount)
@@ -436,8 +538,9 @@ class MinirStore:
         with self._lock:
             cur = self._conn.execute(
                 "UPDATE conclusions SET status = 'expired', updated_at = ? "
-                "WHERE kind = 'handoff' AND session_id = ? AND status = 'pending' "
-                "AND created_at < ?", (time.time(), session_id, float(before)))
+                "WHERE kind IN ('session_summary', 'handoff') "
+                "AND session_id = ? AND status = 'pending' AND created_at < ?",
+                (time.time(), session_id, float(before)))
             self._conn.commit()
             return int(cur.rowcount)
 
@@ -587,7 +690,7 @@ class MinirStore:
             version = int(row["version"]) if row is not None else 0
             sections = _split_sections(content, _ARTIFACT_SECTIONS.get(layer, ()))
             for heading, kind, scope in _ARTIFACT_SECTIONS.get(layer, ()):
-                if heading not in sections:
+                if heading not in sections or scope == "projection":
                     continue
                 key = _scope_key(scope, subject, session_id, ai_subject)
                 self._put_conclusion_locked(

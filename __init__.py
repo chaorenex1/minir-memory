@@ -388,7 +388,8 @@ class MinirMemoryProvider(MemoryProvider):
                 # An artifact published by another session keeps its durable cards but loses
                 # the previous session's summary/focus/review, or the next turn would follow
                 # stale advice.
-                body = previous_content(layer, state, session).strip()
+                drop = ("## Session Summary",) if layer == BASE_LAYER else ()
+                body = previous_content(layer, state, session, drop=drop).strip()
                 if not body:
                     continue
                 chunk = f"### {title} (v{(state or {}).get('version', 0)})\n{body}"
