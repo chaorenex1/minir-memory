@@ -248,6 +248,19 @@ def test_tools_roundtrip(provider):
     assert stats["notes"] == 0 and stats["markers"] == {} and "db_path" in stats
 
 
+def test_prefetch_kind_filter_survives_derived_crowding(provider):
+    provider.handle_tool_call(
+        "minir_remember", {"type": "tools", "content": "zebraword note"})
+    for index in range(25):
+        provider._store.put_conclusion(
+            "base.user_representation", f"goal:{index}",
+            f"zebraword zebraword zebraword derived {index}",
+            session_id=provider._session_id)
+    block = provider.prefetch("zebraword")
+    assert "zebraword note" in block
+    assert "zebraword zebraword" not in block
+
+
 def test_search_does_not_advertise_untyped_notes_as_forgettable(provider):
     note_id = provider._store.remember("untyped durable note")
     payload = json.loads(provider.handle_tool_call(

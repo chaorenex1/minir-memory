@@ -1048,8 +1048,9 @@ _TOOL_REMEMBER = _tool_schema(
 _TOOL_FORGET = _tool_schema(
     "minir_forget",
     "Delete an old value-output marker by its note_id and type. Use only the note_id returned "
-    "for a result with kind='note' (or by minir_remember); conclusions have no note_id and "
-    "cannot be forgotten. The type must match the marker or nothing is deleted.",
+    "for a typed marker result (kind='note' with marker_type) or by minir_remember; untyped "
+    "notes and conclusions have no note_id and cannot be forgotten. The type must match the "
+    "marker or nothing is deleted.",
     {"type": _prop("Value-marker type the marker was stored with.", "string",
                    enum=list(VALUE_MARKER_TYPES)),
      "note_id": _prop("Id of the marker to delete.", "integer")},
