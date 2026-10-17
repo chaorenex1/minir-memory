@@ -4,9 +4,9 @@ A minimal, dependency-free **Hermes memory-provider plugin template** — a work
 reference implementation of the `MemoryProvider` contract that you can fork, rename,
 and grow into a real provider.
 
-It keeps explicit notes and every derived conclusion in a per-profile SQLite database, recalls
-them through an FTS5 trigram index (CJK-safe, with a token-scan fallback), and exposes four tools
-(`minir_search`, `minir_remember`, `minir_forget`, `minir_stats`). On top of that it runs the
+It keeps explicit value markers and every derived conclusion in a per-profile SQLite database,
+recalls them through an FTS5 trigram index (CJK-safe, with a token-scan fallback), and exposes
+four tools (`minir_search`, `minir_remember`, `minir_forget`, `minir_stats`). On top of that it runs the
 **base / dialectic reasoning layers**: the turn counter queues a base job every *n* turns, a
 background worker builds the user/AI cards from the host's own history, and a dependent dialectic
 pass reviews those cards against that history. The review can correct the base artifact (a
@@ -127,6 +127,23 @@ session boundary, so the real boundary uses the memory-provider method. Observer
 the chat. `register()` closes the hooks over the provider instance and falls back to the
 process-wide active provider, since the host can construct the plugin twice.
 
+## Tools
+
+The provider exposes four tools; every response is a JSON string (errors are `{"error": ...}`).
+
+| Tool | Parameters | Behaviour |
+| --- | --- | --- |
+| `minir_search` | `query` (required), `limit`, `scope`, `session_id` | Ranked FTS5 recall. Default `scope="session"`: the current session plus durable cards and notes. `scope="all"` searches every session; `session_id` targets one explicitly. `limit` defaults to `prefetch_limit` and is capped at 20. Each result carries `kind`, `when`, `source`, `session_id`, `text` (600-char excerpt) and, for a typed marker, `marker_type`. Only a note exposes a forgettable `note_id`/`id`. |
+| `minir_remember` | `type` (required), `content` (required) | Records an explicit value-output marker of that type (`entities`, `trajectories`, `experiences`, `tools`, `projects`), bound to the current session and mirrored into `conclusions` so FTS finds it. Returns `{stored, note_id, type, session_id}`. |
+| `minir_forget` | `type` (required), `note_id` (required) | Deletes the marker only when its stored type matches. Returns `{deleted, note_id, type}`; a wrong type or unknown id yields `deleted: false`. Conclusions have no `note_id` and cannot be deleted. |
+| `minir_stats` | none | Store counts (including `markers` per type), layer counters, published artifacts, buffered messages, in-memory tool metrics and the database path. |
+
+Explicit markers are separate from the base layer's automatic `value_markers`: the worker keeps
+merging its own five-key inventory per refresh, while a remembered marker is a session-bound,
+type-tagged row that search can recall and `minir_forget` can remove. Notes mirrored from the
+host's built-in memory tools (`on_memory_write`) stay durable and untyped; they are recallable in
+both public scopes.
+
 ## The two layers (base / dialectic)
 
 `turn_counter.py` keeps two counters per session. The base counter turns its cadence into *jobs*
@@ -138,9 +155,12 @@ calls the auxiliary model, and publishes into `layer_state`/`conclusions`. Each 
 appends one structured row to `base_refreshes` (session, time window, actual turn range, the six
 outputs, `is_latest`); one base window has one job.
 `prefetch()` injects only the newest dialectic review (`## Adviser Review`, bounded to 1200 chars)
-ahead of recall. The six base cards are deliberately **not injected**; they remain recallable
-through `minir_search`. Pending advices are the actionable channel and are injected by
-`pre_llm_call` (bounded to 900 chars; blockers first), once per advice id.
+ahead of recall. Recall covers explicit notes and value markers only — the current session's
+notes plus durable notes; every derived artifact (the six base sections, review, chunks and
+summaries) stays explicit-recall through `minir_search`. Another session's rows are reachable only
+through `minir_search(scope="all")`, never by automatic injection. Pending advices are the
+actionable channel and are injected by `pre_llm_call` (bounded to 900 chars; blockers first), once
+per advice id.
 
 | Layer | Models | Artifact sections | Subject key |
 | --- | --- | --- | --- |
@@ -637,8 +657,9 @@ FTS5 `trigram` so Chinese queries work; if the SQLite build lacks FTS5, `minir_s
 to a token scan. Base revisions are a separate audit surface (`search_base_revisions`, trigram
 over the six pre-overwrite fields plus advices); pending advices live in `advisories` and are
 delivered through `pre_llm_call`, not injected as durable recall. Session summaries, reviews,
-handoffs and chunks only match their own `session_id`; user peer cards, AI identity, value markers
-and notes recall across sessions.
+chunks and session-bound value markers only match their own `session_id`; user peer
+cards, AI identity and durable notes recall across sessions. `minir_search` defaults to the
+current session's view and only crosses sessions when `scope="all"` is passed.
 
 Restart Hermes (an already-running Gateway/TUI keeps the previous code in memory).
 Data lands in `$HERMES_HOME/minir-memory/memory.db`; delete that file to reset. A database

@@ -54,7 +54,7 @@ from tools.registry import tool_error
 from . import adviser
 from . import history as host_history
 from .adviser_mode import AdviserMode
-from .store import MinirStore, format_when
+from .store import VALUE_MARKER_TYPES, MinirStore, format_when
 from .transcript import TranscriptBuffer
 from .turn_counter import (
     BASE_LAYER,
@@ -88,9 +88,10 @@ _MAX_ADVICE_CHARS = 900           # injected advice block, markers included
 _MAX_AUTHOR_CACHE = 64            # per-session last-seen author, bounded like the turn counter
 _COMPRESSION_GATE_TTL = 300.0     # seconds a crashed compression may pause periodic scheduling
 _PRE_COMPRESS_TIMEOUT = 120.0     # synchronous base -> dialectic budget before compress()
-# Durable base cards are explicit-recall only: prefetch must not inject them, even when an
-# FTS query happens to match. ``minir_search`` still returns them.
-_PREFETCH_EXCLUDED_KINDS = frozenset({"base.user_peer_card", "base.ai_identity_card"})
+# Prefetch injects explicit memory only. Every derived artifact — the six base sections, the
+# dialectic review (injected separately by ``_layer_block``), chunk summaries and compression
+# summaries — stays explicit-recall through ``minir_search``.
+_PREFETCH_KINDS = frozenset({"note"})
 
 _ACTIVE_PROVIDER: Optional["MinirMemoryProvider"] = None
 """The provider instance ``initialize`` actually opened.
@@ -336,12 +337,14 @@ class MinirMemoryProvider(MemoryProvider):
         logger.info("Minir system_prompt_block (built once per session)")
         return (
             "# Minir Memory\n"
-            f"Long-term memory lives in {_PROVIDER_LABEL}'s local store, which holds notes and "
-            "derived conclusions — no transcripts. Derived text may quote or reference the "
-            "messages it reasoned over.\n"
-            "Use minir_search to look up stored notes and conclusions, minir_remember to store "
-            "facts worth keeping across sessions, minir_forget to delete a note by id, "
-            "and minir_stats to inspect the store."
+            f"Long-term memory lives in {_PROVIDER_LABEL}'s local store, which holds value "
+            "markers and derived conclusions — no transcripts. Derived text may quote or "
+            "reference the messages it reasoned over.\n"
+            "Use minir_search to look up stored markers and conclusions; it searches the "
+            "current session by default, and scope=\"all\" searches every session.\n"
+            "Use minir_remember with type (entities, trajectories, experiences, tools or "
+            "projects) and content to record a value marker, minir_forget with the same type "
+            "plus note_id to delete one, and minir_stats to inspect the store."
         )
 
     def queue_prefetch(self, query: str, *, session_id: str = "") -> None:
@@ -357,8 +360,7 @@ class MinirMemoryProvider(MemoryProvider):
 
         def _work() -> None:
             try:
-                rows = self._search(query, session_id=session,
-                                    exclude=_PREFETCH_EXCLUDED_KINDS)
+                rows = self._search(query, session_id=session, kinds=_PREFETCH_KINDS)
                 block = self._format_block(rows)
                 with self._lock:
                     self._cached = (session, block, len(rows))
@@ -378,8 +380,13 @@ class MinirMemoryProvider(MemoryProvider):
 
         The dialectic artifact is read live (one indexed row, no model call) and prepended:
         it is what the agent layer last concluded about how this assistant should work, which
-        is rarely what a keyword query would have surfaced. Base-layer cards are deliberately
-        not injected here; they stay recallable through ``minir_search``.
+        is rarely what a keyword query would have surfaced. No base-layer section is injected
+        here; every base artifact stays recallable through ``minir_search``.
+
+        Recall covers explicit notes and value markers only: the current session's notes plus
+        durable notes. Every derived artifact (base sections, review, chunks, summaries) is
+        explicit-recall through ``minir_search``, and another session's rows are reachable only
+        by an explicit ``minir_search(scope="all")`` call — never by automatic injection.
         """
         session = session_id or self._session_id
         block, count = "", 0
@@ -388,8 +395,7 @@ class MinirMemoryProvider(MemoryProvider):
             block, count = cached
         elif self._store is not None and (query or "").strip() and not is_trivial_prompt(query):
             try:
-                rows = self._search(query, session_id=session,
-                                    exclude=_PREFETCH_EXCLUDED_KINDS)
+                rows = self._search(query, session_id=session, kinds=_PREFETCH_KINDS)
                 block, count = self._format_block(rows), len(rows)
             except Exception as exc:
                 logger.debug("Minir prefetch search failed: %s", exc)
@@ -404,8 +410,8 @@ class MinirMemoryProvider(MemoryProvider):
     def _layer_block(self, session: str) -> tuple[str, int]:
         """Last published dialectic artifact as one block; counts its bullet items.
 
-        The base artifact is deliberately absent: its durable cards are not injected into the
-        prompt, only the agent's own working model is. Base cards remain reachable through
+        The base artifact is deliberately absent: no base section is injected into the prompt,
+        only the agent's own working model is. Base artifacts remain reachable through
         ``minir_search``.
         """
         if self._store is None or self._worker is None:
@@ -418,9 +424,8 @@ class MinirMemoryProvider(MemoryProvider):
             size = items = 0
             for title, layer, subject in wanted:
                 state = self._store.layer_state(layer, subject) or self._store.newest_layer_state(layer)
-                # An artifact published by another session keeps its durable constraints and
-                # preferences but loses the previous session's review, or the next turn would
-                # follow stale advice.
+                # An artifact published by another session loses its review, or the next turn
+                # would follow stale advice. Only the current session's review is projected.
                 body = project_artifact(layer, previous_content(layer, state, session)).strip()
                 if not body:
                     continue
@@ -736,32 +741,53 @@ class MinirMemoryProvider(MemoryProvider):
             query = str(args.get("query") or "").strip()
             if not query:
                 return tool_error("query is required")
+            scope = str(args.get("scope") or "session").strip().lower()
+            if scope not in {"session", "all"}:
+                return tool_error("scope must be 'session' or 'all'")
             rows = self._search(query, limit=args.get("limit"),
-                                session_id=str(args.get("session_id") or self._session_id))
+                                session_id=str(args.get("session_id") or self._session_id),
+                                scope=scope)
             results = []
             for row in rows:
                 entry = {"kind": row["kind"], "when": format_when(row["when"]),
                          "source": row["author"], "session_id": row.get("session_id", ""),
                          "text": _excerpt(row["text"])}
+                if row.get("marker_type"):
+                    entry["marker_type"] = row["marker_type"]
                 # Only a note has a forgettable id. Never expose a conclusion id under ``id``:
                 # minir_forget deletes notes, and a colliding number would delete the wrong row.
                 if row["kind"] == "note" and row.get("note_id") is not None:
                     entry["note_id"] = row["note_id"]
                     entry["id"] = row["note_id"]
                 results.append(entry)
-            return json.dumps({"count": len(rows), "results": results})
+            return json.dumps({"count": len(rows), "scope": scope, "results": results})
         if tool_name == "minir_remember":
+            marker_type = str(args.get("type") or "").strip()
+            if not marker_type:
+                return tool_error("type is required")
+            if marker_type not in VALUE_MARKER_TYPES:
+                return tool_error(
+                    f"type must be one of: {', '.join(VALUE_MARKER_TYPES)}")
             content = str(args.get("content") or "").strip()
             if not content:
                 return tool_error("content is required")
-            note_id = self._store.remember(content, source="tool")
-            return json.dumps({"stored": True, "note_id": note_id})
+            note_id = self._store.remember(
+                content, source="tool", marker_type=marker_type, session_id=self._session_id)
+            return json.dumps({"stored": True, "note_id": note_id, "type": marker_type,
+                               "session_id": self._session_id})
         if tool_name == "minir_forget":
+            marker_type = str(args.get("type") or "").strip()
+            if not marker_type:
+                return tool_error("type is required")
+            if marker_type not in VALUE_MARKER_TYPES:
+                return tool_error(
+                    f"type must be one of: {', '.join(VALUE_MARKER_TYPES)}")
             try:  # tolerate "5" from models that stringify integers
                 note_id = int(args.get("note_id"))
             except (TypeError, ValueError):
                 return tool_error("note_id must be an integer")
-            return json.dumps({"deleted": self._store.forget(note_id), "note_id": note_id})
+            deleted = self._store.forget(note_id, marker_type=marker_type)
+            return json.dumps({"deleted": deleted, "note_id": note_id, "type": marker_type})
         if tool_name == "minir_stats":
             with self._lock:
                 metrics = {tool: dict(values) for tool, values in self._metrics.items()}
@@ -944,18 +970,15 @@ class MinirMemoryProvider(MemoryProvider):
     # -- internals ------------------------------------------------------------
 
     def _search(self, query: str, limit: Optional[Any] = None, *, session_id: str = "",
-                exclude: frozenset[str] = frozenset()) -> list[dict[str, Any]]:
+                kinds: Optional[frozenset[str]] = None,
+                scope: str = "session") -> list[dict[str, Any]]:
         try:
             requested = int(limit) if limit is not None else self._prefetch_limit
         except (TypeError, ValueError):
             requested = self._prefetch_limit
         session = session_id or self._session_id
-        # Over-fetch when filtering: otherwise excluded cards can occupy the whole limit and
-        # hide recallable rows behind them. The store caps the candidate count at 20.
-        search_limit = max(1, min(20, requested + (2 * len(exclude) if exclude else 0)))
-        rows = self._store.search(query, limit=search_limit, session_id=session)
-        if exclude:
-            rows = [row for row in rows if row.get("kind") not in exclude][:requested]
+        rows = self._store.search(query, limit=max(1, min(20, requested)),
+                                  session_id=session, scope=scope, kinds=kinds)
         return rows
 
     def _take_cached(self, session: str) -> Optional[tuple[str, int]]:
@@ -970,15 +993,15 @@ class MinirMemoryProvider(MemoryProvider):
         return block, count
 
     def _format_block(self, rows: list[dict[str, Any]]) -> str:
-        """Render recall rows as a compact markdown block (empty string when there are none)."""
+        """Render note/marker rows as the compact recall block (empty when there are none)."""
         if not rows:
             return ""
         lines = [f"## {_PROVIDER_LABEL} recall"]
         size = len(lines[0])
         for row in rows:
-            kind = str(row.get("kind") or "note")
-            label = (f"Note ({row['author'] or 'tool'})" if kind == "note"
-                     else f"{kind} ({row.get('session_id') or 'durable'})")
+            marker_type = str(row.get("marker_type") or "")
+            label = (f"{marker_type} marker ({row['author'] or 'tool'})" if marker_type
+                     else f"Note ({row['author'] or 'tool'})")
             label = f"{label} · {format_when(row['when'])}"
             text = " ".join(row["text"].split())
             line = f"- [{label}] {text}"
@@ -1002,24 +1025,36 @@ def _prop(description: str, type_: str = "string", **extra: Any) -> dict[str, An
 
 _TOOL_SEARCH = _tool_schema(
     "minir_search",
-    "Search Minir's long-term memory for stored notes and derived conclusions — user/AI cards, "
-    "adviser reviews, constraints and second-brain items. Minir keeps no transcripts; this "
-    "searches the conclusions derived from them.",
+    "Search Minir's long-term memory for stored value markers and derived conclusions — "
+    "user/AI cards, adviser reviews, session summaries and notes. Minir keeps no "
+    "transcripts; this searches the conclusions derived from them. The default scope is the "
+    "current session plus durable cards; set scope='all' to search across sessions.",
     {"query": _prop("What to search for."),
-     "limit": _prop("Maximum results to return (default: the provider's prefetch limit).", "integer")},
+     "limit": _prop("Maximum results to return (default: the provider's prefetch limit).", "integer"),
+     "scope": _prop("Recall scope: 'session' (default) or 'all' for cross-session search.",
+                    "string", enum=["session", "all"]),
+     "session_id": _prop("Optional session to search instead of the current one "
+                         "(ignored when scope='all').")},
     ("query",))
 _TOOL_REMEMBER = _tool_schema(
     "minir_remember",
-    "Store an explicit fact, preference, or decision in long-term memory so future sessions can recall it.",
-    {"content": _prop("The information to remember.")}, ("content",))
+    "Record a new value-output marker of a specified type as long-term memory. The type is one "
+    "of entities, trajectories, experiences, tools or projects.",
+    {"type": _prop("Value-marker type.", "string", enum=list(VALUE_MARKER_TYPES)),
+     "content": _prop("The value-output marker to remember.")},
+    ("type", "content"))
 _TOOL_FORGET = _tool_schema(
     "minir_forget",
-    "Delete a stored note by its note_id. Use only the note_id returned for a result with "
-    "kind='note' (or by minir_remember); conclusions have no note_id and cannot be forgotten.",
-    {"note_id": _prop("Id of the note to delete.", "integer")}, ("note_id",))
+    "Delete an old value-output marker by its note_id and type. Use only the note_id returned "
+    "for a result with kind='note' (or by minir_remember); conclusions have no note_id and "
+    "cannot be forgotten. The type must match the marker or nothing is deleted.",
+    {"type": _prop("Value-marker type the marker was stored with.", "string",
+                   enum=list(VALUE_MARKER_TYPES)),
+     "note_id": _prop("Id of the marker to delete.", "integer")},
+    ("type", "note_id"))
 _TOOL_STATS = _tool_schema(
     "minir_stats",
-    "Report Minir store statistics — note/session/job counts, the base + dialectic layer "
+    "Report Minir store statistics — note/marker/session/job counts, the base + dialectic layer "
     "counters for this session, the published layer artifacts (subject + version), and the "
     "database path.")
 

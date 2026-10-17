@@ -42,9 +42,10 @@
   searchable inside their own session.
 * ``metrics`` — aggregated tool counters, flushed in batches rather than per call.
 
-``search()`` enforces session isolation: session summaries, reviews, current-focus statements
-and handoffs only match the session that produced them. User peer cards, AI identity, brain
-entries and notes are durable and recall across sessions.
+``search()`` enforces session isolation by default: session summaries, reviews, focus
+statements and session-bound markers only match the session that produced them. User peer
+cards, AI identity and durable notes are recallable across sessions; ``scope="all"``
+additionally exposes every session's rows for explicit cross-session recall.
 """
 
 from __future__ import annotations
@@ -64,14 +65,20 @@ logger = logging.getLogger(__name__)
 _MAX_CONTENT = 4000  # stored text is truncated to this many chars
 _MAX_TERMS = 8       # query tokens considered per search
 _MAX_SCAN = 200      # candidate rows fetched per table before scoring
-_EXCERPT = 240       # search-result text length
+
+#: The five value-marker types the base layer already merges. Explicit markers written through
+#: ``minir_remember`` use the same vocabulary so search and deletion stay type-safe.
+VALUE_MARKER_TYPES: tuple[str, ...] = (
+    "entities", "trajectories", "experiences", "tools", "projects")
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS notes (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     source TEXT NOT NULL DEFAULT 'tool',
     content TEXT NOT NULL,
-    created_at REAL NOT NULL
+    created_at REAL NOT NULL,
+    session_id TEXT NOT NULL DEFAULT '',
+    marker_type TEXT NOT NULL DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS idx_notes_created ON notes(created_at DESC);
 CREATE TABLE IF NOT EXISTS jobs (
@@ -226,6 +233,8 @@ CREATE TABLE IF NOT EXISTS metrics (
 
 # Columns added after the first release; ``_migrate`` adds whichever an existing database lacks.
 _ADDED_COLUMNS: dict[str, tuple[tuple[str, str], ...]] = {
+    "notes": (("session_id", "TEXT NOT NULL DEFAULT ''"),
+              ("marker_type", "TEXT NOT NULL DEFAULT ''")),
     "jobs": (("attempts", "INTEGER NOT NULL DEFAULT 0"), ("claimed_at", "REAL"),
              ("finished_at", "REAL"), ("error", "TEXT NOT NULL DEFAULT ''"),
              ("processed_ts", "REAL")),
@@ -244,15 +253,11 @@ _ADDED_COLUMNS: dict[str, tuple[tuple[str, str], ...]] = {
 _DROPPED_TABLES: tuple[str, ...] = ("turns",)
 
 # Kinds that may be recalled across sessions. Everything else (session summaries, reviews,
-# compression handoffs) is bound to the session that produced it: injecting another session's
-# review as a high-weight conclusion would be actively wrong.
+# compression summaries, focus statements) is bound to the session that produced it: injecting
+# another session's review as a high-weight conclusion would be actively wrong.
 _LONG_TERM_KINDS: tuple[str, ...] = (
-    "note",
     "base.user_peer_card",
     "base.ai_identity_card",
-    "dialectic.constraints",
-    "dialectic.preferences",
-    "dialectic.second_brain",
 )
 
 # Fixed headings -> conclusion kind. The worker validates the same headings; publishing splits
@@ -269,7 +274,7 @@ _ARTIFACT_SECTIONS: dict[str, tuple[tuple[str, str, str], ...]] = {
     ),
     "dialectic": (
         # The six corrected cards live on the base layer; the dialectic artifact owns only the
-        # review/advices so prefetch never leaks base cards into the prompt.
+        # review/advices, so the live layer injection never leaks a base card.
         ("## Adviser Review", "dialectic.review", "session"),
     ),
 }
@@ -288,11 +293,7 @@ _KIND_WEIGHT: dict[str, float] = {
     "base.user_representation": 1.2,
     "base.ai_self_representation": 1.0,
     "base.value_markers": 1.0,
-    "dialectic.constraints": 1.0,
-    "dialectic.preferences": 1.0,
-    "dialectic.second_brain": 0.9,
     "session_summary": 0.8,
-    "handoff": 0.8,
     "session_chunk_summary": 0.6,
     "note": 0.7,
 }
@@ -346,11 +347,6 @@ def _terms(query: str) -> list[str]:
     return seen
 
 
-def _excerpt(content: str) -> str:
-    flat = " ".join(content.split())
-    return flat if len(flat) <= _EXCERPT else flat[:_EXCERPT] + "…"
-
-
 class MinirStore:
     """Thread-safe SQLite store.
 
@@ -396,6 +392,10 @@ class MinirStore:
             for name, declaration in columns:
                 if name not in present:
                     self._conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {declaration}")
+        # The index is created here, not in ``_SCHEMA``: on an older notes table the column
+        # only exists after the ALTER above.
+        self._conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_notes_session ON notes(session_id)")
         # After the ALTER loop: an old ``advisories`` table has no ``request_id`` yet. A request
         # staged by a process that died was never confirmed delivered; make it pending again so
         # the next request can carry it.
@@ -598,25 +598,41 @@ class MinirStore:
 
     # -- writes ---------------------------------------------------------------
 
-    def remember(self, content: str, source: str = "tool") -> int:
-        """Store an explicit note; returns its row id. Also indexes it as a conclusion."""
+    def remember(self, content: str, source: str = "tool", *, marker_type: str = "",
+                 session_id: str = "") -> int:
+        """Store an explicit note; returns its row id. Also indexes it as a conclusion.
+
+        ``marker_type`` turns the note into an explicit value-output marker (one of
+        :data:`VALUE_MARKER_TYPES`); ``session_id`` binds it to the conversation that wrote it.
+        An empty ``session_id`` stays durable and is recallable from every session.
+        """
         stamp = time.time()
         with self._lock:
             cur = self._conn.execute(
-                "INSERT INTO notes (source, content, created_at) VALUES (?, ?, ?)",
-                (source, content[:_MAX_CONTENT], stamp),
+                "INSERT INTO notes (source, content, created_at, session_id, marker_type) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (source, content[:_MAX_CONTENT], stamp, session_id or "", marker_type or ""),
             )
             note_id = int(cur.lastrowid)
             self._put_conclusion_locked(
-                "note", f"note:{note_id}", content[:_MAX_CONTENT], session_id="",
+                "note", f"note:{note_id}", content[:_MAX_CONTENT], session_id=session_id or "",
                 subject=source or "tool", evidence="[]", status="active",
                 created_at=stamp, version=1)
             self._conn.commit()
             return note_id
 
-    def forget(self, note_id: int) -> bool:
-        """Delete a note by id; False when no such note exists."""
+    def forget(self, note_id: int, *, marker_type: str = "") -> bool:
+        """Delete a note by id; False when no such note exists.
+
+        With ``marker_type``, the row is deleted only when it is a marker of exactly that type:
+        a stale or wrong type must not erase a different marker.
+        """
         with self._lock:
+            if marker_type:
+                row = self._conn.execute(
+                    "SELECT marker_type FROM notes WHERE id = ?", (int(note_id),)).fetchone()
+                if row is None or str(row["marker_type"] or "") != marker_type:
+                    return False
             cur = self._conn.execute("DELETE FROM notes WHERE id = ?", (int(note_id),))
             self._conn.execute("DELETE FROM conclusions WHERE kind = 'note' AND key = ?",
                                (f"note:{int(note_id)}",))
@@ -694,13 +710,6 @@ class MinirStore:
                     (kind, session_id)).fetchone()
         return dict(row) if row is not None else None
 
-    def delete_conclusion(self, kind: str, key: str) -> bool:
-        with self._lock:
-            cur = self._conn.execute(
-                "DELETE FROM conclusions WHERE kind = ? AND key = ?", (kind, key))
-            self._conn.commit()
-            return cur.rowcount > 0
-
     def promote_summary_run(self, session_id: str, run_id: str) -> int:
         """Promote the pending compression summary identified by its marker run id."""
         key = f"session_summary:{session_id}:{run_id}"
@@ -763,16 +772,6 @@ class MinirStore:
                 (session_id,)).fetchone()
         return float(row["ts"]) if row is not None and row["ts"] is not None else 0.0
 
-    def latest_chunk_turn(self, session_id: str) -> int:
-        """Highest turn any chunk of this session covers, active or superseded."""
-        with self._lock:
-            row = self._conn.execute(
-                "SELECT MAX(to_turn) AS turn FROM conclusions "
-                "WHERE kind = 'session_chunk_summary' AND session_id = ?",
-                (session_id,)).fetchone()
-        value = row["turn"] if row is not None else None
-        return int(value) if value is not None else 0
-
     def chunk_turn_range(self, session_id: str,
                          from_ts: float) -> tuple[Optional[int], Optional[int]]:
         """The stored turn range for the window starting at *from_ts*, or ``(None, None)``.
@@ -834,7 +833,11 @@ class MinirStore:
             return int(cur.rowcount)
 
     def expire_pending_handoffs(self, session_id: str, *, before: float) -> int:
-        """Drop pending summaries whose committed message never appeared (TTL sweep)."""
+        """Drop pending summaries whose committed message never appeared (TTL sweep).
+
+        ``handoff`` is included only to expire rows written by an older release; the current
+        compression pipeline writes ``session_summary``.
+        """
         with self._lock:
             cur = self._conn.execute(
                 "UPDATE conclusions SET status = 'expired', updated_at = ? "
@@ -1621,31 +1624,49 @@ class MinirStore:
     # -- reads ----------------------------------------------------------------
 
     @staticmethod
-    def _visibility_sql(session_id: str) -> tuple[str, list[Any]]:
-        """SQL predicate + params: session-bound kinds only for the matching session.
+    def _visibility_sql(session_id: str, scope: str = "session") -> tuple[str, list[Any]]:
+        """SQL predicate + params for the requested recall scope.
 
-        ``dialectic.review`` and ``base.session_summary`` are statements about one conversation;
-        recalling another session's review as a high-weight conclusion would mislead the model.
-        Cross-session recall is limited to durable user/agent/brain/note conclusions.
+        ``scope="session"`` (the default) is the current conversation's view: its own rows,
+        durable user/agent cards, and notes written without a session. ``scope="all"`` drops
+        the isolation entirely for explicit cross-session search.
         """
+        if scope == "all":
+            return "1=1", []
         marks = ",".join("?" * len(_LONG_TERM_KINDS))
+        durable = (f"(c.kind IN ({marks}) "
+                   "OR (c.kind = 'note' AND c.session_id = ''))")
         if session_id:
-            return (f"(c.session_id = ? OR c.kind IN ({marks}) OR c.kind LIKE 'brain.%')",
-                    [session_id, *_LONG_TERM_KINDS])
-        return (f"(c.kind IN ({marks}) OR c.kind LIKE 'brain.%')", list(_LONG_TERM_KINDS))
+            return f"(c.session_id = ? OR {durable})", [session_id, *_LONG_TERM_KINDS]
+        return durable, list(_LONG_TERM_KINDS)
 
-    def search(self, query: str, limit: int = 5, *, session_id: str = "") -> list[dict[str, Any]]:
-        """Ranked matches across conclusions, scoped to *session_id* where required.
+    def search(self, query: str, limit: int = 5, *, session_id: str = "",
+               scope: str = "session",
+               kinds: Optional[frozenset[str]] = None) -> list[dict[str, Any]]:
+        """Ranked matches across conclusions, scoped to *session_id* or every session.
 
         FTS5 with the trigram tokenizer is the primary index (CJK-safe). A scan over the same
         rows is the fallback when FTS5 is unavailable or the query terms are too short for
-        trigram. Returns ``{kind, id, note_id?, text, when, author, subject, session_id, score}``.
+        trigram. Returns ``{kind, id, note_id?, marker_type, text, when, author, subject,
+        session_id, score}``. ``scope="all"`` searches every session; the default searches the
+        current one plus durable cards and notes. ``kinds`` restricts the SQL candidate set, so
+        a filtered recall cannot be crowded out by rows the caller would discard.
         """
         terms = _terms(query)
         if not terms:
             return []
+        if kinds is not None and not kinds:
+            return []
         capped = max(1, min(int(limit), 20))
-        visibility, visible_params = self._visibility_sql(session_id)
+        scope = str(scope).lower()
+        if scope != "all":
+            scope = "session"
+        visibility, visible_params = self._visibility_sql(session_id, scope)
+        kind_sql, kind_params = "", []
+        if kinds is not None:
+            marks = ",".join("?" * len(kinds))
+            kind_sql = f" AND c.kind IN ({marks})"
+            kind_params = list(kinds)
         rows: list[dict[str, Any]] = []
         # Historical chunk summaries stay recallable inside their own session after a final
         # summary supersedes them; the visibility predicate keeps them from leaking elsewhere.
@@ -1656,11 +1677,12 @@ class MinirStore:
             sql = (
                 "SELECT c.*, bm25(conclusions_fts) AS rank FROM conclusions_fts "
                 "JOIN conclusions c ON c.id = conclusions_fts.rowid "
-                f"WHERE conclusions_fts MATCH ? AND {status} AND {visibility} "
+                f"WHERE conclusions_fts MATCH ? AND {status} AND {visibility}{kind_sql} "
                 "ORDER BY rank LIMIT ?")
             try:
                 with self._lock:
-                    found = self._conn.execute(sql, [match, *visible_params, _MAX_SCAN]).fetchall()
+                    found = self._conn.execute(
+                        sql, [match, *visible_params, *kind_params, _MAX_SCAN]).fetchall()
                 rows = [dict(row) for row in found]
             except sqlite3.OperationalError as exc:
                 logger.debug("Minir FTS query failed, falling back to scan: %s", exc)
@@ -1668,11 +1690,12 @@ class MinirStore:
             where = " OR ".join("lower(c.content) LIKE ?" for _ in terms)
             sql = (
                 f"SELECT c.*, 0 AS rank FROM conclusions c WHERE {status} "
-                f"AND {visibility} AND ({where}) "
+                f"AND {visibility}{kind_sql} AND ({where}) "
                 "ORDER BY c.updated_at DESC LIMIT ?")
             with self._lock:
                 found = self._conn.execute(
-                    sql, [*visible_params, *[f"%{term}%" for term in terms], _MAX_SCAN]).fetchall()
+                    sql, [*visible_params, *kind_params,
+                          *[f"%{term}%" for term in terms], _MAX_SCAN]).fetchall()
             rows = [dict(row) for row in found]
 
         results: list[dict[str, Any]] = []
@@ -1695,6 +1718,7 @@ class MinirStore:
                 "id": note_id if note_id is not None else int(row.get("id") or 0),
                 "conclusion_id": int(row.get("id") or 0),
                 "note_id": note_id,
+                "marker_type": "",
                 "key": row.get("key") or "",
                 "text": text,
                 "when": when,
@@ -1706,6 +1730,17 @@ class MinirStore:
                 "score": float(overlap) + _KIND_WEIGHT.get(kind, 0.5),
                 "rank": float(row.get("rank") or 0),
             })
+        # One lookup for every note hit: a marker type is metadata on the notes row, not on the
+        # conclusion, so it stays out of the FTS index.
+        note_ids = [entry["note_id"] for entry in results if entry["note_id"] is not None]
+        if note_ids:
+            marks = ",".join("?" * len(note_ids))
+            with self._lock:
+                marked = self._conn.execute(
+                    f"SELECT id, marker_type FROM notes WHERE id IN ({marks})", note_ids).fetchall()
+            by_id = {int(row["id"]): str(row["marker_type"] or "") for row in marked}
+            for entry in results:
+                entry["marker_type"] = by_id.get(entry["note_id"], "")
         results.sort(key=lambda item: (item["score"], -item["rank"], item["when"], item["id"]),
                      reverse=True)
         return results[:capped]
@@ -1714,6 +1749,10 @@ class MinirStore:
         """Row counts and on-disk size, for the ``minir_stats`` tool."""
         with self._lock:
             notes = self._conn.execute("SELECT COUNT(*) AS n FROM notes").fetchone()["n"]
+            marker_rows = self._conn.execute(
+                "SELECT marker_type, COUNT(*) AS n FROM notes WHERE marker_type <> '' "
+                "GROUP BY marker_type").fetchall()
+            markers = {row["marker_type"]: int(row["n"]) for row in marker_rows}
             sessions = self._conn.execute(
                 "SELECT COUNT(DISTINCT session_id) AS n FROM jobs").fetchone()["n"]
             jobs = self._conn.execute("SELECT COUNT(*) AS n FROM jobs").fetchone()["n"]
@@ -1732,7 +1771,7 @@ class MinirStore:
             size = self.path.stat().st_size
         except OSError:
             size = 0
-        return {"notes": int(notes), "sessions": int(sessions),
+        return {"notes": int(notes), "markers": markers, "sessions": int(sessions),
                 "jobs": int(jobs), "pending_jobs": int(pending), "failed_jobs": int(failed),
                 "layer_states": int(states), "base_refreshes": int(refreshes),
                 "base_revisions": int(revisions), "advisories": int(advices),

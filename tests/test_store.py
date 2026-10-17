@@ -69,6 +69,47 @@ def test_remember_and_forget(store):
     assert store.search("rotate credentials") == []
 
 
+def test_session_scope_hides_other_sessions_until_scope_all(store):
+    mine = store.remember("alpha marker", marker_type="tools", session_id="s1")
+    other = store.remember("alpha marker", marker_type="tools", session_id="s2")
+    durable = store.remember("alpha marker durable")
+
+    rows = store.search("alpha marker", session_id="s1")
+    ids = {row["note_id"] for row in rows}
+    assert mine in ids and durable in ids and other not in ids
+    assert next(row for row in rows if row["note_id"] == mine)["marker_type"] == "tools"
+
+    rows = store.search("alpha marker", session_id="s1", scope="all")
+    ids = {row["note_id"] for row in rows}
+    assert {mine, other, durable} <= ids
+    assert next(row for row in rows if row["note_id"] == other)["session_id"] == "s2"
+
+
+def test_session_scope_keeps_other_reviews_out_until_scope_all(store):
+    store.put_layer_state("dialectic", "agent:minir",
+                          "## Adviser Review\n- zebraword review", session_id="s2")
+    assert store.search("zebraword", session_id="s3") == []
+    assert any(row["kind"] == "dialectic.review"
+               for row in store.search("zebraword", session_id="s3", scope="all"))
+
+
+def test_search_kind_filter_applies_before_the_limit(store):
+    note_id = store.remember("zebraword note", marker_type="tools", session_id="s1")
+    for index in range(25):
+        store.put_conclusion("base.user_representation", f"goal:{index}",
+                             f"zebraword derived {index}", session_id="s1")
+    rows = store.search("zebraword", limit=1, session_id="s1", kinds=frozenset({"note"}))
+    assert [row["note_id"] for row in rows] == [note_id]
+
+
+def test_forget_marker_requires_the_stored_type(store):
+    note_id = store.remember("typed marker", marker_type="tools", session_id="s1")
+    assert store.forget(note_id, marker_type="projects") is False
+    assert store.search("typed marker", session_id="s1")
+    assert store.forget(note_id, marker_type="tools") is True
+    assert store.search("typed marker", session_id="s1") == []
+
+
 def test_forget_by_content(store):
     store.remember("mirrored entry")
     store.remember("unrelated")

@@ -57,7 +57,7 @@ def test_initialize_creates_profile_scoped_store(provider, tmp_path):
 
 def test_notes_survive_a_new_instance(plugin_package, make_provider):
     first = make_provider({})
-    first.handle_tool_call("minir_remember", {"content": "We standardized on SQLite for the store"})
+    first.handle_tool_call("minir_remember", {"type": "tools", "content": "We standardized on SQLite for the store"})
     first.shutdown()
 
     second = make_provider({})  # same tmp home -> same db file
@@ -198,7 +198,7 @@ def test_prefetch_limit_can_be_set_by_env(make_provider, monkeypatch):
 
 
 def test_queue_prefetch_feeds_next_prefetch(provider):
-    provider.handle_tool_call("minir_remember", {"content": "User deploys via Docker Desktop"})
+    provider.handle_tool_call("minir_remember", {"type": "tools", "content": "User deploys via Docker Desktop"})
     provider.queue_prefetch("Docker Desktop")
     thread = provider._prefetch_thread
     if thread is not None:
@@ -211,7 +211,7 @@ def test_queue_prefetch_feeds_next_prefetch(provider):
 
 def test_prefetch_falls_back_to_inline_search(provider):
     """No queued result (first turn): prefetch still recalls, bounded and inline."""
-    provider.handle_tool_call("minir_remember", {"content": "staging cluster lives in eu-west"})
+    provider.handle_tool_call("minir_remember", {"type": "entities", "content": "staging cluster lives in eu-west"})
     block = provider.prefetch("staging cluster")
     assert "eu-west" in block
 
@@ -222,28 +222,57 @@ def test_prefetch_on_empty_store_is_blank(provider):
 
 
 def test_prefetch_never_returns_stale_recall(provider):
-    provider.handle_tool_call("minir_remember", {"content": "remembered once"})
+    provider.handle_tool_call("minir_remember", {"type": "experiences", "content": "remembered once"})
     assert provider.prefetch("remembered") != ""
     assert provider.prefetch("totally unrelated empty query") == ""
     assert provider.recall_status() is None
 
 
 def test_tools_roundtrip(provider):
-    stored = json.loads(provider.handle_tool_call("minir_remember", {"content": "prefers terse output"}))
-    assert stored["stored"] is True
+    stored = json.loads(provider.handle_tool_call(
+        "minir_remember", {"type": "experiences", "content": "prefers terse output"}))
+    assert stored["stored"] is True and stored["type"] == "experiences"
     found = json.loads(provider.handle_tool_call("minir_search", {"query": "terse output"}))
-    assert found["count"] >= 1
-    note_id = next(row["id"] for row in found["results"] if row["kind"] == "note")
-    assert json.loads(provider.handle_tool_call("minir_forget", {"note_id": note_id}))["deleted"] is True
-    assert json.loads(provider.handle_tool_call("minir_forget", {"note_id": str(note_id)}))["deleted"] is False
+    assert found["count"] >= 1 and found["scope"] == "session"
+    note = next(row for row in found["results"] if row["kind"] == "note")
+    note_id = note["id"]
+    assert note["marker_type"] == "experiences"
+    # A wrong type must not delete the marker.
+    assert json.loads(provider.handle_tool_call(
+        "minir_forget", {"type": "tools", "note_id": note_id}))["deleted"] is False
+    assert json.loads(provider.handle_tool_call(
+        "minir_forget", {"type": "experiences", "note_id": note_id}))["deleted"] is True
+    assert json.loads(provider.handle_tool_call(
+        "minir_forget", {"type": "experiences", "note_id": str(note_id)}))["deleted"] is False
     stats = json.loads(provider.handle_tool_call("minir_stats", {}))
-    assert stats["notes"] == 0 and "db_path" in stats
+    assert stats["notes"] == 0 and stats["markers"] == {} and "db_path" in stats
 
 
 def test_tool_argument_validation(provider):
     assert "error" in json.loads(provider.handle_tool_call("minir_search", {"query": "  "}))
+    assert "error" in json.loads(provider.handle_tool_call(
+        "minir_search", {"query": "x", "scope": "galaxy"}))
     assert "error" in json.loads(provider.handle_tool_call("minir_remember", {}))
+    assert "error" in json.loads(provider.handle_tool_call(
+        "minir_remember", {"type": "nonsense", "content": "x"}))
+    assert "error" in json.loads(provider.handle_tool_call(
+        "minir_remember", {"content": "x"}))
     assert "error" in json.loads(provider.handle_tool_call("minir_forget", {"note_id": "abc"}))
+    assert "error" in json.loads(provider.handle_tool_call(
+        "minir_forget", {"type": "nonsense", "note_id": 1}))
+
+
+def test_search_scope_all_crosses_sessions(provider):
+    provider.handle_tool_call(
+        "minir_remember", {"type": "projects", "content": "cross session fact"})
+    provider.on_session_switch("other-session")
+    current = json.loads(provider.handle_tool_call(
+        "minir_search", {"query": "cross session fact"}))
+    assert current["count"] == 0, "the default scope must not leak another session's marker"
+    across = json.loads(provider.handle_tool_call(
+        "minir_search", {"query": "cross session fact", "scope": "all"}))
+    assert across["scope"] == "all" and across["count"] == 1
+    assert across["results"][0]["marker_type"] == "projects"
 
 
 def test_on_memory_write_mirrors_and_removes(provider):
@@ -256,12 +285,17 @@ def test_on_memory_write_mirrors_and_removes(provider):
 
 
 def test_on_session_switch_rebinds_and_reset_clears_cache(provider):
-    provider.handle_tool_call("minir_remember", {"content": "switch test fact"})
+    provider.handle_tool_call(
+        "minir_remember", {"type": "experiences", "content": "switch test fact"})
     provider.queue_prefetch("switch test")
     provider.on_session_switch("session-2")
     assert provider._session_id == "session-2"
     provider.on_session_switch("session-3", reset=True)
-    assert provider.prefetch("switch test") != ""  # store survives; only caches are dropped
+    # The marker is session-bound: automatic recall must not leak it into session-3.
+    assert provider.prefetch("switch test") == ""
+    found = json.loads(provider.handle_tool_call(
+        "minir_search", {"query": "switch test", "scope": "all"}))
+    assert found["count"] == 1, "explicit cross-session search must still find it"
 
 
 def test_shutdown_is_idempotent(plugin_package, make_provider):
@@ -271,7 +305,7 @@ def test_shutdown_is_idempotent(plugin_package, make_provider):
 
 
 def test_search_results_are_excerpted(provider):
-    provider.handle_tool_call("minir_remember", {"content": "long " * 400})
+    provider.handle_tool_call("minir_remember", {"type": "experiences", "content": "long " * 400})
     payload = json.loads(provider.handle_tool_call("minir_search", {"query": "long"}))
     assert payload["results"]
     assert all(len(row["text"]) <= 601 for row in payload["results"])
@@ -870,7 +904,7 @@ def test_search_never_exposes_a_conclusion_as_a_forgettable_note(plugin_package,
     assert "conclusion_id" not in conclusion
 
     note_id = json.loads(provider.handle_tool_call(
-        "minir_remember", {"content": "a forgettable note"}))["note_id"]
+        "minir_remember", {"type": "experiences", "content": "a forgettable note"}))["note_id"]
     found = json.loads(provider.handle_tool_call("minir_search", {"query": "forgettable"}))
     note = next(row for row in found["results"] if row["kind"] == "note")
     assert note["note_id"] == note_id and note["id"] == note_id
@@ -910,7 +944,7 @@ def test_prefetch_does_not_inject_another_sessions_review_or_summary(provider):
         "## Adviser Review\n- old advice\n\n## Constraints\n- durable constraint\n\n"
         "## Preferences\n- durable preference\n\n## Second Brain\n- [project] durable project",
         session_id="other-session")
-    block = provider.prefetch("q")
+    block = provider.prefetch("durable")
     assert block == "", "another session's review and base cards are not injectable"
     assert "durable constraint" not in block and "durable project" not in block
 
@@ -946,11 +980,25 @@ def test_prefetch_never_injects_durable_base_cards_from_fts(provider):
 def test_prefetch_does_not_inject_any_base_artifact(provider):
     provider._store.put_layer_state(
         "base", "user:default",
-        "## Session Summary\n- OLD PROJECTION\n\n## User Representation\n- [goal] current\n\n"
-        "## User Peer Card\n- durable preference\n\n## AI Self Representation\n- direct\n\n"
-        "## AI Identity Card\n- careful\n\n## Value Markers\n- [tool] pytest")
-    block = provider.prefetch("q")
-    assert block == ""
-    assert "durable preference" not in block
-    assert "OLD PROJECTION" not in block
+        "## Session Summary\n- zebraword projection\n\n"
+        "## User Representation\n- [goal] zebraword current goal\n\n"
+        "## User Peer Card\n- zebraword durable preference\n\n"
+        "## AI Self Representation\n- zebraword ai stance\n\n"
+        "## AI Identity Card\n- zebraword identity\n\n"
+        "## Value Markers\n- [tool] zebraword tool",
+        session_id=provider._session_id)
+    provider.handle_tool_call(
+        "minir_remember", {"type": "experiences", "content": "zebraword note"})
+
+    block = provider.prefetch("zebraword")
+    assert "zebraword note" in block
+    assert "zebraword current goal" not in block
+    assert "zebraword durable preference" not in block
+    assert "zebraword ai stance" not in block
+    assert "zebraword tool" not in block
     assert "## Session Summary" not in block
+
+    payload = json.loads(provider.handle_tool_call("minir_search", {"query": "zebraword"}))
+    kinds = {row["kind"] for row in payload["results"]}
+    assert {"base.user_representation", "base.ai_self_representation",
+            "base.value_markers"} <= kinds, "minir_search still exposes the base sections"

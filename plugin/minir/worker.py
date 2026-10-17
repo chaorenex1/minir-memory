@@ -618,9 +618,10 @@ def previous_content(layer: str, previous: Optional[dict[str, Any]], session: st
 def project_artifact(layer: str, content: str) -> str:
     """Keep only the headings the current layer contract owns.
 
-    A dialectic artifact written by an older release may still contain the four old sections;
-    projecting it is what keeps ``prefetch`` from leaking constraints/preferences/second-brain
-    (or, more importantly, the six base cards) into the prompt.
+    An artifact written by an older release may still contain retired sections (base cards on
+    the dialectic layer, the old constraints/preferences/second-brain headings). Projection keeps
+    ``_layer_block`` from injecting anything except the current contract's headings — for the
+    dialectic layer that is ``## Adviser Review`` only.
     """
     parts: list[str] = []
     for heading in LAYER_SECTIONS.get(layer, ()):

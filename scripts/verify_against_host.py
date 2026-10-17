@@ -70,7 +70,7 @@ try:
     # itself must NOT: this provider keeps turns in memory for the length of the process only.
     told = "The verification probe stores this distinctive sentence"
     provider.sync_turn(told, "acknowledged")
-    provider.handle_tool_call("minir_remember", {"content": told})
+    provider.handle_tool_call("minir_remember", {"type": "entities", "content": told})
     block = provider.prefetch("distinctive sentence")
     assert "distinctive sentence" in block, "prefetch did not recall the stored note: %%r" %% block
     import sqlite3
