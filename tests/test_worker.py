@@ -753,6 +753,31 @@ def test_base_ai_pass_repairs_an_echoed_window_instruction(plugin_package, store
     assert "POST_COMMIT_OK" in ai_prompts[1]
 
 
+def test_sparse_window_completes_without_publishing_an_artifact(
+        plugin_package, store, transcript):
+    """A valid JSON reply with every list empty is a sparse window, not a failed pass."""
+    def complete(task, system, prompt, **kwargs):
+        return json.dumps({
+            "session_chunk_summary": [],
+            "user_representation": [],
+            "user_peer_card": [],
+            "ai_self_representation": [],
+            "ai_identity_card": [],
+            "value_markers": {"entities": [], "trajectories": [], "experiences": [],
+                              "tools": [], "projects": []},
+        })
+
+    instance = plugin_package.worker.LayerWorker(
+        store, transcript, complete=complete, enqueue_dialectic=False)
+    transcript.add(SESSION, "user", "Reply with exactly: POST_COMMIT_OK", created_at=10.0)
+    _dispatch(store, transcript, SESSION, BASE, 0.0, 20.0)
+
+    assert instance.run_once() == 1
+    assert store.pending_jobs() == []
+    assert store.layer_state("base", "user:default") is None, \
+        "nothing durable was found, so no artifact should be published"
+
+
 def test_one_shot_fallback_prompt_does_not_mention_unavailable_tools(store, transcript, worker):
     transcript.add(SESSION, "user", "fallback path", created_at=10.0)
     _dispatch(store, transcript, SESSION, BASE, 0.0, 20.0)

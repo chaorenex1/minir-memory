@@ -964,14 +964,15 @@ class LayerWorker:
             BASE_USER_SYSTEM_PROMPT,
             _base_user_prompt(subject, session, prior_user, evidence, first,
                               from_ts=from_ts, to_ts=to_ts, first_message=first_message),
-            lambda text: bool(_json_items(_json_object(text).get("user_representation"))),
+            lambda text: "user_representation" in _json_object(text),
             label="base user pass")
         user_obj = _json_object(user_text)
         user_items = _json_items(user_obj.get("user_representation"))
         peer_items = _json_items(user_obj.get("user_peer_card"))
-        # A sparse window can legitimately have no peer-card entries; only the primary list
-        # proves the pass produced content. An empty *both* is still a failed pass.
-        if not user_items:
+        # A sparse window can legitimately produce empty arrays (a health check or a one-shot
+        # "reply with X" turn). Only a missing/invalid object is a failed pass; the artifact
+        # can carry empty sections when the summary has something to say.
+        if not user_obj:
             logger.debug("Minir base user pass raw output for %s: %s", subject, user_text[:4000])
             raise LayerMergeError(f"base user pass for {subject} returned invalid JSON cards")
         user_cards = "\n\n".join((
@@ -982,14 +983,13 @@ class LayerWorker:
             _base_ai_prompt(subject, session, user_cards, prior_ai, evidence,
                             identity=self._identity, preference=self._preference, first=first,
                             from_ts=from_ts, to_ts=to_ts),
-            lambda text: bool(_json_items(_json_object(text).get("ai_self_representation"))),
+            lambda text: "ai_self_representation" in _json_object(text),
             label="base AI pass")
         ai_obj = _json_object(ai_text)
         self_items = _json_items(ai_obj.get("ai_self_representation"))
         identity_items = _json_items(ai_obj.get("ai_identity_card"))
-        # Same rule as the user pass: the self-representation carries the content; an empty
-        # identity card is a valid sparse-window result, not a malformed response.
-        if not self_items:
+        # Empty arrays are a valid sparse result; only a missing/invalid object fails the pass.
+        if not ai_obj:
             logger.debug("Minir base AI pass raw output for %s: %s", subject, ai_text[:4000])
             raise LayerMergeError(f"base AI pass for {subject} returned invalid JSON cards")
         ai_cards = "\n\n".join((
@@ -1000,17 +1000,24 @@ class LayerWorker:
             _base_summary_prompt(subject, session, user_cards, ai_cards, evidence,
                                  from_ts=from_ts, to_ts=to_ts,
                                  previous_markers=prior_markers),
-            lambda text: bool(_json_items(_json_object(text).get("session_chunk_summary"))),
+            lambda text: "session_chunk_summary" in _json_object(text),
             label="base summary pass")
         summary_obj = _json_object(summary_text)
         summary_items = _json_items(summary_obj.get("session_chunk_summary"))
         markers = _marker_items(summary_obj.get("value_markers"))
-        if not summary_items:
+        if not summary_obj:
             logger.debug("Minir base summary pass raw output for %s: %s", subject, summary_text[:4000])
             raise LayerMergeError(f"base summary pass for {subject} returned invalid JSON summary")
         summary = _render_section("## Session Summary", summary_items, _MAX_SUMMARY_CHARS)
         marker_body = _render_marker_body(markers)
         markers_section = f"## Value Markers\n{marker_body}"
+        # A valid JSON reply with every list empty is a sparse window: there is nothing durable
+        # to publish. Completing the job is correct; retrying the same model cannot add content.
+        if not (user_items or peer_items or self_items or identity_items or summary_items
+                or any(markers.values())):
+            logger.info("Minir base refresh for %s produced no durable content; skipping publish",
+                        subject)
+            return "", {}, ""
         content = "\n\n".join((summary, user_cards, ai_cards, markers_section))
         if not _normalize_state(BASE_LAYER, content):
             raise LayerMergeError(f"base refresh for {subject} assembled an invalid artifact")
@@ -1218,6 +1225,8 @@ class LayerWorker:
         content, parts, chunk_text = self._merge_base_cards(
             subject, evidence, previous, session=session, first=first,
             first_message=first_message, from_ts=from_ts, to_ts=to_ts)
+        if not content.strip():
+            return [], []  # the model found nothing durable; complete the window
         # ``job["turns"]`` is the dispatch stamp; ``_covered_turns`` maps the messages this
         # window actually reasoned over onto a non-overlapping session turn range. A retry
         # reuses the range already stored for this exact window: the chunk is written before
