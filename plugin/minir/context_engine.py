@@ -34,9 +34,10 @@ SUMMARY_MARKER = "[minir summary"
 NOTICE_MARKER = "[minir memory notice"
 SUMMARY_RE = re.compile(r"\[minir summary #([0-9A-Za-z_.-]+)\]")
 NOTICE_TEXT = (
-    f"{NOTICE_MARKER}] Older turns in this session were summarized by minir. The assistant "
-    "summary that follows is a compressed record of those turns, not a live reply. Use "
-    "minir_search or adviser_session_search to recover details.")
+    f"{NOTICE_MARKER}] Earlier turns in this session were compressed into the assistant summary "
+    "below. Treat that summary as a derived record, not a live reply: it may be incomplete or "
+    "stale, and the current conversation wins on conflict. Use minir_search or "
+    "adviser_session_search to recover exact details.")
 
 _MAX_FOLD_MESSAGES = 24
 _MAX_SUMMARY_CHARS = 8_000

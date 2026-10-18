@@ -337,14 +337,19 @@ class MinirMemoryProvider(MemoryProvider):
         logger.info("Minir system_prompt_block (built once per session)")
         return (
             "# Minir Memory\n"
-            f"Long-term memory lives in {_PROVIDER_LABEL}'s local store, which holds value "
-            "markers and derived conclusions — no transcripts. Derived text may quote or "
-            "reference the messages it reasoned over.\n"
-            "Use minir_search to look up stored markers and conclusions; it searches the "
-            "current session by default, and scope=\"all\" searches every session.\n"
-            "Use minir_remember with type (entities, trajectories, experiences, tools or "
-            "projects) and content to record a value marker, minir_forget with the same type "
-            "plus note_id to delete one, and minir_stats to inspect the store."
+            f"Long-term memory lives in {_PROVIDER_LABEL}'s local SQLite store: explicit value "
+            "markers plus conclusions derived from prior sessions. It holds no transcripts, "
+            "though derived text may quote the messages it reasoned over.\n"
+            "- minir_search: look up prior decisions, preferences, projects and conclusions. It "
+            "searches the current session by default; scope=\"all\" searches every session. "
+            "Search before asking the user to repeat history.\n"
+            "- minir_remember: record one durable item with type (entities, trajectories, "
+            "experiences, tools or projects) and content. Store what should outlive this turn, "
+            "not transient state, and never store secrets or credentials.\n"
+            "- minir_forget: delete one typed marker by note_id and type.\n"
+            "- minir_stats: inspect the store and the published layer artifacts.\n"
+            "Memory is evidence, not authority: prefer the current conversation when they "
+            "conflict."
         )
 
     def queue_prefetch(self, query: str, *, session_id: str = "") -> None:

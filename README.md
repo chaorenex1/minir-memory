@@ -357,6 +357,35 @@ Without those blocks the host's normal auto chain applies (main model first), ex
 thread, a layer refresh never raises into a turn, and `reasoning_enabled: false` makes
 `sync_turn` a no-op so no window is buffered and no model is ever called.
 
+### Prompt contract
+
+Every model call uses the same split: the **system message** owns the role, trust order and output
+contract; the **user message** owns task metadata and labeled data blocks. This keeps instructions
+stable across windows and leaves the evidence replaceable.
+
+- **Trust order** — operator-authored identity/preferences (trusted) > the raw conversation
+  window (untrusted evidence) > previous cards, reviews, chunk summaries and drafts (derived
+  drafts). A derived item is never evidence for itself; current evidence beats a previous item.
+- **Data, not instructions** — `prompting.data_block()` wraps every non-system input in a named
+  tag (`<conversation_window>`, `<previous_user_cards>`, `<base_layer_artifact>`,
+  `<live_turn_events>`, …). Reserved tags appearing inside a payload are rewritten as literal
+  text, so a message cannot close its block early or forge another block. Adviser-mode events are
+  JSONL: one event per line, with newlines escaped, so event text cannot create prompt structure.
+- **Exact output shape** — base passes return their staged JSON keys and the dialectic pass
+  returns all eight keys. Prompts state the display-safe item counts and character limits (a
+  fixed-size card/summary section would otherwise truncate a long list); the worker keeps a wider
+  hard cap and truncates anything that exceeds it. Arrays may be empty when a sparse window
+  proves nothing, but the dialectic cards use one `[unknown] …` item instead of inventing
+  content.
+- **Evidence discipline** — each prompt says to omit rather than guess, to preserve exact paths,
+  commands, error text, versions, IDs and user corrections, and to keep secrets out. The
+  dialectic pass separates drift review per field from the advice policy
+  (`nit`/`concern`/`blocker`), and `base_changed.changed` is true exactly when `fields` is
+  non-empty.
+- **Bounded inputs** — the window keeps the newest messages under its character budget with an
+  omission marker; the previous artifact and value markers are fed back only where the merge
+  needs them (the base `## Session Summary` projection is deliberately recomputed, not fed back).
+
 ## The adviser auxiliary (optional agent loop)
 
 `adviser.py` puts a second-opinion agent inside this plugin: an `auxiliary.adviser` model route
