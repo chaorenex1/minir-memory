@@ -139,7 +139,7 @@ _DIALECTIC_FIELDS: tuple[str, ...] = (
     "ai_identity_card", "session_chunk_summary", "value_markers",
 )
 _ADVICE_SEVERITIES: tuple[str, ...] = ("nit", "concern", "blocker")
-_ADVICE_TARGETS: tuple[str, ...] = tuple(name for name, _ in ADVICE_TARGETS)
+_ADVICE_TARGETS: tuple[str, ...] = tuple(name for name, *_ in ADVICE_TARGETS)
 # Cards a review may empty outright: the four representation cards. The window record and the
 # marker inventory stay append/merge only, because clearing them destroys evidence.
 _CLEARABLE_FIELDS: tuple[str, ...] = (

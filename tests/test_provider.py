@@ -791,7 +791,7 @@ def test_cold_start_rejects_a_non_primary_agent_context(plugin_package, make_pro
     assert provider._store.pending_jobs() == []
 
 
-def test_review_is_injected_once_per_turn(plugin_package, make_provider):
+def test_legacy_review_is_not_injected_at_the_boundary(plugin_package, make_provider):
     provider = make_provider({})
     provider._store.put_layer_state(
         "dialectic", "agent:minir",
@@ -800,13 +800,10 @@ def test_review_is_injected_once_per_turn(plugin_package, make_provider):
         "## Preferences\n- act first\n\n"
         "## Second Brain\n- [tool] pytest",
         session_id="session-test")
-    first = plugin_package._on_pre_llm_call(
-        session_id="session-test", turn_id="turn-1", provider=provider)
-    assert first and "[minir adviser review" in first and "ran the smoke test" in first
     assert plugin_package._on_pre_llm_call(
         session_id="session-test", turn_id="turn-1", provider=provider) is None
     assert plugin_package._on_pre_llm_call(
-        session_id="session-test", turn_id="turn-2", provider=provider)
+        session_id="session-test", turn_id="turn-2", provider=provider) is None
     assert plugin_package._on_pre_llm_call(
         session_id="other", turn_id="turn-3", provider=provider) is None
     assert plugin_package._on_pre_llm_call(
@@ -814,7 +811,7 @@ def test_review_is_injected_once_per_turn(plugin_package, make_provider):
         parent_session_id="parent") is None
 
 
-def test_pending_advices_are_injected_once(plugin_package, provider):
+def test_dialectic_advices_remain_candidates(plugin_package, provider):
     provider._store.add_advisories("session-test", [
         {"severity": "nit", "target": "general", "content": "polish the wording",
          "decision": "keep or trim", "evidence": ["m1"]},
@@ -822,40 +819,11 @@ def test_pending_advices_are_injected_once(plugin_package, provider):
          "content": "verify the deploy target before deleting", "decision": "confirm the path",
          "evidence": ["m2"]},
     ])
-    block = plugin_package._on_pre_llm_call(
-        session_id="session-test", turn_id="turn-1", provider=provider)
-    assert block and "[minir adviser — advisory only]" in block
-    assert "verify the deploy target" in block and "polish the wording" in block
-    assert block.index("verify the deploy target") < block.index("polish the wording"), \
-        "blockers are delivered before nits"
-    assert provider._store.pending_advisories("session-test") == []
     assert plugin_package._on_pre_llm_call(
-        session_id="session-test", turn_id="turn-2", provider=provider) is None, \
-        "an existing advice ledger suppresses the legacy review fallback"
-
-
-def test_advice_injection_leaves_overflow_pending(plugin_package, provider):
-    provider._store.add_advisories("session-test", [
-        {"severity": "concern", "target": "general",
-         "content": f"advice {index} " + "x" * 380, "decision": "d" * 180}
-        for index in range(6)
-    ])
-    first = provider.advisory_block("session-test", "turn-1")
-    assert first and len(first) <= 900
+        session_id="session-test", turn_id="turn-1", provider=provider) is None
     pending = provider._store.pending_advisories("session-test")
-    assert 0 < len(pending) < 6, "the budget must defer the overflow, not drop it"
-    delivered = first.count("- [")
-    assert delivered == 6 - len(pending), "only the lines actually injected may be marked"
-
-    second = provider.advisory_block("session-test", "turn-2")
-    assert second and len(second) <= 900
-    assert len(provider._store.pending_advisories("session-test")) < len(pending)
-
-    for turn in range(3, 10):
-        if not provider.advisory_block("session-test", f"turn-{turn}"):
-            break
-    assert provider._store.pending_advisories("session-test") == [], \
-        "draining repeatedly must eventually deliver every advice"
+    assert len(pending) == 2, "dialectic advices are candidates, not boundary injections"
+    assert all(row["source"] == "dialectic" for row in pending)
 
 
 def test_post_tool_call_aggregates_metrics(plugin_package, make_provider):
@@ -911,8 +879,8 @@ def test_layers_reason_from_host_history_and_publish_searchable_sections(
     hits = provider._store.search("kubernetes deploy", session_id="session-test")
     assert hits and any(row["kind"] == "base.user_representation" for row in hits)
     assert not any("not user intent" in row["text"] for row in hits)
-    review = provider.review_block("session-test")
-    assert "deploy smoke test" in review
+    review = provider._store.layer_state("dialectic", "agent:minir")
+    assert "deploy smoke test" in str((review or {}).get("content") or "")
 
 
 def test_search_never_exposes_a_conclusion_as_a_forgettable_note(plugin_package, provider):
@@ -1026,3 +994,34 @@ def test_prefetch_does_not_inject_any_base_artifact(provider):
     kinds = {row["kind"] for row in payload["results"]}
     assert {"base.user_representation", "base.ai_self_representation",
             "base.value_markers"} <= kinds, "minir_search still exposes the base sections"
+
+
+def test_system_prompt_block_gates_adviser_sections(plugin_package, make_provider):
+    off = make_provider({"adviser_mode": {"enabled": False}})
+    assert "# Advisers" not in off.system_prompt_block()
+    assert "ADVICE SEVERITY" not in off.system_prompt_block()
+
+    on = make_provider({"adviser_mode": {"enabled": True, "mode": "watch"}})
+    block = on.system_prompt_block()
+    assert "# Advisers" in block
+    for section in ("ADVICE SEVERITY", "ADVICE TARGETS", "ADVICE HANDLING",
+                    "NIT REPORTING", "ADVICE LANGUAGE"):
+        assert section in block
+    for name, _, _ in plugin_package.prompting.ADVICE_TARGETS:
+        assert name in block, name
+    for severity, _ in plugin_package.prompting.ADVICE_SEVERITIES:
+        for target in plugin_package.prompting.ACTION_TARGETS:
+            assert plugin_package.prompting.ADVICE_HANDLING[severity][target] in block
+    assert "| Nit | Status | Note |" in block
+    assert "Advice text follows the user's language" in block
+    assert "[adviser-only mode" not in block
+    assert "## adviser_consult" not in block
+
+    only = make_provider({"adviser_mode": {"enabled": True, "mode": "adviser_only"}})
+    assert "[adviser-only mode" in only.system_prompt_block()
+
+    consult = make_provider({"adviser_mode": {"enabled": False}})
+    consult._adviser_consult_registered = True
+    consult_block = consult.system_prompt_block()
+    assert "## adviser_consult" in consult_block
+    assert "ADVICE SEVERITY" not in consult_block

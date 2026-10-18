@@ -13,12 +13,14 @@ pass reviews those cards against that history. The review can correct the base a
 pre-overwrite snapshot and an FTS index are kept) and emits severity-ranked advices, which are
 injected into later turns for the main session or the user to decide.
 
-It also ships an optional **adviser mode**: a fast, per-turn side channel that watches the live
-tool loop (user goal, assistant intent, tool results), asks the same auxiliary reviewer for
-actionable advice, and injects it before the next model request through the host's `llm_request`
-middleware. Unlike the dialectic layer it never writes base cards or revisions; it only appends
-to the shared advice ledger with `source='adviser_mode'`. It is controlled by configuration
-only (`memory.minir.adviser_mode.enabled`; there is no `/adviser` command).
+It also ships an optional **main adviser**: a fast, per-turn side channel that watches the live
+tool loop (user goal, assistant intent, tool results), grades pending dialectic advices as
+candidates, and injects only the surviving advice before the next model request through the
+host's `llm_request` middleware. `adviser_consult` is the same adviser's synchronous entry
+point, not a separate personality. Unlike the dialectic layer it never writes base cards or
+revisions; it appends delivered advice to the shared ledger with `source='adviser_mode'`. It is
+controlled by configuration only (`memory.minir.adviser_mode.enabled`; there is no `/adviser`
+command).
 
 **It stores no transcripts.** The worker reads `(from_ts, to_ts]` messages from
 `$HERMES_HOME/state.db` read-only (plus the in-process buffer for turns not yet committed) and
@@ -52,8 +54,9 @@ plugin/minir/          the deployable plugin directory (copy this to plugins/min
   cadence.py           config/store-path helpers shared by the provider and the engine
   context_engine.py    audited summary compression (context.engine: minir)
   agent_loop.py        one-shot in-process AIAgent runs — sync + async (Feishu-shaped)
-  adviser.py           optional adviser route + the adviser toolset (adviser_consult)
-  adviser_mode.py      per-turn side channel: event ring, reviewer worker, llm_request delivery
+  adviser.py           adviser route + tool adapter: adviser_consult delegates to the main adviser
+  adviser_prompts.py   one adviser core plus the CONSULT/REVIEW mode contracts
+  adviser_mode.py      main adviser: event ring, candidate grading, consult, llm_request delivery
   session_search.py    read-only multi-shape search over the host's session store (state.db)
   prompts/             operator-supplied Task Handoff template
 tests/                 pytest suite: contract, store, transcript, provider, counting, worker, engine
@@ -105,7 +108,7 @@ both surfaces:
 | `on_session_start(session_id=, model=, platform=)` | record the session; queue one cold-start *base* job when history exists, gated to the bound primary session |
 | `on_session_reset(session_id=, old_session_id=, reason=)` | `/new`, `/reset`: stop the old counters, initialize the new session |
 | `on_session_finalize(session_id=)` | process teardown: stop counting, expire adviser-mode advice, flush tool metrics |
-| `pre_llm_call` | record the turn's user goal; inject pending dialectic advices (and the `adviser_only` brief); adviser-mode advice stays for the `llm_request` staging path; fall back to the legacy session review only when no advice ledger exists |
+| `pre_llm_call` | record the turn's user goal; inject only the `adviser_only` brief. Dialectic advices are candidates for the main adviser, never boundary injections; legacy review injection is retired |
 | `post_llm_call` / `post_tool_call` | per-turn logging; `post_tool_call` also aggregates tool counters and feeds the adviser-mode event ring |
 | `pre_tool_call` | `adviser_only` enforcement: block mutating tools before execution and tell the model to propose the change instead |
 | `on_interim_message` | record the assistant's mid-loop intent for the adviser-mode reviewer |
@@ -435,10 +438,13 @@ and an explicit `enabled_toolsets`, call `run_conversation(prompt, system_messag
 `async def` in `run_agent`/`agent.conversation_loop`); the blocking HTTP and tool subprocesses stay
 off the event loop, and `close()` still happens in the thread that built the agent.
 
-`adviser.py` therefore only owns what the caller owns: the `auxiliary.adviser` block
-(`provider`/`model`/`toolsets`), the adviser brief as the run's **system message**, and the tool
-entry. `handle(args)` is the sync handler and `handle_async(args)` the async one. The tool is
-registered as `handler=handle_async, is_async=True` — the host bridges that for sync callers
+`adviser.py` is now a thin adapter: it owns the `auxiliary.adviser` block
+(`provider`/`model`/`toolsets`) and the tool entry, while `adviser_mode.AdviserMode.consult()`
+supplies the shared `ADVISER_CORE + MODE_CONSULT` system message and the same session context
+as review. `register(ctx, provider)` binds the tool to that instance; `handle(args,
+provider=...)` and `handle_async(args, provider=...)` delegate to `consult`/`consult_async`, and
+fall back to the standalone `run` for direct callers. The registered handler is an async
+closure with `is_async=True` — the host bridges that for sync callers
 (`tools.registry.dispatch` → `_run_async`) and awaits it on a gateway loop, so one consult does not
 stall other conversations. The pairing matters: an async handler with `is_async=False` would hand a
 coroutine to the result normaliser.
@@ -509,10 +515,10 @@ write authority:
 | | dialectic layer | adviser mode |
 | --- | --- | --- |
 | Trigger | base refresh / compression boundary | tool cadence, tool error, mutation, final answer |
-| Input | base artifact + window history | user goal, assistant intent, tool results, final answer |
-| Output | six corrected cards + `advices` | `silent` or 1–3 lightweight advices |
+| Input | base artifact + window history | user goal, intent, tool results, final answer, dialectic candidates |
+| Output | six corrected cards + `advices` (candidates) | `silent` or 1–3 graded advices |
 | Writes | `base_refreshes`, `base_revisions`, `layer_state`, `advisories` | `advisories` only |
-| Delivery | `pre_llm_call` (once per turn) | `pre_llm_call` + `llm_request` (mid-tool-loop) |
+| Delivery | ledger only (candidates) | `llm_request` (mid-tool-loop) |
 | Lifetime | durable audit | current turn, expires |
 
 Config (under `memory.minir`) is the only switch — there is no `/adviser` command:
@@ -526,30 +532,37 @@ adviser_mode:
   max_reviews_per_turn: 6
   max_advices: 3
   max_chars: 900
+  candidate_limit: 6       # pending dialectic advices read per review
   toolsets: [adviser]      # read-only by default; never inherits the base/dialectic route
 ```
 
 Changes are read when the provider opens a session; restart Hermes to apply them to a running one.
 
-The reviewer runs on the same `auxiliary.adviser` route with a three-iteration tool budget. Its
-input is a bounded in-memory event ring (no transcript is written): `pre_llm_call` records the
-user goal, `on_interim_message`/`post_api_request` record the assistant's intent, `post_tool_call`
-records the tool outcome, and `post_llm_call` records the final answer. It may call
-`adviser_session_search` to ground a claim.
+The main adviser runs on the same `auxiliary.adviser` route with a three-iteration tool budget.
+Its input is a bounded in-memory event ring (no transcript is written): `pre_llm_call` records the
+user goal, `on_interim_message`/`post_api_request` record the assistant's intent,
+`post_tool_call` records the tool outcome, and `post_llm_call` records the final answer. It may
+call `adviser_session_search` to ground a claim. Its system block is composed dynamically from
+`memory.minir.adviser_mode.enabled`: severity, all 11 advice targets (definition + usage),
+the severity × target handling matrix, the nit-report table, and the language rule. When the mode
+is off, those sections are absent.
 
-Delivery has two stages because Hermes's `pre_llm_call` fires only once per turn:
+Delivery is one channel; dialectic advices are inputs, not a second channel:
 
-1. Turn boundary — `pre_llm_call` drains pending **dialectic** advice (plus the `adviser_only`
-   brief). Adviser-mode advice is deliberately not drained here: marking it injected before the
-   request is sent would break the at-least-once staging contract.
+1. Candidate intake — `review_once` reads up to `candidate_limit` pending `source='dialectic'`
+   advices into `<candidate_advices>`. `consult` may read the same rows but never consumes them.
 2. Mid-loop — `llm_request` middleware appends pending `source='adviser_mode'` advice to the next
    provider request (after the last tool result, or as a synthetic user message), then stages the
    rows. `post_api_request` marks them delivered; `api_request_error` returns them to pending.
+3. Success-only consume — candidates are marked `consumed` only after a review publishes `silent`
+   or `advised`. Model errors, non-JSON output, session-ended, and dropped reviews leave every
+   candidate `pending` for the next attempt.
 
 `adviser_only` is enforced, not just prompted: `pre_llm_call` injects the advisory brief and
 `pre_tool_call` blocks mutating tools (`write_file`, `patch`, `terminal`, code execution,
-`delegate_task`, `cronjob`) with a message asking for a proposed change. The policy is checked
-independently of the review/compression gate, so a compression cannot briefly re-enable writes.
+`delegate_task`, `cronjob`, `cronjob_manage`) with a message asking for a proposed change.
+The policy is checked independently of the review/compression gate, so a compression cannot
+briefly re-enable writes.
 The main agent still sees the schemas; the gate is the policy, so a blocked call costs one tool
 iteration.
 

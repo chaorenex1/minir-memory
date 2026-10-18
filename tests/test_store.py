@@ -389,6 +389,20 @@ def test_advisories_are_deduped_and_blockers_come_first(store):
     assert store.has_advisories("s1") is True
 
 
+def test_promoted_candidate_with_same_text_is_deliverable(store):
+    candidate = store.add_advisories("s1", [{
+        "severity": "concern", "target": "current_step", "content": "check the path",
+    }], source="dialectic")
+    assert len(candidate) == 1
+    promoted = store.add_advisories("s1", [{
+        "severity": "blocker", "target": "tool_choice", "content": "check the path",
+    }], source="adviser_mode")
+    assert promoted == candidate
+    row = store.pending_advisories("s1", source="adviser_mode")[0]
+    assert row["source"] == "adviser_mode" and row["severity"] == "blocker"
+    assert store.pending_advisories("s1", source="dialectic") == []
+
+
 def test_apply_base_revision_snapshots_then_updates_atomically(store):
     refresh_id = _refresh(store, from_ts=0.0, to_ts=10.0, peer="old peer")
     content = ("## Session Summary\n- window\n\n## User Representation\n- [goal] need at 0.0\n\n"

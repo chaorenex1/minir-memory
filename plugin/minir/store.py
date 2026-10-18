@@ -1409,6 +1409,27 @@ class MinirStore:
                     continue
                 fingerprint = hashlib.sha256(
                     f"{session_id}\0{content.lower()}".encode("utf-8")).hexdigest()[:32]
+                existing = self._conn.execute(
+                    "SELECT id, source FROM advisories WHERE session_id = ? AND fingerprint = ?",
+                    (session_id, fingerprint)).fetchone()
+                if existing:
+                    # A promoted dialectic candidate often keeps the candidate's text. Promote
+                    # that row in place instead of letting the unique fingerprint drop the
+                    # advice that must actually be delivered.
+                    if (str(existing["source"]) == "dialectic"
+                            and str(source) == "adviser_mode"):
+                        self._conn.execute(
+                            "UPDATE advisories SET source = ?, review_id = ?, severity = ?, "
+                            "target = ?, content = ?, decision = ?, evidence = ?, "
+                            "status = 'pending', expires_at = ? WHERE id = ?",
+                            (str(source), int(review_id),
+                             str(item.get("severity") or "concern"),
+                             str(item.get("target") or ""), content,
+                             str(item.get("decision") or ""),
+                             json.dumps(item.get("evidence") or []),
+                             float(expires_at or 0.0) or None, int(existing["id"])))
+                        inserted.append(int(existing["id"]))
+                    continue
                 cur = self._conn.execute(
                     "INSERT OR IGNORE INTO advisories (revision_id, review_id, session_id, "
                     "source, severity, target, content, decision, evidence, fingerprint, status, "
@@ -1443,6 +1464,23 @@ class MinirStore:
                 "ORDER BY CASE severity WHEN 'blocker' THEN 0 WHEN 'concern' THEN 1 ELSE 2 END, "
                 "id LIMIT ?", params).fetchall()
         return [dict(row) for row in rows]
+
+    def consume_advisories(self, ids: list[int], review_id: int = 0) -> int:
+        """Mark dialectic candidates evaluated by a successfully published review.
+
+        Only a review that published ``silent``/``advised`` calls this. A failed, parsed-empty,
+        or dropped review leaves the candidates ``pending`` so the next review can retry them.
+        """
+        if not ids:
+            return 0
+        marks = ",".join("?" * len(ids))
+        with self._lock:
+            cur = self._conn.execute(
+                f"UPDATE advisories SET status = 'consumed', review_id = ? "
+                f"WHERE id IN ({marks}) AND status = 'pending' AND source = 'dialectic'",
+                (int(review_id), *[int(item) for item in ids]))
+            self._conn.commit()
+            return int(cur.rowcount)
 
     def mark_advisories_injected(self, ids: list[int], turn_id: str = "") -> int:
         if not ids:

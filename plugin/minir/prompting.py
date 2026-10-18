@@ -69,34 +69,149 @@ def marker_section(*, heading: str = "VALUE MARKERS — DEFINITIONS",
     return f"{heading}\n{marker_glossary(bullet=bullet)}"
 
 
-# Advice targets, shared by both producers of an advisory block (the dialectic review and the
-# live adviser). One vocabulary, so the agent reads the same tokens whatever produced the advice.
-ADVICE_TARGETS: tuple[tuple[str, str], ...] = (
-    ("user_representation", "the user's need-path card"),
-    ("user_peer_card", "the user's durable preferences card"),
-    ("ai_self_representation", "the assistant's action-state card"),
-    ("ai_identity_card", "the assistant's identity card"),
-    ("session_chunk_summary", "the window record"),
-    ("value_markers", "the durable marker inventory"),
-    ("tool_choice", "the tool or arguments the turn is using"),
-    ("current_step", "the next action of the turn"),
-    ("final_answer", "the answer given to the user"),
-    ("user_intent", "the reading of what the user asked for"),
-    ("general", "none of the above"),
+# Advice targets, shared by every producer and consumer of advice. ``usage`` is what the
+# receiving agent should do with that target; keeping it beside the definition prevents the
+# system block and the reviewer prompt from drifting apart.
+ADVICE_TARGETS: tuple[tuple[str, str, str], ...] = (
+    ("user_representation", "the user's need-path card",
+     "candidate-only; remap to an action target or general before delivery."),
+    ("user_peer_card", "the user's durable preferences card",
+     "candidate-only; remap to an action target or general before delivery."),
+    ("ai_self_representation", "the assistant's action-state card",
+     "candidate-only; remap to an action target or general before delivery."),
+    ("ai_identity_card", "the assistant's identity card",
+     "candidate-only; remap to an action target or general before delivery."),
+    ("session_chunk_summary", "the window record",
+     "candidate-only; remap to an action target or general before delivery."),
+    ("value_markers", "the durable marker inventory",
+     "candidate-only; remap to an action target or general before delivery."),
+    ("tool_choice", "the tool or arguments the turn is using",
+     "blocker -> do not execute; re-check name, args, scope, permissions. "
+     "concern -> verify before executing. nit -> optional."),
+    ("current_step", "the next action of the turn",
+     "blocker -> stop and re-plan. concern -> consider an alternative and decide. "
+     "nit -> fold or ignore."),
+    ("final_answer", "the answer about to be sent",
+     "blocker -> do not send; fix or qualify. concern -> check claims and evidence. "
+     "nit -> optional."),
+    ("user_intent", "the reading of what the user asked",
+     "blocker -> re-read; clarify only if the action changes. "
+     "concern -> re-check; ask only if the action changes. nit -> optional."),
+    ("general", "none of the above",
+     "blocker -> stop and verify. concern -> decide. nit -> optional."),
 )
 
+ACTION_TARGETS: tuple[str, ...] = (
+    "tool_choice", "current_step", "final_answer", "user_intent", "general")
+MEMORY_TARGETS: tuple[str, ...] = (
+    "user_representation", "user_peer_card", "ai_self_representation",
+    "ai_identity_card", "session_chunk_summary", "value_markers")
 
-def advice_target_glossary(*, bullet: str = "  * ") -> str:
+ADVICE_SEVERITIES: tuple[tuple[str, str], ...] = (
+    ("blocker", "a concrete risk of wrong or destructive work, a breached explicit instruction, "
+                "or a false completion claim. Stop, verify the cited evidence, fix or report "
+                "before continuing."),
+    ("concern", "you may be heading wrong or missing a constraint. Decide; adjust if the "
+                "evidence supports it; no automatic stop."),
+    ("nit", "optional polish. Fold at the next step boundary or ignore; never delay."),
+)
+
+# The main agent's disposition per (severity, action target). This is the single source for the
+# dynamic system block; keep the strings short enough to survive a prompt.
+ADVICE_HANDLING: dict[str, dict[str, str]] = {
+    "blocker": {
+        "tool_choice": "do not execute; re-check args",
+        "current_step": "stop; re-plan",
+        "final_answer": "do not send; fix or qualify",
+        "user_intent": "re-read; clarify only if the action changes",
+        "general": "stop; verify",
+    },
+    "concern": {
+        "tool_choice": "verify before executing",
+        "current_step": "consider an alternative; decide",
+        "final_answer": "check claims and evidence; adjust",
+        "user_intent": "re-check; ask only if the action changes",
+        "general": "decide",
+    },
+    "nit": {target: "fold or ignore" for target in ACTION_TARGETS},
+}
+
+
+def _advice_target_line(name: str, definition: str, usage: str, *, bullet: str,
+                        width: int, include_usage: bool) -> str:
+    line = f"{bullet}{name.ljust(width)} {definition}"
+    return f"{line} Use: {usage}" if include_usage and usage else line
+
+
+def advice_target_glossary(*, bullet: str = "  * ", include_usage: bool = True) -> str:
     """One aligned line per advice target, ready to paste into a prompt body."""
-    width = max(len(key) for key, _ in ADVICE_TARGETS)
-    return "\n".join(f"{bullet}{key.ljust(width)} {meaning}"
-                     for key, meaning in ADVICE_TARGETS)
+    width = max(len(name) for name, _, _ in ADVICE_TARGETS)
+    return "\n".join(
+        _advice_target_line(name, definition, usage, bullet=bullet, width=width,
+                           include_usage=include_usage)
+        for name, definition, usage in ADVICE_TARGETS)
 
 
 def advice_target_section(*, heading: str = "ADVICE TARGETS — DEFINITIONS",
-                          bullet: str = "  * ") -> str:
-    """The shared target vocabulary under a heading."""
-    return f"{heading}\n{advice_target_glossary(bullet=bullet)}"
+                          bullet: str = "  * ", grouped: bool = False,
+                          include_usage: bool = True) -> str:
+    """The shared target vocabulary under a heading.
+
+    ``grouped`` separates action targets (delivered to the agent) from memory targets
+    (candidate-only). The system block uses the grouped form; the reviewer prompt can use the
+    flat form.
+    """
+    if not grouped:
+        return f"{heading}\n{advice_target_glossary(bullet=bullet, include_usage=include_usage)}"
+    width = max(len(name) for name, _, _ in ADVICE_TARGETS)
+    def lines(names: tuple[str, ...]) -> list[str]:
+        return [_advice_target_line(name, definition, usage, bullet=bullet, width=width,
+                                    include_usage=include_usage)
+                for name, definition, usage in ADVICE_TARGETS if name in names]
+    return "\n".join([
+        heading,
+        "Action targets (delivered):",
+        *lines(ACTION_TARGETS),
+        "",
+        "Memory targets (candidate-only; remap to an action target or general before delivery):",
+        *lines(MEMORY_TARGETS),
+    ])
+
+
+def advice_severity_section(*, heading: str = "ADVICE SEVERITY") -> str:
+    return heading + "\n" + "\n".join(f"- {name}: {meaning}"
+                                     for name, meaning in ADVICE_SEVERITIES)
+
+
+def advice_handling_section(*, heading: str = "ADVICE HANDLING") -> str:
+    header = "| severity | " + " | ".join(ACTION_TARGETS) + " |"
+    rule = "|" + "---|" * (len(ACTION_TARGETS) + 1)
+    rows = [
+        "| " + " | ".join([severity, *[ADVICE_HANDLING[severity][target]
+                                       for target in ACTION_TARGETS]]) + " |"
+        for severity, _ in ADVICE_SEVERITIES
+    ]
+    return "\n".join([heading, header, rule, *rows])
+
+
+def advice_nit_report_section(*, heading: str = "NIT REPORTING") -> str:
+    return "\n".join([
+        heading,
+        "If one or more nit advices were delivered this turn, end the final answer with this table:",
+        "| Nit | Status | Note |",
+        "|---|---|---|",
+        "| <short nit text> | applied / deferred / ignored | "
+        "<where applied / when deferred / why ignored> |",
+        "Omit the table when no nit was delivered. Keep the main result first; do not delay it.",
+    ])
+
+
+def advice_language_line(*, heading: str = "ADVICE LANGUAGE") -> str:
+    return "\n".join([
+        heading,
+        "Advice text follows the user's language; severity and target tokens stay English. "
+        "Preserve code, paths, commands, identifiers, and quoted errors verbatim.",
+    ])
 
 
 def data_block(label: str, text: object, *, empty: str = "(none)") -> str:

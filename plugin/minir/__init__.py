@@ -54,7 +54,15 @@ from tools.registry import tool_error
 from . import adviser
 from . import history as host_history
 from .adviser_mode import AdviserMode
-from .prompting import marker_glossary
+from .adviser_prompts import MAIN_CONSULT_SECTION
+from .prompting import (
+    advice_handling_section,
+    advice_language_line,
+    advice_nit_report_section,
+    advice_severity_section,
+    advice_target_section,
+    marker_glossary,
+)
 from .store import VALUE_MARKER_TYPES, MinirStore, format_when
 from .transcript import TranscriptBuffer
 from .turn_counter import (
@@ -84,8 +92,6 @@ _DEFAULT_PREFETCH_LIMIT = 5
 _MAX_BLOCK_CHARS = 2000           # recall block injected into the prompt is truncated to this
 _MAX_LAYER_CHARS = 1200           # layer artifacts injected next to it are capped separately
 _MAX_TOOL_EXCERPT = 600           # text excerpt returned by the minir_search tool
-_MAX_ADVICE_ITEMS = 6             # pending advices drained into one injection
-_MAX_ADVICE_CHARS = 900           # injected advice block, markers included
 _MAX_AUTHOR_CACHE = 64            # per-session last-seen author, bounded like the turn counter
 _COMPRESSION_GATE_TTL = 300.0     # seconds a crashed compression may pause periodic scheduling
 _PRE_COMPRESS_TIMEOUT = 120.0     # synchronous base -> dialectic budget before compress()
@@ -223,7 +229,7 @@ class MinirMemoryProvider(MemoryProvider):
         self._prefetch_thread: Optional[threading.Thread] = None
         self._metrics: dict[str, dict[str, Any]] = {}
         self._metrics_seen = 0
-        self._review_turns: dict[str, str] = {}  # session -> last turn already injected
+        self._adviser_consult_registered = False  # set by register() on the real host
         # Per-turn side channel: event ring + reviewer worker + llm_request delivery. Constructed
         # before initialize (the host may register hooks first); every path guards on the store.
         self._adviser_mode = AdviserMode(self)
@@ -334,8 +340,13 @@ class MinirMemoryProvider(MemoryProvider):
     # -- prompt + recall ------------------------------------------------------
 
     def system_prompt_block(self) -> str:
-        """STATIC prompt text; dynamic recall goes through ``prefetch()``."""
+        """Session-static prompt text: memory contract plus the gated adviser contract."""
         logger.info("Minir system_prompt_block (built once per session)")
+        return "\n\n".join(part for part in (
+            self._memory_prompt_block(), self._adviser_prompt_block()) if part)
+
+    @staticmethod
+    def _memory_prompt_block() -> str:
         return (
             "# Minir Memory\n"
             f"Long-term memory lives in {_PROVIDER_LABEL}'s local SQLite store: explicit value "
@@ -366,6 +377,42 @@ class MinirMemoryProvider(MemoryProvider):
             "4. When a stored item is superseded or wrong, delete it with minir_forget rather "
             "than storing a contradiction."
         )
+
+    def _adviser_prompt_block(self) -> str:
+        """Dynamic adviser contract, gated on the configured/registered surfaces."""
+        try:
+            enabled = self._adviser_mode.enabled(self._session_id)
+            adviser_only = enabled and self._adviser_mode.mode(self._session_id) == "adviser_only"
+            consult = bool(self._adviser_consult_registered)
+        except Exception:
+            return ""
+        if not (enabled or consult):
+            return ""
+        parts = [
+            "# Advisers",
+            "Advice from the main adviser is advice, never authority. You own the decision and "
+            "the verification.",
+        ]
+        if enabled:
+            parts.extend([
+                "Live advice may arrive mid-turn as:\n"
+                "- `[adviser — advisory only] ... [end adviser]`\n"
+                "The adviser sees events, not your full brief. Do not restate or thank it.",
+                advice_severity_section(),
+                advice_target_section(heading="ADVICE TARGETS", grouped=True),
+                advice_handling_section(),
+                advice_nit_report_section(),
+                advice_language_line(),
+                "Dialectic candidates are internal to the adviser and never injected into your "
+                "context. Do not wait for a turn-boundary advice block.",
+            ])
+        if adviser_only:
+            brief = self._adviser_mode.mode_brief(self._session_id)
+            if brief:
+                parts.append(brief)
+        if consult:
+            parts.append(MAIN_CONSULT_SECTION)
+        return "\n\n".join(parts)
 
     def queue_prefetch(self, query: str, *, session_id: str = "") -> None:
         """Run recall in the background at turn end; ``prefetch()`` consumes it next turn."""
@@ -824,101 +871,7 @@ class MinirMemoryProvider(MemoryProvider):
                                "reasoning_enabled": self._reasoning})
         return tool_error(f"Unknown tool: {tool_name}")
 
-    # -- review + cold start --------------------------------------------------
-
-    def review_block(self, session_id: str = "") -> str:
-        """Latest adviser review for *session_id*, bounded for a user-message injection."""
-        if self._store is None:
-            return ""
-        session = session_id or self._session_id
-        if not session:
-            return ""
-        row = self._store.newest_conclusion("dialectic.review", session_id=session)
-        body = str((row or {}).get("content") or "").strip()
-        if not body:
-            state = self._store.layer_state(DIALECTIC_LAYER, self._worker.dialectic_subject()) \
-                if self._worker is not None else None
-            marker = "## Adviser Review"
-            text = str((state or {}).get("content") or "")
-            if marker in text:
-                body = text.split(marker, 1)[1].split("\n## ", 1)[0].strip()
-        if not body:
-            return ""
-        body = body[:600].rstrip()
-        return ("[minir adviser review — session-scoped, advisory only]\n"
-                f"{body}\n[end minir adviser review]")
-
-    def should_inject_review(self, session_id: str = "", turn_id: str = "") -> bool:
-        """True once per turn: tool loops issue several LLM calls under one turn id."""
-        session = session_id or self._session_id
-        turn = str(turn_id or "")
-        if not session or not turn:
-            return True
-        with self._lock:
-            if self._review_turns.get(session) == turn:
-                return False
-            if len(self._review_turns) >= 64:
-                self._review_turns.pop(next(iter(self._review_turns)))
-            self._review_turns[session] = turn
-            return True
-
-    def advisory_block(self, session_id: str = "", turn_id: str = "",
-                       *, source: str = "") -> str:
-        """Drain pending advices into one bounded injection block.
-
-        The advices are the actionable half of the dialectic review; the six corrected cards
-        stay on the base layer and are never injected here. Marking them injected happens
-        after the block is built, so a tool loop does not receive the same advice twice.
-
-        ``source`` narrows the ledger for the turn-boundary channel. The provider passes
-        ``dialectic`` there: adviser-mode advice is staged by ``llm_request`` and confirmed by
-        ``post_api_request``, so draining it here would mark it injected before it was sent.
-        """
-        if self._store is None:
-            return ""
-        session = session_id or self._session_id
-        if not session:
-            return ""
-        rows = self._store.pending_advisories(
-            session, limit=_MAX_ADVICE_ITEMS, source=source)
-        if not rows:
-            return ""
-        header, footer = "[minir adviser — advisory only]", "[end minir adviser]"
-        budget = _MAX_ADVICE_CHARS - len(header) - len(footer) - 2
-        if budget <= 0:
-            return ""
-        lines: list[str] = []
-        included: list[int] = []
-        for row in rows:
-            severity = str(row.get("severity") or "concern")
-            target = str(row.get("target") or "")
-            source = str(row.get("source") or "dialectic")
-            label = f"[{source} · {severity} · {target}]" if target else f"[{source} · {severity}]"
-            line = f"- {label} {str(row.get('content') or '').strip()}"
-            decision = str(row.get("decision") or "").strip()
-            if decision:
-                line += f" — decide: {decision}"
-            candidate = "\n".join((*lines, line))
-            if len(candidate) <= budget:
-                lines.append(line)
-                included.append(int(row["id"]))
-                continue
-            if not lines:  # one oversized advice: deliver a bounded prefix, not nothing
-                lines.append(line[:budget].rstrip())
-                included.append(int(row["id"]))
-            break  # the rest stay pending for the next LLM request
-        if not lines:
-            return ""
-        block = f"{header}\n" + "\n".join(lines) + f"\n{footer}"
-        self._store.mark_advisories_injected(included, turn_id or "")
-        return block[:_MAX_ADVICE_CHARS]
-
-    def has_advisories(self, session_id: str = "") -> bool:
-        """Whether this session has a dialectic delivery ledger at all."""
-        if self._store is None:
-            return False
-        session = session_id or self._session_id
-        return bool(session and self._store.has_advisories(session))
+    # -- cold start -----------------------------------------------------------
 
     def cold_start(self, session_id: str = "") -> bool:
         """Queue the first *base* refresh for a freshly opened primary session.
@@ -1135,7 +1088,8 @@ def register(ctx) -> None:
     # API (or a config that refuses the key) must still get the memory provider, so a failure
     # here is logged and swallowed rather than raising out of ``register()``.
     try:
-        adviser.register(ctx)
+        adviser.register(ctx, provider)
+        provider._adviser_consult_registered = True
     except Exception as exc:
         logger.warning("Minir adviser registration failed: %s", exc)
 
@@ -1198,9 +1152,6 @@ def _on_session_reset(session_id: str = "", old_session_id: str = "",
         if old_session_id:
             TRACKER.stop(old_session_id)
         TRACKER.begin(session_id)
-        resolved = _resolve_provider(provider)
-        if resolved is not None:
-            resolved._review_turns.clear()
         logger.info("Minir on_session_reset: %s -> %s (reason=%s)",
                     old_session_id or "-", session_id or "-", reason or "-")
     except Exception as exc:
@@ -1224,11 +1175,11 @@ def _on_session_finalize(session_id: str = "", provider: Optional[MinirMemoryPro
 def _on_pre_llm_call(session_id: str = "", turn_id: str = "",
                      provider: Optional[MinirMemoryProvider] = None,
                      **kwargs) -> Optional[str]:
-    """Inject pending dialectic advices, then fall back to the legacy adviser review.
+    """Inject only the ``adviser_only`` policy brief.
 
-    Returning a string is the host's injection channel. Both channels are session-scoped and
-    skipped for a child session or a provider bound elsewhere. Advices dedupe by advice id
-    (the ledger marks them injected); the legacy review dedupes once per turn id.
+    Returning a string is the host's injection channel. The brief is session-scoped and skipped
+    for a child session or a provider bound elsewhere. Dialectic advices are candidates for the
+    main adviser now, never boundary injections.
     """
     logger.info("Minir pre_llm_call: session=%s turn=%s", session_id or "-", turn_id or "-")
     provider = _resolve_provider(provider)
@@ -1246,24 +1197,10 @@ def _on_pre_llm_call(session_id: str = "", turn_id: str = "",
             user_message=kwargs.get("user_message"))
         # ``adviser_only`` is a policy mode, not a different reviewer: the brief tells the main
         # agent to propose changes instead of executing them, and ``pre_tool_call`` enforces it.
+        # Dialectic advices are candidates for the main adviser now; they are never injected at
+        # the turn boundary. The legacy review fallback is retired with the same cutover.
         brief = provider._adviser_mode.mode_brief(session_id)
-        # The dialectic advices are the actionable channel. When the ledger exists, the review
-        # summary already rides ``prefetch``; do not inject it a second time through this hook.
-        advices = provider.advisory_block(session_id, turn_id, source="dialectic")
-        if advices:
-            return f"{brief}\n\n{advices}" if brief else advices
-        if brief:
-            return brief
-        if provider.has_advisories(session_id):
-            return None
-        history = kwargs.get("conversation_history") or []
-        if any("[minir adviser review" in str(
-                (message.get("content") if isinstance(message, dict) else message) or "")
-               for message in history[-6:]):
-            return None
-        if not provider.should_inject_review(session_id, turn_id):
-            return None
-        return provider.review_block(session_id) or None
+        return brief or None
     except Exception as exc:  # injection must never break a turn
         logger.debug("Minir review injection skipped: %s", exc)
         return None

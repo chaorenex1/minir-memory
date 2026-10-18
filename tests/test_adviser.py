@@ -8,6 +8,7 @@ frames the message, the JSON contract of the two handlers, and the route/tool re
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 import sys
 import types
@@ -193,6 +194,19 @@ def test_async_handler_reports_success(adviser, host):
     assert payload == {"success": True, "data": RUN}
 
 
+def test_handler_uses_the_bound_provider_main_adviser(adviser):
+    class Mode:
+        def consult(self, question, context="", toolsets=None):
+            return {"answer": "main adviser", "api_calls": 1, "model": "m",
+                    "provider": "p", "toolsets": []}
+
+    provider = types.SimpleNamespace(_adviser_mode=Mode())
+    payload = json.loads(adviser.handle({"question": "q"}, provider=provider))
+    assert payload == {"success": True, "data": {
+        "answer": "main adviser", "api_calls": 1, "model": "m",
+        "provider": "p", "toolsets": []}}
+
+
 def test_handler_turns_a_failure_into_json(adviser, host):
     host["fail_with"] = RuntimeError("no credentials")
 
@@ -250,7 +264,7 @@ def test_register_declares_the_route_and_both_tools(adviser):
     assert tool["schema"]["name"] == "adviser_consult"
     # The registered handler must be the coroutine function, and the flag must agree with it:
     # the host bridges async handlers (tools.registry.dispatch -> _run_async).
-    assert tool["handler"] is adviser.handle_async
+    assert inspect.iscoroutinefunction(tool["handler"])
     assert tool["is_async"] is True
     assert (search_kind, search["name"], search["toolset"]) == (
         "tool", "adviser_session_search", "adviser")
