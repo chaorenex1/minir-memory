@@ -39,11 +39,12 @@ def _dialectic_json(*, user=None, peer=None, ai_self=None, identity=None, summar
                     advices=None, markers=None, changed=False, fields=None):
     """A full eight-key dialectic reply; the default carries one actionable concern."""
     return json.dumps({
-        "user_representation": user or ["[goal] ship the plugin"],
-        "user_peer_card": peer or ["Wants terse answers."],
-        "ai_self_representation": ai_self or ["[done] ran the smoke test"],
-        "ai_identity_card": identity or ["careful with user files"],
-        "session_chunk_summary": summary or ["[done] ships a Hermes memory plugin"],
+        "user_representation": user if user is not None else ["[goal] ship the plugin"],
+        "user_peer_card": peer if peer is not None else ["Wants terse answers."],
+        "ai_self_representation": ai_self if ai_self is not None else ["[done] ran the smoke test"],
+        "ai_identity_card": identity if identity is not None else ["careful with user files"],
+        "session_chunk_summary": (summary if summary is not None
+                                  else ["[done] ships a Hermes memory plugin"]),
         "advices": advices if advices is not None else [{
             "severity": "concern", "target": "user_peer_card",
             "text": "run a smoke test before shipping",
@@ -968,6 +969,44 @@ def test_placeholder_only_corrections_do_not_overwrite_the_base_cards(
     assert json.loads(latest["value_markers"])["entities"] == ["Hermes memory plugin"]
     assert store.base_revisions(SESSION, "user:default") == [], \
         "unknown-only or empty corrections must not create a revision"
+
+
+def test_a_listed_empty_card_clears_it(plugin_package, store, transcript):
+    def complete(task, system, prompt, **kwargs):
+        if task == plugin_package.worker.DIALECTIC_LAYER_TASK:
+            return _dialectic_json(peer=[], changed=True, fields=["user_peer_card"])
+        return _base_json()
+
+    transcript.add(SESSION, "user", "ship it", created_at=10.0)
+    _dispatch(store, transcript, SESSION, BASE, 0.0, 20.0)
+    instance = plugin_package.worker.LayerWorker(store, transcript, complete=complete)
+    assert instance.run_once() == 2
+
+    latest = store.latest_base_refresh(SESSION, "user:default")
+    assert json.loads(latest["user_peer_card"]) == []
+    revisions = store.base_revisions(SESSION, "user:default")
+    assert len(revisions) == 1
+    assert json.loads(revisions[0]["changed_fields"]) == ["user_peer_card"]
+    # The revision row is the pre-overwrite snapshot; the live row carries the cleared card.
+    assert json.loads(revisions[0]["user_peer_card"]) == ["Wants terse answers."]
+    published = store.layer_state(BASE, "user:default")["content"]
+    assert "## User Peer Card\n\n## AI Self Representation" in published
+
+
+def test_an_empty_card_outside_a_listed_change_is_refused(plugin_package, store, transcript):
+    def complete(task, system, prompt, **kwargs):
+        if task == plugin_package.worker.DIALECTIC_LAYER_TASK:
+            return _dialectic_json(peer=[])  # empty, but base_changed does not list it
+        return _base_json()
+
+    transcript.add(SESSION, "user", "ship it", created_at=10.0)
+    _dispatch(store, transcript, SESSION, BASE, 0.0, 20.0)
+    instance = plugin_package.worker.LayerWorker(store, transcript, complete=complete)
+    assert instance.run_once() == 2  # the base job ran, the broken review failed and was recorded
+
+    latest = store.latest_base_refresh(SESSION, "user:default")
+    assert json.loads(latest["user_peer_card"]) == ["Wants terse answers."]
+    assert store.base_revisions(SESSION, "user:default") == []
 
 
 def test_a_dialectic_job_without_its_base_window_does_not_correct_another_window(

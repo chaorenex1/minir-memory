@@ -44,6 +44,61 @@ _TAG_RE = re.compile(
 )
 
 
+# The five value-marker types, defined once. Every prompt that writes, corrects, tags or
+# describes a marker uses this table, so the meaning cannot drift between the pass that stores an
+# item and the pass that later judges it.
+MARKER_TYPES: tuple[tuple[str, str], ...] = (
+    ("entities", "named people, organizations, services, systems or devices, and why they "
+                 "matter here"),
+    ("trajectories", "an ongoing goal or plan and its current state"),
+    ("experiences", "a reusable lesson, procedure or outcome proven by the evidence"),
+    ("tools", "a tool, command or API and the context in which it worked or failed"),
+    ("projects", "a project, repository or workspace and its status"),
+)
+
+
+def marker_glossary(*, bullet: str = "  * ") -> str:
+    """One aligned line per marker type, ready to paste into a prompt body."""
+    width = max(len(key) for key, _ in MARKER_TYPES)
+    return "\n".join(f"{bullet}{key.ljust(width)} {meaning}" for key, meaning in MARKER_TYPES)
+
+
+def marker_section(*, heading: str = "VALUE MARKERS — DEFINITIONS",
+                   bullet: str = "  * ") -> str:
+    """The glossary under a heading, for prompts that reference the types by name."""
+    return f"{heading}\n{marker_glossary(bullet=bullet)}"
+
+
+# Advice targets, shared by both producers of an advisory block (the dialectic review and the
+# live adviser). One vocabulary, so the agent reads the same tokens whatever produced the advice.
+ADVICE_TARGETS: tuple[tuple[str, str], ...] = (
+    ("user_representation", "the user's need-path card"),
+    ("user_peer_card", "the user's durable preferences card"),
+    ("ai_self_representation", "the assistant's action-state card"),
+    ("ai_identity_card", "the assistant's identity card"),
+    ("session_chunk_summary", "the window record"),
+    ("value_markers", "the durable marker inventory"),
+    ("tool_choice", "the tool or arguments the turn is using"),
+    ("current_step", "the next action of the turn"),
+    ("final_answer", "the answer given to the user"),
+    ("user_intent", "the reading of what the user asked for"),
+    ("general", "none of the above"),
+)
+
+
+def advice_target_glossary(*, bullet: str = "  * ") -> str:
+    """One aligned line per advice target, ready to paste into a prompt body."""
+    width = max(len(key) for key, _ in ADVICE_TARGETS)
+    return "\n".join(f"{bullet}{key.ljust(width)} {meaning}"
+                     for key, meaning in ADVICE_TARGETS)
+
+
+def advice_target_section(*, heading: str = "ADVICE TARGETS — DEFINITIONS",
+                          bullet: str = "  * ") -> str:
+    """The shared target vocabulary under a heading."""
+    return f"{heading}\n{advice_target_glossary(bullet=bullet)}"
+
+
 def data_block(label: str, text: object, *, empty: str = "(none)") -> str:
     """Wrap *text* as one labeled data block.
 

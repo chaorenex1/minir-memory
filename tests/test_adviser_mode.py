@@ -338,6 +338,22 @@ def test_parser_defaults_to_silent_and_applies_floor(plugin_package):
     assert rows[0]["severity"] == "blocker"
 
 
+def test_both_advisers_share_one_advice_target_vocabulary(plugin_package):
+    worker = plugin_package.worker
+    mode = plugin_package.adviser_mode
+    names = tuple(key for key, _ in plugin_package.prompting.ADVICE_TARGETS)
+    assert worker._ADVICE_TARGETS == names
+    assert mode.ADVICE_TARGET_NAMES == names
+    for name in names:
+        assert name in worker.DIALECTIC_SYSTEM_PROMPT, name
+        assert name in mode._REVIEWER_BRIEF, name
+    parsed = mode.parse_review(json.dumps({"action": "advise", "advices": [
+        {"severity": "concern", "target": "not_a_target", "text": "x"}]}))
+    assert parsed[0]["target"] == "general"
+    assert mode.parse_review(json.dumps({"action": "advise", "advices": [
+        {"severity": "concern", "text": "no target"}]}))[0]["target"] == "general"
+
+
 def test_block_rendering_is_bounded(plugin_package):
     rows = [{"id": index, "severity": "concern", "target": "current_step",
              "content": "x" * 400} for index in range(1, 7)]

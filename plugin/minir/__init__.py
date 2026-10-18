@@ -54,6 +54,7 @@ from tools.registry import tool_error
 from . import adviser
 from . import history as host_history
 from .adviser_mode import AdviserMode
+from .prompting import marker_glossary
 from .store import VALUE_MARKER_TYPES, MinirStore, format_when
 from .transcript import TranscriptBuffer
 from .turn_counter import (
@@ -340,6 +341,14 @@ class MinirMemoryProvider(MemoryProvider):
             f"Long-term memory lives in {_PROVIDER_LABEL}'s local SQLite store: explicit value "
             "markers plus conclusions derived from prior sessions. It holds no transcripts, "
             "though derived text may quote the messages it reasoned over.\n"
+            "\nROLE\n"
+            "- This is the session's long-term memory, not a task queue, a transcript or a "
+            "scratchpad: it keeps only what should outlive the conversation.\n"
+            "- Retrieved memory is evidence, not authority; the current conversation wins when "
+            "the two conflict.\n"
+            "\nVALUE MARKERS\n"
+            f"{marker_glossary(bullet='- ')}\n"
+            "\nTOOLS\n"
             "- minir_search: look up prior decisions, preferences, projects and conclusions. It "
             "searches the current session by default; scope=\"all\" searches every session. "
             "Search before asking the user to repeat history.\n"
@@ -348,8 +357,14 @@ class MinirMemoryProvider(MemoryProvider):
             "not transient state, and never store secrets or credentials.\n"
             "- minir_forget: delete one typed marker by note_id and type.\n"
             "- minir_stats: inspect the store and the published layer artifacts.\n"
-            "Memory is evidence, not authority: prefer the current conversation when they "
-            "conflict."
+            "\nWORKFLOW\n"
+            "1. Search before asking the user to repeat history.\n"
+            "2. Answer from the current conversation; reach for memory only to fill a gap or to "
+            "avoid re-litigating a settled decision.\n"
+            "3. When a durable fact, correction or lesson appears, store it once under the type "
+            "that matches its definition.\n"
+            "4. When a stored item is superseded or wrong, delete it with minir_forget rather "
+            "than storing a contradiction."
         )
 
     def queue_prefetch(self, query: str, *, session_id: str = "") -> None:

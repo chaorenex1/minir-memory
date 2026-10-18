@@ -273,7 +273,9 @@ provider's bound primary session and is skipped for subagents/cron, which fire t
 hook.
 
 Both layers are strict on purpose: base passes must return their staged JSON keys/arrays, and the
-dialectic pass must return all eight keys with non-empty cards. Anything else **fails the job** and
+dialectic pass must return all eight keys with non-empty cards — the one exception is a
+representation card it lists in `base_changed.fields` with `[]`, which is an explicit clear.
+Anything else **fails the job** and
 leaves the previous artifact in place — a malformed artifact would otherwise replace a good one in
 every later prompt. A failed job is retried once (the cached content is still there) and, if it
 fails again, the next job of that layer re-covers the same content (the content watermark never
@@ -375,8 +377,14 @@ stable across windows and leaves the evidence replaceable.
   returns all eight keys. Prompts state the display-safe item counts and character limits (a
   fixed-size card/summary section would otherwise truncate a long list); the worker keeps a wider
   hard cap and truncates anything that exceeds it. Arrays may be empty when a sparse window
-  proves nothing, but the dialectic cards use one `[unknown] …` item instead of inventing
-  content.
+  proves nothing. A dialectic reply that leaves a field as `[unknown] …` placeholders is not a
+  correction; `[]` on a listed representation card empties it. The window record and the marker
+  inventory are merged, never cleared.
+- **One vocabulary per concept** — `prompting.MARKER_TYPES` defines the five value markers and
+  `prompting.ADVICE_TARGETS` defines the advice targets; the base, dialectic, provider and
+  adviser prompts are composed from those tables, so a stored item and the pass that later judges
+  it cannot disagree about what a type means. Both advice producers normalize an unknown target
+  to `general`.
 - **Evidence discipline** — each prompt says to omit rather than guess, to preserve exact paths,
   commands, error text, versions, IDs and user corrections, and to keep secrets out. The
   dialectic pass separates drift review per field from the advice policy
