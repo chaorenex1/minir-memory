@@ -61,6 +61,7 @@ from .prompting import (
     advice_nit_report_section,
     advice_severity_section,
     advice_target_section,
+    craft_rules_section,
     marker_glossary,
 )
 from .store import VALUE_MARKER_TYPES, MinirStore, format_when
@@ -340,10 +341,11 @@ class MinirMemoryProvider(MemoryProvider):
     # -- prompt + recall ------------------------------------------------------
 
     def system_prompt_block(self) -> str:
-        """Session-static prompt text: memory contract plus the gated adviser contract."""
+        """Session-static prompt text: memory, craft, and the gated adviser contract."""
         logger.info("Minir system_prompt_block (built once per session)")
         return "\n\n".join(part for part in (
-            self._memory_prompt_block(), self._adviser_prompt_block()) if part)
+            self._memory_prompt_block(), self._craft_prompt_block(),
+            self._adviser_prompt_block()) if part)
 
     @staticmethod
     def _memory_prompt_block() -> str:
@@ -377,6 +379,11 @@ class MinirMemoryProvider(MemoryProvider):
             "4. When a stored item is superseded or wrong, delete it with minir_forget rather "
             "than storing a contradiction."
         )
+
+    @staticmethod
+    def _craft_prompt_block() -> str:
+        """Static craft contract; emitted regardless of adviser_mode and consult gating."""
+        return craft_rules_section()
 
     def _adviser_prompt_block(self) -> str:
         """Dynamic adviser contract, gated on the configured/registered surfaces."""

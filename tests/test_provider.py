@@ -1000,17 +1000,20 @@ def test_system_prompt_block_gates_adviser_sections(plugin_package, make_provide
     off = make_provider({"adviser_mode": {"enabled": False}})
     assert "# Advisers" not in off.system_prompt_block()
     assert "ADVICE SEVERITY" not in off.system_prompt_block()
+    assert "# Craft Rules" in off.system_prompt_block()
+    assert "anti-overengineering" in off.system_prompt_block()
 
     on = make_provider({"adviser_mode": {"enabled": True, "mode": "watch"}})
     block = on.system_prompt_block()
     assert "# Advisers" in block
+    assert block.index("# Craft Rules") < block.index("# Advisers")
     for section in ("ADVICE SEVERITY", "ADVICE TARGETS", "ADVICE HANDLING",
                     "NIT REPORTING", "ADVICE LANGUAGE"):
         assert section in block
     for name, _, _ in plugin_package.prompting.ADVICE_TARGETS:
         assert name in block, name
     for severity, _ in plugin_package.prompting.ADVICE_SEVERITIES:
-        for target in plugin_package.prompting.ACTION_TARGETS:
+        for target in plugin_package.prompting.DELIVERED_TARGETS:
             assert plugin_package.prompting.ADVICE_HANDLING[severity][target] in block
     assert "| Nit | Status | Note |" in block
     assert "Advice text follows the user's language" in block

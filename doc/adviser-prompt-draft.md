@@ -195,9 +195,11 @@ READ-ONLY
 WORKFLOW
 1. Read the events oldest to newest; infer the goal from the user event and the current intent.
 2. Check the turn: wrong tool or arguments, wrong next step, an answer that outruns the
-   evidence, a misread request, a missed constraint, a premature "done".
+   evidence, a misread request, a missed constraint, a premature "done", an artifact that
+   repeats an existing capability or reads as machine-generated.
 3. Grade the candidates against the turn using ADVICE GRADING.
-4. Advise only when a correction changes the next action or prevents a bad outcome.
+4. Advise only when a correction changes the next action, changes the artifact, or prevents a
+   bad outcome.
 5. Otherwise return silent.
 
 OUTPUT CONTRACT
@@ -222,8 +224,29 @@ BUDGET
 
 TARGETS
 - Live-turn targets: tool_choice, current_step, final_answer, user_intent.
+- Artifact targets: output_surface (the wording, formatting, or interface being emitted),
+  code_economy (the amount or structure of code being added).
 - Use general when none fits.
 - One token only; unknown targets degrade to general.
+
+ARTIFACT ADVICE
+- Use an artifact target only when the action itself is correct and the failing element is
+  visible in the events. Quote the phrase, element, or code line in evidence.
+- final_answer means the whole answer must not be sent. output_surface means one cited element
+  inside a sendable answer fails the craft rules.
+- output_surface blocker: fabricated specificity, a control that does nothing, contrast below
+  WCAG AA, or an em dash in English prose. concern: hype vocabulary, significance inflation,
+  formulaic rhythm, emphasis by formatting, or a default technique with no written reason.
+- code_economy blocker: a signature, hash lock, or integrity layer over git; a vN file copy; a
+  broad except that swallows a real failure; a behavior change with no green baseline.
+  concern: an unrequested abstraction, a single-impl interface, over-validated optional config,
+  an oversized module, a test of a test, or an unbounded ledger.
+- code_economy requires naming the existing capability being duplicated (git, the license, the
+  framework, the stdlib) or the threshold crossed.
+- At most one output_surface and one code_economy advice per turn; merge examples into one.
+- Artifact advice never outranks an action or factual blocker. When both apply, send the
+  blocker.
+- Do not advise on taste. A style or hardening the user explicitly asked for is not slop.
 
 NEVER
 - Restate what the agent is already doing.
@@ -245,6 +268,8 @@ NEVER
 | action | `final_answer` | the answer about to be sent | blocker → 不发送，修正/加限定；concern → 核对主张与证据；nit → 可选 |
 | action | `user_intent` | the reading of what the user asked | blocker → 重读请求，仅当动作改变时澄清；concern → 重读，必要时再问；nit → 可选 |
 | action | `general` | none of the above | blocker → 停下核对证据；concern → 自行决定；nit → 可选 |
+| artifact | `output_surface` | the wording, formatting, or interface of what is being produced | blocker → 不发送，删掉或重写被引用的元素；concern → 对照 craft rules 核对，只有影响诚实或可读性才改；nit → 可选 |
+| artifact | `code_economy` | the amount or structure of code being added | blocker → 不新增，改用已有能力；concern → 先查 git/许可证/框架/stdlib，再决定保留或删除；nit → 可选 |
 | memory | `user_representation` | the user's need-path card | 候选内部使用；提升时重映射到 action target 或 general；不直接投递 |
 | memory | `user_peer_card` | the user's durable preferences card | 候选内部使用；提升时重映射；不直接投递 |
 | memory | `ai_self_representation` | the assistant's action-state card | 候选内部使用；提升时重映射；不直接投递 |
@@ -252,24 +277,38 @@ NEVER
 | memory | `session_chunk_summary` | the window record | 候选内部使用；提升时重映射；不直接投递 |
 | memory | `value_markers` | the durable marker inventory | 候选内部使用；提升时重映射；不直接投递 |
 
-这张表由 `advice_target_section()` 从 `ADVICE_TARGETS` 生成；system block 与 REVIEW 共用同一份定义。`ADVICE_TARGETS` 必须是 `(name, definition, usage)` 三元组，覆盖全部 11 个 token。
+这张表由 `advice_target_section()` 从 `ADVICE_TARGETS` 生成；system block 与 REVIEW 共用同一份定义。`ADVICE_TARGETS` 必须是 `(name, definition, usage)` 三元组，覆盖全部 13 个 token，分三组：action / artifact / memory。
 
 **处理矩阵（主 agent 视角）**
 
-| severity | tool_choice | current_step | final_answer | user_intent | general |
-|---|---|---|---|---|---|
-| `blocker` | 不执行；复核参数/权限 | 停下；重新规划 | 不发送；修正或加限定 | 重读请求；仅当动作改变时澄清 | 停下；核对证据 |
-| `concern` | 执行前复核 | 考虑替代方案；自行决定 | 核对主张与证据；必要时调整 | 重读；仅当动作改变时再问 | 自行决定 |
-| `nit` | 折叠或忽略 | 折叠或忽略 | 折叠或忽略 | 折叠或忽略 | 折叠或忽略 |
+| severity | tool_choice | current_step | final_answer | user_intent | general | output_surface | code_economy |
+|---|---|---|---|---|---|---|---|
+| `blocker` | 不执行；复核参数/权限 | 停下；重新规划 | 不发送；修正或加限定 | 重读请求；仅当动作改变时澄清 | 停下；核对证据 | 不发送；删掉或重写被引用的元素 | 不新增；改用已有能力 |
+| `concern` | 执行前复核 | 考虑替代方案；自行决定 | 核对主张与证据；必要时调整 | 重读；仅当动作改变时再问 | 自行决定 | 对照 craft rules 核对；只有影响诚实或可读性才改 | 先查 git/许可证/框架/stdlib；保留需给出一行理由 |
+| `nit` | 折叠或忽略 | 折叠或忽略 | 折叠或忽略 | 折叠或忽略 | 折叠或忽略 | 折叠或忽略 | 折叠或忽略 |
 
 这张表是 `advice_handling_section()` 的源表；system block 从它生成，不手写重复。
+
+**Artifact advice 规则（主 adviser 侧）**
+
+artifact targets 只在"动作本身没问题、但产物表面或代码体量有问题"时使用。加这两个 target 是为了让建议落到具体元素，而不是把每条风格意见都塞进 `final_answer`。
+
+| 规则 | 内容 |
+|---|---|
+| 归属判定 | 修正会改变下一步动作 → 用 action target。动作正确、只有文本或界面元素不合格 → `output_surface`。动作正确、但新增代码在重复已有能力 → `code_economy`。 |
+| `final_answer` 与 `output_surface` 的边界 | 整条回答不该发出 → `final_answer`。回答可发、但其中某一句或某个元素不合格 → `output_surface`，并在 evidence 中引用该句。 |
+| 证据 | 必须引用事件中可见的原文、元素或代码行；引用不到就不发。`code_economy` 必须点名被重复的已有能力（git、许可证、框架、stdlib）或越过的阈值。 |
+| 预算 | 每轮最多各一条 `output_surface` 与 `code_economy`，多个例子合并进同一条。 |
+| 排序 | artifact advice 不得压过 action 或事实类 blocker；同一轮两者冲突时先发 blocker。 |
+| 反向约束 | 不因个人审美发 advice；只有 craft rules 的 blocker/concern 清单命中时才发。用户明确要求的风格与防御层不算 slop（两边技能都有此例外）。 |
+| 来源限制 | artifact targets 只由主 adviser 依据 live events 产出。dialectic 候选仍使用 memory targets；若候选携带 artifact target，主 adviser 按 `general` 处理并重新判定，不直接转发。 |
 
 三个级别同时用于 live findings 与 dialectic candidates：
 
 | 级别 | 含义 | 投递规则 |
 |---|---|---|
 | `blocker` | 具体风险：错误/破坏性操作、违反明确指令、虚假完成 | 始终投递，可低于 floor；要求暂停/重审 |
-| `concern` | 可能走错、漏约束、即将固化的边缘情况 | 只有改变下一步动作时才投递；由主 agent 决定 |
+| `concern` | 可能走错、漏约束、即将固化的边缘情况，或产物表面/代码体量有明显问题 | 只有会改变下一步动作、产物内容或代码体量时才投递；由主 agent 决定 |
 | `nit` | 可选清理、简化、风格 | 在步骤边界折叠或丢弃；若投递，最终回答必须用表格展示处理结果 |
 
 候选重新分级矩阵：
@@ -357,6 +396,23 @@ review_prompt = "\n\n".join([CORE, MODE_REVIEW, REVIEW_BUDGET, ADVICE_TARGETS])
 以下内容放在 minir 的 `system_prompt_block()`，不是 SOUL。`[...]` 是构建时的门控注释，不进入最终文本。
 
 ```text
+# Craft Rules
+
+Two filters, different objects; load by name when the work matches. Neither overrides a
+functional requirement or the user's explicit direction.
+
+antislop — surface filter: prose, UI copy, mobile layout, accessibility, code comments. Load
+`antislop` (core) plus the satellite for the task; skip its install wizard and mode question,
+work in during mode.
+
+anti-overengineering — code-economy brake: the amount and structure of code added or removed.
+Load `anti-overengineering`.
+
+Brake before surface: ask whether the line should exist, then whether it reads as generated.
+Cleanup removes structure first, comments last; a comment-only task belongs to `antislop-code`.
+Functionality outranks economy, economy outranks surface. The user's explicit direction
+outranks all three, and a style or hardening the user asked for is not slop.
+
 # Advisers
 
 Advice from the main adviser is advice, never authority. You own the decision and the
@@ -385,6 +441,13 @@ Action targets (delivered):
 - user_intent: the reading of what the user asked. blocker -> re-read; clarify only if the
   action changes. concern -> re-check; ask only if the action changes. nit -> optional.
 - general: none of the above. blocker -> stop and verify. concern -> decide. nit -> optional.
+Artifact targets (delivered):
+- output_surface: the wording, formatting, or interface being produced. blocker -> do not send;
+  cut or rewrite the cited element. concern -> check the craft rules; adjust only if honesty or
+  clarity changes. nit -> optional.
+- code_economy: the amount or structure of code being added. blocker -> do not add; reuse the
+  existing capability. concern -> check git, the license, the framework, or the stdlib first;
+  justify or drop. nit -> optional.
 Memory targets (candidate-only; remap to an action target or general before delivery):
 - user_representation: the user's need-path card. Use: candidate-only; remap before delivery.
 - user_peer_card: the user's durable preferences card. Use: candidate-only; remap before delivery.
@@ -395,11 +458,11 @@ Memory targets (candidate-only; remap to an action target or general before deli
 If a memory target reaches you anyway, treat it as general and use its evidence.
 
 ADVICE HANDLING
-| severity | tool_choice | current_step | final_answer | user_intent | general |
-|---|---|---|---|---|---|
-| blocker | do not execute; re-check args | stop; re-plan | do not send; fix or qualify | re-read; clarify only if the action changes | stop; verify |
-| concern | verify before executing | consider an alternative; decide | check claims and evidence; adjust | re-check; ask only if the action changes | decide |
-| nit | fold or ignore | fold or ignore | fold or ignore | fold or ignore | fold or ignore |
+| severity | tool_choice | current_step | final_answer | user_intent | general | output_surface | code_economy |
+|---|---|---|---|---|---|---|---|
+| blocker | do not execute; re-check args | stop; re-plan | do not send; fix or qualify | re-read; clarify only if the action changes | stop; verify | do not send; cut or rewrite the cited element | do not add; reuse the existing capability |
+| concern | verify before executing | consider an alternative; decide | check claims and evidence; adjust | re-check; ask only if the action changes | decide | check the craft rules; adjust only if honesty or clarity changes | check git, the license, the framework, or the stdlib first; justify or drop |
+| nit | fold or ignore | fold or ignore | fold or ignore | fold or ignore | fold or ignore | fold or ignore | fold or ignore |
 
 NIT REPORTING
 If one or more nit advices were delivered this turn, end the final answer with this table:
@@ -436,20 +499,28 @@ turns — for a second opinion on a decision, design, diagnosis, or a plan with 
 
 ### 2.1.1 动态拼接
 
-`system_prompt_block()` 不手写上面四段；构建时从 `prompting.py` 生成：
+`system_prompt_block()` 不手写上面的段落；构建时从 `prompting.py` 生成：
 
+- `craft_rules_section()` → `# Craft Rules`（静态文本，不受 adviser 门控）
 - `ADVICE_SEVERITIES` → `ADVICE SEVERITY`
-- `ADVICE_TARGETS`（全量 11 个：`name`, `definition`, `usage`）→ `ADVICE TARGETS`；action 直接投递，memory 标 candidate-only
+- `ADVICE_TARGETS`（全量 13 个：`name`, `definition`, `usage`）→ `ADVICE TARGETS`；action 与 artifact 直接投递，memory 标 candidate-only
 - `advice_handling_section()` → `ADVICE HANDLING`
 - `advice_nit_report_section()` → `NIT REPORTING`
 - `advice_language_line()` → `ADVICE LANGUAGE`
 
-拼接顺序与门控：
+分组由 `ADVICE_TARGET_GROUPS` 定义，顺序固定为 action / artifact / memory；`advice_target_section(grouped=True)` 按组渲染，不再假设只有两组。
 
-1. `# Advisers` 通用句。
-2. `[if adviser_mode.enabled(session)]`：live marker + SEVERITY + TARGETS + HANDLING + NIT REPORTING + LANGUAGE。
-3. `[if mode(session) == "adviser_only"]`：policy brief。
-4. `[if adviser_consult is registered]`：consult 用法。
+`_adviser_prompt_block()` 仍只返回 `# Advisers` 及之后的段；craft 由独立的 `_craft_prompt_block()` 返回，两者在 `system_prompt_block()` 中按 memory → craft → adviser 合并。
+
+拼接顺序（memory 块之后）与门控：
+
+1. `# Craft Rules`：始终输出，不看 `adviser_mode` 与 consult 注册状态。它是主 agent 的输出契约，不是建议通道。
+2. `# Advisers` 通用句：`adviser_mode.enabled` 或 consult 已注册时输出。
+3. `[if adviser_mode.enabled(session)]`：live marker + SEVERITY + TARGETS + HANDLING + NIT REPORTING + LANGUAGE。
+4. `[if mode(session) == "adviser_only"]`：policy brief。
+5. `[if adviser_consult is registered]`：consult 用法。
+
+craft 块放在 adviser 块之前，因为"产物该不该存在、该怎么写"先于"建议如何处理"。两个块之间不共享状态；`advice_target_section()` 与 craft block 都从 `prompting.py` 取词，避免同一规则出现两份措辞。
 
 `adviser_mode` 关闭时不输出 severity/targets/handling；consult 返回 prose，不依赖这些 token。
 
@@ -461,6 +532,13 @@ Recognize advisory blocks by their exact markers and check them against the curr
 ```
 
 不要把主 adviser 标记、`adviser_mode`、`adviser_consult` 或 dialectic 候选写进 SOUL。
+
+craft block 与 SOUL 的分工：
+
+- SOUL 持有全局输出过滤器（`# Output filter`），管"每句话的硬禁与语气"。它已经落地，不随插件变化。
+- minir 的 craft block 只持有两个技能的角色、路由与配合顺序，不重抄 SOUL 的禁词表与格式规则。同一规则出现两份措辞时，以 SOUL 为准，craft block 只留一句指针。
+- em dash 的语言作用域以 SOUL 为准：英文散文禁 em dash 与 ASCII `--`；中文 `——` 是合法破折号。
+- SOUL 不写技能的安装向导、mode 提问或 `skill_view` 细节以外的东西；craft block 负责"什么时候加载哪个技能"。
 
 ### 2.3 标记必须逐字识别
 
@@ -545,6 +623,28 @@ Recognize advisory blocks by their exact markers and check them against the curr
 
 风险：关闭 `adviser_mode` 后，dialectic 建议只留审计、不再送达。这是“单通道”的直接代价；如果不可接受，需要单独配置一个边界兜底开关，而不是默认恢复旧行为。
 
+### 3.1 本次新增（已落地）
+
+以下为本次实现记录；回归测试在 `tests/test_adviser_mode.py` 与 `tests/test_provider.py`。
+
+11. **craft block**：`prompting.craft_rules_section()` 保存静态文本；`MinirProvider._craft_prompt_block()` 返回它；`system_prompt_block()` 按 `memory → craft → adviser` 顺序拼接。craft 不受 `adviser_mode` 与 consult 门控。
+12. **artifact targets**：`ADVICE_TARGETS` 增加 `output_surface` 与 `code_economy`；新增 `ARTIFACT_TARGETS`、`DELIVERED_TARGETS = ACTION_TARGETS + ARTIFACT_TARGETS` 与 `ADVICE_TARGET_GROUPS = (action, artifact, memory)`；`advice_target_section(grouped=True)` 按组渲染。
+    - `adviser_mode.parse_review` 的投递校验已从 `ACTION_TARGET_NAMES` 改为 `DELIVERED_TARGET_NAMES`（`adviser_mode.py:43`/`:213`），两个新 target 不再被降级。
+    - `ACTION_TARGET_NAMES` 已删除，只保留 `ADVICE_TARGET_NAMES`（全量）与 `DELIVERED_TARGET_NAMES`（投递）。
+    - `ADVICE_TARGET_NAMES`（全量 13）保持不变；`test_adviser_mode.py::test_both_advisers_share_one_advice_target_vocabulary` 仍按它断言。
+    - `worker._ADVICE_TARGETS` 从 `ADVICE_TARGETS` 派生，自动包含新 token；`DIALECTIC_SYSTEM_PROMPT` 末尾共用 `advice_target_section()`，所以名字检查仍通过。dialectic 的 target 使用仍限 memory，见 §1.4 来源限制。
+13. **handling**：`ADVICE_HANDLING` 已增加两个 artifact target 的 blocker/concern 行；`advice_handling_section()` 的列已改为 `DELIVERED_TARGETS`；`nit` 行对全部投递 target 生成。
+14. **review prompt**：`MODE_REVIEW` 的 `TARGETS` 增加 artifact 两行，新增 `ARTIFACT ADVICE` 段。`adviser_prompts.review_prompt()` 签名不变，仍只追加 severities/budget/targets。
+15. **测试**：
+   - craft block 在 `adviser_mode` 关闭且 consult 未注册时仍出现；
+   - `system_prompt_block()` 顺序为 memory → craft → advisers；
+   - `ADVICE_TARGETS` 覆盖 13 个 token，三组齐全；
+   - `parse_review` 保留 `output_surface` 与 `code_economy`（经 `DELIVERED_TARGET_NAMES` 校验），未知 target 仍降级为 `general`；
+   - `test_provider.py::test_system_prompt_block_gates_adviser_sections` 的 handling 循环从 `ACTION_TARGETS` 改为 `DELIVERED_TARGETS`，覆盖 artifact 列；
+   - 处理矩阵覆盖 3 severity × 7 个投递 target；
+   - review prompt 含 `output_surface` / `code_economy` 与 `ARTIFACT ADVICE`；
+   - artifact advice 的引用证据要求只写在 prompt 里，不新增运行时校验（与现有 target 校验保持同一层）。
+
 ---
 
 ## 4. 已确认决策
@@ -556,8 +656,13 @@ Recognize advisory blocks by their exact markers and check them against the curr
 - 主 adviser 是唯一建议投递通道：已确认。`[adviser — advisory only]` + `[adviser-only mode]` 两个标记。
 - advice 分级：`blocker` / `concern` / `nit`；候选按 live 证据重新分级、合并或丢弃。
 - system block 动态拼接 advice 分级/分类/处理矩阵：已确认。`prompting.py` 是唯一源；`system_prompt_block()` 按 §2.1.1 门控拼接，不手写重复表。
-- Advice targets 全量覆盖：已确认。`ADVICE_TARGETS` 为 `(name, definition, usage)`，覆盖 11 个 token；system block 与 REVIEW 动态生成。
-- Target 分类：action targets 投递到主 agent；memory targets 仅候选内部使用，提升时重映射。
+- Advice targets 全量覆盖：已确认。`ADVICE_TARGETS` 为 `(name, definition, usage)`，13 个已落地，见 §3.1；system block 与 REVIEW 动态生成。
+- 两个 craft 技能的角色：已确认。`antislop` 是表面过滤器（文字、界面、移动布局、无障碍、注释）；`anti-overengineering` 是代码体量刹车（防御层、抽象、版本文件、校验、测试、模块规模）。两者互不替代。
+- 配合顺序：已确认。先刹车后表面；清理任务先做结构删除，最后做注释卫生。理由：被删掉的代码不需要再打磨文案与注释。
+- 冲突优先级：已确认。用户明确指令 > 工具证据 > craft rules；craft rules 内部按功能正确性 > 代码体量 > 表面呈现排序。
+- artifact targets 的归属：已确认。动作错误用 action target；动作正确但产物表面不合格用 `output_surface`；动作正确但新增代码重复已有能力用 `code_economy`。每轮各最多一条。
+- craft block 常开：已确认。不为一个静态文本块增加配置开关；技能未安装时路由与优先级仍成立，判级细则退化到 review prompt 与技能。
+- Target 分类：action 与 artifact targets 投递到主 agent；memory targets 仅候选内部使用，提升时重映射。artifact targets 只由主 adviser 产出，dialectic 候选携带时按 `general` 重判。
 - nit 最终回答表格：已确认。收到 nit 时末尾展示 `Nit / Status / Note` 表；无 nit 不加表。
 - advice 输出跟随用户语言：已确认。`text`/`decision`/consult prose 用用户语言；JSON keys、severity、target token 保持英文；代码/路径/命令/标识符原样。
 - 候选 consume 是 success-only：只有 review 成功发布 `silent`/`advised` 后才消费；模型错误、解析失败、session ended、任何 dropped 路径都保持 pending。
@@ -570,3 +675,6 @@ Recognize advisory blocks by their exact markers and check them against the curr
 
 - `adviser_mode` 关闭时是否需要可选的边界兜底：当前无；候选只保留为审计数据。若需要，单独加配置，不恢复为默认行为。
 - consult 是否读取完整 live event ring：当前只读 long-term digest + pending candidates，不复制事件环。
+- craft block 是否需要在技能缺失时降级：当前不降级。该块只做路由与优先级，不含判级清单；技能缺失时路由仍成立，但 blocker/concern 的判定只剩 review prompt 与技能里的版本。
+- artifact advice 每轮 1+1 的预算是否按模型能力调整：当前固定 1+1，防止风格建议刷屏。
+- 是否把两个技能改为 `skills.auto_load` 常驻：当前不采用。`antislop` 核心 57 KB，常驻成本高；路由加按需 `skill_view` 已够。

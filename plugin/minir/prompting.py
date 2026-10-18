@@ -99,13 +99,30 @@ ADVICE_TARGETS: tuple[tuple[str, str, str], ...] = (
      "concern -> re-check; ask only if the action changes. nit -> optional."),
     ("general", "none of the above",
      "blocker -> stop and verify. concern -> decide. nit -> optional."),
+    ("output_surface", "the wording, formatting, or interface being produced",
+     "blocker -> do not send; cut or rewrite the cited element. concern -> check the craft "
+     "rules; adjust only if honesty or clarity changes. nit -> optional."),
+    ("code_economy", "the amount or structure of code being added",
+     "blocker -> do not add; reuse the existing capability. concern -> check git, the license, "
+     "the framework, or the stdlib first; justify or drop. nit -> optional."),
 )
 
 ACTION_TARGETS: tuple[str, ...] = (
     "tool_choice", "current_step", "final_answer", "user_intent", "general")
+ARTIFACT_TARGETS: tuple[str, ...] = ("output_surface", "code_economy")
+DELIVERED_TARGETS: tuple[str, ...] = (*ACTION_TARGETS, *ARTIFACT_TARGETS)
 MEMORY_TARGETS: tuple[str, ...] = (
     "user_representation", "user_peer_card", "ai_self_representation",
     "ai_identity_card", "session_chunk_summary", "value_markers")
+
+# Ordered groups for the system block. Action and artifact targets are delivered to the main
+# agent; memory targets stay candidate-only inside the adviser.
+ADVICE_TARGET_GROUPS: tuple[tuple[str, tuple[str, ...]], ...] = (
+    ("Action targets (delivered):", ACTION_TARGETS),
+    ("Artifact targets (delivered):", ARTIFACT_TARGETS),
+    ("Memory targets (candidate-only; remap to an action target or general before delivery):",
+     MEMORY_TARGETS),
+)
 
 ADVICE_SEVERITIES: tuple[tuple[str, str], ...] = (
     ("blocker", "a concrete risk of wrong or destructive work, a breached explicit instruction, "
@@ -125,6 +142,8 @@ ADVICE_HANDLING: dict[str, dict[str, str]] = {
         "final_answer": "do not send; fix or qualify",
         "user_intent": "re-read; clarify only if the action changes",
         "general": "stop; verify",
+        "output_surface": "do not send; cut or rewrite the cited element",
+        "code_economy": "do not add; reuse the existing capability",
     },
     "concern": {
         "tool_choice": "verify before executing",
@@ -132,8 +151,10 @@ ADVICE_HANDLING: dict[str, dict[str, str]] = {
         "final_answer": "check claims and evidence; adjust",
         "user_intent": "re-check; ask only if the action changes",
         "general": "decide",
+        "output_surface": "check the craft rules; adjust only if honesty or clarity changes",
+        "code_economy": "check git, the license, the framework, or the stdlib first; justify or drop",
     },
-    "nit": {target: "fold or ignore" for target in ACTION_TARGETS},
+    "nit": {target: "fold or ignore" for target in DELIVERED_TARGETS},
 }
 
 
@@ -168,14 +189,12 @@ def advice_target_section(*, heading: str = "ADVICE TARGETS — DEFINITIONS",
         return [_advice_target_line(name, definition, usage, bullet=bullet, width=width,
                                     include_usage=include_usage)
                 for name, definition, usage in ADVICE_TARGETS if name in names]
-    return "\n".join([
-        heading,
-        "Action targets (delivered):",
-        *lines(ACTION_TARGETS),
-        "",
-        "Memory targets (candidate-only; remap to an action target or general before delivery):",
-        *lines(MEMORY_TARGETS),
-    ])
+    parts = [heading]
+    for label, names in ADVICE_TARGET_GROUPS:
+        parts.append(label)
+        parts.extend(lines(names))
+        parts.append("")
+    return "\n".join(parts).rstrip()
 
 
 def advice_severity_section(*, heading: str = "ADVICE SEVERITY") -> str:
@@ -184,11 +203,12 @@ def advice_severity_section(*, heading: str = "ADVICE SEVERITY") -> str:
 
 
 def advice_handling_section(*, heading: str = "ADVICE HANDLING") -> str:
-    header = "| severity | " + " | ".join(ACTION_TARGETS) + " |"
-    rule = "|" + "---|" * (len(ACTION_TARGETS) + 1)
+    targets = DELIVERED_TARGETS
+    header = "| severity | " + " | ".join(targets) + " |"
+    rule = "|" + "---|" * (len(targets) + 1)
     rows = [
         "| " + " | ".join([severity, *[ADVICE_HANDLING[severity][target]
-                                       for target in ACTION_TARGETS]]) + " |"
+                                       for target in targets]]) + " |"
         for severity, _ in ADVICE_SEVERITIES
     ]
     return "\n".join([heading, header, rule, *rows])
@@ -212,6 +232,29 @@ def advice_language_line(*, heading: str = "ADVICE LANGUAGE") -> str:
         "Advice text follows the user's language; severity and target tokens stay English. "
         "Preserve code, paths, commands, identifiers, and quoted errors verbatim.",
     ])
+
+
+CRAFT_RULES = """# Craft Rules
+
+Two filters, different objects; load by name when the work matches. Neither overrides a
+functional requirement or the user's explicit direction.
+
+antislop — surface filter: prose, UI copy, mobile layout, accessibility, code comments. Load
+`antislop` (core) plus the satellite for the task; skip its install wizard and mode question,
+work in during mode.
+
+anti-overengineering — code-economy brake: the amount and structure of code added or removed.
+Load `anti-overengineering`.
+
+Brake before surface: ask whether the line should exist, then whether it reads as generated.
+Cleanup removes structure first, comments last; a comment-only task belongs to `antislop-code`.
+Functionality outranks economy, economy outranks surface. The user's explicit direction
+outranks all three, and a style or hardening the user asked for is not slop."""
+
+
+def craft_rules_section() -> str:
+    """The main agent's static craft contract; emitted regardless of adviser gating."""
+    return CRAFT_RULES
 
 
 def data_block(label: str, text: object, *, empty: str = "(none)") -> str:

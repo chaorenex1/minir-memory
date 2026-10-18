@@ -452,12 +452,30 @@ def test_parse_review_remaps_memory_target_and_keeps_candidate_id(plugin_package
     assert "candidate:7" in rows[0]["evidence"]
 
 
+def test_parse_review_keeps_artifact_targets(plugin_package):
+    rows = plugin_package.adviser_mode.parse_review(json.dumps({
+        "action": "advise", "advices": [
+            {"severity": "blocker", "target": "output_surface", "text": "fabricated number"},
+            {"severity": "concern", "target": "code_economy", "text": "signature layer"},
+        ],
+    }))
+    assert [row["target"] for row in rows] == ["output_surface", "code_economy"]
+
+
+def test_review_prompt_carries_artifact_advice(plugin_package):
+    brief = plugin_package.adviser_mode._review_brief({})
+    assert "ARTIFACT ADVICE" in brief
+    assert "changes the artifact" in brief
+
+
 def test_both_advisers_share_one_advice_target_vocabulary(plugin_package):
     worker = plugin_package.worker
     mode = plugin_package.adviser_mode
     names = tuple(key for key, *_ in plugin_package.prompting.ADVICE_TARGETS)
     assert worker._ADVICE_TARGETS == names
     assert mode.ADVICE_TARGET_NAMES == names
+    assert set(mode.DELIVERED_TARGET_NAMES) == set(
+        plugin_package.prompting.ACTION_TARGETS + plugin_package.prompting.ARTIFACT_TARGETS)
     for name in names:
         assert name in worker.DIALECTIC_SYSTEM_PROMPT, name
         assert name in mode._review_brief({}), name

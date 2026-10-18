@@ -34,13 +34,15 @@ from .adviser_prompts import consult_prompt, review_prompt
 from .prompting import (
     ACTION_TARGETS,
     ADVICE_TARGETS,
+    ARTIFACT_TARGETS,
     advice_severity_section,
     advice_target_section,
     data_block,
 )
 
 ADVICE_TARGET_NAMES: tuple[str, ...] = tuple(name for name, *_ in ADVICE_TARGETS)
-ACTION_TARGET_NAMES: tuple[str, ...] = tuple(ACTION_TARGETS)
+# Targets the main agent can receive: action plus artifact. Memory targets stay candidate-only.
+DELIVERED_TARGET_NAMES: tuple[str, ...] = (*ACTION_TARGETS, *ARTIFACT_TARGETS)
 
 logger = logging.getLogger(__name__)
 
@@ -205,10 +207,10 @@ def parse_review(answer: str, *, severity_floor: str = "concern",
             severity = "concern"
         if severity != "blocker" and SEVERITY_ORDER[severity] < floor:
             continue
-        # The delivered advice vocabulary is the live-turn action targets. A memory target is
-        # candidate-only and is remapped here; an unknown token degrades to "general".
+        # The delivered advice vocabulary is the action plus artifact targets. A memory target
+        # is candidate-only and is remapped here; an unknown token degrades to "general".
         target = str(item.get("target") or "general").strip().lower()
-        if target not in ACTION_TARGET_NAMES:
+        if target not in DELIVERED_TARGET_NAMES:
             target = "general"
         evidence = item.get("evidence") or []
         if isinstance(evidence, (str, dict)):
