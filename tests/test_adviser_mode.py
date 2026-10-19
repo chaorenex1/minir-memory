@@ -251,13 +251,39 @@ def test_failed_review_inserts_nothing_and_records_failure(
     assert provider._store.adviser_reviews("session-test")[0]["status"] == "failed"
 
 
+def test_a_non_json_review_is_repaired_once(plugin_package, make_provider, monkeypatch):
+    """The host log showed reviews that answered in prose after spending the tool budget; one
+    no-tools repair pass turns those into advice instead of a lost review."""
+    provider = _mode_provider(make_provider, cadence=99)
+    calls: list = []
+    replies = iter(["not json", _advice("check the timeout")])
+
+    def _fake(message, **kwargs):
+        calls.append({"message": message, **kwargs})
+        return SimpleNamespace(answer=next(replies), api_calls=1, model="reviewer",
+                               provider="test", toolsets=tuple(kwargs.get("toolsets") or ()))
+
+    monkeypatch.setattr(plugin_package.agent_loop, "run", _fake)
+    provider._adviser_mode.record_tool("session-test", "read_file", turn_id="t1",
+                                       status="ok", result="contents")
+
+    assert provider._adviser_mode.review_once("session-test", "test") is True
+    assert len(calls) == 2
+    assert "Return ONLY the JSON object" in calls[1]["message"]
+    assert calls[1]["max_iterations"] == 1
+    pending = provider._store.pending_advisories("session-test", source="adviser_mode")
+    assert [row["content"] for row in pending] == ["check the timeout"]
+
+
 def test_non_json_review_inserts_nothing(plugin_package, make_provider, monkeypatch):
     provider = _mode_provider(make_provider, cadence=99)
-    monkeypatch.setattr(plugin_package.agent_loop, "run", _run("not json"))
+    calls: list = []
+    monkeypatch.setattr(plugin_package.agent_loop, "run", _run("not json", calls))
     provider._adviser_mode.record_tool("session-test", "read_file", turn_id="t1",
                                        status="ok", result="contents")
 
     assert provider._adviser_mode.review_once("session-test", "test") is False
+    assert len(calls) == 2, "the repair pass runs before the review is failed"
     assert provider._store.pending_advisories("session-test") == []
     assert provider._store.adviser_reviews("session-test")[0]["status"] == "failed"
 

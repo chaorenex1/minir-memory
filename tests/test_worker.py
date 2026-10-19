@@ -479,7 +479,7 @@ class _FakeAuxiliary:
 
 
 def _seed_base_refresh(store, *, window_from_ts: float = 0.0, window_to_ts: float = 20.0,
-                       peer=None, user=None, summary=None):
+                       peer=None, user=None, summary=None, identity=None):
     """A base refresh row for the window a dialectic job will review."""
     return store.add_base_refresh(
         SESSION, "user:default",
@@ -489,7 +489,8 @@ def _seed_base_refresh(store, *, window_from_ts: float = 0.0, window_to_ts: floa
             user if user is not None else ["[goal] ship the plugin"]),
         user_peer_card=json.dumps(peer if peer is not None else ["Wants terse answers."]),
         ai_self_representation=json.dumps(["[done] ran the smoke test"]),
-        ai_identity_card=json.dumps(["careful with user files"]),
+        ai_identity_card=json.dumps(identity if identity is not None
+                                    else ["careful with user files"]),
         session_chunk_summary=json.dumps(summary if summary is not None
                                          else ["[done] ships a Hermes memory plugin"]),
         value_markers=json.dumps({"entities": [], "trajectories": [], "experiences": [],
@@ -1056,6 +1057,26 @@ def test_an_empty_card_outside_a_listed_change_is_refused(plugin_package, store,
     latest = store.latest_base_refresh(SESSION, "user:default")
     assert json.loads(latest["user_peer_card"]) == ["Wants terse answers."]
     assert store.base_revisions(SESSION, "user:default") == []
+
+
+def test_a_sparse_base_window_is_reviewed_without_inventing_cards(plugin_package, store,
+                                                                  transcript):
+    """A window whose base artifact legitimately has no AI identity card or summary must not
+    fail its dialectic review for echoing that emptiness (the host log repeated "returned empty
+    cards" for a base row with exactly these fields empty)."""
+    _seed_base_refresh(store, summary=[], identity=[])
+
+    def complete(task, system, prompt, **kwargs):
+        return _dialectic_json(summary=[], identity=[], changed=False)
+
+    instance = plugin_package.worker.LayerWorker(store, transcript, complete=complete)
+    transcript.add(SESSION, "user", "review this", created_at=10.0)
+    _dispatch(store, transcript, SESSION, DIALECTIC, 0.0, 20.0)
+
+    assert instance.run_once() == 1
+    assert store.pending_jobs() == [], "the review must not be re-queued as a failed attempt"
+    note = store.layer_state(DIALECTIC, "agent:minir")["content"]
+    assert note.startswith("## Base Revision") and "no change this window" in note
 
 
 def test_a_dialectic_job_without_its_base_window_does_not_correct_another_window(

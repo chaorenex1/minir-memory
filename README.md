@@ -276,9 +276,11 @@ provider's bound primary session and is skipped for subagents/cron, which fire t
 hook.
 
 Both layers are strict on purpose: base passes must return their staged JSON keys/arrays, and the
-dialectic pass must return all eight keys with non-empty cards — the one exception is a
-representation card it lists in `base_changed.fields` with `[]`, which is an explicit clear.
-Anything else **fails the job** and
+dialectic pass must return all seven keys plus `base_changed`. A review may not *drop* content: an
+empty card fails the job when the base artifact for that window carried items, unless the card is
+listed in `base_changed.fields` with `[]` (an explicit clear). An empty field the base already had
+empty is a faithful copy, not a broken reply; the base pass accepts sparse cards, so the review
+must be allowed to echo them. Anything else **fails the job** and
 leaves the previous artifact in place — a malformed artifact would otherwise replace a good one in
 every later prompt. A failed job is retried once (the cached content is still there) and, if it
 fails again, the next job of that layer re-covers the same content (the content watermark never
@@ -598,7 +600,8 @@ the ledger stages it, and the hooks deliver it.
    A send failure leaves the rows pending, so the normal channels still carry them.
 7. Failure isolation — model errors, non-JSON output, a session that ended mid-review, and
    dropped reviews insert nothing; the review row records `failed`/`dropped` and the next review
-   recomputes from the same cursor.
+   recomputes from the same cursor. A non-JSON reply gets one no-tools repair pass first, because
+   a small route can spend its tool budget before writing the object.
 
 `adviser_only` is enforced, not just prompted: `pre_llm_call` injects the advisory brief and
 `pre_tool_call` blocks mutating tools (`write_file`, `patch`, `terminal`, code execution,

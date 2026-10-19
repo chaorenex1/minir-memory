@@ -1414,8 +1414,10 @@ class LayerWorker:
         # a catch-up drain can publish a newer base before the older review runs.
         base_row = self._store.base_refresh_for_window(
             session, self.user_subject(), float(from_ts))
+        base_parts: dict[str, Any] = {}
         if base_row is not None:
-            base_content = _render_base_artifact(_base_parts(base_row, {}), "")
+            base_parts = _base_parts(base_row, {})
+            base_content = _render_base_artifact(base_parts, "")
         else:
             base_state = self._store.layer_state(BASE_LAYER, self.user_subject()) or {}
             base_content = str(base_state.get("content") or "").strip()
@@ -1456,12 +1458,18 @@ class LayerWorker:
             "session_chunk_summary": summary_items,
             "value_markers": markers,
         }
-        # An explicit [] on a listed card is a deliberate clear, not missing evidence. Any other
-        # empty field is a broken reply: refuse it instead of publishing an empty artifact.
+        # An explicit [] on a listed card is a deliberate clear, not missing evidence. Elsewhere
+        # only *dropped* content is a broken reply: a sparse window legitimately leaves a base
+        # card or the window summary empty (the base pass accepts that), so a review that echoes
+        # that emptiness is faithful, not empty. Compare against the base row this review was
+        # queued for instead of demanding that every card be non-empty.
         clears = {field for field in requested
                   if field in _CLEARABLE_FIELDS and payload.get(field) == []}
-        if not summary_items or any(
-                not values[field] and field not in clears for field in _CLEARABLE_FIELDS):
+        carried = {field: bool(_json_items(base_parts.get(field)))
+                   for field in (*_CLEARABLE_FIELDS, "session_chunk_summary")}
+        if ((not summary_items and carried["session_chunk_summary"])
+                or any(not values[field] and field not in clears and carried[field]
+                       for field in _CLEARABLE_FIELDS)):
             raise LayerMergeError(f"{DIALECTIC_LAYER} review for {subject} returned empty cards")
         corrected: dict[str, Any] = {}
         changes: dict[str, str] = {}

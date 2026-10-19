@@ -300,6 +300,16 @@ def _json_object(answer: str) -> Optional[dict[str, Any]]:
     return value if isinstance(value, dict) else None
 
 
+def _repair_prompt(prompt: str) -> str:
+    """Second attempt after a non-JSON reply: restate the format contract, ban tool calls."""
+    return (
+        "Your previous reply was not the required JSON object. Return ONLY the JSON object "
+        "described in the system message, with no prose, markdown or code fence. Do not call "
+        "any tool: the evidence this review needs is already in the original task.\n\n"
+        f"Original task:\n{prompt}"
+    )
+
+
 def parse_review(answer: str, *, severity_floor: str = "concern",
                  max_advices: int = MAX_ADVICES) -> list[dict[str, Any]]:
     """Parse the reviewer's JSON into normalized advice rows (``[]`` means silent)."""
@@ -908,31 +918,40 @@ class AdviserMode:
             # Read-only by default: the adviser toolset or a roster entry may add tools, but the
             # base/dialectic file and terminal toolsets are never inherited.
             toolsets = list(spec.get("toolsets") or cfg["toolsets"] or [TOOLSET])
+            prompt = self._prompt(session, turn_id, trigger, fresh, adviser=spec)
+            model = str(spec.get("model") or route.get("model") or "")
+            provider = str(route.get("provider") or "")
             result = agent_loop.run(
-                self._prompt(session, turn_id, trigger, fresh, adviser=spec),
-                model=str(spec.get("model") or route.get("model") or ""),
-                provider=str(route.get("provider") or ""),
-                toolsets=toolsets,
-                system_message=_review_brief(cfg),
-                max_iterations=3,
+                prompt, model=model, provider=provider, toolsets=toolsets,
+                system_message=_review_brief(cfg), max_iterations=3,
             )
+            api_calls = int(result.api_calls)
             if _json_object(result.answer) is None:
-                # A malformed response is not a silent review: fail it and leave every
-                # candidate pending for the next attempt.
-                self._finish_safe(
-                    review_id, status="failed", model=result.model,
-                    api_calls=result.api_calls,
-                    latency_ms=(time.time() - started) * 1000.0,
-                    error="reviewer returned non-JSON")
-                logger.warning("adviser mode: %s returned non-JSON", name)
-                return {"called": True}
+                # A weak route can answer in prose or burn its tool budget before writing the
+                # object (the host log showed exactly that). Restate the contract once with no
+                # tool budget; only a second malformed reply fails the review, and every
+                # candidate stays pending either way.
+                retry = agent_loop.run(
+                    _repair_prompt(prompt), model=model, provider=provider,
+                    toolsets=toolsets, system_message=_review_brief(cfg), max_iterations=1,
+                )
+                api_calls += int(retry.api_calls)
+                if _json_object(retry.answer) is None:
+                    self._finish_safe(
+                        review_id, status="failed", model=retry.model,
+                        api_calls=api_calls,
+                        latency_ms=(time.time() - started) * 1000.0,
+                        error="reviewer returned non-JSON")
+                    logger.warning("adviser mode: %s returned non-JSON", name)
+                    return {"called": True}
+                result = retry
             parsed = parse_review(
                 result.answer, severity_floor=str(cfg["severity_floor"]),
                 max_advices=int(cfg["max_notes_per_update"]))
             if self._stop.is_set() or session in self._ended:
                 self._finish_safe(
                     review_id, status="dropped", model=result.model,
-                    api_calls=result.api_calls,
+                    api_calls=api_calls,
                     latency_ms=(time.time() - started) * 1000.0,
                     error="session ended before the review published")
                 return {"called": True}
@@ -942,7 +961,7 @@ class AdviserMode:
                 expires_at=time.time() + ADVICE_TTL, adviser=name)
             finished = self._finish_safe(
                 review_id, status="advised" if inserted else "silent",
-                model=result.model, api_calls=result.api_calls,
+                model=result.model, api_calls=api_calls,
                 latency_ms=(time.time() - started) * 1000.0,
                 notes_dropped=len(verdict.detail),
                 drop_detail=json.dumps(verdict.dropped, ensure_ascii=False))

@@ -339,7 +339,8 @@ SOUL 覆盖不到的地方：
 ## 8. 下一步
 
 1. 英文成稿：`doc/hermes-soul.md`，16 章、2,061 词。
-2. 装载验证已过：`load_soul_md(home_override=<临时 home>)` 返回 13,232 字符、无截断标记、无注入告警、无遗留 Bot Mode 段；切到真实 profile 前仍需重启会话复查一次。
+2. 装载验证已过：`load_soul_md(home_override=<临时 home>)` 返回 13,232 字符、无截断标记、无注入告警、无遗留 Bot Mode 段。
+   真实 profile 复查（2026-10-19 14:29，`home_override=$HERMES_HOME`，宿主 .venv）：返回 13,232 字符，与 `doc/hermes-soul.md` 逐字符相同；无 `truncated` 标记（上限 20,000）、无扫描告警、无 Bot Mode 段；首行 `# Role`。本会话 system prompt 已含该内容，装载路径生效。
 3. 在 adviser 子运行中抽查：角色让位与实现流程关闭是否生效。
 4. 在 `delegate_task` 子运行中抽查：不依赖 SOUL 的 worker 规则是否由 child prompt 提供。
 5. 抽查 `# Craft`：构造一个含编造数字与叙述式注释的产物，确认 review 能列出具体行、clean 只改列出的项、re-review 收敛，且代码被改动后重跑了检查。
