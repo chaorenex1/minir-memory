@@ -73,6 +73,7 @@ from .turn_counter import (
     DEFAULT_SESSION_MODE,
     DIALECTIC_LAYER,
     TRACKER,
+    WINDOW_EPSILON,
     Trigger,
 )
 from .worker import LayerWorker, previous_content, project_artifact
@@ -699,7 +700,8 @@ class MinirMemoryProvider(MemoryProvider):
             stored_tail = host_history.latest_ts(self._state_db, session_id) > drained
             if not (buffered_tail or stored_tail):
                 continue
-            pending.append(Trigger(layer=layer, session_id=session_id, from_ts=drained, to_ts=now,
+            pending.append(Trigger(layer=layer, session_id=session_id, from_ts=drained,
+                                   to_ts=max(now, drained + WINDOW_EPSILON),
                                    turns=int((counted.get(layer) or {}).get("turns", 0))))
         return pending
 

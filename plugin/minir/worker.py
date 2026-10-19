@@ -1284,7 +1284,12 @@ class LayerWorker:
                 self._process(job)
             except Exception as exc:  # a layer failure must never take the worker (or a turn) down
                 logger.warning("Minir %s-layer job #%s failed: %s", job["layer"], job["id"], exc)
-                self._store.fail_job(int(job["id"]), f"{type(exc).__name__}: {exc}", max_attempts=_MAX_ATTEMPTS)
+                try:
+                    self._store.fail_job(int(job["id"]), f"{type(exc).__name__}: {exc}",
+                                         max_attempts=_MAX_ATTEMPTS)
+                except Exception as record_exc:  # a closing store must not kill the drain thread
+                    logger.debug("Minir job #%s failure could not be recorded: %s",
+                                 job["id"], record_exc)
                 processed += 1
                 break
             processed += 1

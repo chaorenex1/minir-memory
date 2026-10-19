@@ -9,6 +9,7 @@ rejected so a malformed summary never replaces a usable context.
 
 from __future__ import annotations
 
+import contextvars
 import os
 import re
 import threading
@@ -91,7 +92,11 @@ def _run_with_timeout(run: Callable[[], Any], timeout: float) -> Any:
         except BaseException as exc:  # never let a background failure escape the thread
             box["error"] = exc
 
-    thread = threading.Thread(target=target, name="minir-summary-agent", daemon=True)
+    # The summary agent calls the model on this thread, and a multiplexed gateway resolves the
+    # API key through a ContextVar (``agent.secret_scope``): a bare thread would fail closed.
+    context = contextvars.copy_context()
+    thread = threading.Thread(target=lambda: context.run(target),
+                              name="minir-summary-agent", daemon=True)
     thread.start()
     thread.join(max(0.1, float(timeout)))
     if thread.is_alive():

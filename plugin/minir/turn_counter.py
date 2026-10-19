@@ -35,6 +35,12 @@ from typing import Any, Optional
 BASE_LAYER = "base"
 DIALECTIC_LAYER = "dialectic"
 
+# The wall clock is coarser than the gap between two dispatches on Windows (~15 ms on the
+# Python 3.11 the host runs), so an unadjusted edge can repeat the previous one. Windows are
+# unique by their exact ``(from_ts, to_ts)`` pair in the store, and a repeated edge would
+# collapse two distinct jobs into one. A microsecond keeps the edge strictly increasing.
+WINDOW_EPSILON = 1e-6
+
 DEFAULT_BASE_INTERVAL = 20
 DEFAULT_DIALECTIC_INTERVAL = 10
 DEFAULT_SESSION_MODE = "default"
@@ -296,10 +302,11 @@ class TurnTracker:
     @staticmethod
     def _fire(state: SessionCounter, counter: LayerCounter, now: float) -> Trigger:
         """Build the trigger a due counter owes, and move its watermark onto it."""
+        edge = max(float(now), counter.last_trigger_ts + WINDOW_EPSILON)
         trigger = Trigger(layer=counter.layer, session_id=state.session_id,
-                          from_ts=counter.last_trigger_ts, to_ts=now, turns=counter.turns)
+                          from_ts=counter.last_trigger_ts, to_ts=edge, turns=counter.turns)
         counter.last_trigger_turn = counter.turns
-        counter.last_trigger_ts = now
+        counter.last_trigger_ts = edge
         return trigger
 
 

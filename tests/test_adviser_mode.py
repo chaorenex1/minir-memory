@@ -77,6 +77,44 @@ def test_error_and_mutation_force_a_review(plugin_package, make_provider, monkey
     assert len(calls) == 1
 
 
+def test_a_review_runs_in_the_context_it_was_scheduled_from(plugin_package, make_provider,
+                                                            monkeypatch):
+    """The gateway resolves the adviser route's API key through a ContextVar. A plain worker
+    thread sees the default and fails closed (the host log showed ``UnscopedSecretError`` on
+    every scheduled review), so the scheduling call's context must travel with the job."""
+    import contextvars
+
+    provider = _mode_provider(make_provider, cadence=1)
+    scope = contextvars.ContextVar("minir_test_scope", default="")
+    seen: dict = {}
+
+    def _fake(message, **kwargs):
+        seen["scope"] = scope.get()
+        return SimpleNamespace(answer=_advice(), api_calls=1, model="reviewer", provider="test",
+                               toolsets=tuple(kwargs.get("toolsets") or ()))
+
+    monkeypatch.setattr(plugin_package.agent_loop, "run", _fake)
+    token = scope.set("profile-a")
+    try:
+        provider._adviser_mode.on_post_tool_call(
+            session_id="session-test", turn_id="t1", tool_name="read_file", status="ok",
+            args={}, result="contents")
+        assert provider._adviser_mode.wait_idle(2.0)
+    finally:
+        scope.reset(token)
+    assert seen["scope"] == "profile-a"
+
+
+def test_session_reset_without_a_store_is_silent(plugin_package, make_provider, caplog):
+    """The host can reset a session after the provider's store was torn down; that path must
+    not log the AttributeError traceback the unguarded ``self._store()`` call produced."""
+    provider = _mode_provider(make_provider)
+    provider._store = None
+    with caplog.at_level("DEBUG"):
+        provider._adviser_mode.session_reset("session-test")  # must not raise
+    assert "expire on reset failed" not in caplog.text
+
+
 def test_review_input_contains_intent_and_tool_outcome(plugin_package, make_provider, monkeypatch):
     provider = _mode_provider(make_provider, cadence=1)
     calls: list = []

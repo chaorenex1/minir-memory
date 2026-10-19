@@ -892,6 +892,8 @@ class MinirStore:
         pre-compression synchronous drain needs.
         """
         with self._lock:
+            if self._conn is None:
+                return []
             # A review is queued only after its base job published, and it owns the window
             # that base just produced. Claim it before any later base job so the review sees
             # the live artifact and its correction can carry into the next base merge.
@@ -920,8 +922,15 @@ class MinirStore:
         return [dict(row) for row in rows]
 
     def complete_job(self, job_id: int, processed_ts: float, *, error: str = "") -> None:
-        """Finish a job and advance its layer/session content watermark to *processed_ts*."""
+        """Finish a job and advance its layer/session content watermark to *processed_ts*.
+
+        A closed store is a no-op: a drain still running when the host tears the provider down
+        must not raise out of the worker thread. The job stays ``running`` and is reclaimed by
+        the next process.
+        """
         with self._lock:
+            if self._conn is None:
+                return
             self._conn.execute(
                 "UPDATE jobs SET status = 'done', finished_at = ?, processed_ts = ?, error = ? WHERE id = ?",
                 (time.time(), float(processed_ts), error[:500], int(job_id)),
@@ -934,8 +943,12 @@ class MinirStore:
         A re-queued job keeps its window — the content watermark never moved, so the retry
         reads the same turns. A job that exhausts its attempts stays ``failed`` and the *next*
         job of that layer/session re-covers the same content, so an error cannot lose it.
+        ``closed`` means the provider was torn down mid-drain; the row is left ``running`` for
+        the next process to reclaim.
         """
         with self._lock:
+            if self._conn is None:
+                return "closed"
             row = self._conn.execute("SELECT attempts FROM jobs WHERE id = ?", (int(job_id),)).fetchone()
             attempts = int(row["attempts"]) if row is not None else max_attempts
             status = "pending" if attempts < max(1, int(max_attempts)) else "failed"
@@ -1020,6 +1033,8 @@ class MinirStore:
 
     def pending_job_count(self, session_id: str) -> int:
         with self._lock:
+            if self._conn is None:
+                return 0
             row = self._conn.execute(
                 "SELECT COUNT(*) AS n FROM jobs WHERE session_id = ? AND status = 'pending'",
                 (session_id,)).fetchone()
@@ -1027,6 +1042,8 @@ class MinirStore:
 
     def open_job_count(self, session_id: str) -> int:
         with self._lock:
+            if self._conn is None:
+                return 0
             row = self._conn.execute(
                 "SELECT COUNT(*) AS n FROM jobs WHERE session_id = ? "
                 "AND status IN ('pending', 'running')", (session_id,)).fetchone()
@@ -1835,7 +1852,12 @@ class MinirStore:
             self._conn.commit()
 
     def close(self) -> None:
-        """Close the connection; safe to call twice."""
+        """Close the connection; safe to call twice.
+
+        The worker drain can still be unwinding when the host tears the provider down, so the
+        job methods that path uses (``claim_jobs``, ``complete_job``, ``fail_job``, the two job
+        counts) treat a closed connection as "store is gone" instead of raising into that thread.
+        """
         with self._lock:
             if self._conn is not None:
                 self._conn.close()

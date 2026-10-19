@@ -77,6 +77,18 @@ def test_begin_reopens_a_stopped_session(tracker):
     assert [t.turns for t in tracker.tick("s", 3, now=6.0)] == [3]  # base due; dialectic fired at 2
 
 
+def test_a_coarse_clock_still_moves_the_window_edge(tracker):
+    """Windows are keyed by their exact ``(from_ts, to_ts)`` pair in the store, and Windows'
+    clock granularity (~15 ms on the host's Python 3.11) can be wider than the gap between two
+    dispatches. A repeated edge would make the store collapse the second job into the first."""
+    triggers = [trigger for turn in range(1, 7)
+                for trigger in tracker.tick("s", turn, now=5.0) if trigger.layer == "base"]
+    assert [trigger.turns for trigger in triggers] == [3, 6]
+    assert triggers[0].from_ts < triggers[0].to_ts
+    assert triggers[0].to_ts == triggers[1].from_ts  # edge-to-edge, no gap and no overlap
+    assert triggers[1].from_ts < triggers[1].to_ts
+
+
 def test_sessions_are_counted_independently(tracker):
     assert _tick(tracker, "a", 3)
     assert tracker.snapshot("b") is None

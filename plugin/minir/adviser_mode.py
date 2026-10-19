@@ -22,6 +22,7 @@ writes base cards, revisions or layer state — only the shared ``advisories`` l
 
 from __future__ import annotations
 
+import contextvars
 import json
 import logging
 import queue
@@ -281,6 +282,7 @@ class AdviserMode:
         self._reviewing: set[str] = set()
         self._ended: set[str] = set()
         self._staged: dict[str, list[int]] = {}
+        self._contexts: dict[str, contextvars.Context] = {}
         self._queue: "queue.Queue[Optional[str]]" = queue.Queue()
         self._thread: Optional[threading.Thread] = None
         self._stop = threading.Event()
@@ -457,6 +459,11 @@ class AdviserMode:
             if session in self._queued:
                 return
             self._queued.add(session)
+            # The review calls the model, and on a multiplexed gateway the API key is resolved
+            # through a ContextVar (``agent.secret_scope``). A plain thread sees the default
+            # value, so the scheduling call's context travels with the session and the review
+            # runs inside it — the same guarantee the host's own ``spawn_context_thread`` gives.
+            self._contexts[session] = contextvars.copy_context()
         self._ensure_thread()
         self._queue.put(session)
 
@@ -488,8 +495,12 @@ class AdviserMode:
             with self._lock:
                 self._queued.discard(session)
                 self._reviewing.add(session)
+                context = self._contexts.pop(session, None)
             try:
-                self.review_once(session, trigger="scheduled")
+                if context is None:
+                    self.review_once(session, trigger="scheduled")
+                else:
+                    context.run(self.review_once, session, "scheduled")
             except Exception:
                 logger.exception("adviser mode: review failed")
             finally:
@@ -606,8 +617,11 @@ class AdviserMode:
 
     def _finish_safe(self, review_id: int, **fields: Any) -> bool:
         """Finish a review row without letting a closing store hide the original outcome."""
+        store = self._store()
+        if store is None:
+            return False
         try:
-            self._store().finish_adviser_review(review_id, **fields)
+            store.finish_adviser_review(review_id, **fields)
             return True
         except Exception:
             logger.debug("adviser mode: could not finish review row", exc_info=True)
@@ -928,11 +942,14 @@ class AdviserMode:
             self._tool_counts.pop(session_id, None)
             self._last_review_seq.pop(session_id, None)
             self._turn_reviews.pop(session_id, None)
+            self._contexts.pop(session_id, None)
         if session_id:
-            try:
-                self._store().expire_adviser_advices(session_id)
-            except Exception:
-                logger.debug("adviser mode: expire on reset failed", exc_info=True)
+            store = self._store()
+            if store is not None:  # a provider torn down mid-session has no store to clean up
+                try:
+                    store.expire_adviser_advices(session_id)
+                except Exception:
+                    logger.debug("adviser mode: expire on reset failed", exc_info=True)
 
     def session_end(self, session_id: str = "") -> None:
         with self._lock:
@@ -952,3 +969,4 @@ class AdviserMode:
             self._dirty.clear()
             self._ended.clear()
             self._staged.clear()
+            self._contexts.clear()

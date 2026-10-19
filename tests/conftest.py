@@ -52,6 +52,26 @@ _IMPORT_ERRORS: dict[str, str] = {}
 _host_memory_provider = _try_import("agent.memory_provider")
 _host_context_engine = _try_import("agent.context_engine")
 _host_tool_registry = _try_import("tools.registry")
+
+
+def _ensure_host_root(module: Optional[types.ModuleType]) -> None:
+    """Expose the host's top-level modules when it was installed editable.
+
+    An editable Hermes exposes ``agent``/``hermes_cli`` through a finder, but not root-level
+    modules such as ``hermes_yaml`` — the host imports those with its own directory on
+    ``sys.path``. Without this, a host module that lazily imports one of them raises
+    ``ModuleNotFoundError`` in the middle of a test even though host mode was selected.
+    """
+    if module is None or not getattr(module, "__file__", None):
+        return
+    root = Path(module.__file__).resolve().parent.parent
+    if (root / "hermes_yaml.py").exists() and str(root) not in sys.path:
+        sys.path.insert(0, str(root))
+
+
+_ensure_host_root(_host_memory_provider)
+_ensure_host_root(_host_context_engine)
+_ensure_host_root(_host_tool_registry)
 CONTRACT_MODE = "host" if _host_memory_provider and _host_context_engine and _host_tool_registry else (
     "shim" if not _host_memory_provider and not _host_tool_registry else "partial")
 

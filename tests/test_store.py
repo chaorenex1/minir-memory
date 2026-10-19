@@ -257,6 +257,19 @@ def test_close_is_idempotent(store):
     store.close()
 
 
+def test_the_worker_job_path_does_not_raise_after_close(store):
+    """The host can close the store while a drain is still unwinding (the log showed the
+    drain thread dying on ``fail_job``). Job bookkeeping must treat a closed store as gone."""
+    store.record_job("base", "s1", 1.0, 2.0, turns=1)
+    assert [job["id"] for job in store.claim_jobs()] == [1]
+    store.close()
+    assert store.claim_jobs() == []
+    assert store.pending_job_count("s1") == 0
+    assert store.open_job_count("s1") == 0
+    assert store.fail_job(1, "shutdown") == "closed"
+    store.complete_job(1, 2.0)  # no raise either
+
+
 def test_conclusions_are_indexed_and_session_scoped(store):
     """Durable conclusions recall across sessions; a review/summary never leaks."""
     base = ("## Session Summary\n- deploy the Windows build\n\n"
