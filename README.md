@@ -9,18 +9,18 @@ recalls them through an FTS5 trigram index (CJK-safe, with a token-scan fallback
 four tools (`minir_search`, `minir_remember`, `minir_forget`, `minir_stats`). On top of that it runs the
 **base / dialectic reasoning layers**: the turn counter queues a base job every *n* turns, a
 background worker builds the user/AI cards from the host's own history, and a dependent dialectic
-pass reviews those cards against that history. The review can correct the base artifact (a
-pre-overwrite snapshot and an FTS index are kept) and emits severity-ranked advices, which are
-injected into later turns for the main session or the user to decide.
+pass reviews those cards against that history. The review corrects the base artifact (a
+pre-overwrite snapshot and an FTS index are kept) and publishes a short `## Base Revision` note
+naming the fields it changed. It emits no advice.
 
 It also ships an optional **main adviser**: a fast, per-turn side channel that watches the live
-tool loop (user goal, assistant intent, tool results), grades pending dialectic advices as
-candidates, and injects only the surviving advice before the next model request through the
-host's `llm_request` middleware. `adviser_consult` is the same adviser's synchronous entry
-point, not a separate personality. Unlike the dialectic layer it never writes base cards or
-revisions; it appends delivered advice to the shared ledger with `source='adviser_mode'`. It is
-controlled by configuration only (`memory.minir.adviser_mode.enabled`; there is no `/adviser`
-command).
+tool loop (user goal, assistant intent, tool results) and injects its advice before the next
+model request through the host's `llm_request` middleware. It is the only advice producer in the
+provider: the dialectic corrects memory, the adviser advises the turn, and there is one
+review → emission guard → ledger → delivery chain. `adviser_consult` is the same adviser's
+synchronous entry point, not a separate personality. Unlike the dialectic layer it never writes
+base cards or revisions. It is controlled by configuration only
+(`memory.minir.adviser_mode.enabled`; there is no `/adviser` command).
 
 **It stores no transcripts.** The worker reads `(from_ts, to_ts]` messages from
 `$HERMES_HOME/state.db` read-only (plus the in-process buffer for turns not yet committed) and
@@ -45,18 +45,18 @@ pyproject.toml         package metadata, pytest config, pip entry point
 plugin/minir/          the deployable plugin directory (copy this to plugins/minir)
   plugin.yaml          manifest (name/version/description + metadata)
   __init__.py          register(ctx) + MinirMemoryProvider + the engine export
-  store.py             SQLite storage: notes, conclusions + FTS5, base revisions/advices, jobs, metrics
+  store.py             SQLite storage: notes, conclusions + FTS5, base revisions, jobs, metrics
   history.py           read-only host history, profile resolution, identity files
   transcript.py        in-memory, bounded window of the session's messages (never persisted)
   turn_counter.py      base / dialectic layer turn counters + job windows
-  worker.py            drains base jobs, then the dependent dialectic review (base corrections + advices)
+  worker.py            drains base jobs, then the dependent dialectic base correction
   handoff.py           Task Handoff template, summary-agent prompt + validation
   cadence.py           config/store-path helpers shared by the provider and the engine
   context_engine.py    audited summary compression (context.engine: minir)
   agent_loop.py        one-shot in-process AIAgent runs — sync + async (Feishu-shaped)
   adviser.py           adviser route + tool adapter: adviser_consult delegates to the main adviser
   adviser_prompts.py   one adviser core plus the CONSULT/REVIEW mode contracts
-  adviser_mode.py      main adviser: event ring, candidate grading, consult, llm_request delivery
+  adviser_mode.py      the only advice producer: event ring, review, guard, delivery channels
   session_search.py    read-only multi-shape search over the host's session store (state.db)
   prompts/             operator-supplied Task Handoff template
 tests/                 pytest suite: contract, store, transcript, provider, counting, worker, engine
@@ -108,11 +108,12 @@ both surfaces:
 | `on_session_start(session_id=, model=, platform=)` | record the session; queue one cold-start *base* job when history exists, gated to the bound primary session |
 | `on_session_reset(session_id=, old_session_id=, reason=)` | `/new`, `/reset`: stop the old counters, initialize the new session |
 | `on_session_finalize(session_id=)` | process teardown: stop counting, expire adviser-mode advice, flush tool metrics |
-| `pre_llm_call` | record the turn's user goal; inject only the `adviser_only` brief. Dialectic advices are candidates for the main adviser, never boundary injections; legacy review injection is retired |
+| `pre_llm_call` | record the turn's user goal; inject the `adviser_only` brief and below-floor advice (one-shot aside). Advice has a single producer (the live reviewer); nothing is staged here |
 | `post_llm_call` / `post_tool_call` | per-turn logging; `post_tool_call` also aggregates tool counters and feeds the adviser-mode event ring |
-| `pre_tool_call` | `adviser_only` enforcement: block mutating tools before execution and tell the model to propose the change instead |
+| `pre_tool_call` | `adviser_only` enforcement plus the opt-in blocker gate: refuse mutating tools before execution and hand the model the reason |
 | `on_interim_message` | record the assistant's mid-loop intent for the adviser-mode reviewer |
 | `post_api_request` / `api_request_error` | confirm adviser-mode delivery or return staged advice to pending |
+| `pre_verify` | opt-in (`verify_continue`): a live blocker keeps one code-editing turn going |
 
 Every hook `register()` subscribes to must also be listed under `provides_hooks:` in
 `plugin.yaml` — `hermes plugins validate` fails the manifest otherwise (`hermes plugins doctor`
@@ -157,24 +158,23 @@ the base job just published. A job is one row in the store's
 calls the auxiliary model, and publishes into `layer_state`/`conclusions`. Each base refresh also
 appends one structured row to `base_refreshes` (session, time window, actual turn range, the six
 outputs, `is_latest`); one base window has one job.
-`prefetch()` injects only the newest dialectic review (`## Adviser Review`, bounded to 1200 chars)
+`prefetch()` injects only the newest base revision note (`## Base Revision`, bounded to 1200 chars)
 ahead of recall. Recall covers explicit notes and value markers only — the current session's
-notes plus durable notes; every derived artifact (the six base sections, review, chunks and
-summaries) stays explicit-recall through `minir_search`. Another session's rows are reachable only
-through `minir_search(scope="all")`, never by automatic injection. Pending advices are the
-actionable channel and are injected by `pre_llm_call` (bounded to 900 chars; blockers first), once
-per advice id.
+notes plus durable notes; every derived artifact (the six base sections, the revision note, chunks
+and summaries) stays explicit-recall through `minir_search`. Another session's rows are reachable
+only through `minir_search(scope="all")`, never by automatic injection. Advice has one producer
+(the live reviewer); the dialectic layer writes no advice at all.
 
 | Layer | Models | Artifact sections | Subject key |
 | --- | --- | --- | --- |
-| base | this profile's user: window + previous user/AI cards, three staged JSON passes on `auxiliary.adviser` | `## Session Summary`, `## User Representation`, `## User Peer Card`, `## AI Self Representation`, `## AI Identity Card`, `## Value Markers` | `user:<user_id \| default>` |
-| dialectic | the latest base artifact + history up to the window; reviews drift in all six fields and emits advices | `## Adviser Review` only (base cards stay on the base layer) | `agent:<agent_identity \| minir>` |
+| base | this profile's user: window + previous user/AI cards, three staged JSON passes on `auxiliary.adviser` | `## Session Summary`, `## User Representation`, `## User Peer Card`, `## AI Self Representation`, `## AI Identity Card`, `## Value Markers` | `user:<profile>` |
+| dialectic | the latest base artifact + history up to the window; reviews drift in all six fields and corrects them | `## Base Revision` only (base cards stay on the base layer, and it emits no advice) | `agent:<agent_identity>` |
 
 The dialectic job is **dependent**: a successful base refresh queues the matching review with the
 same `(from_ts, to_ts]`, so the reviewer always sees a published base row. The review re-reads that
 window's raw turns even when a previous review already advanced the dialectic watermark; the
-context engine never queues an independent review. It runs an eight-key JSON
-contract: the six base fields, `advices`, `value_markers`, and `base_changed`
+context engine never queues an independent review. It runs a seven-key JSON
+contract: the six base fields and `base_changed`
 (`{changed, fields}`). The pass count is adaptive — short windows get one synthesis, longer ones add
 a self-audit and a reconcile, capped by `dialectic_depth`. A failed or malformed pass falls back to
 the last valid one. `layer_state.version` counts refreshes; the newest review is what `prefetch`
@@ -515,10 +515,10 @@ write authority:
 | | dialectic layer | adviser mode |
 | --- | --- | --- |
 | Trigger | base refresh / compression boundary | tool cadence, tool error, mutation, final answer |
-| Input | base artifact + window history | user goal, intent, tool results, final answer, dialectic candidates |
-| Output | six corrected cards + `advices` (candidates) | `silent` or 1–3 graded advices |
-| Writes | `base_refreshes`, `base_revisions`, `layer_state`, `advisories` | `advisories` only |
-| Delivery | ledger only (candidates) | `llm_request` (mid-tool-loop) |
+| Input | base artifact + window history | user goal, intent, tool results, final answer, long-term context |
+| Output | six corrected cards + `## Base Revision` note | `silent` or 1–3 advices |
+| Writes | `base_refreshes`, `base_revisions`, `layer_state` | `advisories` only |
+| Delivery | none: memory correction, no advice | `llm_request`, boundary aside, gate, gateway |
 | Lifetime | durable audit | current turn, expires |
 
 Config (under `memory.minir`) is the only switch — there is no `/adviser` command:
@@ -530,10 +530,36 @@ adviser_mode:
   cadence: 3                # tool calls between reviews
   severity_floor: concern   # nit | concern | blocker
   max_reviews_per_turn: 6
-  max_advices: 3
+  max_advices: 3            # rows per injected block
   max_chars: 900
-  candidate_limit: 6       # pending dialectic advices read per review
-  toolsets: [adviser]      # read-only by default; never inherits the base/dialectic route
+  toolsets: [adviser]       # read-only by default; never inherits the base/dialectic route
+  # omp `advisor` parity (see doc/omp-adviser-hermes-integration.md)
+  review_mode: turn         # turn | agent-end (only the finished turn)
+  review_interval: 1        # every N tool-triggered updates
+  max_notes_per_update: 4   # non-blockers accepted per review; blockers exempt
+  continue_severity: concern
+  immune_turns: 3           # concerns stay out of mid-turn injection after an intervention
+  block_tools: true         # a live blocker refuses the next mutating tool (once per advice)
+  verify_continue: false    # a live blocker keeps a code-editing turn going once
+  aside_at_turn_start: true # below-floor advice (nit) rides the next turn's user message
+  sync_backlog: off         # wait: let one in-flight review finish before the request
+  wait_ms: 1500
+  notify_gateway: true      # gateway turns: send preserved advice to the chat
+  project_context: true     # AGENTS.md + WATCHDOG.md into the review prompt
+  max_project_chars: 1500
+  roster: []                # empty = one `default` adviser; see below
+```
+
+A roster pays for one review per member. Each member reviews the same delta with its own
+cursor, model and instructions, and its name is stamped on every row it publishes:
+
+```yaml
+  roster:
+    - name: quality
+      instructions: Focus on robustness and failure paths.
+    - name: cost
+      model: deepseek-v4-flash
+      instructions: Focus on wasted model calls and latency.
 ```
 
 Changes are read when the provider opens a session; restart Hermes to apply them to a running one.
@@ -547,16 +573,32 @@ call `adviser_session_search` to ground a claim. Its system block is composed dy
 the severity × target handling matrix, the nit-report table, and the language rule. When the mode
 is off, those sections are absent.
 
-Delivery is one channel; dialectic advices are inputs, not a second channel:
+Delivery is one chain with one producer: the live reviewer writes advice, the guard filters it,
+the ledger stages it, and the hooks deliver it.
 
-1. Candidate intake — `review_once` reads up to `candidate_limit` pending `source='dialectic'`
-   advices into `<candidate_advices>`. `consult` may read the same rows but never consumes them.
-2. Mid-loop — `llm_request` middleware appends pending `source='adviser_mode'` advice to the next
-   provider request (after the last tool result, or as a synthetic user message), then stages the
-   rows. `post_api_request` marks them delivered; `api_request_error` returns them to pending.
-3. Success-only consume — candidates are marked `consumed` only after a review publishes `silent`
-   or `advised`. Model errors, non-JSON output, session-ended, and dropped reviews leave every
-   candidate `pending` for the next attempt.
+1. Review — `review_once` reads the live event ring from its own cursor and returns the strict
+   JSON advice contract. There is no second reviewer and no candidate intake; the dialectic
+   layer corrects memory and emits no advice.
+2. Mid-loop (`llm_request`) — pending `source='adviser_mode'` advice at or above
+   `severity_floor` is appended to the next provider request (after the last tool result, or as a
+   synthetic user message), then staged. `post_api_request` marks it delivered;
+   `api_request_error` returns it to pending.
+3. Emission guard — before a row is written it is normalized (NFKC, lowercase, punctuation-free),
+   checked against the noise list, deduped against the session ledger (an escalation still
+   passes), and capped at `max_notes_per_update` non-blockers per review. A blocker is always
+   published and does not spend that budget. Drop counts land on the review row
+   (`notes_dropped`, `drop_detail`) and surface in `minir_stats`.
+4. Turn boundary (`pre_llm_call`) — advice below the floor (nits, and concerns inside the immune
+   window) rides the next turn's user message once, then is marked `injected`.
+5. Gates — a live blocker refuses the next mutating tool through `pre_tool_call` (at most twice
+   per turn, consumed by the refusal), and with `verify_continue` keeps one code-editing turn
+   going through `pre_verify`.
+6. Gateway — when a turn ends before the review publishes, `notify_gateway` sends the preserved
+   block to the chat through the host's `send_message` tool instead of waiting for the next turn.
+   A send failure leaves the rows pending, so the normal channels still carry them.
+7. Failure isolation — model errors, non-JSON output, a session that ended mid-review, and
+   dropped reviews insert nothing; the review row records `failed`/`dropped` and the next review
+   recomputes from the same cursor.
 
 `adviser_only` is enforced, not just prompted: `pre_llm_call` injects the advisory brief and
 `pre_tool_call` blocks mutating tools (`write_file`, `patch`, `terminal`, code execution,
@@ -566,10 +608,11 @@ briefly re-enable writes.
 The main agent still sees the schemas; the gate is the policy, so a blocked call costs one tool
 iteration.
 
-The block is bounded and tagged (`[adviser — advisory only]`). A blocker is the highest-priority
-next request, not a preemption: plugins cannot interrupt a running tool or wake a finished turn.
-The middleware skips a block already present in the request tail, so the host loading the same
-plugin directory twice cannot inject it twice.
+The block is bounded and tagged (`[adviser — advisory only]`). Two hard limits remain: plugins
+cannot interrupt a running tool, and they cannot wake a finished turn. A blocker therefore
+refuses the *next* mutating tool instead of aborting the current one, and preserve-in-chat is the
+only way advice reaches a turn that already ended. The middleware skips a block already present in
+the request tail, so the host loading the same plugin directory twice cannot inject it twice.
 
 Adviser mode never writes base cards. It may use a compact dialectic digest (user path, peer
 constraints, latest review) as context; dialectic input filters adviser injections so ephemeral

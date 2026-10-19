@@ -33,18 +33,13 @@ def _base_json(*, summary=None, user=None, peer=None, ai_self=None, identity=Non
     })
 
 
-def _dialectic_json(*, text="run a smoke test", severity="concern", target="user_peer_card",
-                    advices=None, changed=False, fields=None):
+def _dialectic_json(*, changed=False, fields=None, peer=None):
     return json.dumps({
         "user_representation": ["[goal] ship"],
-        "user_peer_card": ["wants evidence"],
+        "user_peer_card": peer if peer is not None else ["wants evidence"],
         "ai_self_representation": ["[done] ran the smoke test"],
         "ai_identity_card": ["careful"],
         "session_chunk_summary": ["[done] deployed on Windows"],
-        "advices": advices if advices is not None else [{
-            "severity": severity, "target": target, "text": text,
-            "decision": "adopt it", "evidence": ["msg-1"],
-        }],
         "value_markers": {"entities": ["Windows"], "trajectories": [], "experiences": [],
                           "tools": ["pytest"], "projects": ["minir-memory"]},
         "base_changed": {"changed": bool(changed), "fields": list(fields or [])},
@@ -412,7 +407,9 @@ def test_pre_compress_pauses_scheduling_and_resets_both_layers(plugin_package, m
                                                                monkeypatch):
     monkeypatch.setenv("MINIR_REASONING_ENABLED", "true")
     monkeypatch.setattr(plugin_package.worker, "call_model", lambda task, *args, **kwargs: (
-        _dialectic_json() if task == plugin_package.worker.DIALECTIC_LAYER_TASK
+        _dialectic_json(peer=["wants evidence", "no emoji"], changed=True,
+                        fields=["user_peer_card"])
+        if task == plugin_package.worker.DIALECTIC_LAYER_TASK
         else _base_json()))
     provider = make_provider({"base_interval": 2, "dialectic_interval": 2})
     for turn in range(1, 4):
@@ -437,7 +434,9 @@ def test_pre_compress_drains_base_and_dependent_dialectic(plugin_package, make_p
                                                           monkeypatch):
     monkeypatch.setenv("MINIR_REASONING_ENABLED", "true")
     monkeypatch.setattr(plugin_package.worker, "call_model", lambda task, *args, **kwargs: (
-        _dialectic_json() if task == plugin_package.worker.DIALECTIC_LAYER_TASK
+        _dialectic_json(peer=["wants evidence", "no emoji"], changed=True,
+                        fields=["user_peer_card"])
+        if task == plugin_package.worker.DIALECTIC_LAYER_TASK
         else _base_json()))
 
     provider = make_provider({"base_interval": 50, "dialectic_interval": 10})
@@ -587,16 +586,13 @@ def test_prefetch_injects_only_the_dialectic_artifact(provider):
                                     "## AI Identity Card\n- terse\n\n"
                                     "## Value Markers\n- [tool] pytest")
     provider._store.put_layer_state("dialectic", "agent:minir",
-                                    "## Adviser Review\n- run a smoke test\n\n"
-                                    "## Constraints\n- never edit outside the repo\n\n"
-                                    "## Preferences\n- act first\n\n## Second Brain\n- [tool] pytest")
+                                    "## Base Revision\n- user_peer_card: works on Windows")
     block = provider.prefetch("nothing matches this query")
     assert block.startswith("## Minir layer state")
     assert "### Agent model (v1)" in block
     assert "### User model" not in block
-    assert "run a smoke test" in block
-    assert "never edit outside the repo" not in block
-    assert "works on Windows" not in block and "## User Peer Card" not in block
+    assert "works on Windows" in block
+    assert "## User Peer Card" not in block
     status = provider.recall_status()
     assert status is not None and status.count == 1, "only the current review is injected"
 
@@ -662,7 +658,7 @@ def test_layer_reasoning_runs_end_to_end(plugin_package, make_provider, monkeypa
     """Reasoning enabled: a turn ends, both layers publish, and prefetch carries only the agent one."""
     monkeypatch.setenv("MINIR_REASONING_ENABLED", "true")
     monkeypatch.setattr(plugin_package.worker, "call_model", lambda task, system, prompt, **kw: (
-        _dialectic_json(text="run a smoke test")
+        _dialectic_json(peer=["no emoji"], changed=True, fields=["user_peer_card"])
         if task == plugin_package.worker.DIALECTIC_LAYER_TASK else
         _base_json()))
 
@@ -676,7 +672,7 @@ def test_layer_reasoning_runs_end_to_end(plugin_package, make_provider, monkeypa
     subjects = sorted(state["subject"] for state in provider._store.all_layer_states())
     assert subjects == ["agent:Masía", "user:default"]
     block = provider.prefetch("q")
-    assert "run a smoke test" in block
+    assert "user_peer_card" in block, "the dialectic publishes a revision note, not advice"
     assert "wants evidence" not in block, "base cards are search-only"
 
 
@@ -710,8 +706,8 @@ def test_register_wires_the_provider_and_its_hooks(plugin_package):
     assert isinstance(ctx.provider, plugin_package.MinirMemoryProvider)
     assert set(ctx.hooks) == {"on_session_start", "on_session_reset", "on_session_finalize",
                               "pre_llm_call", "post_llm_call", "post_tool_call",
-                              "pre_tool_call", "on_interim_message", "post_api_request",
-                              "api_request_error"}
+                              "pre_tool_call", "pre_verify", "on_interim_message",
+                              "post_api_request", "api_request_error"}
     # A non-None result would be injected into the user message (pre_llm_call) or sent to
     # the chat (on_session_finalize), so every handler must return None.
     for callback in ctx.hooks.values():
@@ -846,7 +842,8 @@ def test_layers_reason_from_host_history_and_publish_searchable_sections(
     """The restart-durable path: a job reads state.db, not the in-process buffer."""
     monkeypatch.setenv("MINIR_REASONING_ENABLED", "true")
     monkeypatch.setattr(plugin_package.worker, "call_model", lambda task, system, prompt, **kw: (
-        _dialectic_json(text="ran the deploy smoke test")
+        _dialectic_json(peer=["wants evidence", "no emoji"], changed=True,
+                        fields=["user_peer_card"])
         if task == plugin_package.worker.DIALECTIC_LAYER_TASK else
         _base_json(summary=["kubernetes deploy"], user=["[goal] deploy the cluster"],
                    peer=["wants evidence"], ai_self=["direct"],
@@ -880,7 +877,7 @@ def test_layers_reason_from_host_history_and_publish_searchable_sections(
     assert hits and any(row["kind"] == "base.user_representation" for row in hits)
     assert not any("not user intent" in row["text"] for row in hits)
     review = provider._store.layer_state("dialectic", "agent:minir")
-    assert "deploy smoke test" in str((review or {}).get("content") or "")
+    assert "user_peer_card" in str((review or {}).get("content") or "")
 
 
 def test_search_never_exposes_a_conclusion_as_a_forgettable_note(plugin_package, provider):

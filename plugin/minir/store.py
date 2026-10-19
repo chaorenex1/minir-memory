@@ -26,14 +26,13 @@
   may quote the messages they reasoned over even though the provider never copies the
   transcript itself.
 * ``base_revisions`` — the pre-overwrite snapshot of a base refresh when the dialectic layer
-  corrects it: the same six fields plus the advices that justified the correction, the changed
-  field list, the affected refresh id and an ``is_latest`` flag. ``base_revisions_fts`` indexes
-  the seven content fields (six snapshots + advices) with the same trigram design.
-* ``advisories`` — the delivery ledger: normalized, deduped advices with severity/target and
-  a ``pending``/``injected`` state. The revision table keeps the immutable audit copy; this
-  table is what ``pre_llm_call`` drains.
+  corrects it: the same six fields, the changed field list, the affected refresh id and an
+  ``is_latest`` flag. The ``advices`` column is historical: the dialectic no longer emits advice.
+  ``base_revisions_fts`` indexes the six content fields plus that legacy column.
+* ``advisories`` — the delivery ledger for the single advice producer (the live reviewer):
+  normalized, deduped advices with severity/target and a ``pending``/``injected`` state.
 * ``conclusions`` — every durable result split into individually searchable rows: notes, the
-  six base-layer sections, the dialectic review, local
+  six base-layer sections, the base revision note, local
   compression chunks, and final session summaries. ``conclusions_fts`` is an FTS5 trigram index
   over it (CJK-safe); when FTS5 is unavailable, ``search()`` falls back to the token scan.
   ``session_chunk_summary`` is the canonical local-compression chain; each row records the time
@@ -199,7 +198,8 @@ CREATE TABLE IF NOT EXISTS advisories (
     delivered_at REAL,
     request_id TEXT NOT NULL DEFAULT '',
     expires_at REAL,
-    turn_id TEXT NOT NULL DEFAULT ''
+    turn_id TEXT NOT NULL DEFAULT '',
+    adviser TEXT NOT NULL DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS idx_advisories_pending
     ON advisories(session_id, status, id);
@@ -217,6 +217,9 @@ CREATE TABLE IF NOT EXISTS adviser_reviews (
     api_calls INTEGER NOT NULL DEFAULT 0,
     latency_ms REAL NOT NULL DEFAULT 0,
     error TEXT NOT NULL DEFAULT '',
+    adviser TEXT NOT NULL DEFAULT '',
+    notes_dropped INTEGER NOT NULL DEFAULT 0,
+    drop_detail TEXT NOT NULL DEFAULT '{}',
     created_at REAL NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_adviser_reviews_session
@@ -245,7 +248,14 @@ _ADDED_COLUMNS: dict[str, tuple[tuple[str, str], ...]] = {
     "advisories": (("review_id", "INTEGER NOT NULL DEFAULT 0"),
                    ("delivered_at", "REAL"),
                    ("request_id", "TEXT NOT NULL DEFAULT ''"),
-                   ("expires_at", "REAL")),
+                   ("expires_at", "REAL"),
+                   # Which adviser in the roster produced the note; '' on pre-roster rows.
+                   ("adviser", "TEXT NOT NULL DEFAULT ''")),
+    "adviser_reviews": (("adviser", "TEXT NOT NULL DEFAULT ''"),
+                        # Emission-guard outcome, so a silent reviewer is distinguishable
+                        # from one that produced only noise/duplicates.
+                        ("notes_dropped", "INTEGER NOT NULL DEFAULT 0"),
+                        ("drop_detail", "TEXT NOT NULL DEFAULT '{}'")),
 }
 
 # Tables a previous release wrote that this one must not keep: earlier versions persisted every
@@ -274,8 +284,8 @@ _ARTIFACT_SECTIONS: dict[str, tuple[tuple[str, str, str], ...]] = {
     ),
     "dialectic": (
         # The six corrected cards live on the base layer; the dialectic artifact owns only the
-        # review/advices, so the live layer injection never leaks a base card.
-        ("## Adviser Review", "dialectic.review", "session"),
+        # revision note, so the live layer injection never leaks a base card or advice.
+        ("## Base Revision", "dialectic.review", "session"),
     ),
 }
 
@@ -1285,7 +1295,7 @@ class MinirStore:
         return dict(row) if row is not None else None
 
     def apply_base_revision(self, session_id: str, subject: str, *, window_from_ts: float,
-                            changes: dict[str, str], advices: str, changed_fields: list[str],
+                            changes: dict[str, str], changed_fields: list[str],
                             content: str, source_job_id: int = 0,
                             ai_subject: str = "") -> Optional[int]:
         """Snapshot the current base row, apply a dialectic correction, republish the artifact.
@@ -1323,7 +1333,9 @@ class MinirStore:
                      row["user_representation"], row["user_peer_card"],
                      row["ai_self_representation"], row["ai_identity_card"],
                      row["session_chunk_summary"], row["value_markers"],
-                     advices or "[]", json.dumps(changed_fields), int(source_job_id),
+                     # The dialectic no longer produces advice; the column keeps revision
+                     # history readable for rows written before the merge.
+                     "[]", json.dumps(changed_fields), int(source_job_id),
                      time.time()))
                 revision_id = int(cur.lastrowid)
                 if allowed:
@@ -1416,50 +1428,78 @@ class MinirStore:
 
     def add_advisories(self, session_id: str, advices: list[dict[str, Any]], *,
                        revision_id: int = 0, source: str = "dialectic",
-                       review_id: int = 0, expires_at: float = 0.0) -> list[int]:
-        """Insert normalized advices, deduped by session + normalized text fingerprint."""
+                       review_id: int = 0, expires_at: float = 0.0,
+                       adviser: str = "") -> list[int]:
+        """Insert normalized advices, deduped by session + normalized text fingerprint.
+
+        An advice may carry the emission guard's normalized ``fingerprint`` key; without it the
+        fingerprint falls back to the lowercased text. ``adviser`` records which roster member
+        produced the row (empty for dialectic candidates and pre-roster advice).
+        """
         inserted: list[int] = []
         with self._lock:
             for item in advices:
                 content = " ".join(str(item.get("content") or item.get("text") or "").split())
                 if not content:
                     continue
+                key = str(item.get("fingerprint") or content.lower())
                 fingerprint = hashlib.sha256(
-                    f"{session_id}\0{content.lower()}".encode("utf-8")).hexdigest()[:32]
-                existing = self._conn.execute(
-                    "SELECT id, source FROM advisories WHERE session_id = ? AND fingerprint = ?",
-                    (session_id, fingerprint)).fetchone()
-                if existing:
-                    # A promoted dialectic candidate often keeps the candidate's text. Promote
-                    # that row in place instead of letting the unique fingerprint drop the
-                    # advice that must actually be delivered.
-                    if (str(existing["source"]) == "dialectic"
-                            and str(source) == "adviser_mode"):
-                        self._conn.execute(
-                            "UPDATE advisories SET source = ?, review_id = ?, severity = ?, "
-                            "target = ?, content = ?, decision = ?, evidence = ?, "
-                            "status = 'pending', expires_at = ? WHERE id = ?",
-                            (str(source), int(review_id),
-                             str(item.get("severity") or "concern"),
-                             str(item.get("target") or ""), content,
-                             str(item.get("decision") or ""),
-                             json.dumps(item.get("evidence") or []),
-                             float(expires_at or 0.0) or None, int(existing["id"])))
-                        inserted.append(int(existing["id"]))
-                    continue
+                    f"{session_id}\0{key}".encode("utf-8")).hexdigest()[:32]
                 cur = self._conn.execute(
                     "INSERT OR IGNORE INTO advisories (revision_id, review_id, session_id, "
                     "source, severity, target, content, decision, evidence, fingerprint, status, "
-                    "created_at, expires_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)",
+                    "created_at, expires_at, adviser) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?)",
                     (int(revision_id), int(review_id), session_id, str(source),
                      str(item.get("severity") or "concern"), str(item.get("target") or ""),
                      content, str(item.get("decision") or ""),
                      json.dumps(item.get("evidence") or []), fingerprint, time.time(),
-                     float(expires_at or 0.0) or None))
+                     float(expires_at or 0.0) or None, str(adviser or "")))
                 if cur.rowcount:
                     inserted.append(int(cur.lastrowid))
             self._conn.commit()
         return inserted
+
+    def advisory_fingerprints(self, session_id: str, keys: list[str]) -> dict[str, str]:
+        """Map normalized advice key -> severity for rows already in this session's ledger.
+
+        The emission guard asks once per review so a repeat of a delivered note is dropped
+        while an escalation (same key, higher severity) still passes.
+        """
+        out: dict[str, str] = {}
+        wanted = [str(key) for key in keys or [] if key]
+        if not wanted or not session_id:
+            return out
+        hashes = {
+            key: hashlib.sha256(f"{session_id}\0{key}".encode("utf-8")).hexdigest()[:32]
+            for key in wanted
+        }
+        marks = ",".join("?" * len(hashes))
+        with self._lock:
+            rows = self._conn.execute(
+                f"SELECT fingerprint, severity FROM advisories "
+                f"WHERE session_id = ? AND fingerprint IN ({marks})",
+                (session_id, *hashes.values())).fetchall()
+        by_hash = {value: key for key, value in hashes.items()}
+        for row in rows:
+            key = by_hash.get(str(row["fingerprint"]))
+            if key:
+                out[key] = str(row["severity"])
+        return out
+
+    def pending_blocker(self, session_id: str, *, source: str = "") -> Optional[dict[str, Any]]:
+        """The oldest live blocker, if any. Used by the tool gate and the verify nudge."""
+        clauses = ["session_id = ?", "status IN ('pending', 'staged')", "severity = 'blocker'",
+                   "(expires_at IS NULL OR expires_at > ?)"]
+        params: list[Any] = [session_id, time.time()]
+        if source:
+            clauses.append("source = ?")
+            params.append(str(source))
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM advisories WHERE " + " AND ".join(clauses) + " ORDER BY id LIMIT 1",
+                params).fetchone()
+        return dict(row) if row else None
 
     def pending_advisories(self, session_id: str, limit: int = 8, *,
                            source: str = "") -> list[dict[str, Any]]:
@@ -1481,23 +1521,6 @@ class MinirStore:
                 "ORDER BY CASE severity WHEN 'blocker' THEN 0 WHEN 'concern' THEN 1 ELSE 2 END, "
                 "id LIMIT ?", params).fetchall()
         return [dict(row) for row in rows]
-
-    def consume_advisories(self, ids: list[int], review_id: int = 0) -> int:
-        """Mark dialectic candidates evaluated by a successfully published review.
-
-        Only a review that published ``silent``/``advised`` calls this. A failed, parsed-empty,
-        or dropped review leaves the candidates ``pending`` so the next review can retry them.
-        """
-        if not ids:
-            return 0
-        marks = ",".join("?" * len(ids))
-        with self._lock:
-            cur = self._conn.execute(
-                f"UPDATE advisories SET status = 'consumed', review_id = ? "
-                f"WHERE id IN ({marks}) AND status = 'pending' AND source = 'dialectic'",
-                (int(review_id), *[int(item) for item in ids]))
-            self._conn.commit()
-            return int(cur.rowcount)
 
     def mark_advisories_injected(self, ids: list[int], turn_id: str = "") -> int:
         if not ids:
@@ -1571,25 +1594,29 @@ class MinirStore:
             return int(cur.rowcount)
 
     def start_adviser_review(self, session_id: str, turn_id: str, trigger: str,
-                             from_seq: int, to_seq: int) -> int:
+                             from_seq: int, to_seq: int, adviser: str = "") -> int:
         with self._lock:
             cur = self._conn.execute(
                 "INSERT INTO adviser_reviews (session_id, turn_id, trigger, status, "
-                "from_seq, to_seq, created_at) VALUES (?, ?, ?, 'running', ?, ?, ?)",
+                "from_seq, to_seq, adviser, created_at) "
+                "VALUES (?, ?, ?, 'running', ?, ?, ?, ?)",
                 (session_id, turn_id or "", trigger or "", int(from_seq), int(to_seq),
-                 time.time()))
+                 str(adviser or ""), time.time()))
             self._conn.commit()
             return int(cur.lastrowid)
 
     def finish_adviser_review(self, review_id: int, *, status: str, model: str = "",
                               api_calls: int = 0, latency_ms: float = 0.0,
-                              error: str = "") -> None:
+                              error: str = "", notes_dropped: int = 0,
+                              drop_detail: str = "") -> None:
         with self._lock:
             self._conn.execute(
                 "UPDATE adviser_reviews SET status = ?, model = ?, api_calls = ?, "
-                "latency_ms = ?, error = ? WHERE id = ?",
+                "latency_ms = ?, error = ?, notes_dropped = ?, drop_detail = ? "
+                "WHERE id = ?",
                 (status, model or "", int(api_calls or 0), float(latency_ms or 0.0),
-                 (error or "")[:500], int(review_id)))
+                 (error or "")[:500], int(notes_dropped or 0),
+                 (drop_detail or "{}")[:2000], int(review_id)))
             self._conn.commit()
 
     def adviser_reviews(self, session_id: str, limit: int = 10) -> list[dict[str, Any]]:
@@ -1599,6 +1626,44 @@ class MinirStore:
                 "ORDER BY created_at DESC, id DESC LIMIT ?",
                 (session_id, max(1, min(50, int(limit or 10))))).fetchall()
         return [dict(row) for row in rows]
+
+    def adviser_mode_stats(self, session_id: str) -> dict[str, Any]:
+        """Per-adviser review/advice counters for ``minir_stats``.
+
+        Review rows carry the emission guard's drop counts, so an adviser whose output is
+        entirely noise is visible instead of looking like a quiet reviewer.
+        """
+        with self._lock:
+            reviews = self._conn.execute(
+                "SELECT adviser, status, notes_dropped, drop_detail FROM adviser_reviews "
+                "WHERE session_id = ?", (session_id,)).fetchall()
+            advice_rows = self._conn.execute(
+                "SELECT adviser, severity, status, COUNT(*) AS n FROM advisories "
+                "WHERE session_id = ? AND source = 'adviser_mode' "
+                "GROUP BY adviser, severity, status", (session_id,)).fetchall()
+        stats: dict[str, Any] = {"reviews": len(reviews), "by_adviser": {},
+                                 "advisories": {}, "dropped": {}}
+        for row in reviews:
+            name = str(row["adviser"] or "default")
+            entry = stats["by_adviser"].setdefault(
+                name, {"reviews": 0, "advised": 0, "silent": 0, "failed": 0, "dropped": 0})
+            entry["reviews"] += 1
+            status = str(row["status"] or "")
+            if status in entry:
+                entry[status] += 1
+            entry["dropped"] += int(row["notes_dropped"] or 0)
+            try:
+                detail = json.loads(row["drop_detail"] or "{}")
+            except (TypeError, ValueError):
+                detail = {}
+            if isinstance(detail, dict):
+                for reason, count in detail.items():
+                    stats["dropped"][str(reason)] = (
+                        int(stats["dropped"].get(str(reason), 0)) + int(count or 0))
+        for row in advice_rows:
+            key = f"{row['severity']}/{row['status']}"
+            stats["advisories"][key] = int(stats["advisories"].get(key, 0)) + int(row["n"])
+        return stats
 
     def has_advisories(self, session_id: str) -> bool:
         """Whether a non-expired advice ledger exists (expired adviser rows must not suppress

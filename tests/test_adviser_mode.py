@@ -149,7 +149,6 @@ def test_review_brief_carries_the_configured_limits(plugin_package):
         {"max_advices": 5, "severity_floor": "blocker"})
     assert "at most 5 advice objects" in brief
     assert "Severity floor: blocker" in brief
-    assert "candidate advices" in brief
     assert "ADVICE SEVERITY" in brief
     assert "blocker:" in brief
     assert "ADVICE TARGETS" in brief
@@ -221,8 +220,8 @@ def _add_candidate(provider, text: str = "candidate one") -> None:
     }], source="dialectic")
 
 
-def test_review_reads_candidates_and_consumes_after_silent(
-        plugin_package, make_provider, monkeypatch):
+def test_review_does_not_read_or_touch_dialectic_rows(plugin_package, make_provider, monkeypatch):
+    """Legacy dialectic rows are not an input: the live reviewer is the only producer."""
     provider = _mode_provider(make_provider, cadence=99)
     _add_candidate(provider)
     calls: list = []
@@ -231,15 +230,15 @@ def test_review_reads_candidates_and_consumes_after_silent(
                                        status="ok", result="contents")
 
     assert provider._adviser_mode.review_once("session-test", "test") is True
-    assert "candidate one" in calls[0]["message"]
-    assert "<candidate_advices>" in calls[0]["message"]
-    assert provider._store.pending_advisories("session-test", source="dialectic") == []
+    assert "<candidate_advices>" not in calls[0]["message"]
+    assert "candidate one" not in calls[0]["message"]
+    assert len(provider._store.pending_advisories(
+        "session-test", source="dialectic")) == 1, "nothing consumes it any more"
 
 
-def test_failed_review_keeps_candidates_pending(
+def test_failed_review_inserts_nothing_and_records_failure(
         plugin_package, make_provider, monkeypatch):
     provider = _mode_provider(make_provider, cadence=99)
-    _add_candidate(provider)
     provider._adviser_mode.record_tool("session-test", "read_file", turn_id="t1",
                                        status="ok", result="contents")
 
@@ -248,28 +247,23 @@ def test_failed_review_keeps_candidates_pending(
 
     monkeypatch.setattr(plugin_package.agent_loop, "run", _boom)
     assert provider._adviser_mode.review_once("session-test", "test") is False
-    assert len(provider._store.pending_advisories(
-        "session-test", source="dialectic")) == 1
+    assert provider._store.pending_advisories("session-test") == []
+    assert provider._store.adviser_reviews("session-test")[0]["status"] == "failed"
 
 
-def test_non_json_review_keeps_candidates_pending(
-        plugin_package, make_provider, monkeypatch):
+def test_non_json_review_inserts_nothing(plugin_package, make_provider, monkeypatch):
     provider = _mode_provider(make_provider, cadence=99)
-    _add_candidate(provider)
     monkeypatch.setattr(plugin_package.agent_loop, "run", _run("not json"))
     provider._adviser_mode.record_tool("session-test", "read_file", turn_id="t1",
                                        status="ok", result="contents")
 
     assert provider._adviser_mode.review_once("session-test", "test") is False
-    assert len(provider._store.pending_advisories(
-        "session-test", source="dialectic")) == 1
+    assert provider._store.pending_advisories("session-test") == []
     assert provider._store.adviser_reviews("session-test")[0]["status"] == "failed"
 
 
-def test_dropped_review_keeps_candidates_pending(
-        plugin_package, make_provider, monkeypatch):
+def test_dropped_review_inserts_nothing(plugin_package, make_provider, monkeypatch):
     provider = _mode_provider(make_provider, cadence=99)
-    _add_candidate(provider)
 
     def _late(message, **kwargs):
         provider._adviser_mode.session_end("session-test")
@@ -280,14 +274,15 @@ def test_dropped_review_keeps_candidates_pending(
     provider._adviser_mode.record_tool("session-test", "read_file", turn_id="t1",
                                        status="ok", result="contents")
     assert provider._adviser_mode.review_once("session-test", "test") is False
-    assert len(provider._store.pending_advisories(
-        "session-test", source="dialectic")) == 1
+    assert provider._store.pending_advisories("session-test") == []
 
 
-def test_consult_uses_the_main_adviser_and_reads_candidates_without_consuming(
+def test_consult_uses_the_main_adviser_and_leaves_advice_alone(
         plugin_package, make_provider, monkeypatch):
     provider = _mode_provider(make_provider, cadence=99)
-    _add_candidate(provider)
+    provider._store.add_advisories("session-test", [{
+        "severity": "concern", "target": "current_step", "text": "pending advice"}],
+        source="adviser_mode")
     calls: list = []
     monkeypatch.setattr(plugin_package.agent_loop, "run", _agent_run("advice", calls))
 
@@ -296,10 +291,9 @@ def test_consult_uses_the_main_adviser_and_reads_candidates_without_consuming(
     assert data["answer"] == "advice"
     call = calls[0]
     assert call["system_message"] == plugin_package.adviser_prompts.consult_prompt()
-    assert "<candidate_advices>" in call["context"]
-    assert "candidate one" in call["context"]
+    assert "candidate_advices" not in call["context"]
     assert len(provider._store.pending_advisories(
-        "session-test", source="dialectic")) == 1, "consult must not consume candidates"
+        "session-test", source="adviser_mode")) == 1, "consult must not consume advice"
 
 
 def test_adviser_only_policy_survives_the_compression_gate(plugin_package, make_provider):
@@ -479,15 +473,15 @@ def test_parser_defaults_to_silent_and_applies_floor(plugin_package):
     assert rows[0]["severity"] == "blocker"
 
 
-def test_parse_review_remaps_memory_target_and_keeps_candidate_id(plugin_package):
+def test_parse_review_remaps_an_unknown_target_to_general(plugin_package):
     rows = plugin_package.adviser_mode.parse_review(json.dumps({
         "action": "advise", "advices": [{
             "severity": "concern", "target": "user_peer_card", "text": "candidate",
-            "candidate_id": 7, "evidence": ["m1"],
+            "evidence": ["m1"],
         }],
     }))
     assert rows[0]["target"] == "general"
-    assert "candidate:7" in rows[0]["evidence"]
+    assert rows[0]["evidence"] == ["m1"], "evidence is not rewritten"
 
 
 def test_parse_review_keeps_artifact_targets(plugin_package):
@@ -506,17 +500,16 @@ def test_review_prompt_carries_artifact_advice(plugin_package):
     assert "changes the artifact" in brief
 
 
-def test_both_advisers_share_one_advice_target_vocabulary(plugin_package):
-    worker = plugin_package.worker
+def test_one_advice_target_vocabulary(plugin_package):
+    """One producer, one vocabulary: every target the reviewer may emit is deliverable."""
     mode = plugin_package.adviser_mode
     names = tuple(key for key, *_ in plugin_package.prompting.ADVICE_TARGETS)
-    assert worker._ADVICE_TARGETS == names
     assert mode.ADVICE_TARGET_NAMES == names
-    assert set(mode.DELIVERED_TARGET_NAMES) == set(
-        plugin_package.prompting.ACTION_TARGETS + plugin_package.prompting.ARTIFACT_TARGETS)
+    assert set(mode.DELIVERED_TARGET_NAMES) == set(names)
     for name in names:
-        assert name in worker.DIALECTIC_SYSTEM_PROMPT, name
         assert name in mode._review_brief({}), name
+    assert "ADVICE TARGETS" not in plugin_package.worker.DIALECTIC_SYSTEM_PROMPT, \
+        "the dialectic no longer emits advice"
     parsed = mode.parse_review(json.dumps({"action": "advise", "advices": [
         {"severity": "concern", "target": "not_a_target", "text": "x"}]}))
     assert parsed[0]["target"] == "general"

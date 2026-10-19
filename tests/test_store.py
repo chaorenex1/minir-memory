@@ -87,7 +87,7 @@ def test_session_scope_hides_other_sessions_until_scope_all(store):
 
 def test_session_scope_keeps_other_reviews_out_until_scope_all(store):
     store.put_layer_state("dialectic", "agent:minir",
-                          "## Adviser Review\n- zebraword review", session_id="s2")
+                          "## Base Revision\n- zebraword revision", session_id="s2")
     assert store.search("zebraword", session_id="s3") == []
     assert any(row["kind"] == "dialectic.review"
                for row in store.search("zebraword", session_id="s3", scope="all"))
@@ -279,10 +279,7 @@ def test_conclusions_are_indexed_and_session_scoped(store):
             "## AI Identity Card\n- never edits outside the repo\n\n"
             "## Value Markers\n- [tool] pytest")
     store.put_layer_state("base", "user:ada", base, session_id="s1", ai_subject="agent:minir")
-    dialectic = ("## Adviser Review\n- skipped the smoke test\n\n"
-                 "## Constraints\n- never delete user files\n\n"
-                 "## Preferences\n- act first\n\n"
-                 "## Second Brain\n- [tool] pytest -q")
+    dialectic = "## Base Revision\n- user_peer_card: skipped the smoke test"
     store.put_layer_state("dialectic", "agent:minir", dialectic, session_id="s1")
 
     goal = store.search("finish the plugin", session_id="s1")
@@ -402,32 +399,15 @@ def test_advisories_are_deduped_and_blockers_come_first(store):
     assert store.has_advisories("s1") is True
 
 
-def test_promoted_candidate_with_same_text_is_deliverable(store):
-    candidate = store.add_advisories("s1", [{
-        "severity": "concern", "target": "current_step", "content": "check the path",
-    }], source="dialectic")
-    assert len(candidate) == 1
-    promoted = store.add_advisories("s1", [{
-        "severity": "blocker", "target": "tool_choice", "content": "check the path",
-    }], source="adviser_mode")
-    assert promoted == candidate
-    row = store.pending_advisories("s1", source="adviser_mode")[0]
-    assert row["source"] == "adviser_mode" and row["severity"] == "blocker"
-    assert store.pending_advisories("s1", source="dialectic") == []
-
-
 def test_apply_base_revision_snapshots_then_updates_atomically(store):
     refresh_id = _refresh(store, from_ts=0.0, to_ts=10.0, peer="old peer")
     content = ("## Session Summary\n- window\n\n## User Representation\n- [goal] need at 0.0\n\n"
                "## User Peer Card\n- new peer\n\n## AI Self Representation\n- [done] window 0.0\n\n"
                "## AI Identity Card\n- direct\n\n## Value Markers\n- [tool] pytest")
-    advices = json.dumps([{"severity": "concern", "target": "user_peer_card",
-                           "content": "the peer card is stale", "decision": "update it",
-                           "evidence": ["m1"]}])
     revision_id = store.apply_base_revision(
         "s1", "user:ada", window_from_ts=0.0,
         changes={"user_peer_card": json.dumps(["new peer"])},
-        advices=advices, changed_fields=["user_peer_card"], content=content)
+        changed_fields=["user_peer_card"], content=content)
 
     assert revision_id
     latest = store.latest_base_refresh("s1", "user:ada")
@@ -440,10 +420,10 @@ def test_apply_base_revision_snapshots_then_updates_atomically(store):
     assert revision["base_refresh_id"] == refresh_id
     assert revision["user_peer_card"] == "old peer"
     assert json.loads(revision["changed_fields"]) == ["user_peer_card"]
-    assert "stale" in revision["advices"]
+    assert revision["advices"] == "[]"
     state = store.layer_state("base", "user:ada")
     assert state["version"] == 1 and "new peer" in state["content"]
-    hits = store.search_base_revisions("stale", session_id="s1")
+    hits = store.search_base_revisions("old peer", session_id="s1")
     assert hits and hits[0]["id"] == revision_id
 
 
@@ -458,7 +438,7 @@ def test_an_older_window_revision_does_not_replace_the_live_artifact(store):
     revision = store.apply_base_revision(
         "s1", "user:ada", window_from_ts=0.0,
         changes={"user_peer_card": json.dumps(["corrected old peer"])},
-        advices="[]", changed_fields=["user_peer_card"],
+        changed_fields=["user_peer_card"],
         content="## User Peer Card\n- corrected old peer")
 
     assert revision

@@ -1,5 +1,5 @@
 name: minir
-version: 0.7.0
+version: 0.8.0
 description: "Minir — local-first memory plugin: base/dialectic layer artifacts in SQLite, FTS5 recall over every conclusion, six-section user/AI cards with value markers, a dependent dialectic review that corrects the base artifact (snapshot + FTS) and emits severity-ranked advices, an optional main adviser that reviews live tool events, grades dialectic advices as candidates, and delivers only promoted advice through llm_request middleware; adviser_consult uses the same adviser core, with dynamic severity/target/handling/nit/language guidance in the system block, plus identity files and a context engine that synchronously refreshes both layers at the 95%-of-threshold boundary and replaces the unprotected window with an audited assistant session_summary. Stores no transcripts (derived text may quote evidence). Stdlib only; fork it."
 author: chaorenex1
 license: MIT
@@ -17,6 +17,7 @@ provides_hooks:
   - post_llm_call
   - post_tool_call
   - pre_tool_call
+  - pre_verify
   - on_interim_message
   - post_api_request
   - api_request_error

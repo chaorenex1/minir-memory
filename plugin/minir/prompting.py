@@ -73,18 +73,6 @@ def marker_section(*, heading: str = "VALUE MARKERS — DEFINITIONS",
 # receiving agent should do with that target; keeping it beside the definition prevents the
 # system block and the reviewer prompt from drifting apart.
 ADVICE_TARGETS: tuple[tuple[str, str, str], ...] = (
-    ("user_representation", "the user's need-path card",
-     "candidate-only; remap to an action target or general before delivery."),
-    ("user_peer_card", "the user's durable preferences card",
-     "candidate-only; remap to an action target or general before delivery."),
-    ("ai_self_representation", "the assistant's action-state card",
-     "candidate-only; remap to an action target or general before delivery."),
-    ("ai_identity_card", "the assistant's identity card",
-     "candidate-only; remap to an action target or general before delivery."),
-    ("session_chunk_summary", "the window record",
-     "candidate-only; remap to an action target or general before delivery."),
-    ("value_markers", "the durable marker inventory",
-     "candidate-only; remap to an action target or general before delivery."),
     ("tool_choice", "the tool or arguments the turn is using",
      "blocker -> do not execute; re-check name, args, scope, permissions. "
      "concern -> verify before executing. nit -> optional."),
@@ -111,17 +99,11 @@ ACTION_TARGETS: tuple[str, ...] = (
     "tool_choice", "current_step", "final_answer", "user_intent", "general")
 ARTIFACT_TARGETS: tuple[str, ...] = ("output_surface", "code_economy")
 DELIVERED_TARGETS: tuple[str, ...] = (*ACTION_TARGETS, *ARTIFACT_TARGETS)
-MEMORY_TARGETS: tuple[str, ...] = (
-    "user_representation", "user_peer_card", "ai_self_representation",
-    "ai_identity_card", "session_chunk_summary", "value_markers")
 
-# Ordered groups for the system block. Action and artifact targets are delivered to the main
-# agent; memory targets stay candidate-only inside the adviser.
+# Ordered groups for the system block.
 ADVICE_TARGET_GROUPS: tuple[tuple[str, tuple[str, ...]], ...] = (
-    ("Action targets (delivered):", ACTION_TARGETS),
-    ("Artifact targets (delivered):", ARTIFACT_TARGETS),
-    ("Memory targets (candidate-only; remap to an action target or general before delivery):",
-     MEMORY_TARGETS),
+    ("Action targets:", ACTION_TARGETS),
+    ("Artifact targets:", ARTIFACT_TARGETS),
 )
 
 ADVICE_SEVERITIES: tuple[tuple[str, str], ...] = (

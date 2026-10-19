@@ -36,8 +36,8 @@ def _base_json(*, summary=None, user=None, peer=None, ai_self=None, identity=Non
 
 
 def _dialectic_json(*, user=None, peer=None, ai_self=None, identity=None, summary=None,
-                    advices=None, markers=None, changed=False, fields=None):
-    """A full eight-key dialectic reply; the default carries one actionable concern."""
+                    markers=None, changed=False, fields=None):
+    """A full seven-key dialectic reply: the six base fields plus ``base_changed``."""
     return json.dumps({
         "user_representation": user if user is not None else ["[goal] ship the plugin"],
         "user_peer_card": peer if peer is not None else ["Wants terse answers."],
@@ -45,12 +45,6 @@ def _dialectic_json(*, user=None, peer=None, ai_self=None, identity=None, summar
         "ai_identity_card": identity if identity is not None else ["careful with user files"],
         "session_chunk_summary": (summary if summary is not None
                                   else ["[done] ships a Hermes memory plugin"]),
-        "advices": advices if advices is not None else [{
-            "severity": "concern", "target": "user_peer_card",
-            "text": "run a smoke test before shipping",
-            "decision": "adopt the smoke test as a standing check",
-            "evidence": ["msg-1"],
-        }],
         "value_markers": markers or {
             "entities": ["Hermes memory plugin"], "trajectories": [],
             "experiences": [], "tools": ["pytest"], "projects": ["minir-memory"],
@@ -229,8 +223,32 @@ def test_merge_bumps_the_version_and_feeds_the_previous_artifact_forward(store, 
         "the latest-chunk projection must be recomputed, not fed back"
 
 
-def test_dialectic_layer_publishes_advices_without_base_cards(plugin_package, store, transcript):
+def test_an_unchanged_review_replaces_the_note_without_advice(plugin_package, store, transcript):
+    """A no-op review still republishes the note, so an old advice artifact cannot linger."""
+    store.put_layer_state("dialectic", "agent:minir", "## Adviser Review\n- stale advice")
+    _seed_base_refresh(store)
+
     def complete(task, system, prompt, **kwargs):
+        return _dialectic_json(changed=False)
+
+    instance = plugin_package.worker.LayerWorker(store, transcript, complete=complete)
+    transcript.add(SESSION, "user", "review this", created_at=10.0)
+    _dispatch(store, transcript, SESSION, DIALECTIC, 0.0, 20.0)
+    assert instance.run_once() == 1
+
+    note = store.layer_state(DIALECTIC, "agent:minir")["content"]
+    assert note == "## Base Revision\n- no change this window"
+    assert store.base_revisions(SESSION) == []
+    assert store.pending_advisories(SESSION) == []
+
+
+def test_dialectic_job_without_a_base_row_does_not_call_the_model(plugin_package, store,
+                                                                  transcript):
+    """Without the base refresh it corrects, a dialectic job has nothing to produce."""
+    calls: list[str] = []
+
+    def complete(task, system, prompt, **kwargs):
+        calls.append(task)
         return _dialectic_json()
 
     transcript.add(SESSION, "user", "review this", created_at=10.0)
@@ -238,14 +256,9 @@ def test_dialectic_layer_publishes_advices_without_base_cards(plugin_package, st
     instance = plugin_package.worker.LayerWorker(store, transcript, complete=complete,
                                                 agent_identity="Masía")
     assert instance.run_once() == 1
-    state = store.layer_state(DIALECTIC, "agent:Masía")
-    assert state["version"] == 1
-    assert state["content"].startswith("## Adviser Review")
-    assert "run a smoke test" in state["content"]
-    assert "## User Peer Card" not in state["content"]
-    assert "## Constraints" not in state["content"]
-    pending = store.pending_advisories(SESSION)
-    assert [row["severity"] for row in pending] == ["concern"]
+    assert calls == []
+    assert store.layer_state(DIALECTIC, "agent:Masía") is None
+    assert store.pending_advisories(SESSION) == []
 
 
 def test_an_unusable_artifact_fails_the_job_and_keeps_the_previous_version(plugin_package, store,
@@ -465,6 +478,24 @@ class _FakeAuxiliary:
         return type("Response", (), {"choices": [choice]})()
 
 
+def _seed_base_refresh(store, *, window_from_ts: float = 0.0, window_to_ts: float = 20.0,
+                       peer=None, user=None, summary=None):
+    """A base refresh row for the window a dialectic job will review."""
+    return store.add_base_refresh(
+        SESSION, "user:default",
+        window_from_ts=window_from_ts, window_to_ts=window_to_ts,
+        window_from_turn=None, window_to_turn=None,
+        user_representation=json.dumps(
+            user if user is not None else ["[goal] ship the plugin"]),
+        user_peer_card=json.dumps(peer if peer is not None else ["Wants terse answers."]),
+        ai_self_representation=json.dumps(["[done] ran the smoke test"]),
+        ai_identity_card=json.dumps(["careful with user files"]),
+        session_chunk_summary=json.dumps(summary if summary is not None
+                                         else ["[done] ships a Hermes memory plugin"]),
+        value_markers=json.dumps({"entities": [], "trajectories": [], "experiences": [],
+                                  "tools": [], "projects": []}))
+
+
 def _install_fake_aux(plugin_package, monkeypatch, fake):
     import sys
     import types
@@ -524,7 +555,8 @@ def test_dialectic_depth_adapts_and_runs_three_passes_for_long_windows(
         calls.append(system)
         return _dialectic_json()
 
-    store.put_layer_state("dialectic", "agent:minir", "## Adviser Review\n- prior")
+    store.put_layer_state("dialectic", "agent:minir", "## Base Revision\n- prior")
+    _seed_base_refresh(store)
     for index in range(4):
         transcript.add(SESSION, "user", f"long evidence {index} " + "z" * 3500,
                        created_at=10.0 + index)
@@ -541,19 +573,24 @@ def test_cold_start_uses_identity_files_without_messages(plugin_package, store, 
 
     def complete(task, system, prompt, **kwargs):
         seen.append(system)
-        return _dialectic_json(advices=[])
+        return _dialectic_json(peer=["Ships on Fridays only."], changed=True,
+                               fields=["user_peer_card"])
 
+    _seed_base_refresh(store)
     instance = plugin_package.worker.LayerWorker(
         store, transcript, identity="I am Masía.", preference="Be terse.",
         depth=1, complete=complete)
     store.record_job(DIALECTIC, SESSION, 0.0, 20.0, turns=0)
     assert instance.run_once() == 1
     assert "no previous dialectic" in seen[0].lower()
-    assert store.layer_state(DIALECTIC, "agent:minir") is not None
+    note = store.layer_state(DIALECTIC, "agent:minir")["content"]
+    assert note.startswith("## Base Revision") and "user_peer_card" in note
+    assert store.pending_advisories(SESSION) == []
 
 
 def test_a_dialectic_audit_failure_keeps_the_initial_draft(plugin_package, store, transcript):
-    replies = [_dialectic_json(), "not a valid artifact"]
+    replies = [_dialectic_json(peer=["Friday deploys only."], changed=True,
+                               fields=["user_peer_card"]), "not a valid artifact"]
     seen: list[int] = []
 
     def complete(task, system, prompt, **kwargs):
@@ -561,11 +598,13 @@ def test_a_dialectic_audit_failure_keeps_the_initial_draft(plugin_package, store
         seen.append(index)
         return replies[index]
 
+    _seed_base_refresh(store)
     instance = plugin_package.worker.LayerWorker(store, transcript, depth=2, complete=complete)
     transcript.add(SESSION, "user", "review this " + "z" * 5000, created_at=10.0)
     _dispatch(store, transcript, SESSION, DIALECTIC, 0.0, 20.0)
     assert instance.run_once() == 1
-    assert "run a smoke test" in store.layer_state(DIALECTIC, "agent:minir")["content"]
+    note = store.layer_state(DIALECTIC, "agent:minir")["content"]
+    assert "Friday deploys only" in note, "a failed audit must not discard a usable draft"
 
 
 # -- canonical chunk chain ----------------------------------------------------
@@ -635,6 +674,7 @@ def test_final_summary_supersedes_the_chunk_chain(store, transcript, worker):
 def test_dialectic_prompt_consumes_the_chunk_chain(store, transcript, worker):
     store.add_chunk_summary(SESSION, 1.0, 2.0, "chunk one: tests pass")
     store.add_chunk_summary(SESSION, 2.0, 3.0, "chunk two: tests fail")
+    _seed_base_refresh(store)
     transcript.add(SESSION, "user", "reconcile this", created_at=10.0)
     _dispatch(store, transcript, SESSION, DIALECTIC, 0.0, 20.0)
     assert worker.run_once() == 1
@@ -657,19 +697,21 @@ def test_base_prompt_does_not_feed_the_previous_projection_back(store, transcrip
     assert "durable peer" in prompt, "the other five sections still carry forward"
 
 
-def test_a_dialectic_job_can_run_from_the_chunk_chain_alone(plugin_package, store, transcript):
+def test_a_dialectic_job_without_a_base_row_spends_no_model_call(
+        plugin_package, store, transcript):
+    """The chunk chain alone cannot correct anything: there is no base refresh to target."""
     store.add_chunk_summary(SESSION, 1.0, 2.0, "chunk-only evidence")
     calls: list[str] = []
 
     def complete(task, system, prompt, **kwargs):
         calls.append(prompt)
-        return ("## Adviser Review\n- reconciled\n\n## Constraints\n- c\n\n"
-                "## Preferences\n- p\n\n## Second Brain\n- [tool] t")
+        return _dialectic_json(peer=["changed"], changed=True, fields=["user_peer_card"])
 
     instance = plugin_package.worker.LayerWorker(store, transcript, depth=1, complete=complete)
     store.record_job(DIALECTIC, SESSION, 0.0, 20.0)
-    assert instance.run_once() == 1, "chunks alone must drive the dialectic pass"
-    assert "chunk-only evidence" in calls[0]
+    assert instance.run_once() == 1
+    assert calls == []
+    assert store.base_revisions(SESSION) == []
 
 
 # -- the structured base refresh record ---------------------------------------
@@ -880,7 +922,9 @@ def test_a_base_job_queues_the_dependent_dialectic_window(plugin_package, store,
 
     def complete(task, system, prompt, **kwargs):
         calls.append(task)
-        return (_dialectic_json() if task == plugin_package.worker.DIALECTIC_LAYER_TASK
+        return (_dialectic_json(peer=["Ships on Fridays only."], changed=True,
+                                fields=["user_peer_card"])
+                if task == plugin_package.worker.DIALECTIC_LAYER_TASK
                 else _base_json())
 
     transcript.add(SESSION, "user", "ship it", created_at=10.0)
@@ -892,8 +936,9 @@ def test_a_base_job_queues_the_dependent_dialectic_window(plugin_package, store,
         plugin_package.worker.DIALECTIC_LAYER_TASK]
     assert store.pending_jobs() == []
     assert store.layer_state(BASE, "user:default") is not None
-    assert store.layer_state(DIALECTIC, "agent:minir") is not None
-    assert store.pending_advisories(SESSION)
+    note = store.layer_state(DIALECTIC, "agent:minir")["content"]
+    assert note.startswith("## Base Revision") and "user_peer_card" in note
+    assert store.pending_advisories(SESSION) == [], "the dialectic produces no advice"
 
 
 def test_a_review_reads_its_window_after_an_earlier_review_advanced_the_watermark(
@@ -911,6 +956,7 @@ def test_a_review_reads_its_window_after_an_earlier_review_advanced_the_watermar
     # watermark would leave only "late evidence" and make the review circular.
     prior = store.record_job(DIALECTIC, SESSION, 0.0, 20.0)
     store.complete_job(prior, 20.0)
+    _seed_base_refresh(store, window_to_ts=30.0)
     store.record_job(DIALECTIC, SESSION, 0.0, 30.0)
 
     instance = plugin_package.worker.LayerWorker(store, transcript, complete=complete)
@@ -939,7 +985,7 @@ def test_dialectic_revision_snapshots_the_old_base_and_applies_the_change(
     assert revision["base_refresh_id"] == latest["id"]
     assert json.loads(revision["user_peer_card"]) == ["Wants terse answers."]
     assert json.loads(revision["changed_fields"]) == ["user_peer_card"]
-    assert "smoke test" in revision["advices"]
+    assert revision["advices"] == "[]", "the dialectic no longer stores advice"
     assert "No emoji." in store.layer_state(BASE, "user:default")["content"]
     assert store.search_base_revisions("smoke test", session_id=SESSION)
     assert store.stats()["base_revisions"] == 1
@@ -991,6 +1037,9 @@ def test_a_listed_empty_card_clears_it(plugin_package, store, transcript):
     assert json.loads(revisions[0]["user_peer_card"]) == ["Wants terse answers."]
     published = store.layer_state(BASE, "user:default")["content"]
     assert "## User Peer Card\n\n## AI Self Representation" in published
+    note = store.layer_state(DIALECTIC, "agent:minir")["content"]
+    assert note.startswith("## Base Revision") and "user_peer_card" in note
+    assert store.pending_advisories(SESSION) == []
 
 
 def test_an_empty_card_outside_a_listed_change_is_refused(plugin_package, store, transcript):
@@ -1023,8 +1072,8 @@ def test_a_dialectic_job_without_its_base_window_does_not_correct_another_window
     base_worker.run_once()
     before = store.latest_base_refresh(SESSION, "user:default")
 
-    # A job that did not follow this base window (the context engine can queue one) may still
-    # emit advice, but must not overwrite an unrelated base row.
+    # A job that did not follow this base window (the context engine can queue one) has nothing
+    # to correct: it must not overwrite an unrelated base row, publish advice, or spend a call.
     store.record_job(DIALECTIC, SESSION, -1.0, 100.0)
     dialectic_worker = plugin_package.worker.LayerWorker(store, transcript, complete=complete)
     assert dialectic_worker.run_once() == 1
@@ -1032,7 +1081,7 @@ def test_a_dialectic_job_without_its_base_window_does_not_correct_another_window
     after = store.latest_base_refresh(SESSION, "user:default")
     assert after["user_peer_card"] == before["user_peer_card"]
     assert store.base_revisions(SESSION) == []
-    assert store.pending_advisories(SESSION)
+    assert store.pending_advisories(SESSION) == []
 
 
 def test_dialectic_reviews_the_base_row_for_its_own_window(

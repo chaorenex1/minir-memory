@@ -411,8 +411,8 @@ class MinirMemoryProvider(MemoryProvider):
                 advice_handling_section(),
                 advice_nit_report_section(),
                 advice_language_line(),
-                "Dialectic candidates are internal to the adviser and never injected into your "
-                "context. Do not wait for a turn-boundary advice block.",
+                "Advice is injected only when it clears the severity floor; do not wait for a "
+                "turn-boundary advice block.",
             ])
         if adviser_only:
             brief = self._adviser_mode.mode_brief(self._session_id)
@@ -872,6 +872,7 @@ class MinirMemoryProvider(MemoryProvider):
             return json.dumps({**self._store.stats(), "session_id": self._session_id,
                                "profile": self._profile,
                                "layers": TRACKER.snapshot(self._session_id),
+                               "adviser_mode": self._store.adviser_mode_stats(self._session_id),
                                "artifacts": self._store.all_layer_states(),
                                "buffered_messages": len(self._transcript.messages(self._session_id)),
                                "prefetch_limit": self._prefetch_limit,
@@ -1075,6 +1076,8 @@ def register(ctx) -> None:
     ctx.register_hook("post_tool_call", _hook(_on_post_tool_call, provider))
     # ``adviser_only`` is enforced before execution; returning action=block wins the gate.
     ctx.register_hook("pre_tool_call", _hook(_on_pre_tool_call, provider))
+    # Verify-on-stop gate: a live blocker may keep a code-editing turn going once.
+    ctx.register_hook("pre_verify", _hook(_on_pre_verify, provider))
     # Adviser mode observers: the event ring needs the assistant's intent (interim text and
     # successful API responses with tool calls), the tool outcome, and the final answer.
     ctx.register_hook("on_interim_message", _hook(_on_interim_message, provider))
@@ -1141,7 +1144,7 @@ def _on_session_start(session_id: str = "", model: str = "", platform: str = "",
         TRACKER.begin(session_id)
         resolved = _resolve_provider(provider)
         if resolved is not None:
-            resolved._adviser_mode.session_started(session_id)
+            resolved._adviser_mode.session_started(session_id, platform=platform)
             resolved.cold_start(session_id)
         logger.info("Minir on_session_start: session=%s model=%s platform=%s",
                     session_id or "-", model or "-", platform or "-")
@@ -1209,7 +1212,10 @@ def _on_pre_llm_call(session_id: str = "", turn_id: str = "",
         # Dialectic advices are candidates for the main adviser now; they are never injected at
         # the turn boundary. The legacy review fallback is retired with the same cutover.
         brief = provider._adviser_mode.mode_brief(session_id)
-        return brief or None
+        # Turn-boundary channel: advice below the mid-turn floor (nits) rides this turn's user
+        # message once. It is marked injected, so the next boundary does not repeat it.
+        aside = provider._adviser_mode.aside_block(session_id)
+        return "\n\n".join(part for part in (brief, aside) if part) or None
     except Exception as exc:  # injection must never break a turn
         logger.debug("Minir review injection skipped: %s", exc)
         return None
@@ -1246,13 +1252,26 @@ def _on_post_tool_call(tool_name: str = "", session_id: str = "",
 def _on_pre_tool_call(tool_name: str = "", session_id: str = "",
                       provider: Optional[MinirMemoryProvider] = None,
                       **kwargs) -> Optional[dict[str, str]]:
-    """``adviser_only`` enforcement: block mutating tools before they execute."""
+    """``adviser_only`` enforcement plus the blocker gate (``adviser_mode.block_tools``)."""
     resolved = _resolve_provider(provider)
-    if resolved is not None and resolved._adviser_mode.blocks_tool(session_id, tool_name):
-        return {"action": "block",
-                "message": (f"adviser_only mode: {tool_name} is a mutating tool. "
-                            "Propose the exact change for the user to apply instead.")}
-    return None
+    if resolved is None:
+        return None
+    reason = resolved._adviser_mode.block_reason(session_id, tool_name)
+    return {"action": "block", "message": reason} if reason else None
+
+
+def _on_pre_verify(session_id: str = "", changed_paths: Any = None,
+                   provider: Optional[MinirMemoryProvider] = None, **kwargs) -> Optional[dict]:
+    """Keep a code-editing turn going once when a live blocker is pending.
+
+    Opt-in (``adviser_mode.verify_continue``). The host bounds the number of nudges; this
+    adapter additionally consumes the blocker, so one advice produces at most one continue.
+    """
+    resolved = _resolve_provider(provider)
+    if resolved is None:
+        return None
+    return resolved._adviser_mode.verify_continue(
+        session_id, changed_paths or kwargs.get("changed_paths"))
 
 
 def _on_interim_message(session_id: str = "", turn_id: str = "", text: Any = None,

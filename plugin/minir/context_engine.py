@@ -3,7 +3,7 @@
 The engine no longer maintains a progressive carrier chain. It waits for the host's compression
 boundary, folds the unprotected middle of the window into one **assistant summary message**, and
 returns ``head + notice + summary + tail``. The summary is produced by a real adviser agent run
-that audits the base layer's prepared chunk and the dialectic review against history up to the
+that audits the base layer's prepared chunk and the base revision note against history up to the
 window end; raw transcript text stays in the host's ``state.db`` and is never copied into this
 provider's store.
 
