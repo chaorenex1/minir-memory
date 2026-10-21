@@ -922,9 +922,10 @@ class AdviserMode:
             prompt = self._prompt(session, turn_id, trigger, fresh, adviser=spec)
             model = str(spec.get("model") or route.get("model") or "")
             provider = str(route.get("provider") or "")
+            # 5 iterations: one search round, up to two page reads, then the object.
             result = agent_loop.run(
                 prompt, model=model, provider=provider, toolsets=toolsets,
-                system_message=_review_brief(cfg), max_iterations=3,
+                system_message=_review_brief(cfg), max_iterations=5,
                 project_dir=adviser.project_dir(route),
             )
             api_calls = int(result.api_calls)

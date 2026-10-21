@@ -14,8 +14,8 @@
 | `rules/user-preferences.md` | 用户偏好 7 字段 | B1 全文；dialectic 与复盘读 REVIEW CHECKS |
 | `rules/ai-self.md` | AI 自我表示 6 字段与状态枚举 | B2 全文；dialectic 读 REVIEW CHECKS |
 | `rules/ai-identity.md` | AI 身份卡 13 字段与硬字段取证 | B2 全文；dialectic 与复盘读 REVIEW CHECKS |
-| `rules/markers-category.md` | 维度 A：K/V/I/M/G、认识状态、topic、10 对判定、3 条特殊规则 | B3 全文 |
-| `rules/markers-org.md` | 维度 B：五种组织类型、objects、relations | B3 全文 |
+| `rules/markers-category.md` | 维度 A：K/V/I/M/G 覆盖范围、四态认识状态、10 对判定（带正反例）、3 条特殊规则、topic 与 unit 身份 | B3 全文 |
+| `rules/markers-org.md` | 维度 B：五种组织类型的核心问题与覆盖、选择顺序、category×org 组合示例、objects、relations | B3 全文 |
 
 窗口摘要与知识页规则不进这 6 份。前者是 8 个字段的结构约定，跟着 B3 的 OUTPUT 走；后者是单层格式，跟着 knowledge_render 走。它们没有跨层复用的需要。
 
@@ -63,10 +63,10 @@ sections: [contract, review_checks]
 | --- | --- | --- | --- |
 | base B1 | user-self, user-preferences | CONTRACT | 700 tokens |
 | base B2 | ai-self, ai-identity | CONTRACT | 800 tokens |
-| base B3 | markers-category, markers-org | CONTRACT | 900 tokens |
+| base B3 | markers-category, markers-org | CONTRACT | 1 900 tokens（实测） |
 | dialectic | 四份卡规则 | REVIEW CHECKS | 450 tokens |
 | card_review | 四份卡规则 | CONTRACT | 1200 tokens |
-| knowledge_render | markers-category, markers-org | 全文 | 900 tokens |
+| knowledge_render | markers-category, markers-org | 全文 | 1 900 tokens（实测） |
 
 dialectic 不读 markers 规则，因为它不写 markers（分层草稿 2.3）。复盘读四份卡规则的全文，因为它是唯一允许剪枝的角色，需要完整判定标准而不是缺陷清单。knowledge_render 读 markers 全文，因为合并后的这个 pass 自己决定页面的 category 与 org，不再由 B4 代劳。
 
@@ -112,7 +112,7 @@ class RulesLoader:
 | B1 窗口 | 约 2400 |
 | 合计 | 约 4000 tokens，等于 16000 字符上限 |
 
-B3 是最紧的一层：核心 700、规则 900、窗口 2400。超过就压缩规则，不压窗口，因为窗口是证据，规则是常量。
+B3 是最紧的一层：核心 700、规则 1900、窗口 2400，已经超出 4000 的目标值。这是刻意的：判定规则要写细，只能从窗口里挪预算。代价落在 B4 上，`_MAX_PROMPT_CHARS`（16000 字符）不变，`_fit_window` 最旧优先裁窗口，规则正文从 3271 字符涨到 7047 字符，等于每次少留约 3800 字符证据。要收回预算，先删 `markers-org` 的 EXAMPLES 段和 `markers-category` 的 CATEGORIES 覆盖词，不动窗口。
 
 表里没算基线卡与 `global_cards`。它们在窗口之外，实际余量只有 300 到 500 tokens，所以上表的规则预算是硬上限，不是目标值。
 
@@ -221,8 +221,8 @@ REVIEW CHECKS：
 CONTRACT：
 
 - WHAT：一条知识表达的是什么。恰好一个主类，不设双主类。
-- CATEGORIES：K 事实与认知；V 价值与评价；I 目标与意图；M 方法与行动；G 规则与规范。每类再给两个典型对象，例如 K 含定义与机制，G 含制度与合规要求。
-- EPISTEMIC：仅 K 允许，`fact|inference|hypothesis|prediction` 必填；其余类出现即错。
+- CATEGORIES：每类给覆盖范围。K 事实与认知（事实、概念、定义、原理、规律、机制、测量、可验证解释）；V 价值与评价（价值观、标准、偏好、优先级、取舍、评价）；I 目标与意图（目标、需求、计划、目的、预期、目标状态）；M 方法与行动（方法、技术、流程、策略、命令、工作流）；G 规则与规范（规则、制度、约束、权限、禁止、义务、合规要求）。category 与 org 相互独立，主类不决定 org。
+- EPISTEMIC：仅 K 允许且必填，四态各一句定义：fact 本窗口观察到；inference 由本窗口证据推出；hypothesis 提出未验证；prediction 关于未来状态。「可能发生」不得记成事实，未验证的因果也不得记成事实。
 - TOPIC：名词短语 2 至 40 字，命名这条知识讲什么；它是去重键与文件名。禁整句、疑问句、其他、杂项。
 - UNIT IDENTITY：`category + org + topic`；同身份是修订，不新增。
 - DISAMBIGUATION：10 对判定，一行一对，按顺序匹配。
@@ -239,35 +239,40 @@ CONTRACT：
 | 表达目的或预期结果 / 表达行动步骤或手段 | I / M |
 | 表达想做什么 / 表达必须遵守什么 | I / G |
 | 说明怎样完成任务 / 规定必须或禁止怎样做 | M / G |
-- SPECIAL RULES：描述规范不等于规范；计划与方法拆开；事实与推断分开。
+- 示例：10 对判定每对在规则正文里带正反各一个短例，示例只存于正文，避免两处漂移。
+- SPECIAL RULES：描述规范不等于规范。引用法规须求的是 G；讲这条规则的来源、历史、结构或成因是 K，按用途判断。计划与方法在各有独立意义时拆成两条（I 与 M）。事实、推断、假设、预测是 K 内部的不同认识状态。
 
 REVIEW CHECKS：
 
-- 是否出现双主类。
+- 是否出现双主类，或按内容里的名词而不是按论断选类。
 - K 是否缺 epistemic，非 K 是否带了 epistemic。
-- 是否把评价写成事实，或把事实写成目标。
+- 是否把评价写成事实，或把仅计划中的能力写成既有事实。
 - 计划与方法是否被塞进同一条。
-- topic 是否是句子或空泛词。
-- 引用规范时是否被归成 K。
+- `must|only|never` 句是否被归成 K，或描述句被归成 G。
+- topic 是否是句子、空泛词或超过 40 字。
+- 预测或假设是否被记成已观察到的事实。
 
 ### 4.6 `rules/markers-org.md`
 
 CONTRACT：
 
-- WHAT：这条知识围绕什么对象组织。
-- ORGS：entities 有身份的对象；trajectories 随时间变化的状态；experiences 具体发生的事件与所得；tools 可调用的能力与用法；projects 有目标与交付的持续工作。各给一句定义与一条边界反例。
-- SELECTION：先判断对象有没有身份；有身份的对对象，没有的对过程；跨时间变化对轨迹，单次发生对经历。
-- OBJECTS：其他关联对象写成 `type:name`，可多个。
-- RELATIONS：只引用同窗口内的单元；类型限定 `supersedes|caused_by|part_of|contradicts`。
-- BOUNDARIES：一个单元只有一个主 org；不同 org 不合并。
+- WHAT：这条知识围绕什么对象组织，也就是页面落在哪个目录。category 与 org 相互独立，任意主类可以落在任意 org。
+- ORGS：每条给核心问题、覆盖范围、时间属性。entities 是谁或什么（身份、属性、关系，可长期存在）；trajectories 如何随时间变化（技能、进度、决策演变、版本史，强时间序）；experiences 单次发生了什么与得到什么（一次部署、故障、诊断、复盘结论，过去且单次）；tools 有哪些可调用能力与怎么用（软件、API、CLI、模型、库，含输入输出、限制、依赖、失效场景）；projects 围绕什么目标在持续工作（目标、范围、阶段、交付物、分工、决策、约束、风险、验收、状态，有生命周期）。
+- SELECTION：按身份、时间变化、单次事件、能力、持续工作依次匹配；两者都像时取「下个会话会去搜的那个对象」，工具用法落 tools，项目决策落 projects。
+- EXAMPLES：六条 category×org 组合示例。用户→entities+K；部署项目目标与约束→projects+I+G；调用 Docker→tools+K+M；版本冲突导致部署失败→experiences+K（事件与验证后的因果）；部署从失败到恢复→trajectories+K（状态变化）；事后锁定版本→experiences 或 projects+I+M。
+- OBJECTS：其他关联对象写成 `type:name` 单数，最多五个，主 org 不重复。
+- RELATIONS：只引用同窗口内的单元；类型限定 `supersedes|caused_by|part_of|contradicts`；`caused_by` 需要正文写明原因或已验证的诊断。
+- BOUNDARIES：一个单元只有一个主 org；不同 org 不合并；org 决定归档位置，不决定内容类别。
 
 REVIEW CHECKS：
 
-- 是否把一次经历写成了轨迹。
-- 是否把工具用法写成了项目。
-- objects 是否没有 `type:` 前缀。
-- relations 是否引用了窗口外的 id。
+- 是否把一次经历写成了轨迹，或把轨迹压成一次经历。
+- 是否把工具用法写成了项目，或把项目决策写到 tools 下。
+- 是否把项目写成实体，或把项目写成一堆事件。
+- objects 是否没有 `type:` 前缀、用了复数，或重复主 org。
+- relations 是否引用了窗口外的 id，或写了正文没说的因果。
 - 是否同一内容在两个 org 下各存一份。
+- 是否按主类反推 org（「因为是 INTENT，所以 projects」）而不是按对象选。
 
 ## 5. 与两份主文档的改动
 

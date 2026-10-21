@@ -239,7 +239,7 @@ def test_the_page_pass_reads_the_marker_rules(plugin_package, monkeypatch, tmp_p
 
     system = seen["system"]
     assert "OVERRIDE MARKER ORG" in system, "the profile override must reach the page pass"
-    assert "KNOWLEDGE: facts, definitions, mechanisms, measurements." in system
+    assert "GOVERNANCE: what binds a subject." in system
     assert system.rstrip().endswith("no prose."), "the output contract closes the system prompt"
 
 

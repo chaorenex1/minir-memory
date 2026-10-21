@@ -168,7 +168,8 @@ def run(message: str, *, context: str = "", model: str = "", provider: str = "",
     """Run one agent loop on *message* and return its answer. Never leaves an agent open.
 
     ``max_iterations`` is the tool-call budget for this peer run. The default is the Feishu
-    comment agent's 15; a narrow reviewer should pass a smaller bound (adviser mode uses 3).
+    comment agent's 15; a narrow reviewer should pass a smaller bound (adviser mode uses 5: one
+    knowledge search round, up to two page reads, then the object).
 
     ``project_dir`` grants read-only access to that project root. Every peer run inherits the
     cwd's git root by default (``None``); a caller passes ``""`` only to opt out, or an explicit
