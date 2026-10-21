@@ -62,12 +62,13 @@ plugin/minir/          the deployable plugin directory (copy this to plugins/min
   transcript.py        bounded turn window + async JSON audit mirror (sessions/)
   turn_counter.py      base / dialectic layer turn counters + job windows
   worker.py            drains base and review jobs FIFO per session, publishes artifacts
-  card_review.py       three-day review: four card files, validation, revisions, scheduler
+  card_review.py       three-day review: four card files, validation, revisions, anchor policy
   knowledge.py         one page per unit, path-hint retrieval block
-  tools.py             the minir toolset: same four schemas, registered for plugin agents
+  tools.py             the minir toolset: same four schemas, registered for plugin agents; file grant
   session_summary.py   end-of-session summary agent (hand-off is its first user prompt input)
-  extraction.py        idle-timer scheduler + knowledge-page extraction agent
-  file_guard.py        pre-tool-call scope for the layer passes' file tools
+  extraction.py        idle-timer due-row runner + knowledge-page extraction agent
+  file_guard.py        pre-tool-call scope for the plugin agents' file tools
+  scheduler.py         one clock for turn and time tasks, with a per-task ledger and logs
   layers.py            output contracts, field validation, the four-section renderer
   agents/              one markdown core per model pass, filled at call time (B1-B4, dialectic,
                        both card-review halves, knowledge_render, session_summary,
@@ -136,7 +137,7 @@ both surfaces:
 | `on_session_finalize(session_id=)` | process teardown: stop counting, expire adviser-mode advice, flush tool metrics |
 | `pre_llm_call` | record the turn's user goal; inject the `adviser_only` brief and below-floor advice (one-shot aside). Advice has a single producer (the live reviewer); nothing is staged here |
 | `post_llm_call` / `post_tool_call` | per-turn logging; `post_tool_call` also aggregates tool counters and feeds the adviser-mode event ring |
-| `pre_tool_call` | `adviser_only` enforcement plus the opt-in blocker gate: refuse mutating tools before execution and hand the model the reason |
+| `pre_tool_call` | `adviser_only` enforcement, the `file_guard` scope for peer-agent file tools, plus the opt-in blocker gate: refuse mutating tools before execution and hand the model the reason |
 | `on_interim_message` | record the assistant's mid-loop intent for the adviser-mode reviewer |
 | `post_api_request` / `api_request_error` | confirm adviser-mode delivery or return staged advice to pending |
 | `pre_verify` | opt-in (`verify_continue`): a live blocker keeps one code-editing turn going |
@@ -168,7 +169,7 @@ be granted them explicitly (see "The `minir` toolset" below).
 | `minir_search` | `query` (required), `limit`, `scope`, `session_id` | Ranked FTS5 recall. Default `scope="session"`: the current session plus durable cards and notes. `scope="all"` searches every session; `session_id` targets one explicitly. `limit` defaults to `prefetch_limit` and is capped at 20. Each result carries `kind`, `when`, `source`, `session_id`, `text` (600-char excerpt) and, for a typed marker, `marker_type`. Only a typed marker exposes a forgettable `note_id`/`id`. |
 | `minir_remember` | `type` (required), `content` (required) | Records an explicit value-output marker of that type (`entities`, `trajectories`, `experiences`, `tools`, `projects`), bound to the current session and mirrored into `conclusions` so FTS finds it. Returns `{stored, note_id, type, session_id}`. |
 | `minir_forget` | `type` (required), `note_id` (required) | Deletes the marker only when its stored type matches. Returns `{deleted, note_id, type}`; a wrong type or unknown id yields `deleted: false`. Conclusions have no `note_id` and cannot be deleted. |
-| `minir_stats` | none | Store counts (including `markers` per type), layer counters, published artifacts, buffered messages, in-memory tool metrics, the session's token usage and its newest turn rows, and the database path. |
+| `minir_stats` | none | Store counts (including `markers` per type), layer counters, the scheduler ledger, published artifacts, buffered messages, in-memory tool metrics, the session's token usage and its newest turn rows, and the database path. |
 
 Explicit markers are separate from the base layer's automatic `value_markers`: the worker keeps
 merging its own five-key inventory per refresh, while a remembered marker is a session-bound,
@@ -182,16 +183,17 @@ The four tools have two delivery paths. The memory-provider surface (`get_tool_s
 them into a main agent that has the host's `memory` toolset enabled. For the plugin's own agents —
 the adviser, the layer worker, the hand-off and session-summary agents, the idle extraction — the
 same schemas are registered through the plugin context under a registry toolset named `minir`.
-That toolset also carries the `adviser` toolset (read-only `adviser_session_search`), so a plugin
-agent grants both with:
+That toolset also carries the `adviser` toolset (read-only `adviser_session_search`) and the
+host's `file` toolset, so a plugin agent grants all three with:
 
 ```python
 toolsets = ["file", "minir", "adviser"]
 ```
 
 Every in-process agent this plugin runs builds its list with `tools.agent_toolsets(...)`, which
-appends both to whatever the caller configured. The registered handlers call the live provider's
-`handle_tool_call`, so the registry path and the provider path cannot drift.
+appends the three to whatever the caller configured, `file` included and not left to the caller.
+The registered handlers call the live provider's `handle_tool_call`, so the registry path and
+the provider path cannot drift.
 
 ## Session end: idle timer, summary and knowledge extraction
 
@@ -208,8 +210,9 @@ event). Four things happen there beyond the layer drain:
    session with no markers arms nothing; the timer is for durable sessions.
 3. **A cancellable timer.** Any user turn in that session (`on_turn_start`, `sync_turn`) deletes
    the pending row. Opening the session is not input; typing in it is.
-4. **The due run.** A wall-clock daemon (`ExtractionScheduler`) claims due rows atomically, so a
-   timer armed in one process is honoured after a restart. For each due session it runs the
+4. **The due run.** The unified scheduler's `session_extraction` time task
+   (`ExtractionScheduler.tick`) claims due rows atomically, so a timer armed in one process is
+   honoured after a restart. For each due session it runs the
    **session summary agent** — the Task Handoff from `handoff.summarize_agent` is the first
    evidence block of its user message, and it writes `## Session Goal`, `## Work Done`,
    `## Decisions`, `## Durable Knowledge` and `## Open Threads` — then the **knowledge extraction
@@ -221,6 +224,23 @@ event). Four things happen there beyond the layer drain:
 on the next tick) control it. Both need `reasoning_enabled: true`; with reasoning off the provider
 stays a pure store. A failed run retries once after an hour, then is parked as `failed` in
 `session_extractions` rather than retried forever.
+
+## Scheduling: one clock for turn and time work
+
+`scheduler.py` owns every recurring decision. A task is registered as one of two kinds:
+
+- **turn**: `layers` ticks the base/dialectic counters on `on_turn_start`; the host's turn
+  number is the clock, and the task returns how many jobs it queued.
+- **time**: `card_review` (polled every 10 minutes; due every `card_review_days`) and
+  `session_extraction` (polled every 60 seconds; due when a session's idle timer expires) run on
+  one daemon thread, and each polls its own durable state before running.
+
+`Scheduler.snapshot()` records runs, failures, skips, the last outcome/detail and the duration
+of every task; `minir_stats` exposes it under `scheduler`. Every execution also emits one
+structured line (`Minir scheduler: task=… trigger=… outcome=… detail=… ms=…`), and startup logs
+the inventory (`turn=[layers] time=[card_review@600s, session_extraction@60s]`). A task that
+raises is contained and counted, so the clock keeps running. `shutdown()` stops the one clock
+before the store closes: no scheduled job can touch a closing database.
 
 ## The two layers (base / dialectic)
 
@@ -491,12 +511,16 @@ provider, toolsets, system message and `messages`; it is an audit trail, not a r
 ### Where the model call comes from
 
 Base and dialectic passes run through `agent_loop.run` on the `auxiliary.adviser` route with a
-**fixed** toolset: the host's `file` toolset plus this plugin's `adviser` toolset (which carries
-`adviser_session_search`). Operator-configured adviser toolsets are not used, and the list is never
-`None` (which the host reads as "every tool"). While a pass runs, a `pre_tool_call` guard scopes
-those file tools: reads stay under `$HERMES_HOME` minus `config.yaml`/`.env`/`credentials*`, writes
-only under `minir-memory/scratch/`. Each pass is prompted to call `adviser_session_search` with the
-session id and window from its prompt when it needs more evidence:
+**fixed** toolset built by `tools.agent_toolsets(...)`: the host's `file` toolset, this plugin's
+`minir` toolset and its `adviser` toolset (which carries `adviser_session_search`). Operator-
+configured adviser toolsets are not used, and the list is never `None`: `agent_loop.run` passes
+the list it was given, so an empty list means no tools while `None` would mean every tool.
+`agent_loop.run` marks every peer run with `file_guard.aux_scope()` and passes the project root
+(the nearest `.git` above the cwd), so a `pre_tool_call` guard scopes the file tools for every
+plugin agent: reads stay under `$HERMES_HOME` and the project root, minus secret files and
+`.git` metadata; writes only under `minir-memory/scratch/`. Each pass is prompted to call
+`adviser_session_search` with the session id and window from its prompt when it needs more
+evidence:
 
 ```yaml
 auxiliary:
@@ -586,6 +610,12 @@ for the model (with the provider's default as the fallback), `_resolve_runtime_a
 `reasoning_effort` reach the adapter. The system message goes to the *turn*
 (`run_conversation(..., system_message=...)`), so the user message stays exactly what the caller
 asked and the instructions stay instructions.
+
+Every peer agent, layer passes included, inherits read-only access to the project root: the
+nearest `.git` above the cwd, or `MINIR_PROJECT_DIR` when the process does not run inside the
+project. `auxiliary.adviser.project_dir` overrides it on the adviser routes; an unusable
+override disables project reads there rather than falling back silently. Writes stay under
+`minir-memory/scratch` for every plugin agent.
 
 A pinned `provider` that differs from the gateway route is *re-resolved as a provider*
 (`resolve_runtime_provider`), so an override is a real route and not another provider's model with

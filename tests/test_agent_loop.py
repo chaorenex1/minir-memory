@@ -9,6 +9,7 @@ which overrides reach the agent, and which values come from the host resolver.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import sys
 import threading
 import types
@@ -161,7 +162,7 @@ def test_the_agent_is_built_like_the_feishu_comment_agent(loop, host):
     assert agent.kwargs["skip_background_review"] is True
     assert agent.kwargs["load_soul_identity"] is True
     assert agent.kwargs["max_iterations"] == loop.MAX_ITERATIONS
-    assert agent.kwargs["enabled_toolsets"] is None
+    assert agent.kwargs["enabled_toolsets"] == [], "no toolset means no tools, never every tool"
     assert agent.closed is True
 
 
@@ -248,6 +249,24 @@ def test_toolsets_are_forwarded(loop, host):
     assert agent.kwargs["enabled_toolsets"] == ["file", "web"]
     assert result.toolsets == ("file", "web")
     assert result.as_dict()["toolsets"] == ["file", "web"]
+
+
+def test_every_peer_run_is_scoped_for_the_file_guard(loop, host, monkeypatch):
+    entered: list[str] = []
+
+    @contextlib.contextmanager
+    def scope(project_dir=""):
+        entered.append(str(project_dir))
+        yield
+
+    monkeypatch.setattr(loop.file_guard, "aux_scope", scope)
+    monkeypatch.setattr(loop.file_guard, "project_root", lambda: "/tmp/default-project")
+    loop.run("q")
+    loop.run("q", project_dir="/tmp/project")
+    loop.run("q", project_dir="")
+
+    assert entered == ["/tmp/default-project", "/tmp/project", ""], \
+        "every peer run must inherit the project root unless it opts out"
 
 
 # -- the transcript the audit trail needs --------------------------------------

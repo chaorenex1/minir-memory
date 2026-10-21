@@ -107,3 +107,21 @@ def test_the_card_scheduler_anchors_at_install(make_provider, monkeypatch):
     state = provider._store.layer_state("card_review", "user:default")
     assert state is not None and json.loads(state["content"])["attempts"] == 0
     provider.shutdown()
+
+
+def test_the_unified_scheduler_owns_every_recurring_task(make_provider, monkeypatch):
+    monkeypatch.setenv("MINIR_REASONING_ENABLED", "true")
+    provider = make_provider({})
+
+    tasks = provider._scheduler.snapshot()
+    assert {"layers", "card_review", "session_extraction"} <= set(tasks)
+    assert tasks["layers"]["kind"] == "turn"
+    assert tasks["card_review"]["kind"] == "time"
+    assert tasks["session_extraction"]["kind"] == "time"
+    assert provider._scheduler.start() is False, "the initialise path already started the clock"
+
+    provider.on_turn_start(1, "a real turn")
+    assert provider._scheduler.snapshot()["layers"]["runs"] >= 1
+
+    payload = json.loads(provider.handle_tool_call("minir_stats", {}))
+    assert set(payload["scheduler"]) == set(tasks)

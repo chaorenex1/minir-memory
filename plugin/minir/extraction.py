@@ -1,4 +1,4 @@
-"""Idle-session knowledge extraction and the wall-clock scheduler that starts it.
+"""Idle-session knowledge extraction and the due-row runner the unified clock polls.
 
 A session that ends is not necessarily finished: the operator can resume it. This module waits
 ``knowledge_idle_hours`` (24 by default) after the session's last activity and only then treats
@@ -13,9 +13,10 @@ When the timer fires, the provider's callback runs two agents in order:
    the agent returns knowledge pages with a body each. The caller writes them through
    :func:`minir.knowledge.write_unit`, so the page budget and atomic-write rules still apply.
 
-The scheduler is a daemon thread, not a turn counter: it must fire with no live session. Rows
-live in SQLite, so a timer set in one process is still honoured after a restart; a claim marks a
-row ``running`` and a failed run is retried once after an hour before it is parked as ``failed``.
+The unified scheduler polls it on a wall-clock cadence, not a turn counter: it must fire with
+no live session. Rows live in SQLite, so a timer set in one process is still honoured after a
+restart; a claim marks a row ``running`` and a failed run is retried once after an hour before
+it is parked as ``failed``.
 """
 
 from __future__ import annotations
@@ -23,7 +24,6 @@ from __future__ import annotations
 import json
 import logging
 import re
-import threading
 import time
 from typing import Any, Callable, Optional
 
@@ -194,39 +194,11 @@ def extract_pages(*, session_id: str, summary: str, handoff: str, markers: Any =
 
 
 class ExtractionScheduler:
-    """One daemon thread that starts the sessions whose idle timer has fired."""
+    """Claims and runs the sessions whose idle timer has fired (polled by the unified clock)."""
 
-    def __init__(self, store: Any, callback: Callable[[dict[str, Any]], Any], *,
-                 tick: float = TICK_SECONDS):
+    def __init__(self, store: Any, callback: Callable[[dict[str, Any]], Any]):
         self._store = store
         self._callback = callback
-        self._tick = max(1.0, float(tick))
-        self._stop = threading.Event()
-        self._lock = threading.Lock()
-        self._started = False
-        self._thread = threading.Thread(target=self._run, name="minir-extraction", daemon=True)
-
-    def start(self) -> "ExtractionScheduler":
-        with self._lock:
-            if self._started or self._stop.is_set():
-                return self
-            self._started = True
-        self._thread.start()
-        return self
-
-    def stop(self, timeout: float = 5.0) -> None:
-        self._stop.set()
-        if self._started and self._thread.is_alive() \
-                and threading.current_thread() is not self._thread:
-            self._thread.join(timeout)
-
-    def _run(self) -> None:
-        while not self._stop.is_set():
-            try:
-                self.tick()
-            except Exception:  # one bad row must not stop the clock
-                logger.warning("Minir extraction tick failed", exc_info=True)
-            self._stop.wait(self._tick)
 
     def tick(self, *, now: Optional[float] = None) -> int:
         """Claim and run every due row (bounded); returns how many completed."""

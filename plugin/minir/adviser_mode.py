@@ -925,6 +925,7 @@ class AdviserMode:
             result = agent_loop.run(
                 prompt, model=model, provider=provider, toolsets=toolsets,
                 system_message=_review_brief(cfg), max_iterations=3,
+                project_dir=adviser.project_dir(route),
             )
             api_calls = int(result.api_calls)
             if _json_object(result.answer) is None:
@@ -935,6 +936,7 @@ class AdviserMode:
                 retry = agent_loop.run(
                     _repair_prompt(prompt), model=model, provider=provider,
                     toolsets=toolsets, system_message=_review_brief(cfg), max_iterations=1,
+                    project_dir=adviser.project_dir(route),
                 )
                 api_calls += int(retry.api_calls)
                 if _json_object(retry.answer) is None:
@@ -1022,6 +1024,7 @@ class AdviserMode:
             toolsets=tools.agent_toolsets(
                 toolsets if toolsets is not None else route.get("toolsets")),
             system_message=consult_prompt(),
+            project_dir=adviser.project_dir(route),
         )
         return result.as_dict()
 
@@ -1041,6 +1044,7 @@ class AdviserMode:
             toolsets=tools.agent_toolsets(
                 toolsets if toolsets is not None else route.get("toolsets")),
             system_message=consult_prompt(),
+            project_dir=adviser.project_dir(route),
         )
         return result.as_dict()
 

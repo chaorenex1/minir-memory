@@ -13,6 +13,10 @@ what :func:`register` puts in the registry. The handlers delegate to the live pr
 ``handle_tool_call`` so there is one implementation of every tool and no drift between the two
 surfaces.
 
+:func:`agent_toolsets` also grants the host's ``file`` toolset. Those four tools are not
+re-registered here: the plugin runs the host's handlers and ``file_guard`` scopes their paths
+for the duration of a peer-agent run.
+
 Registering a tool through the plugin context requires it to be listed under
 ``provides_tools`` in ``plugin.yaml``; the host validator rejects an undeclared registration.
 """
@@ -31,6 +35,10 @@ logger = logging.getLogger(__name__)
 
 TOOLSET = "minir"
 ADVISER_TOOLSET = "adviser"
+#: The host's four file tools (``read_file``, ``write_file``, ``patch``, ``search_files``).
+#: This plugin does not re-register them: it grants the host toolset to every in-process
+#: agent it runs, and ``file_guard`` scopes the calls while that agent runs.
+FILE_TOOLSET = "file"
 TOOL_NAMES: tuple[str, ...] = (
     "minir_search", "minir_remember", "minir_forget", "minir_stats")
 
@@ -86,23 +94,26 @@ _TOOL_FORGET = _tool_schema(
 _TOOL_STATS = _tool_schema(
     "minir_stats",
     "Report Minir store statistics — note/marker/session/job counts, the base + dialectic layer "
-    "counters for this session, the published layer artifacts (subject + version), the final "
-    "token usage of this session's turns, and the database path.")
+    "counters for this session, the unified scheduler ledger (every turn/time task: runs, "
+    "failures, skips, last outcome/detail), the published layer artifacts (subject + version), "
+    "the final token usage of this session's turns, and the database path.")
 
 SCHEMAS: tuple[dict[str, Any], ...] = (_TOOL_SEARCH, _TOOL_REMEMBER, _TOOL_FORGET, _TOOL_STATS)
 
 
 def agent_toolsets(base: Any = None) -> list[str]:
-    """*base* plus this plugin's toolsets, order kept, duplicates dropped.
+    """*base* plus this plugin's fixed toolsets, order kept, duplicates dropped.
 
-    Every in-process agent this plugin runs gets both surfaces: ``minir`` for the store tools and
-    ``adviser`` for the read-only session search (and the adviser entry point). ``None`` becomes
-    just the two, never ``None`` — the host reads ``None`` as "every tool".
+    Every in-process agent this plugin runs gets all three surfaces: the host's ``file``
+    toolset, ``minir`` for the store tools and ``adviser`` for the read-only session search
+    (and the adviser entry point). ``file`` is granted here, not left to the caller, so a
+    route that configures no toolsets still gets the file surface ``file_guard`` scopes;
+    ``None`` becomes the three, never ``None`` — the host reads ``None`` as "every tool".
     """
     if isinstance(base, str):
         base = [base]
     toolsets = [str(tool) for tool in (base or []) if str(tool).strip()]
-    for name in (TOOLSET, ADVISER_TOOLSET):
+    for name in (FILE_TOOLSET, TOOLSET, ADVISER_TOOLSET):
         if name not in toolsets:
             toolsets.append(name)
     return toolsets

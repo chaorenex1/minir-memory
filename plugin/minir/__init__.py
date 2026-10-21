@@ -20,6 +20,8 @@ Fork this as a starting point:
   ``on_turn_start`` ticks into queued jobs (a session + the time window to reason
   over); ``worker.py`` drains those jobs into merged per-layer artifacts that
   ``prefetch()`` injects. Delete the worker and the two layers become pure bookkeeping.
+* ``scheduler.py`` owns every recurring decision: the turn-count task above and the two
+  wall-clock tasks (card review, idle extraction), with one ledger and one log line per run.
 * Delete optional methods you do not need instead of leaving empty overrides;
   the ABC already provides no-op defaults.
 
@@ -58,6 +60,7 @@ from . import file_guard
 from . import handoff
 from . import history as host_history
 from . import knowledge
+from . import scheduler
 from . import session_summary
 from . import tools as plugin_tools
 from .adviser_mode import AdviserMode
@@ -115,7 +118,6 @@ _PREFETCH_KINDS = frozenset({"note"})
 #: inside the window; typing again cancels the pending extraction.
 _DEFAULT_KNOWLEDGE_IDLE_HOURS = 24.0
 _DEFAULT_SESSION_EXTRACTION = True
-_EXTRACTION_TICK_SECONDS = 60.0
 
 _ACTIVE_PROVIDER: Optional["MinirMemoryProvider"] = None
 """The provider instance ``initialize`` actually opened.
@@ -287,6 +289,9 @@ class MinirMemoryProvider(MemoryProvider):
         # Per-turn side channel: event ring + reviewer worker + llm_request delivery. Constructed
         # before initialize (the host may register hooks first); every path guards on the store.
         self._adviser_mode = AdviserMode(self)
+        # One clock for every recurring decision: turn tasks tick on the host's turn thread,
+        # time tasks (card review, idle extraction) run on this single daemon.
+        self._scheduler = scheduler.Scheduler()
 
     # -- contract -------------------------------------------------------------
 
@@ -337,14 +342,22 @@ class MinirMemoryProvider(MemoryProvider):
         self._card_scheduler = card_review.CardReviewScheduler(
             self._store, self._run_card_review, subject=self._worker.user_subject(),
             period=float(self._card_review_days) * 24 * 3600)
-        if self._reasoning:
-            self._card_scheduler.start()
         # The idle timer must survive a process: rows are in SQLite, so a session that ended in
         # a previous process is picked up on the first tick here.
         self._extraction_scheduler = extraction.ExtractionScheduler(
-            self._store, self._run_session_extraction, tick=_EXTRACTION_TICK_SECONDS)
+            self._store, self._run_session_extraction)
+        # Everything recurring is registered on one scheduler. A disabled task is simply not
+        # registered; the scheduler inventories what it owns when it starts.
+        self._scheduler.add_turn("layers", self._run_turn_layers)
+        if self._reasoning:
+            self._card_scheduler.ensure_anchor()
+            self._scheduler.add_time("card_review", card_review.TICK_SECONDS,
+                                     self._card_scheduler.tick,
+                                     due=self._card_scheduler.due)
         if self._reasoning and self._session_extraction:
-            self._extraction_scheduler.start()
+            self._scheduler.add_time("session_extraction", extraction.TICK_SECONDS,
+                                     self._extraction_scheduler.tick, first_delay=0.0)
+        self._scheduler.start()
         # Configure before opening the session: intervals/mode apply to sessions opened later
         # (an already-running session keeps the cadence it started with).
         TRACKER.configure(base_interval=self._base_interval,
@@ -731,7 +744,7 @@ class MinirMemoryProvider(MemoryProvider):
             self._cancel_session_extraction(self._session_id)
             if self._store.compression_gate_active(self._session_id):
                 return  # compression owns this window; periodic dispatch resumes afterwards
-            self._dispatch(TRACKER.tick(self._session_id, turn_number))
+            self._scheduler.on_turn(self._session_id, turn_number)
         except Exception as exc:  # counting must never break a turn
             logger.warning("Minir on_turn_start failed: %s", exc)
 
@@ -1091,6 +1104,12 @@ class MinirMemoryProvider(MemoryProvider):
                                    turns=int((counted.get(layer) or {}).get("turns", 0))))
         return pending
 
+    def _run_turn_layers(self, session_id: str, turn_number: Any) -> str:
+        """The one turn task: advance both counters and persist the windows that came due."""
+        triggers = TRACKER.tick(session_id, turn_number)
+        self._dispatch(triggers)
+        return f"queued={len(triggers)}"
+
     def _dispatch(self, triggers: list[Trigger]) -> None:
         """Persist each due job (session + window) for the layer worker to pick up.
 
@@ -1184,10 +1203,7 @@ class MinirMemoryProvider(MemoryProvider):
         self._schedule_session_extraction(self._session_id)
         self._adviser_mode.session_end(self._session_id)
         self._adviser_mode.stop()  # no review may touch the store after this point
-        if self._card_scheduler is not None:
-            self._card_scheduler.stop()  # it writes files and rows: join before store.close()
-        if self._extraction_scheduler is not None:
-            self._extraction_scheduler.stop()  # no new extraction may start under close()
+        self._scheduler.stop()     # no scheduled job may touch the store after this point
         if self._knowledge is not None:
             self._knowledge.stop()      # drain queued units while the filesystem still exists
         self._transcript.close()        # last writer join: no JSON may be half-written
@@ -1283,6 +1299,7 @@ class MinirMemoryProvider(MemoryProvider):
             return json.dumps({**self._store.stats(), "session_id": self._session_id,
                                "profile": self._profile,
                                "layers": TRACKER.snapshot(self._session_id),
+                               "scheduler": self._scheduler.snapshot(),
                                "adviser_mode": self._store.adviser_mode_stats(self._session_id),
                                "artifacts": self._store.all_layer_states(),
                                "buffered_messages": len(self._transcript.messages(self._session_id)),

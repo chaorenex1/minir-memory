@@ -83,3 +83,94 @@ def test_the_provider_hook_blocks_only_inside_the_scope(plugin_package, make_pro
     allowed = hook(tool_name="read_file", provider=provider,
                    args={"path": os.path.join(provider._hermes_home, "state.db")})
     assert allowed is None
+
+
+def test_a_v4a_patch_is_scoped_by_its_header_paths(guard, tmp_path):
+    home = str(tmp_path)
+    scratch = tmp_path / "minir-memory" / "scratch" / "draft.md"
+    allowed = ("*** Begin Patch\n"
+               f"*** Update File: {scratch}\n"
+               "@@\n-old\n+new\n"
+               "*** End Patch")
+    assert guard.check("patch", {"mode": "patch", "patch": allowed}, home) is None
+
+    for path in (tmp_path / "minir-memory" / "agents" / "default" / "identity.md",
+                 tmp_path / "minir-memory" / "user" / "identity.md",
+                 tmp_path / "elsewhere.md"):
+        blocked = ("*** Begin Patch\n"
+                   f"*** Update File: {path}\n"
+                   "@@\n-old\n+new\n"
+                   "*** End Patch")
+        assert guard.check("patch", {"mode": "patch", "patch": blocked}, home) is not None
+
+
+def test_a_v4a_move_checks_both_endpoints(guard, tmp_path):
+    home = str(tmp_path)
+    source = tmp_path / "minir-memory" / "scratch" / "a.md"
+    target = tmp_path / "minir-memory" / "knowledge" / "a.md"
+    patch = ("*** Begin Patch\n"
+             f"*** Move File: {source} -> {target}\n"
+             "*** End Patch")
+    assert "only minir-memory/scratch" in guard.check(
+        "patch", {"mode": "patch", "patch": patch}, home)
+
+
+def test_search_files_without_a_path_is_judged_against_the_cwd(guard, tmp_path, monkeypatch):
+    home = str(tmp_path)
+    assert "HERMES_HOME" in guard.check("search_files", {"pattern": "x"}, home)
+    monkeypatch.chdir(tmp_path)
+    assert guard.check("search_files", {"pattern": "x"}, home) is None
+
+
+def test_the_adviser_project_root_is_readable_but_still_not_writable(guard, tmp_path):
+    home = str(tmp_path / "home")
+    project = tmp_path / "project"
+    (project / ".git").mkdir(parents=True)
+    source = project / "src" / "app.py"
+    source.parent.mkdir()
+    source.write_text("print('hi')\n", encoding="utf-8")
+    secret = project / ".env.local"
+    secret.write_text("TOKEN=1\n", encoding="utf-8")
+    config = project / "config.yaml"
+    config.write_text("debug: true\n", encoding="utf-8")
+
+    assert guard.check("read_file", {"path": str(source)}, home) is not None
+    with guard.aux_scope(str(project)):
+        assert guard.check("read_file", {"path": str(source)}, home) is None
+        assert "scratch" in guard.check("write_file", {"path": str(source), "content": "x"}, home)
+        assert "repository metadata" in guard.check(
+            "read_file", {"path": str(project / ".git" / "config")}, home)
+        assert "not readable" in guard.check("read_file", {"path": str(secret)}, home)
+        assert guard.check("read_file", {"path": str(config)}, home) is None
+        assert guard.check("read_file", {"path": str(tmp_path / "outside.txt")}, home) is not None
+
+
+def test_project_root_is_the_nearest_git_root(guard, tmp_path):
+    project = tmp_path / "project"
+    nested = project / "src" / "pkg"
+    (project / ".git").mkdir(parents=True)
+    nested.mkdir(parents=True)
+
+    assert guard.project_root(str(nested)).name == "project"
+    plain = guard.project_root(str(tmp_path / "plain"))
+    assert plain is None or plain.name == "plain"
+
+
+def test_minir_project_dir_overrides_the_cwd_for_every_agent(guard, tmp_path, monkeypatch):
+    project = tmp_path / "project"
+    (project / ".git").mkdir(parents=True)
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("MINIR_PROJECT_DIR", str(project))
+    assert guard.project_root().name == "project"
+
+
+def test_a_nested_scope_keeps_the_outer_project_root(guard, tmp_path):
+    home = str(tmp_path / "home")
+    project = tmp_path / "project"
+    (project / ".git").mkdir(parents=True)
+    source = project / "main.py"
+    source.write_text("x\n", encoding="utf-8")
+
+    with guard.aux_scope(str(project)):
+        with guard.aux_scope():
+            assert guard.check("read_file", {"path": str(source)}, home) is None

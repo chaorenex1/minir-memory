@@ -30,9 +30,9 @@ from __future__ import annotations
 
 import json
 import logging
-from typing import Any
+from typing import Any, Optional
 
-from . import agent_loop, session_search, tools
+from . import agent_loop, file_guard, session_search, tools
 from .adviser_prompts import consult_prompt
 
 logger = logging.getLogger(__name__)
@@ -55,8 +55,9 @@ SCHEMA = {
     "name": TOOL_NAME,
     "description": (
         "Ask an independent adviser (separate agent loop on the auxiliary.adviser model route) "
-        "for a second opinion on a decision, design, or diagnosis. Returns the adviser's answer "
-        "plus how many model calls it took."
+        "for a second opinion on a decision, design, or diagnosis. It can read files under the "
+        "project root and your memory store. Returns the adviser's answer plus how many model "
+        "calls it took."
     ),
     "parameters": {
         "type": "object",
@@ -94,27 +95,49 @@ def _route(cfg: dict[str, Any]) -> dict[str, Any]:
             "api_mode": str(cfg.get("api_mode") or ""), "toolsets": cfg.get("toolsets")}
 
 
+def project_dir(cfg: dict[str, Any] | None = None) -> Optional[str]:
+    """Read root an adviser run may use outside HERMES_HOME.
+
+    ``None`` means "use the default": every peer run already inherits the cwd's git root.
+    ``auxiliary.adviser.project_dir`` overrides it; an unusable path returns ``""`` so the run
+    gets no project read instead of silently falling back to another directory.
+    """
+    cfg = load_config() if cfg is None else cfg
+    explicit = str(cfg.get("project_dir") or "").strip()
+    if not explicit:
+        return None
+    root = file_guard.project_root(explicit)
+    if root is None:
+        logger.warning("adviser: project_dir is not a usable directory: %s", explicit)
+        return ""
+    return str(root)
+
+
 def run(question: str, context: str = "", toolsets: Any = None) -> dict[str, Any]:
     """Synchronous consult — one in-process agent loop, returned as a plain dict."""
-    route = _route(load_config())
+    cfg = load_config()
+    route = _route(cfg)
     return agent_loop.run(
         question, context=context, model=route["model"], provider=route["provider"],
         api_mode=route["api_mode"],
         toolsets=tools.agent_toolsets(
             toolsets if toolsets is not None else route["toolsets"]),
         system_message=_ADVISER_BRIEF,
+        project_dir=project_dir(cfg),
     ).as_dict()
 
 
 async def run_async(question: str, context: str = "", toolsets: Any = None) -> dict[str, Any]:
     """Same consult, awaited off the event loop."""
-    route = _route(load_config())
+    cfg = load_config()
+    route = _route(cfg)
     result = await agent_loop.run_async(
         question, context=context, model=route["model"], provider=route["provider"],
         api_mode=route["api_mode"],
         toolsets=tools.agent_toolsets(
             toolsets if toolsets is not None else route["toolsets"]),
         system_message=_ADVISER_BRIEF,
+        project_dir=project_dir(cfg),
     )
     return result.as_dict()
 
@@ -196,7 +219,8 @@ def register(ctx, provider: Any = None) -> None:
         handler=_consult_handler,
         is_async=True,
         description=("Ask the main adviser — the same adviser that reviews your turns — for a "
-                     "second opinion on a decision, design, or diagnosis."),
+                     "second opinion on a decision, design, or diagnosis; it can read files "
+                     "under the project root."),
         emoji="🧭",
     )
     # Read-only, stdlib-only store access. The handler is synchronous on purpose: one bounded

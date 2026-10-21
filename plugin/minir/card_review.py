@@ -15,9 +15,10 @@ Two rules shape the module:
   field or exceeds its token budget fails the whole review; the previous four files stay exactly
   as they were.
 
-The scheduler is a wall-clock thread, not a turn counter: a review is due every three days
-(even with no live session), the anchor advances only on success, and a failure retries after
-30 minutes, 2 hours and 6 hours before waiting for the next period.
+The cadence is wall-clock, not a turn counter: a review is due every three days (even with
+no live session), the anchor advances only on success, and a failure retries after 30 minutes,
+2 hours and 6 hours before waiting for the next period. This module owns only the anchor and
+the retry policy; the plugin's unified :mod:`minir.scheduler` polls ``due()``/``tick()``.
 """
 
 from __future__ import annotations
@@ -27,7 +28,6 @@ import json
 import logging
 import os
 import re
-import threading
 import time
 from pathlib import Path
 from typing import Any, Callable, Optional
@@ -423,19 +423,16 @@ def _json_object(text: str) -> dict[str, Any]:
 # -- scheduling ----------------------------------------------------------------
 
 class CardReviewScheduler:
-    """Wall-clock scheduler: due every period, retry on failure, anchor on success."""
+    """Review anchor: due every period, retry on failure, advance only on success."""
 
     def __init__(self, store: Any, run: Callable[[float], list[int]], *,
                  subject: str, period: float = PERIOD_SECONDS,
-                 retries: tuple[int, ...] = RETRY_SECONDS, tick: float = TICK_SECONDS):
+                 retries: tuple[int, ...] = RETRY_SECONDS):
         self._store = store
         self._run = run
         self._subject = subject
         self._period = max(1.0, float(period))
         self._retries = retries
-        self._tick = max(1.0, float(tick))
-        self._stop = threading.Event()
-        self._thread: Optional[threading.Thread] = None
 
     def _state(self) -> dict[str, Any]:
         row = self._store.layer_state("card_review", self._subject)
@@ -487,24 +484,3 @@ class CardReviewScheduler:
         self._save({"last_success_at": now, "attempts": 0,
                     "next_attempt_at": now + self._period})
         return True
-
-    def start(self) -> None:
-        if self._thread is not None and self._thread.is_alive():
-            return
-        self.ensure_anchor()
-        self._stop.clear()
-        self._thread = threading.Thread(target=self._loop, name="minir-card-review", daemon=True)
-        self._thread.start()
-
-    def _loop(self) -> None:
-        while not self._stop.wait(self._tick):
-            try:
-                self.tick()
-            except Exception as exc:  # the scheduler must never die
-                logger.debug("Minir card review tick failed: %s", exc)
-
-    def stop(self, timeout: float = 5.0) -> None:
-        self._stop.set()
-        thread, self._thread = self._thread, None
-        if thread is not None and thread.is_alive():
-            thread.join(timeout=timeout)

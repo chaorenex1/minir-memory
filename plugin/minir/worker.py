@@ -63,7 +63,6 @@ from pathlib import Path
 from typing import Any, Callable, Optional, Sequence
 
 from . import card_review
-from . import file_guard
 from . import history as host_history
 from . import layers
 from . import rules as layer_rules
@@ -705,16 +704,15 @@ class LayerWorker:
             from . import adviser, agent_loop, session_search, tools
 
             cfg = adviser.load_config()
-            # Fixed surface: the host's file tools (scoped by ``file_guard``) plus this
-            # plugin's session search and its own toolset. Never the operator's adviser
-            # toolsets and never None, which the host reads as "every tool".
-            toolsets = tools.agent_toolsets(["file", session_search.TOOLSET])
-            with file_guard.aux_scope():
-                result = agent_loop.run(
-                    prompt, model=str(cfg.get("model") or ""),
-                    provider=str(cfg.get("provider") or ""),
-                    api_mode=str(cfg.get("api_mode") or ""), toolsets=toolsets,
-                    system_message=f"{system}\n\n{tool_hint}")
+            # Fixed surface: the host's file tools (granted by ``agent_toolsets``, scoped by
+            # ``agent_loop``) plus this plugin's session search and its own toolset. Never the
+            # operator's adviser toolsets and never None, which the host reads as "every tool".
+            toolsets = tools.agent_toolsets([session_search.TOOLSET])
+            result = agent_loop.run(
+                prompt, model=str(cfg.get("model") or ""),
+                provider=str(cfg.get("provider") or ""),
+                api_mode=str(cfg.get("api_mode") or ""), toolsets=toolsets,
+                system_message=f"{system}\n\n{tool_hint}")
             self._record_aux(task_key, system, result, cfg, toolsets)
             return str(result.answer or "")
         except Exception as exc:

@@ -122,10 +122,13 @@ def test_run_frames_the_message_and_forwards_the_route(adviser, host):
 
     assert data == RUN
     (call,) = host["sync_calls"]
-    assert call == {"message": "Ship it?", "context": "tests pass", "model": "some/other",
-                    "provider": "openrouter", "api_mode": "",
-                    "toolsets": ["file", "minir", "adviser"],
-                    "system_message": adviser._ADVISER_BRIEF}
+    expected = {"message": "Ship it?", "context": "tests pass", "model": "some/other",
+                "provider": "openrouter", "api_mode": "",
+                "toolsets": ["file", "minir", "adviser"],
+                "system_message": adviser._ADVISER_BRIEF}
+    # The consult may read the project root (the repo containing the cwd) and nothing else.
+    assert call.pop("project_dir") == adviser.project_dir()
+    assert call == expected
 
 
 def test_tool_toolsets_beat_the_configured_ones(adviser, host):

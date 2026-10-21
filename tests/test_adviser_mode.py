@@ -61,6 +61,7 @@ def test_cadence_enqueues_a_review(plugin_package, make_provider, monkeypatch):
         args={"path": "b.py"}, result="contents")
     assert provider._adviser_mode.wait_idle(2.0)
     assert len(calls) == 1
+    assert calls[0]["project_dir"] == plugin_package.adviser.project_dir()
     pending = provider._store.pending_advisories("session-test", source="adviser_mode")
     assert [row["content"] for row in pending] == ["check stderr before retrying"]
 
@@ -317,6 +318,7 @@ def test_consult_uses_the_main_adviser_and_leaves_advice_alone(
     assert data["answer"] == "advice"
     call = calls[0]
     assert call["system_message"] == plugin_package.adviser_prompts.consult_prompt()
+    assert call["project_dir"] == plugin_package.adviser.project_dir()
     assert "candidate_advices" not in call["context"]
     assert len(provider._store.pending_advisories(
         "session-test", source="adviser_mode")) == 1, "consult must not consume advice"

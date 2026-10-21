@@ -12,7 +12,9 @@ builds an agent (``plugins/platforms/feishu/feishu_comment.py::_resolve_model_an
 * reasoning      — ``resolve_reasoning_config(config, model)`` for the *final* model, the one
                    chokepoint that makes ``reasoning_effort`` reach the adapter;
 * the agent knobs — ``max_iterations``, quiet mode, no context files, no memory, no background
-                   review fork, and the operator's soul identity loaded.
+                   review fork, and the operator's soul identity loaded;
+* the file scope: every run is marked with ``file_guard.aux_scope()``, so the host's file tools
+                   read only under ``$HERMES_HOME`` and write only under ``minir-memory/scratch``.
 
 A pinned ``provider`` re-resolves credentials for that provider instead of borrowing the main
 route's key, so an override is a *route*, not just a string on the request.
@@ -43,6 +45,8 @@ import logging
 from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any, Optional, Sequence
+
+from . import file_guard
 
 logger = logging.getLogger(__name__)
 
@@ -155,11 +159,16 @@ def _prompt(message: str, context: str = "") -> str:
 
 def run(message: str, *, context: str = "", model: str = "", provider: str = "",
         api_mode: str = "", toolsets: Optional[Sequence[str]] = None,
-        system_message: str = "", max_iterations: int = MAX_ITERATIONS) -> AgentRun:
+        system_message: str = "", max_iterations: int = MAX_ITERATIONS,
+        project_dir: Optional[str] = None) -> AgentRun:
     """Run one agent loop on *message* and return its answer. Never leaves an agent open.
 
     ``max_iterations`` is the tool-call budget for this peer run. The default is the Feishu
     comment agent's 15; a narrow reviewer should pass a smaller bound (adviser mode uses 3).
+
+    ``project_dir`` grants read-only access to that project root. Every peer run inherits the
+    cwd's git root by default (``None``); a caller passes ``""`` only to opt out, or an explicit
+    path to override. Writes stay under ``minir-memory/scratch`` in every case.
     """
     from run_agent import AIAgent  # first: it replaces sys.path (managed environment bootstrap)
 
@@ -171,7 +180,10 @@ def run(message: str, *, context: str = "", model: str = "", provider: str = "",
     agent = AIAgent(
         model=final_model,
         **_agent_kwargs(final_provider, final_model, runtime, api_mode),
-        enabled_toolsets=tools or None,
+        # The plugin's fixed toolsets are never empty (``agent_toolsets`` always adds the host
+        # ``file`` toolset plus ``minir``/``adviser``). An explicit empty list therefore means
+        # "no tools", not the host's ``None`` = every tool: the two are different requests.
+        enabled_toolsets=tools,
         max_iterations=max(1, int(max_iterations or MAX_ITERATIONS)),
         # A peer run brings its own instructions and evidence: no project context files, no host
         # memory, no background review fork. ``load_soul_identity`` stays on so the run speaks in
@@ -183,8 +195,14 @@ def run(message: str, *, context: str = "", model: str = "", provider: str = "",
         load_soul_identity=True,
     )
     try:
-        result = agent.run_conversation(_prompt(message, context),
-                                        system_message=str(system_message or "").strip() or None)
+        # A plugin agent's file tools are the host's own four, scoped by ``file_guard``: reads
+        # stay under HERMES_HOME plus an explicitly granted project root, writes under
+        # minir-memory/scratch. The ContextVar is set here so every path that runs a peer agent
+        # gets the guard, not only the layer worker.
+        system = str(system_message or "").strip() or None
+        root = project_dir if project_dir is not None else str(file_guard.project_root() or "")
+        with file_guard.aux_scope(root):
+            result = agent.run_conversation(_prompt(message, context), system_message=system)
         return AgentRun(
             answer=(result.get("final_response") or "").strip(),
             api_calls=result.get("api_calls", 0),
@@ -202,10 +220,10 @@ def run(message: str, *, context: str = "", model: str = "", provider: str = "",
 
 async def run_async(message: str, *, context: str = "", model: str = "", provider: str = "",
                     api_mode: str = "", toolsets: Optional[Sequence[str]] = None,
-                    system_message: str = "",
-                    max_iterations: int = MAX_ITERATIONS) -> AgentRun:
+                    system_message: str = "", max_iterations: int = MAX_ITERATIONS,
+                    project_dir: Optional[str] = None) -> AgentRun:
     """Await :func:`run` off the event loop (see the module docstring for why a thread)."""
     return await asyncio.to_thread(run, message, context=context, model=model,
                                    provider=provider, api_mode=api_mode, toolsets=toolsets,
                                    system_message=system_message,
-                                   max_iterations=max_iterations)
+                                   max_iterations=max_iterations, project_dir=project_dir)
