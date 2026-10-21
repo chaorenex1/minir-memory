@@ -41,8 +41,8 @@ DIALECTIC_LAYER = "dialectic"
 # collapse two distinct jobs into one. A microsecond keeps the edge strictly increasing.
 WINDOW_EPSILON = 1e-6
 
-DEFAULT_BASE_INTERVAL = 20
-DEFAULT_DIALECTIC_INTERVAL = 10
+DEFAULT_BASE_INTERVAL = 24
+DEFAULT_DIALECTIC_INTERVAL = 8
 DEFAULT_SESSION_MODE = "default"
 
 _MAX_SESSIONS = 64  # long-lived processes (gateway) must not accumulate session state forever
@@ -206,31 +206,47 @@ class TurnTracker:
                     if counter.due()]
 
     def tail(self, session_id: str, *, now: Optional[float] = None, close: bool = False) -> list[Trigger]:
-        """Flush the dialectic layer's un-reasoned tail, e.g. at a session boundary.
+        """Flush every layer's un-reasoned tail, e.g. at a session boundary.
 
         A no-op when the counter already sits on a dispatched watermark (the periodic tick
         covered those turns), which is what keeps a boundary that fires several hooks — a
         ``/new`` runs ``on_session_finalize``, ``on_session_end`` and ``on_session_reset`` —
         from queuing the same window more than once. ``close`` freezes the session first.
 
-        A stopped session still flushes: the host fires its boundary hooks in an order that
-        freezes the session *before* the queued tail arrives (CLI ``/new`` sends
-        ``on_session_finalize`` synchronously and only then queues ``on_session_end`` on the
-        memory worker), and the watermark — not the stop — is what makes this exactly-once.
-        Only ``tick`` treats a stop as final.
+        Both layers flush, base first: their watermarks are independent, so either can own
+        turns the other has already covered. A stopped session still flushes: the host fires
+        its boundary hooks in an order that freezes the session *before* the queued tail
+        arrives (CLI ``/new`` sends ``on_session_finalize`` synchronously and only then queues
+        ``on_session_end`` on the memory worker), and the watermark — not the stop — is what
+        makes this exactly-once. Only ``tick`` treats a stop as final.
         """
         with self._lock:
             state = self._sessions.get(session_id)
             if state is None:
                 return []
             stamp = time.time() if now is None else now
-            counter = state.layers[DIALECTIC_LAYER]
-            triggers = [self._fire(state, counter, stamp)] if counter.turns > counter.last_trigger_turn else []
+            triggers = [self._fire(state, state.layers[name], stamp)
+                        for name in (BASE_LAYER, DIALECTIC_LAYER)
+                        if name in state.layers
+                        and state.layers[name].turns > state.layers[name].last_trigger_turn]
             if close:
                 state.closed = True
             return triggers
 
     # -- introspection --------------------------------------------------------
+
+    def mark_dispatched(self, session_id: str, layer: str, ts: float) -> None:
+        """Advance one layer's window edge after an out-of-band job (the cold-start baseline).
+
+        The counter did not originate that job, so without this the next tick would dispatch
+        the same window again on a coarse clock (``time.time`` granularity is ~15 ms on
+        Windows) and the store's one-job-per-window rule would swallow the new trigger.
+        """
+        with self._lock:
+            state = self._sessions.get(session_id)
+            counter = (state.layers.get(layer) if state is not None else None)
+            if counter is not None:
+                counter.last_trigger_ts = max(counter.last_trigger_ts, float(ts))
 
     def snapshot(self, session_id: str) -> Optional[dict[str, Any]]:
         """Counting state for *session_id* (``None`` when the session was never opened)."""

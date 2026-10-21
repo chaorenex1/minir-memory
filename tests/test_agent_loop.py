@@ -21,6 +21,7 @@ class FakeAgent:
 
     instances: list["FakeAgent"] = []
     fail_with: Exception | None = None
+    result_messages: tuple = ()
 
     def __init__(self, **kwargs):
         self.kwargs = kwargs
@@ -34,7 +35,8 @@ class FakeAgent:
         self.system_message = system_message
         if FakeAgent.fail_with is not None:
             raise FakeAgent.fail_with
-        return {"final_response": "  do the simple thing\n", "api_calls": 3}
+        return {"final_response": "  do the simple thing\n", "api_calls": 3,
+                "messages": list(FakeAgent.result_messages)}
 
     def close(self):
         self.closed = True
@@ -45,6 +47,7 @@ def host(monkeypatch):
     """Stand-ins for every host module the loop resolves through."""
     FakeAgent.instances = []
     FakeAgent.fail_with = None
+    FakeAgent.result_messages = ()
 
     state = {
         "gateway_model": "gateway-model",
@@ -245,6 +248,29 @@ def test_toolsets_are_forwarded(loop, host):
     assert agent.kwargs["enabled_toolsets"] == ["file", "web"]
     assert result.toolsets == ("file", "web")
     assert result.as_dict()["toolsets"] == ["file", "web"]
+
+
+# -- the transcript the audit trail needs --------------------------------------
+
+def test_the_run_carries_the_conversation_messages(loop, host):
+    """Prompt plus answer loses the tool calls; the audit trail needs the whole loop."""
+    FakeAgent.result_messages = (
+        {"role": "user", "content": "q"},
+        {"role": "assistant", "content": "", "tool_calls": [{"id": "call-1"}]},
+        {"role": "tool", "content": "ok", "tool_call_id": "call-1"},
+    )
+
+    result = loop.run("q")
+
+    assert isinstance(result.messages, tuple)
+    assert [row["role"] for row in result.messages] == ["user", "assistant", "tool"]
+    assert result.messages[1]["tool_calls"] == [{"id": "call-1"}]
+    # The adviser tool's payload stays small: a transcript there would flood the caller.
+    assert "messages" not in result.as_dict()
+
+
+def test_a_run_without_host_messages_has_an_empty_transcript(loop, host):
+    assert loop.run("q").messages == ()
 
 
 # -- lifecycle ----------------------------------------------------------------

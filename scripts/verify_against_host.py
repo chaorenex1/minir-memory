@@ -7,7 +7,8 @@ What it proves (against the host install running on this machine, not a mock):
 2. The loader can load it by name      — ``plugins.memory.load_memory_provider("minir")``
 3. It satisfies the real ABC           — ``isinstance(provider, agent.memory_provider.MemoryProvider)``
 4. A note round-trips through the store — ``minir_remember`` -> ``prefetch()`` — and a
-   ``sync_turn()`` conversation reaches no table of any kind
+   ``sync_turn()`` conversation reaches no SQLite table (the JSON audit trail under
+   ``minir-memory/sessions`` is separate and never recallable)
 4b. The context engine loads by name    — ``plugins.context_engine.load_context_engine()``, folds
    a window, and restores the folded text from the host's own ``state.db`` (writing nothing)
 5. The layer cadence comes from config  — ``memory.minir.*`` in ``$HERMES_HOME/config.yaml``
@@ -70,7 +71,8 @@ try:
     # itself must NOT: this provider keeps turns in memory for the length of the process only.
     told = "The verification probe stores this distinctive sentence"
     provider.sync_turn(told, "acknowledged")
-    provider.handle_tool_call("minir_remember", {"type": "entities", "content": told})
+    provider.handle_tool_call("minir_remember",
+                                  {"type": "entities", "category": "KNOWLEDGE", "content": told})
     block = provider.prefetch("distinctive sentence")
     assert "distinctive sentence" in block, "prefetch did not recall the stored note: %%r" %% block
     import sqlite3
@@ -98,15 +100,15 @@ try:
     status = provider.recall_status()
 
     # Counting loop on the real surface: tick the host's turn numbers, then a boundary that
-    # must flush the un-reasoned tail. With intervals 3/2: dialectic at turn 2, base at
-    # turn 3, then the session-end boundary flushes turn 3 for the dialectic layer. Only the
-    # base job is persisted here: the dialectic review is dependent, and the worker queues it
-    # after its base job publishes (reasoning is off in this probe, so nothing drains).
+    # flushes each layer's un-reasoned tail. With intervals 3/2 the layers are independent:
+    # dialectic at turn 2, base at turn 3, then the session-end boundary flushes turn 3 for
+    # the dialectic layer. All three jobs persist (reasoning is off in this probe, nothing
+    # drains) and the base job is first in its turn's FIFO pair.
     for turn in (1, 2, 3):
         provider.on_turn_start(turn, "verify turn %%d" %% turn)
     provider.on_session_end([])
     stats = json.loads(provider.handle_tool_call("minir_stats", {}))
-    assert stats["jobs"] == 1 and stats["pending_jobs"] == 1, "base job not queued: %%r" %% stats
+    assert stats["jobs"] == 3 and stats["pending_jobs"] == 3, "layer jobs not queued: %%r" %% stats
     assert stats["reasoning_enabled"] is False, "the probe's config must keep the model calls off"
     layers = stats["layers"]["layers"]
     assert (layers["dialectic"]["turns"], layers["base"]["turns"]) == (3, 3), layers

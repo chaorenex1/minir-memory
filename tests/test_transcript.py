@@ -1,8 +1,36 @@
-"""In-memory transcript — bounds, windows, and the guarantees the worker relies on."""
+"""In-memory transcript — bounds, windows, and the guarantees the worker relies on.
+
+The persistence half is the audit trail of doc/base-dialectic-layers-draft.md §4.9: a host
+session per file, a plugin layer session under its layer directory, a debounced atomic rewrite,
+a second shard past 2000 messages, and prune as the only deleter.
+"""
 
 from __future__ import annotations
 
+import json
+import os
 import time
+
+import pytest
+
+
+@pytest.fixture()
+def persisted(plugin_package, tmp_path):
+    """Factory: ``make(**kwargs)`` -> a buffer writing under ``tmp_path``.
+
+    Every buffer is closed at teardown, so its writer thread is joined and cannot outlive the
+    test's temporary directory.
+    """
+    buffers = []
+
+    def _make(**kwargs):
+        buffer = plugin_package.transcript.TranscriptBuffer(persist_dir=tmp_path, **kwargs)
+        buffers.append(buffer)
+        return buffer
+
+    yield _make, tmp_path
+    for buffer in buffers:
+        buffer.close()
 
 
 def test_window_is_half_open_and_ordered(plugin_package):
@@ -87,3 +115,159 @@ def test_the_process_does_not_share_content_across_sessions(plugin_package):
     buffer = plugin_package.transcript.TranscriptBuffer()
     buffer.add("a", "user", "secret from a", created_at=1.0)
     assert buffer.window("b", 0.0, time.time() + 1) == []
+
+
+# -- persistence: the audit trail (§4.9) --------------------------------------
+
+CONTRACT_KEYS = {"session_id", "layer", "started_at", "updated_at", "model", "provider",
+                 "toolsets", "system_message", "messages"}
+
+
+def test_a_host_session_is_one_json_file_with_the_contract_keys(persisted):
+    make, root = persisted
+    buffer = make()
+
+    buffer.add_turn("session-1", "deploy it", "done", author="Ada", author_id="u-1",
+                    created_at=10.0)
+    assert buffer.flush("session-1") is True
+
+    data = json.loads((root / "session-1.json").read_text(encoding="utf-8"))
+    assert set(data) == CONTRACT_KEYS
+    assert data["session_id"] == "session-1"
+    assert data["layer"] == "host"
+    assert data["started_at"] == 10.0
+    assert data["updated_at"] >= 10.0
+    assert (data["model"], data["provider"], data["toolsets"], data["system_message"]) \
+        == ("", "", [], "")
+    assert [(row["role"], row["content"], row["author_id"]) for row in data["messages"]] \
+        == [("user", "deploy it", "u-1"), ("assistant", "done", "")]
+    assert not list(root.glob("*.tmp"))              # temp + os.replace leaves nothing behind
+
+
+def test_a_plugin_layer_session_lands_under_its_layer_directory(persisted):
+    make, root = persisted
+    buffer = make()
+
+    buffer.record_aux("dialectic", "job-7-2", [{"role": "assistant", "content": "critique"}],
+                      model="aux-model", provider="deepseek", toolsets=("file", "web"),
+                      system_message="be blunt")
+    assert buffer.flush() is True
+
+    data = json.loads((root / "dialectic" / "job-7-2.json").read_text(encoding="utf-8"))
+    assert set(data) == CONTRACT_KEYS
+    assert (data["session_id"], data["layer"]) == ("job-7-2", "dialectic")
+    assert (data["model"], data["provider"], data["toolsets"], data["system_message"]) \
+        == ("aux-model", "deepseek", ["file", "web"], "be blunt")
+    assert data["messages"] == [{"role": "assistant", "content": "critique"}]
+
+
+def test_a_hostile_session_id_cannot_escape_the_persist_directory(persisted):
+    make, root = persisted
+    buffer = make()
+
+    buffer.record_aux("base", "../escape", [{"role": "user", "content": "x"}])
+    assert buffer.flush() is True
+
+    assert (root / "base" / "escape.json").exists()
+    assert not (root.parent / "escape.json").exists()
+
+
+def test_enqueue_never_blocks_the_turn_path(persisted):
+    """The writer is busy on every message and the caller still stays far under 5 ms."""
+    make, _root = persisted
+    buffer = make(debounce_messages=1, debounce_seconds=0.0)
+
+    worst = 0.0
+    for index in range(200):
+        started = time.perf_counter()
+        buffer.add("hot", "user", f"message {index}", created_at=float(index))
+        worst = max(worst, time.perf_counter() - started)
+    assert worst < 0.005, f"slowest add took {worst * 1000:.2f} ms"
+
+
+def test_past_two_thousand_messages_the_overflow_is_a_second_shard(persisted):
+    make, root = persisted
+    # The queue is 2000 deep by default too; give it room so this test exercises the file
+    # shard rather than the (separately specified) drop-the-oldest queue policy.
+    buffer = make(debounce_messages=2000, queue_max=4000)
+
+    for index in range(2001):
+        buffer.add("long", "user", f"m{index}", created_at=float(index))
+    assert buffer.flush("long") is True
+    assert buffer.dropped == 0
+
+    first = json.loads((root / "long.json").read_text(encoding="utf-8"))
+    second = json.loads((root / "long.part2.json").read_text(encoding="utf-8"))
+    assert len(first["messages"]) == 2000            # already-written content is not truncated
+    assert first["messages"][0]["content"] == "m0"
+    assert len(second["messages"]) == 1
+    assert second["messages"][0]["content"] == "m2000"
+
+
+def test_the_debounce_holds_until_flush_ends_it(persisted):
+    make, root = persisted
+    buffer = make()                                  # 30 s / 50 messages
+
+    buffer.add("quiet", "user", "one", created_at=1.0)
+    time.sleep(0.2)
+    assert not (root / "quiet.json").exists()        # still inside the debounce window
+
+    assert buffer.flush("quiet") is True
+    data = json.loads((root / "quiet.json").read_text(encoding="utf-8"))
+    assert [row["content"] for row in data["messages"]] == ["one"]
+
+
+def test_fifty_messages_write_without_a_flush(persisted):
+    make, root = persisted
+    buffer = make(debounce_seconds=30.0, debounce_messages=50)
+
+    for index in range(50):
+        buffer.add("burst", "user", f"m{index}", created_at=float(index))
+
+    deadline = time.time() + 5.0
+    while time.time() < deadline and not (root / "burst.json").exists():
+        time.sleep(0.01)
+    data = json.loads((root / "burst.json").read_text(encoding="utf-8"))
+    assert len(data["messages"]) == 50
+
+
+def test_close_flushes_what_is_still_queued(persisted):
+    make, root = persisted
+    buffer = make()
+
+    buffer.add("last", "user", "unsaved", created_at=1.0)
+    assert not (root / "last.json").exists()
+    buffer.close()
+    buffer.close()                                   # idempotent
+    data = json.loads((root / "last.json").read_text(encoding="utf-8"))
+    assert data["messages"][0]["content"] == "unsaved"
+
+
+def test_a_full_queue_drops_the_oldest_and_counts_it(persisted, monkeypatch):
+    make, _root = persisted
+    buffer = make(queue_max=8)
+    monkeypatch.setattr(buffer, "_drain_locked", lambda *args, **kwargs: None)
+
+    for index in range(20):
+        buffer.add("q", "user", f"m{index}", created_at=float(index))
+    assert buffer.dropped == 12
+
+
+def test_prune_deletes_only_expired_files(plugin_package, persisted):
+    make, root = persisted
+    assert plugin_package.transcript.DEFAULT_RETENTION_SECONDS == 30 * 24 * 60 * 60
+    buffer = make()
+
+    buffer.add("old", "user", "old", created_at=1.0)
+    buffer.add("fresh", "user", "fresh", created_at=1.0)
+    buffer.record_aux("base", "old-aux", [{"role": "user", "content": "x"}])
+    assert buffer.flush() is True
+
+    expired = [root / "old.json", root / "base" / "old-aux.json"]
+    for path in expired:
+        os.utime(path, (1_000.0, 1_000.0))
+
+    assert buffer.prune(plugin_package.transcript.DEFAULT_RETENTION_SECONDS) == 2
+    assert all(not path.exists() for path in expired)
+    assert (root / "fresh.json").exists()
+    assert buffer.prune() == 0                       # the default is the 30-day window

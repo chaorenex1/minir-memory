@@ -52,7 +52,10 @@ from agent.memory_provider import (
 from tools.registry import tool_error
 
 from . import adviser
+from . import card_review
+from . import file_guard
 from . import history as host_history
+from . import knowledge
 from .adviser_mode import AdviserMode
 from .adviser_prompts import MAIN_CONSULT_SECTION
 from .prompting import (
@@ -64,6 +67,7 @@ from .prompting import (
     craft_rules_section,
     marker_glossary,
 )
+from .layers import CATEGORIES as NOTE_CATEGORIES
 from .store import VALUE_MARKER_TYPES, MinirStore, format_when
 from .transcript import TranscriptBuffer
 from .turn_counter import (
@@ -205,6 +209,15 @@ class MinirMemoryProvider(MemoryProvider):
         except (TypeError, ValueError):
             depth = 2
         self._dialectic_depth = max(1, min(3, depth))
+        # File-layer budgets (cards and knowledge are per file, never pooled) and the wall-clock
+        # period of the global card review.
+        self._card_token_budget = max(200, _env_int(
+            "MINIR_CARD_TOKEN_BUDGET", int(self._config.get("card_token_budget") or 2000)))
+        self._card_review_days = max(1, _env_int(
+            "MINIR_CARD_REVIEW_DAYS", int(self._config.get("card_review_days") or 3)))
+        self._knowledge_token_budget = max(200, _env_int(
+            "MINIR_KNOWLEDGE_TOKEN_BUDGET",
+            int(self._config.get("knowledge_token_budget") or 2000)))
         # Layer reasoning: the worker calls the host's auxiliary model to turn each queued job
         # into a layer artifact. On by default (the layers are the point of the provider);
         # ``reasoning_enabled: false`` keeps minir a pure store with no model calls at all.
@@ -223,7 +236,12 @@ class MinirMemoryProvider(MemoryProvider):
         self._identity = ""
         self._preference = ""
         self._worker: Optional[LayerWorker] = None
-        self._transcript = TranscriptBuffer()
+        self._card_scheduler: Optional[card_review.CardReviewScheduler] = None
+        self._knowledge: Optional[knowledge.KnowledgePipeline] = None
+        self._recent_knowledge: list[list[str]] = []
+        self._transcript = TranscriptBuffer(
+            persist_dir=(os.path.join(self._hermes_home, "minir-memory", "sessions")
+                         if str(self._hermes_home or "").strip() else None))
         self._authors: dict[str, dict[str, Any]] = {}   # session -> last author seen on a turn
         self._lock = threading.Lock()              # guards the recall cache below
         self._cached: Optional[tuple[str, str, int]] = None  # (session_id, block, count)
@@ -264,11 +282,29 @@ class MinirMemoryProvider(MemoryProvider):
         self._profile = (host_history.profile_name(self._state_db, self._session_id)
                          or str(kwargs.get("profile") or kwargs.get("profile_name") or "default"))
         self._identity, self._preference = host_history.load_identity(self._hermes_home, self._profile)
+        # The audit trail and the knowledge pipeline are profile-scoped: both need the home the
+        # host just handed us, which the constructor (called before initialize) did not know.
+        self._transcript = TranscriptBuffer(
+            persist_dir=str(Path(self._hermes_home) / _STORE_DIRNAME / "sessions"))
+        self._knowledge = knowledge.KnowledgePipeline(
+            self._hermes_home,
+            language=str(self._config.get("content_language") or "en"),
+            budget=self._knowledge_token_budget, autostart=self._reasoning)
         self._worker = LayerWorker(
             self._store, self._transcript, enabled=self._reasoning,
             agent_identity=self._agent_identity, user_id=self._user_id,
-            state_db=self._state_db, identity=self._identity, preference=self._preference,
-            depth=self._dialectic_depth)
+            state_db=self._state_db, profile=self._profile,
+            identity=self._identity, preference=self._preference,
+            depth=self._dialectic_depth,
+            content_language=str(self._config.get("content_language") or "en"),
+            hermes_home=self._hermes_home,
+            on_units=(self._knowledge.enqueue_from_refresh
+                      if self._knowledge is not None else None))
+        self._card_scheduler = card_review.CardReviewScheduler(
+            self._store, self._run_card_review, subject=self._worker.user_subject(),
+            period=float(self._card_review_days) * 24 * 3600)
+        if self._reasoning:
+            self._card_scheduler.start()
         # Configure before opening the session: intervals/mode apply to sessions opened later
         # (an already-running session keeps the cadence it started with).
         TRACKER.configure(base_interval=self._base_interval,
@@ -335,11 +371,53 @@ class MinirMemoryProvider(MemoryProvider):
              "description": "Let compression call the Task Handoff summary model",
              "type": "boolean", "default": "true", "choices": ["true", "false"],
              "env_var": "MINIR_HANDOFF_ENABLED"},
+            {"key": "content_language",
+             "description": "Language for card and knowledge prose (field names stay English)",
+             "type": "text", "default": "en", "env_var": "MINIR_CONTENT_LANGUAGE"},
+            {"key": "card_token_budget",
+             "description": "Hard per-file budget for the four global card files",
+             "type": "integer", "default": "2000", "minimum": 200,
+             "env_var": "MINIR_CARD_TOKEN_BUDGET"},
+            {"key": "card_review_days",
+             "description": "Days between global card reviews",
+             "type": "integer", "default": "3", "minimum": 1,
+             "env_var": "MINIR_CARD_REVIEW_DAYS"},
+            {"key": "knowledge_token_budget",
+             "description": "Hard per-file budget for one knowledge page",
+             "type": "integer", "default": "2000", "minimum": 200,
+             "env_var": "MINIR_KNOWLEDGE_TOKEN_BUDGET"},
             {"key": "session_mode", "description": "Mode stamped on each newly opened session",
              "type": "text", "default": DEFAULT_SESSION_MODE, "env_var": "MINIR_SESSION_MODE"},
         ]
 
     # -- prompt + recall ------------------------------------------------------
+
+    def _knowledge_block(self, query: str) -> tuple[str, int]:
+        """A path block into the knowledge files, never their content.
+
+        The index is file existence plus front-matter; the model retrieves a page with its own
+        file tool when the one-line hint says it is relevant. Paths selected in the last three
+        turns are skipped so the same page does not ride every prompt.
+        """
+        if self._knowledge is None or not str(self._hermes_home or "").strip():
+            return "", 0
+        if not (query or "").strip() or is_trivial_prompt(query):
+            return "", 0
+        try:
+            rows = knowledge.select_paths(
+                query, knowledge.knowledge_dir(self._hermes_home), limit=6, max_chars=700,
+                recent=[path for turn in self._recent_knowledge for path in turn])
+        except Exception as exc:
+            logger.debug("Minir knowledge selection failed: %s", exc)
+            return "", 0
+        if not rows:
+            return "", 0
+        block = knowledge.render_paths_block(rows)
+        if not block:
+            return "", 0
+        self._recent_knowledge.append([str(row.get("path") or "") for row in rows])
+        del self._recent_knowledge[:-3]
+        return block, len(rows)
 
     def system_prompt_block(self) -> str:
         """Session-static prompt text: memory, craft, and the gated adviser contract."""
@@ -478,6 +556,10 @@ class MinirMemoryProvider(MemoryProvider):
         if state:
             block = f"{state}\n\n{block}" if block else state
             count += state_items
+        paths_block, path_items = self._knowledge_block(query)
+        if paths_block:
+            block = f"{paths_block}\n\n{block}" if block else paths_block
+            count += path_items
         self._last_recall = RecallStatus(provider_label=_PROVIDER_LABEL, count=count, glyph=INDICATOR_GLYPH) \
             if block else None
         return block
@@ -641,9 +723,25 @@ class MinirMemoryProvider(MemoryProvider):
             start = max(self._store.last_processed_ts(BASE_LAYER, session_id),
                         self._store.latest_chunk_end(session_id))
             snapshot = TRACKER.snapshot(session_id) or {}
-            turns = int((snapshot.get("layers") or {}).get(BASE_LAYER, {}).get("turns", 0))
-            if now > start:
-                self._store.record_job(BASE_LAYER, session_id, start, now, turns=turns)
+            counted = snapshot.get("layers") or {}
+            turns = int((counted.get(BASE_LAYER) or {}).get("turns", 0))
+            # The wall clock is coarser (~15 ms on Windows) than a turn, so a boundary that
+            # follows the previous drain within one tick would look like it covers nothing.
+            # The content's own timestamp decides whether there is anything left to reason over.
+            self._transcript.flush(session_id)  # the window is about to be reasoned over
+            end = max(now, self._transcript.latest_ts(session_id),
+                      host_history.latest_ts(self._state_db, session_id))
+            if end > start:
+                self._store.record_job(BASE_LAYER, session_id, start, end, turns=turns)
+            # The review gets its own window, queued after the base job so the FIFO drain
+            # publishes the artifact it reads. Its start is its own dispatch watermark: the
+            # layers never share one, and reusing the base edge would skip the turns between.
+            review_start = float((counted.get(DIALECTIC_LAYER) or {}).get("last_trigger_ts")
+                                 or start)
+            if end > review_start:
+                self._store.record_job(
+                    DIALECTIC_LAYER, session_id, review_start, end,
+                    turns=int((counted.get(DIALECTIC_LAYER) or {}).get("turns", 0)))
             if self._worker is not None:
                 self._worker.drain_session(session_id, timeout=_PRE_COMPRESS_TIMEOUT)
                 self._kick_worker()  # let a timed-out drain finish in the background
@@ -677,6 +775,7 @@ class MinirMemoryProvider(MemoryProvider):
         otherwise never contribute to either artifact.
         """
         triggers = TRACKER.tail(session_id, close=close)
+        self._transcript.flush(session_id)
         self._dispatch(triggers + self._unreasoned_content(session_id, {t.layer for t in triggers}))
         self._kick_worker()
 
@@ -708,17 +807,20 @@ class MinirMemoryProvider(MemoryProvider):
     def _dispatch(self, triggers: list[Trigger]) -> None:
         """Persist each due job (session + window) for the layer worker to pick up.
 
+        Both layers dispatch independently: a tick that makes both due records the base job
+        first and the review second, so the single worker thread (oldest-first FIFO) always
+        publishes the base artifact before the review that reads it. That ordering is the
+        whole dependency: the review is not queued by the base job, and a review whose base
+        never published degrades to a no-op instead of waiting.
+
         Recording only — the drain is kicked where content exists (``sync_turn``, a boundary,
         shutdown). Draining straight from the tick (or from ``initialize``, which would race the
         first turn) hands the worker a window whose turn has not arrived yet and burns it empty.
         """
         if not triggers:
             return
-        for trigger in triggers:
-            if trigger.layer == DIALECTIC_LAYER:
-                # Dialectic is a dependent job: the worker queues it with the exact window its
-                # base job published. A tick/tail trigger here would race that base artifact.
-                continue
+        ordered = sorted(triggers, key=lambda trigger: 0 if trigger.layer == BASE_LAYER else 1)
+        for trigger in ordered:
             job_id: Optional[int] = None
             # Tell the transcript where the next window will start: a message stamped at or
             # before this edge would fall outside both this window and the next one.
@@ -788,6 +890,11 @@ class MinirMemoryProvider(MemoryProvider):
             worker.stop()  # bounded join: the store cannot close under a draining job
         self._adviser_mode.session_end(self._session_id)
         self._adviser_mode.stop()  # no review may touch the store after this point
+        if self._card_scheduler is not None:
+            self._card_scheduler.stop()  # it writes files and rows: join before store.close()
+        if self._knowledge is not None:
+            self._knowledge.stop()      # drain queued units while the filesystem still exists
+        self._transcript.close()        # last writer join: no JSON may be half-written
         self.flush_metrics()
         # Only now that no drain is in flight: a queued boundary job must still find its window.
         self._transcript.clear()
@@ -846,13 +953,20 @@ class MinirMemoryProvider(MemoryProvider):
             if marker_type not in VALUE_MARKER_TYPES:
                 return tool_error(
                     f"type must be one of: {', '.join(VALUE_MARKER_TYPES)}")
+            category = str(args.get("category") or "").strip().upper()
+            if not category:
+                return tool_error("category is required")
+            if category not in NOTE_CATEGORIES:
+                return tool_error(
+                    f"category must be one of: {', '.join(NOTE_CATEGORIES)}")
             content = str(args.get("content") or "").strip()
             if not content:
                 return tool_error("content is required")
             note_id = self._store.remember(
-                content, source="tool", marker_type=marker_type, session_id=self._session_id)
+                content, source="tool", marker_type=marker_type, category=category,
+                session_id=self._session_id)
             return json.dumps({"stored": True, "note_id": note_id, "type": marker_type,
-                               "session_id": self._session_id})
+                               "category": category, "session_id": self._session_id})
         if tool_name == "minir_forget":
             marker_type = str(args.get("type") or "").strip()
             if not marker_type:
@@ -881,13 +995,32 @@ class MinirMemoryProvider(MemoryProvider):
                                "reasoning_enabled": self._reasoning})
         return tool_error(f"Unknown tool: {tool_name}")
 
+    # -- three-day card review ------------------------------------------------
+
+    def _run_card_review(self, since: float) -> list[int]:
+        """Run one global card review; the scheduler owns its anchor and retries."""
+        if self._worker is None:
+            raise card_review.CardReviewError("no layer worker")
+        revisions = card_review.run_review(
+            self._store, self._hermes_home, self._profile,
+            complete=self._worker.review_cards, since=since,
+            plugin_yaml=self._worker._plugin_yaml,
+            language=str(self._config.get("content_language") or "en"),
+            loader=self._worker._rules, budget=self._card_token_budget)
+        self._transcript.prune()  # the review is the retention clock: 30 days
+        return revisions
+
     # -- cold start -----------------------------------------------------------
 
     def cold_start(self, session_id: str = "") -> bool:
         """Queue the first *base* refresh for a freshly opened primary session.
 
-        The dialectic review depends on a published base artifact, so this never queues it
-        directly: the worker queues the matching dialectic job after the base job succeeds.
+        The first base job runs even when the host has no messages yet: its job is to write a
+        session card baseline (the global card files, the previous session card, or the role
+        preset), which the first real window then extends. The review is not queued here — the
+        dialectic watermark starts at the current turn, so only base fires at session start and
+        the review fires on its own cadence once there is a published base artifact to read.
+
         The plugin hook fires for subagent/cron sessions too, so callers must gate on the
         provider's bound session and ``agent_context``. Returns True when a job was queued.
         """
@@ -907,11 +1040,9 @@ class MinirMemoryProvider(MemoryProvider):
             return False
         try:
             started = float(snapshot.get("started_at") or time.time())
-            # Without host history there is nothing for the base cards to model; identity files
-            # alone are consumed by the dialectic prompt only when a base artifact exists.
-            if host_history.latest_ts(self._state_db, session) <= 0:
-                return False
-            job_id = self._store.record_job(BASE_LAYER, session, started, time.time(), turns=0)
+            now = max(time.time(), started + WINDOW_EPSILON)
+            job_id = self._store.record_job(BASE_LAYER, session, started, now, turns=0)
+            TRACKER.mark_dispatched(session, BASE_LAYER, now)
             logger.info("Minir cold-start base job queued (#%s) for session=%s", job_id, session)
             self._kick_worker()
             return True
@@ -1023,11 +1154,13 @@ _TOOL_SEARCH = _tool_schema(
     ("query",))
 _TOOL_REMEMBER = _tool_schema(
     "minir_remember",
-    "Record a new value-output marker of a specified type as long-term memory. The type is one "
-    "of entities, trajectories, experiences, tools or projects.",
-    {"type": _prop("Value-marker type.", "string", enum=list(VALUE_MARKER_TYPES)),
+    "Record a new value-output marker: one semantic category, one organisational type, the "
+    "statement itself.",
+    {"type": _prop("Value-marker organisational type.", "string",
+                   enum=list(VALUE_MARKER_TYPES)),
+     "category": _prop("Semantic category.", "string", enum=list(NOTE_CATEGORIES)),
      "content": _prop("The value-output marker to remember.")},
-    ("type", "content"))
+    ("type", "category", "content"))
 _TOOL_FORGET = _tool_schema(
     "minir_forget",
     "Delete an old value-output marker by its note_id and type. Use only the note_id returned "
@@ -1256,6 +1389,10 @@ def _on_pre_tool_call(tool_name: str = "", session_id: str = "",
     resolved = _resolve_provider(provider)
     if resolved is None:
         return None
+    if file_guard.aux_active():
+        reason = file_guard.check(tool_name, kwargs.get("args") or {}, resolved._hermes_home)
+        if reason:
+            return {"action": "block", "message": reason}
     reason = resolved._adviser_mode.block_reason(session_id, tool_name)
     return {"action": "block", "message": reason} if reason else None
 

@@ -86,7 +86,7 @@ def test_session_scope_hides_other_sessions_until_scope_all(store):
 
 
 def test_session_scope_keeps_other_reviews_out_until_scope_all(store):
-    store.put_layer_state("dialectic", "agent:minir",
+    store.put_layer_state("dialectic", "agent:default:minir",
                           "## Base Revision\n- zebraword revision", session_id="s2")
     assert store.search("zebraword", session_id="s3") == []
     assert any(row["kind"] == "dialectic.review"
@@ -127,8 +127,8 @@ def test_stats_counts(store):
 
 
 def test_stored_content_is_truncated(store):
-    store.remember("x" * 10_000)
-    assert len(store.search("x" * 10)[0]["text"]) <= 4000
+    store.remember("x" * 15_000)
+    assert len(store.search("x" * 10)[0]["text"]) <= 12_000
 
 
 def test_layer_state_versions_increment_and_keep_the_latest_content(store):
@@ -199,9 +199,9 @@ def test_expire_closes_only_jobs_from_before_the_process(store):
     old = store.record_job("base", "s1", 0.0, 10.0)
     time.sleep(0.002)
     cutoff = time.time()
-    store.record_job("base", "s1", 10.0, 20.0)
-    claimed = store.record_job("dialectic", "s1", 0.0, 10.0)
-    store.claim_jobs(limit=5)  # everything running
+    store.record_job("base", "s2", 10.0, 20.0)
+    claimed = store.record_job("dialectic", "s3", 0.0, 10.0)
+    store.claim_jobs(limit=5)  # each job is in its own session, so all can run
     # Only the job queued before the cutoff: the two later ones belong to this process.
     assert store.expire_open_jobs("gone", before=cutoff) == 1
     rows = {row["id"]: row["status"] for row in store._conn.execute("SELECT id, status FROM jobs")}
@@ -271,20 +271,27 @@ def test_the_worker_job_path_does_not_raise_after_close(store):
 
 
 def test_conclusions_are_indexed_and_session_scoped(store):
-    """Durable conclusions recall across sessions; a review/summary never leaks."""
-    base = ("## Session Summary\n- deploy the Windows build\n\n"
-            "## User Representation\n- [goal] finish the plugin\n\n"
-            "## User Peer Card\n- prefers terse answers\n\n"
-            "## AI Self Representation\n- direct\n\n"
-            "## AI Identity Card\n- never edits outside the repo\n\n"
-            "## Value Markers\n- [tool] pytest")
-    store.put_layer_state("base", "user:ada", base, session_id="s1", ai_subject="agent:minir")
-    dialectic = "## Base Revision\n- user_peer_card: skipped the smoke test"
-    store.put_layer_state("dialectic", "agent:minir", dialectic, session_id="s1")
+    """Durable cards recall across sessions; a window summary or review never leaks."""
+    base = ("## User Card\n### Self Representation\n- occupation: finish the plugin\n"
+            "### Preferences\n- communication: prefers terse answers\n\n"
+            "## AI Card\n### Self Representation\n- current_goal: direct\n"
+            "### Identity\n- name: minir\n\n"
+            "## Window Summary\n### Objective\ndeploy the Windows build\n\n"
+            "## Value Markers\n- [KNOWLEDGE:fact/tools] pytest")
+    store.put_layer_state("base", "user:ada", base, session_id="s1", ai_subject="agent:default:minir")
+    dialectic = "## Base Revision\n- user_preferences: skipped the smoke test"
+    store.put_layer_state("dialectic", "agent:default:minir", dialectic, session_id="s1")
 
     goal = store.search("finish the plugin", session_id="s1")
-    assert goal and goal[0]["kind"] == "base.user_representation"
-    assert store.search("finish the plugin", session_id="s2") == [], "session focus must not leak"
+    assert goal and goal[0]["kind"] == "base.user_card"
+    durable = store.search("finish the plugin", session_id="s2")
+    assert durable and durable[0]["kind"] == "base.user_card", \
+        "the user card is durable across sessions"
+
+    summary = store.search("Windows build", session_id="s1")
+    assert summary and summary[0]["kind"] == "base.window_summary"
+    assert store.search("Windows build", session_id="s2") == [], \
+        "a window summary must not leak into another session"
 
     review = store.search("skipped smoke", session_id="s1")
     assert review and review[0]["kind"] == "dialectic.review"
@@ -292,9 +299,11 @@ def test_conclusions_are_indexed_and_session_scoped(store):
                    for row in store.search("skipped smoke", session_id="s2"))
 
     peer = store.search("terse answers", session_id="s2")
-    assert peer and peer[0]["kind"] == "base.user_peer_card", "durable conclusions are cross-session"
+    assert peer and peer[0]["kind"] == "base.user_card", \
+        "durable conclusions are cross-session"
 
-    assert store.search("plugin", session_id="") == [], "no session means no session-bound kinds"
+    assert store.search("Windows build", session_id="") == [], \
+        "a session-bound summary is not visible without a session"
 
 
 def test_compression_gate_pauses_until_cleared_or_expired(store):
@@ -375,13 +384,17 @@ def test_the_same_refresh_window_updates_in_place(store):
     assert store.latest_base_refresh("s1")["session_chunk_summary"] == "retried attempt"
 
 
-def test_a_dependent_dialectic_job_is_claimed_before_a_later_base_job(store):
+def test_claims_are_fifo_within_a_session(store):
+    """A same-turn review waits for the base job before it: no layer priority, only order."""
     base_one = store.record_job("base", "s1", 0.0, 10.0)
     base_two = store.record_job("base", "s1", 10.0, 20.0)
     review = store.record_job("dialectic", "s1", 0.0, 10.0)
-    assert store.claim_jobs(limit=1)[0]["id"] == review
-    assert store.claim_jobs(limit=1)[0]["id"] == base_one
-    assert store.claim_jobs(limit=1)[0]["id"] == base_two
+    assert store.claim_jobs(limit=3)[0]["id"] == base_one
+    assert store.claim_jobs(limit=3) == []  # the running base blocks the rest of the session
+    store.complete_job(base_one, 10.0)
+    assert store.claim_jobs(limit=3)[0]["id"] == base_two
+    store.complete_job(base_two, 20.0)
+    assert store.claim_jobs(limit=3)[0]["id"] == review
 
 
 def test_advisories_are_deduped_and_blockers_come_first(store):
@@ -433,7 +446,7 @@ def test_an_older_window_revision_does_not_replace_the_live_artifact(store):
     live = ("## Session Summary\n- new window\n\n## User Representation\n- [goal] new\n\n"
             "## User Peer Card\n- new peer\n\n## AI Self Representation\n- [done] new\n\n"
             "## AI Identity Card\n- direct\n\n## Value Markers\n- [tool] pytest")
-    store.put_layer_state("base", "user:ada", live, session_id="s1", ai_subject="agent:minir")
+    store.put_layer_state("base", "user:ada", live, session_id="s1", ai_subject="agent:default:minir")
 
     revision = store.apply_base_revision(
         "s1", "user:ada", window_from_ts=0.0,

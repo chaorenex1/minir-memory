@@ -40,6 +40,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any, Optional, Sequence
 
@@ -57,17 +58,43 @@ _RUNTIME_KEYS = ("api_key", "base_url", "api_mode", "credential_pool", "request_
 
 @dataclass(frozen=True)
 class AgentRun:
-    """Result of one in-process run: the answer plus how it was produced."""
+    """Result of one in-process run: the answer, how it was produced, and its transcript."""
 
     answer: str
     api_calls: int
     model: str
     provider: str
     toolsets: tuple[str, ...]
+    #: The conversation loop's messages, tool calls included. The audit trail needs them: prompt
+    #: plus answer alone loses every tool call, which is most of what a peer run actually did.
+    #: A tuple so a frozen result cannot be mutated in place; empty when the host returned none.
+    messages: tuple[dict[str, Any], ...] = ()
 
     def as_dict(self) -> dict[str, Any]:
+        # ``messages`` stays out on purpose: this dict is the adviser tool's JSON payload, and a
+        # full transcript would flood the caller's context (and the socket) with the run's input.
         return {"answer": self.answer, "api_calls": self.api_calls, "model": self.model,
                 "provider": self.provider, "toolsets": list(self.toolsets)}
+
+
+def _transcript(result: dict[str, Any]) -> tuple[dict[str, Any], ...]:
+    """The host's messages as plain dicts, skipping anything that is not a message.
+
+    ``conversation_loop`` returns dicts on the paths this plugin runs, but a message object with
+    ``to_dict()`` is also accepted so a host-side shape change degrades to a shorter trail
+    instead of breaking every layer run.
+    """
+    rows: list[dict[str, Any]] = []
+    for item in result.get("messages") or ():
+        if isinstance(item, Mapping):
+            rows.append(dict(item))
+            continue
+        to_dict = getattr(item, "to_dict", None)
+        if callable(to_dict):
+            converted = to_dict()
+            if isinstance(converted, Mapping):
+                rows.append(dict(converted))
+    return tuple(rows)
 
 
 def _resolve_model_and_runtime() -> tuple[str, dict[str, Any]]:
@@ -164,6 +191,7 @@ def run(message: str, *, context: str = "", model: str = "", provider: str = "",
             model=final_model,
             provider=final_provider,
             toolsets=tuple(tools),
+            messages=_transcript(result),
         )
     finally:
         # One agent per run in a long-lived host: close() releases tool subprocesses and HTTP

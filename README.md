@@ -6,12 +6,15 @@ and grow into a real provider.
 
 It keeps explicit value markers and every derived conclusion in a per-profile SQLite database,
 recalls them through an FTS5 trigram index (CJK-safe, with a token-scan fallback), and exposes
-four tools (`minir_search`, `minir_remember`, `minir_forget`, `minir_stats`). On top of that it runs the
-**base / dialectic reasoning layers**: the turn counter queues a base job every *n* turns, a
-background worker builds the user/AI cards from the host's own history, and a dependent dialectic
-pass reviews those cards against that history. The review corrects the base artifact (a
-pre-overwrite snapshot and an FTS index are kept) and publishes a short `## Base Revision` note
-naming the fields it changed. It emits no advice.
+four tools (`minir_search`, `minir_remember`, `minir_forget`, `minir_stats`). On top of that it runs
+two **independent** reasoning layers: the base layer builds the user/AI cards every 24 turns, the
+dialectic reviews them every 8 turns against its own evidence window, and corrects the newest base
+artifact (a pre-overwrite snapshot and an FTS index are kept). The review publishes a short
+`## Base Revision` note naming the fields it changed and emits no advice.
+
+Three file-backed layers sit on top: a **three-day global card review** merges sessions into four
+durable files; a **knowledge pipeline** writes one page per marker unit and injects path hints;
+and a **transcript audit trail** mirrors host turns and layer runs as JSON (30-day retention).
 
 It also ships an optional **main adviser**: a fast, per-turn side channel that watches the live
 tool loop (user goal, assistant intent, tool results) and injects its advice before the next
@@ -22,13 +25,15 @@ synchronous entry point, not a separate personality. Unlike the dialectic layer 
 base cards or revisions. It is controlled by configuration only
 (`memory.minir.adviser_mode.enabled`; there is no `/adviser` command).
 
-**It stores no transcripts.** The worker reads `(from_ts, to_ts]` messages from
+**SQLite holds no transcripts.** The worker reads `(from_ts, to_ts]` messages from
 `$HERMES_HOME/state.db` read-only (plus the in-process buffer for turns not yet committed) and
-persists only what the layers *derived* from them plus notes you asked to keep. Derived content
-may quote or reference the messages it reasoned over — it is a derived artifact, not a redacted
-one — but the provider never copies the conversation itself. Because the host store is the source
-of truth, a job queued before a restart can still be completed; only when no `state.db` exists are
-inherited jobs expired.
+persists only what the layers *derived* from them plus notes you asked to keep. What the provider
+does keep is a separate **audit trail** of JSON files under
+`$HERMES_HOME/minir-memory/sessions/` (host turns and layer runs, 30-day retention, no recall from
+it). Derived content may quote or reference the messages it reasoned over — it is a derived
+artifact, not a redacted one — but the recall store never copies the conversation itself. Because
+the host store is the source of truth, a job queued before a restart can still be completed; only
+when no `state.db` exists are inherited jobs expired.
 
 The same directory also ships a **context engine** for audited summary compression: at 95% of the
 configured threshold the provider pauses periodic scheduling, refreshes the base and dialectic
@@ -47,9 +52,16 @@ plugin/minir/          the deployable plugin directory (copy this to plugins/min
   __init__.py          register(ctx) + MinirMemoryProvider + the engine export
   store.py             SQLite storage: notes, conclusions + FTS5, base revisions, jobs, metrics
   history.py           read-only host history, profile resolution, identity files
-  transcript.py        in-memory, bounded window of the session's messages (never persisted)
+  transcript.py        bounded turn window + async JSON audit mirror (sessions/)
   turn_counter.py      base / dialectic layer turn counters + job windows
-  worker.py            drains base jobs, then the dependent dialectic base correction
+  worker.py            drains base and review jobs FIFO per session, publishes artifacts
+  card_review.py       three-day review: four card files, validation, revisions, scheduler
+  knowledge.py         one page per unit, path-hint retrieval block
+  file_guard.py        pre-tool-call scope for the layer passes' file tools
+  layers.py            layer cores, field validation, the four-section renderer
+  rules.py             rule-file loader: validation, override, cache, prompt assembly
+  rules/               one file per contract (contract + review checks), read at call time
+  window_summary.py    eight-field summary: schema, validation, fixed Markdown template
   handoff.py           Task Handoff template, summary-agent prompt + validation
   cadence.py           config/store-path helpers shared by the provider and the engine
   context_engine.py    audited summary compression (context.engine: minir)
@@ -150,123 +162,137 @@ both public scopes.
 
 ## The two layers (base / dialectic)
 
-`turn_counter.py` keeps two counters per session. The base counter turns its cadence into *jobs*
-("reason over session X's history in `(from_ts, to_ts]`"); the dialectic counter still advances,
-but its tick triggers are filtered — the worker queues the review itself, with the exact window
-the base job just published. A job is one row in the store's
-`jobs` table; `worker.py` drains it from the host's `state.db` (plus the uncommitted buffer),
-calls the auxiliary model, and publishes into `layer_state`/`conclusions`. Each base refresh also
-appends one structured row to `base_refreshes` (session, time window, actual turn range, the six
-outputs, `is_latest`); one base window has one job.
+`turn_counter.py` keeps two **independent** counters per session. Each turns its own cadence into
+*jobs* ("reason over session X's history in `(from_ts, to_ts]`"): the base layer at 24 turns, the
+review at 8. Neither waits for the other; when both are due on the same turn the base job is
+recorded first, and the store claims strictly FIFO **within a session**, so the artifact is
+published before the review that reads it. A job is one row in the `jobs` table; `worker.py`
+drains it from the host's `state.db` (plus the uncommitted buffer), calls the auxiliary model, and
+publishes into `layer_state`/`conclusions`. Each base refresh also appends one structured row to
+`base_refreshes` (session, time window, actual turn range, the six outputs, `is_latest`); one base
+window has one job.
 `prefetch()` injects only the newest base revision note (`## Base Revision`, bounded to 1200 chars)
 ahead of recall. Recall covers explicit notes and value markers only — the current session's
-notes plus durable notes; every derived artifact (the six base sections, the revision note, chunks
+notes plus durable notes; every derived artifact (the four base sections, the revision note, chunks
 and summaries) stays explicit-recall through `minir_search`. Another session's rows are reachable
 only through `minir_search(scope="all")`, never by automatic injection. Advice has one producer
 (the live reviewer); the dialectic layer writes no advice at all.
 
 | Layer | Models | Artifact sections | Subject key |
 | --- | --- | --- | --- |
-| base | this profile's user: window + previous user/AI cards, three staged JSON passes on `auxiliary.adviser` | `## Session Summary`, `## User Representation`, `## User Peer Card`, `## AI Self Representation`, `## AI Identity Card`, `## Value Markers` | `user:<profile>` |
-| dialectic | the latest base artifact + history up to the window; reviews drift in all six fields and corrects them | `## Base Revision` only (base cards stay on the base layer, and it emits no advice) | `agent:<agent_identity>` |
+| base | this profile's user: window + previous cards, three staged JSON passes on `auxiliary.adviser` | `## User Card`, `## AI Card`, `## Window Summary`, `## Value Markers` | `user:<id>` |
+| dialectic | the live base artifact + its own evidence window; reviews drift and replaces whole parts | `## Base Revision` only (cards stay on the base layer, no advice) | `agent:<profile>:<identity>` |
 
-The dialectic job is **dependent**: a successful base refresh queues the matching review with the
-same `(from_ts, to_ts]`, so the reviewer always sees a published base row. The review re-reads that
-window's raw turns even when a previous review already advanced the dialectic watermark; the
-context engine never queues an independent review. It runs a seven-key JSON
-contract: the six base fields and `base_changed`
-(`{changed, fields}`). The pass count is adaptive — short windows get one synthesis, longer ones add
-a self-audit and a reconcile, capped by `dialectic_depth`. A failed or malformed pass falls back to
-the last valid one. `layer_state.version` counts refreshes; the newest review is what `prefetch`
-injects.
+The review's **evidence** window starts at its own watermark and ends at the live edge; the base
+artifact it may correct is the newest published row for the session. A review that finishes after
+a newer base published is discarded as `stale_base` (whole review, never half a correction): the
+newest row's id and `window_to_ts` are the version fence.
 
-A base refresh runs **three ordered passes** on the `auxiliary.adviser` route. Each pass returns
-**one JSON object** (no Markdown); the worker validates the keys/arrays and renders the six fixed
-sections for the artifact and the chunk chain. The adviser toolset is attached only on this route,
-and the tool hint carries the window bounds: a pass may call `adviser_session_search` with
-`after`/`before` for evidence inside `(from_ts, to_ts]`, but must not read later turns. The first
-user message is the only allowed outside-window evidence, and only on the first refresh.
+The review is **not** queued by the base job. It fires on its own tick; if no base artifact has
+ever been published it degrades to a no-op (`no_base`) instead of becoming a second base writer.
+It re-reads its window's raw turns even when a previous review advanced the dialectic watermark.
+It returns one review object:
+`user_card`, `ai_card`, `window_summary`, `base_changed` (`{changed, fields}`), `changes` and an
+empty `prunings`. A listed part is replaced in full, so a review cannot half-update a card. The
+pass count is adaptive: short windows get one synthesis, longer ones add a self-audit and a
+reconcile, capped by `dialectic_depth`. A failed or malformed pass falls back to the last valid
+one. `layer_state.version` counts refreshes; the newest review note is what `prefetch` injects.
 
-1. **user cards** — previous `## User Representation`/`## User Peer Card` + this window (+ the
-   first user message as intent anchor on bootstrap) → JSON keys `user_representation`,
-   `user_peer_card`;
-2. **AI cards** — the user cards just derived + previous `## AI Self Representation`/
-   `## AI Identity Card` + operator identity/preference files + this window → JSON keys
-   `ai_self_representation`, `ai_identity_card`; the self section carries the action state
-   (`[done]`/`[in-progress]`/`[blocked]`/`[next]`) and produced value
-   (`[entity]`/`[trajectory]`/`[experience]`/`[tool]`/`[project]`);
-3. **local summary + markers** — the user/AI cards + this window → JSON keys
-   `session_chunk_summary` (local compression record) and `value_markers`, a five-key object
-   (`entities`, `trajectories`, `experiences`, `tools`, `projects`). Markers record the
-   session information worth keeping long-term; all five keys are always present and an empty
-   array means “no item of this type”.
+A base refresh runs **three ordered passes** on the `auxiliary.adviser` route. Each system prompt is
+assembled at call time from the layer core, the field rules in `plugin/minir/rules/*.md` and the
+output contract (`rules.build_system`); an operator override under
+`$HERMES_HOME/minir-memory/rules/` replaces a packaged file and falls back with a warning when it
+is invalid. Each pass returns **one JSON object** (no Markdown); the worker validates it against the
+same rules the reviewer reads, and only a validated object is rendered into the artifact. The
+adviser toolset is attached only on this route, and the tool hint carries the window bounds: a pass
+may call `adviser_session_search` with `after`/`before` for evidence inside `(from_ts, to_ts]`, but
+must not read later turns. The first user message is the only allowed outside-window evidence, and
+only on the first refresh.
 
-First refresh means no previous artifact for this user subject: it bootstraps from the window
-(plus the first-message anchor) instead of merging. Later refreshes merge the previous cards, so
-the durable peer and identity cards accumulate while the current-focus/self sections track the
-latest state. `value_markers` are session-bound and cumulative: each pass receives the previous
-markers and merges this window into them; a new session starts empty. One base window has one
-job; an exact repeat dispatch returns the existing job instead of refreshing the same window
-twice.
+1. **user card** — the previous user card + this window (+ the first user message as intent anchor
+   on bootstrap) → `{"user_self": {...6 fields...}, "user_preferences": {...7 fields...}}`;
+2. **AI card** — the user card just derived + the previous AI card + operator identity/preference
+   files + `plugin.yaml` + this window → `{"ai_self": {...7 fields...}, "ai_identity": {...13
+   fields...}}`. `ai_self.state` is one of `idle|executing|reasoning|reviewing|blocked|done`. The
+   seven hard identity fields (`id`, `name`, `version`, `type`, `system`, `creator`, `maintainer`)
+   must appear verbatim in `plugin.yaml`; a value that does not match is dropped with a warning;
+3. **window summary + units** — the two cards + this window → `{"window_summary": {...8 keys...},
+   "value_markers": {"units": [...]}}`. Units carry one primary category (`KNOWLEDGE`, `VALUE`,
+   `INTENT`, `METHOD`, `GOVERNANCE`), one primary org (`entities`, `trajectories`, `experiences`,
+   `tools`, `projects`), a stable `topic`, and `epistemic` for `KNOWLEDGE` only. At most 16 units
+   per window, 160 characters each; a unit merges with an existing one when category, org and
+   topic all match.
 
-The six outputs are stored together in `base_refreshes` as JSON text (`value_markers` is a
-five-key JSON object; the other five are JSON string arrays). The `layer_state` artifact,
-`conclusions` sections and chunk chain render the same data as Markdown bullets for prompts and
-recall.
-`is_latest=1` marks the row with the greatest `window_to_ts` per `(session_id, subject)` — window
-order, not write order, so a slow older window that finishes late is history, never "latest".
-`window_from_turn`/`window_to_turn` record the session turns the window actually covered (one user
-message is one turn), extending past the dispatch stamp when the newest job drained newer messages.
-Older windows stay queryable as history (`base_refreshes()` / `latest_base_refresh()` in
-`store.py`). A `(session, subject, from_ts)` retry updates the same row/chunk; the retry reuses the
-chunk's turn range and never treats its own chunk as the previous window.
+The baseline order is **global card files -> newest row for the subject -> preset**. The four
+files under `$HERMES_HOME/minir-memory/` (see below) are the durable state once they exist; the
+session row is the horizon. With neither, the user card starts from the `software-engineer` preset
+(occupied with `occupation`, the other fields empty and `_preset` recorded) and evidence replaces
+the preset without counting as a clear. The **first base job runs even with an empty window**: it
+publishes that preset baseline so the review cadence has an artifact to read. Later empty windows
+are no-ops. The user card and the AI identity are durable across sessions, while the AI
+self-representation, the window summary and the units are session-bound and drop on a session
+change (`previous_content`). An exact repeat dispatch returns the existing job instead of
+refreshing the same window twice.
 
-`base_refreshes` also has its own external-content FTS5 table over the six outputs
+The six columns keep their names (the draft's column map): `user_representation` holds
+`user_self`, `user_peer_card` holds `user_preferences`, `ai_self_representation` holds `ai_self`,
+`ai_identity_card` holds `ai_identity`, `session_chunk_summary` holds the eight-field
+`window_summary` object, and `value_markers` holds `{"units": [...]}`. The same data is rendered
+into the four-section artifact and split into searchable conclusions (`base.user_card`,
+`base.ai_card`, `base.window_summary`, `base.value_markers`). `is_latest=1` marks the row with the
+greatest `window_to_ts` per `(session_id, subject)` — window order, not write order, so a slow
+older window that finishes late is history, never "latest". `window_from_turn`/`window_to_turn`
+record the session turns the window actually covered (one user message is one turn), extending
+past the dispatch stamp when the newest job drained newer messages. Older windows stay queryable as
+history (`base_refreshes()` / `latest_base_refresh()` in `store.py`). A
+`(session, subject, from_ts)` retry updates the same row/chunk; the retry reuses the chunk's turn
+range and never treats its own chunk as the previous window.
+
+`base_refreshes` also has its own external-content FTS5 table over the six columns
 (`base_refreshes_fts`, trigram). `search_base_refreshes()` supports session/history filtering and
 `latest_only`; like `minir_search`, it falls back to `LIKE` when FTS5 is unavailable **and when all
 query terms are shorter than three characters** (common Chinese queries such as `工具`, which
 trigram cannot match). The `conclusions_fts` index remains the recall index for the rendered
 sections; `base.value_markers` is indexed there too.
 
-The base layer's `## Session Summary` is **not an independent summary**: every base refresh writes
-one `session_chunk_summary` (session + time range + turn range) to the canonical local-compression
-chain, and the artifact's section projects **only the newest active chunk** — the current window
-record. Older chunks stay as independent rows with their turn range and remain searchable by
-`minir_search` inside their own session, unless an explicit session-final summary supersedes them
-(a compression fold never does); they are not re-projected into the live artifact. The previous projection is deliberately omitted from the next
-base merge prompt (only the other five sections carry forward), so chunks do not recursively copy
-the whole chain. The dialectic worker reads the active chain up to its review window and is
-instructed to reconcile
-contradictions across chunks (later evidence wins; stale claims and completed blockers are
-removed). `base.session_summary` is not written as a competing FTS conclusion.
+The window summary is a **rolling state, not a log**: pass 3 receives the previous eight-field
+summary and returns the full new one (only `objective` may be empty on the first refresh). The
+artifact renders it through the fixed template (`window_summary.render`), and the same Markdown body
+is appended to the canonical chunk chain for recall. The rendered projection is never fed back into
+a prompt; the next pass 3 receives the previous summary as JSON. Older chunks stay independent rows
+with their turn range and remain searchable inside their own session, unless an explicit
+session-final summary supersedes them (a compression fold never does). The dialectic worker reads
+the active chain up to its review window and may correct the summary as a whole part; when the
+chunk row cannot be updated, the correction is not claimed.
 
 ### Dialectic review, base corrections, and advices
 
-The dialectic prompt receives the base artifact for *its* review window (a catch-up drain may
-already have published a newer one), the previous review, the operator files, the chunk chain up
-to that window, and the window's messages (tool rows included). It may call `adviser_session_search` with
-`before=<window end>` to inspect earlier history for drift; it never reads later turns. The review
-logic is explicit per field: user representation drift, peer-card gaps/constraints, AI action state,
-and identity/preference conflicts that explain an underperforming action state. Advices are
-forward-looking decisions for the main session or the user — never a restatement of established
-facts — with `severity` (`nit`/`concern`/`blocker`), `target`, `evidence`, and `decision`.
+The dialectic prompt receives the session's **live** base artifact (the newest published row; a
+catch-up drain may have moved past its own window), the previous review note, the operator files,
+the chunk chain up to that window, and the window's messages (tool rows included). It may call
+`adviser_session_search` with `before=<window end>` to inspect earlier history for drift; it never
+reads later turns. It reviews whole parts: the user card, the AI card and the window summary. Its
+system prompt is assembled from the layer core plus the four card **review checks** in
+`plugin/minir/rules/`, so the reviewer reads the same contract the writer was given. It lists a
+part in `base_changed.fields` only when it changed it, and a listed part is replaced in full;
+`prunings` must stay empty because only the three-day review may delete durable content. The
+dialectic writes no advices: advice has a single producer, the live reviewer.
 
-When `base_changed.fields` is non-empty, the six corrected values overwrite the base row **in one
+When `base_changed.fields` is non-empty, the corrected parts overwrite the base row **in one
 transaction**:
 
-1. the current six fields + advices are snapshotted into `base_revisions` (with the affected
+1. the current six columns + advices are snapshotted into `base_revisions` (with the affected
    `base_refresh_id`, window/turn ranges, `changed_fields`, `source_job_id`, `is_latest`);
 2. the changed columns of `base_refreshes` are updated in place (window order and `is_latest` are
    unchanged);
-3. the base `layer_state` artifact is rewritten from the corrected fields, and its
-   `conclusions` sections are updated.
+3. the base `layer_state` artifact is rewritten from the corrected parts, and its `conclusions`
+   sections are updated.
 
-`base_revisions_fts` is an external-content trigram index over the six snapshot fields plus
-`advices` (seven columns), so a previous model state and the advice that changed it are both
-recallable with `search_base_revisions()`. Advices also go to the `advisories` delivery ledger
-(severity/target/fingerprint/status); `pre_llm_call` drains pending rows, blockers first, and marks
-them injected. A base correction never changes which window is `is_latest`; an operator-authored
-identity still wins over any inference.
+`base_revisions_fts` is an external-content trigram index over the six snapshot columns plus
+`advices` (seven columns), so a previous model state is still recallable with
+`search_base_revisions()`. The dialectic writes no advices, so that column stays `[]`; the
+`advisories` ledger belongs to the live reviewer alone. A base correction never changes which
+window is `is_latest`; an operator-authored identity still wins over any inference.
 
 The model may be told who the assistant is from
 `$HERMES_HOME/minir-memory/agents/<profile>/identity.md` and `preference.md`; the profile comes from
@@ -275,16 +301,15 @@ The model may be told who the assistant is from
 provider's bound primary session and is skipped for subagents/cron, which fire the same plugin
 hook.
 
-Both layers are strict on purpose: base passes must return their staged JSON keys/arrays, and the
-dialectic pass must return all seven keys plus `base_changed`. A review may not *drop* content: an
-empty card fails the job when the base artifact for that window carried items, unless the card is
-listed in `base_changed.fields` with `[]` (an explicit clear). An empty field the base already had
-empty is a faithful copy, not a broken reply; the base pass accepts sparse cards, so the review
-must be allowed to echo them. Anything else **fails the job** and
-leaves the previous artifact in place — a malformed artifact would otherwise replace a good one in
-every later prompt. A failed job is retried once (the cached content is still there) and, if it
-fails again, the next job of that layer re-covers the same content (the content watermark never
-moved).
+Both layers are strict on purpose: base passes must return their staged JSON object and the
+dialectic must return the three parts plus `base_changed`. Any missing key, extra key, wrong enum
+or placeholder fails the object; a failed object is retried once with the format rule restated, and
+a second failure fails the job and leaves the previous artifact in place. A review may not empty a
+part the base row carried: a listed empty part fails the job rather than clearing durable content.
+A part the base already had empty is a faithful copy, not a broken reply; the base pass accepts
+sparse cards, so the review must be allowed to echo them. A failed job is retried once (the cached
+content is still there) and, if it fails again, the next job of that layer re-covers the same
+content (the content watermark never moved).
 
 * **Tick** — `on_turn_start` advances both counters with the host's turn number
   (`max(local + 1, host)`, so a `/resume` that rehydrates the host count moves forward instead of
@@ -307,14 +332,16 @@ moved).
   the newest `state.db` row, so the newest job always drains everything available. The next job or the boundary drain
   therefore covers the trigger turn, exactly once, and a re-queued window reads the same content
   again.
-* **Boundaries** — `on_session_end` flushes the base layer's counted tail (the spec's "no trigger
-  on a multiple": when the counter already sits on a dispatched watermark the flush is a no-op, so
-  a `/new` — which fires `on_session_finalize`, the queued `on_session_end` *and*
-  `on_session_reset` for one boundary — queues that window exactly once) and then queues the base
-  layer whose *content* no job has covered. The dialectic review always follows a successful base
-  job; it is never queued directly. `on_pre_compress` is different: it sets the compression gate,
-  queues and synchronously drains the base → dialectic pair, then moves both layer watermarks to
-  the current turn. A stop never swallows a tail that arrives after it (the CLI freezes the
+* **Boundaries** — `on_session_end` flushes **both** layers' counted tails (when the counter
+  already sits on a dispatched watermark the flush is a no-op, so a `/new` — which fires
+  `on_session_finalize`, the queued `on_session_end` *and* `on_session_reset` for one boundary —
+  queues that window exactly once) and then queues each layer whose *content* no job has covered.
+  `on_pre_compress` sets the compression gate, queues and synchronously drains the base -> review
+  pair (base first), then moves both watermarks to the current turn.
+* **First job** — `cold_start` queues one base job at session start even before history exists.
+  It advances that layer's window edge (`mark_dispatched`) so the next tick cannot re-dispatch the
+  same coarse-clock window; the review watermark still starts at session start, so the first review
+  waits for its own cadence. A stop never swallows a tail that arrives after it (the CLI freezes the
   session before the queued flush lands); only `tick` treats a stop as final.
 * **Nothing to observe costs nothing** — a window whose messages are already covered, or empty,
   completes as `done` without a model call, and a session that only ever greets never pays.
@@ -333,12 +360,69 @@ moved).
   memory-provider loader and once through general plugin discovery — while driving only one
   instance.
 
+### Durable card files and the three-day review
+
+Four files under `$HERMES_HOME/minir-memory/` are the profile's durable card state. They are the
+first baseline for a base refresh and the only place a durable item may be deleted:
+
+| File | Content |
+| --- | --- |
+| `user/identity.md` | `user_self` (occupation, skills, thinking models, interests, communication, values) |
+| `user/preference.md` | `user_preferences` (communication, presentation, method, decision, technology, collaboration, taboos) |
+| `agents/<profile>/identity.md` | hard identity (`id`, `name`, `version`, `type`, `system`, `creator`, `maintainer`) + role/domains + `_sources` |
+| `agents/<profile>/preference.md` | `persona_style`, `communication_style`, `permissions`, `prohibitions` |
+
+Each file is front-matter (`schema: minir-card/v1`, scope, part, generated_at, source, evidence,
+reviewer) plus a JSON body. `card_review.py` is the only writer: every pass validates all four
+objects, enforces the per-file `card_token_budget` (2000 by default) and rejects session-scoped
+fields anywhere; one invalid file fails the whole review and leaves all four files untouched.
+Every write records a `card_revisions` row (`before_hash`/`after_hash`, changed fields, evidence,
+source). A hand edit is detected by comparing the file hash with the last revision and recorded as
+`operator_edit` before the review takes over; a legacy file with no front-matter is copied to
+`<name>.declared.md` once. Front-matter `source: operator` lines win over inference; the review
+receives the current files as its baseline.
+
+The scheduler is wall-clock, not turn-driven: a review is due every **3 days**
+(`card_review_days`), the first anchor is written at install, the anchor advances only on success,
+and a failure retries after 30 minutes, 2 hours and 6 hours before waiting for the next period.
+It runs on the `minir_card_review` route with no tools (files and evidence are inline) and prunes
+transcripts older than 30 days after each success.
+
+### Knowledge pages
+
+Pass 3 units also feed a file layer: one page per `(category, org, topic)` under
+`$HERMES_HOME/minir-memory/knowledge/<org>/<CATEGORY>-<slug>.md`. The filename is stable for a
+topic (CJK preserved, separators stripped, collisions hashed); a rewrite bumps `revisions` in the
+front-matter, an older `time` never overwrites a newer page, and the per-file
+`knowledge_token_budget` (2000 by default) rejects an over-long page, keeping the old one and
+writing `_failed/<CATEGORY>-<slug>.json`. The `KnowledgePipeline` consumer is a daemon thread with
+a bounded queue (512, oldest dropped with a counter); a failed unit never propagates into a base
+job.
+
+Retrieval is by **path, never by content**: `prefetch()` scores the front-matter against the query
+(objects 2x, word overlap 1x, recency 0.5x), selects at most 6 paths within 700 characters and
+injects them as `[knowledge — retrieve on demand] ... [end knowledge]`. Paths selected in the last
+three turns are skipped. The model opens a page with its file tool when the hint is relevant.
+
+### The transcript audit trail
+
+Completed host turns and every layer pass are mirrored to
+`$HERMES_HOME/minir-memory/sessions/`: `<session_id>.json` for the primary session and
+`<layer>/<run_id>.json` for base, dialectic, card_review and knowledge passes. All writes happen on
+one writer thread (temp file + `os.replace`), debounced 30 seconds or 50 messages, sharded at 2000
+messages, with a bounded queue; `flush()` runs at every boundary, `close()` joins at shutdown, and
+files older than 30 days are pruned. The JSON keeps `session_id`, `layer`, timestamps, model,
+provider, toolsets, system message and `messages`; it is an audit trail, not a recall source.
+
 ### Where the model call comes from
 
-Base and dialectic passes run through `agent_loop.run` on the `auxiliary.adviser` route and always
-attach the `adviser` toolset explicitly (`adviser.run` does not append it). Each pass is prompted
-to call `adviser_session_search` with the session id and window from its prompt when it needs more
-evidence, so the configured provider/model/toolsets are what a refresh uses:
+Base and dialectic passes run through `agent_loop.run` on the `auxiliary.adviser` route with a
+**fixed** toolset: the host's `file` toolset plus this plugin's `adviser` toolset (which carries
+`adviser_session_search`). Operator-configured adviser toolsets are not used, and the list is never
+`None` (which the host reads as "every tool"). While a pass runs, a `pre_tool_call` guard scopes
+those file tools: reads stay under `$HERMES_HOME` minus `config.yaml`/`.env`/`credentials*`, writes
+only under `minir-memory/scratch/`. Each pass is prompted to call `adviser_session_search` with the
+session id and window from its prompt when it needs more evidence:
 
 ```yaml
 auxiliary:
@@ -350,13 +434,14 @@ auxiliary:
 
 If the adviser route cannot run (host module absent, bad config, provider outage), the pass falls
 back to `worker.call_model`, which imports `agent.auxiliary_client.call_llm` lazily. Each layer
-uses its own task key (`minir_base_layer` / `minir_dialectic_layer`), so the two can still be
-pinned independently:
+uses its own task key (`minir_base_layer` / `minir_dialectic_layer`), the global review uses
+`minir_card_review`, so each can still be pinned independently:
 
 ```yaml
 auxiliary:
   minir_base_layer:      {provider: deepseek, model: deepseek-v4-flash, timeout: 60}
   minir_dialectic_layer: {provider: deepseek, model: deepseek-v4-pro,   timeout: 90}
+  minir_card_review:     {provider: deepseek, model: deepseek-v4-pro,   timeout: 180}
 ```
 
 Without those blocks the host's normal auto chain applies (main model first), exactly as
@@ -397,13 +482,13 @@ stable across windows and leaves the evidence replaceable.
   non-empty.
 - **Bounded inputs** — the window keeps the newest messages under its character budget with an
   omission marker; the previous artifact and value markers are fed back only where the merge
-  needs them (the base `## Session Summary` projection is deliberately recomputed, not fed back).
+  needs them (the base `## Window Summary` projection is deliberately recomputed, not fed back).
 
 ## The adviser auxiliary (optional agent loop)
 
 `adviser.py` puts a second-opinion agent inside this plugin: an `auxiliary.adviser` model route
 plus one `adviser_consult` tool that runs a **real agent loop** (its own LLM + tools) rather than a
-one-shot completion. The base layer's three passes and the dependent dialectic review reuse the
+one-shot completion. The base layer's three passes and the independent review reuse the
 same route and toolset (`worker._adviser_consult`); the loop is not adviser-specific — it lives in
 `agent_loop.py` and can be reused for any one-shot peer run (a review, a summary, a critic):
 
@@ -643,7 +728,7 @@ window has consumed **95% of the configured threshold** (`last_prompt_tokens >=
 0.95 * threshold_tokens`). At that point the host calls `on_pre_compress` and then `compress()`:
 
 1. `on_pre_compress` sets a per-session **compression gate**, queues the base job for the
-   unreasoned window, drains the base and dependent dialectic jobs **synchronously**, resets both
+   unreasoned window, drains the base and review jobs **synchronously** (base first), resets both
    layer counters to the current turn, and leaves the gate in place.
 2. `compress()` reads the prepared chunk and dialectic review, runs a real **summary agent** on
    the `auxiliary.adviser` route with the `adviser` toolset, and produces the final
@@ -730,13 +815,17 @@ directory install for that surface. Use exactly one install visible on the disco
 memory:
   provider: minir
   minir:                       # the provider's own block: memory.<provider name>
-    context_cadence: 20        # turns per periodic base-layer job (alias: base_interval)
-    dialectic_cadence: 10      # periodic dialectic counter; reviews still follow each base job
+    context_cadence: 24        # turns per base-layer job (alias: base_interval)
+    dialectic_cadence: 8       # turns per review job; the two layers never share a watermark
     dialectic_depth: 2         # upper bound: 1 synthesize, 2 audit, 3 reconcile (adaptive by window size)
     reasoning_enabled: true    # run the layer reasoning passes (auxiliary model, no key needed)
     handoff_enabled: true      # let compression call the summary agent
     session_mode: default      # mode stamped on each newly opened session
     prefetch_limit: 5          # memory items injected per turn
+    content_language: en       # language for card/knowledge prose; field names stay English
+    card_token_budget: 2000    # hard per-file budget for the four global card files
+    card_review_days: 3        # days between global card reviews
+    knowledge_token_budget: 2000  # hard per-file budget for one knowledge page
 ```
 
 `memory.minir.*` is the block this plugin reads and the one `hermes memory setup` writes
@@ -744,10 +833,11 @@ memory:
 hand-edited config.yaml are equivalent. Every key also has an env override —
 `MINIR_CONTEXT_CADENCE`, `MINIR_DIALECTIC_CADENCE`, `MINIR_DIALECTIC_DEPTH`,
 `MINIR_BASE_INTERVAL`, `MINIR_DIALECTIC_INTERVAL`, `MINIR_REASONING_ENABLED`,
-`MINIR_HANDOFF_ENABLED`, `MINIR_SESSION_MODE`, `MINIR_PREFETCH_LIMIT` — and **the env var wins**
-when both are set. Layer intervals, depth and `reasoning_enabled` are read when a session opens.
+`MINIR_HANDOFF_ENABLED`, `MINIR_SESSION_MODE`, `MINIR_PREFETCH_LIMIT`, `MINIR_CONTENT_LANGUAGE`,
+`MINIR_CARD_TOKEN_BUDGET`, `MINIR_CARD_REVIEW_DAYS`, `MINIR_KNOWLEDGE_TOKEN_BUDGET` — and **the
+env var wins** when both are set. Layer intervals, depth and `reasoning_enabled` are read when a session opens.
 
-Every published conclusion is searchable: `notes`, the six base sections, the dialectic review,
+Every published conclusion is searchable: `notes`, the four base sections, the dialectic review,
 local compression chunks, and the final `session_summary` of each compression. The index uses
 FTS5 `trigram` so Chinese queries work; if the SQLite build lacks FTS5, `minir_search` falls back
 to a token scan. Base revisions are a separate audit surface (`search_base_revisions`, trigram

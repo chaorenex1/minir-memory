@@ -783,8 +783,7 @@ class AdviserMode:
         parts: list[str] = []
         try:
             for kind, label, scoped in (
-                ("base.user_representation", "User path", True),
-                ("base.user_peer_card", "User constraints", False),
+                ("base.user_card", "User card", False),
             ):
                 row = store.newest_conclusion(kind, session_id=session if scoped else None)
                 body = _bounded((row or {}).get("content"), 320)

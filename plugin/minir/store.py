@@ -32,13 +32,13 @@
 * ``advisories`` — the delivery ledger for the single advice producer (the live reviewer):
   normalized, deduped advices with severity/target and a ``pending``/``injected`` state.
 * ``conclusions`` — every durable result split into individually searchable rows: notes, the
-  six base-layer sections, the base revision note, local
+  four base-layer sections, the base revision note, local
   compression chunks, and final session summaries. ``conclusions_fts`` is an FTS5 trigram index
   over it (CJK-safe); when FTS5 is unavailable, ``search()`` falls back to the token scan.
   ``session_chunk_summary`` is the canonical local-compression chain; each row records the time
-  and session-turn range it covers. The base artifact's ``## Session Summary`` projects only the
-  newest active chunk; older (including superseded) chunks stay as independent rows and remain
-  searchable inside their own session.
+  and session-turn range it covers. The base artifact renders its rolling ``## Window Summary``
+  from the pass's JSON and appends the same body to the chain; older (including superseded)
+  chunks stay as independent rows and remain searchable inside their own session.
 * ``metrics`` — aggregated tool counters, flushed in batches rather than per call.
 
 ``search()`` enforces session isolation by default: session summaries, reviews, focus
@@ -61,7 +61,7 @@ from typing import Any, Optional
 
 logger = logging.getLogger(__name__)
 
-_MAX_CONTENT = 4000  # stored text is truncated to this many chars
+_MAX_CONTENT = 12000  # stored text is truncated to this many chars
 _MAX_TERMS = 8       # query tokens considered per search
 _MAX_SCAN = 200      # candidate rows fetched per table before scoring
 
@@ -77,7 +77,8 @@ CREATE TABLE IF NOT EXISTS notes (
     content TEXT NOT NULL,
     created_at REAL NOT NULL,
     session_id TEXT NOT NULL DEFAULT '',
-    marker_type TEXT NOT NULL DEFAULT ''
+    marker_type TEXT NOT NULL DEFAULT '',
+    category TEXT NOT NULL DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS idx_notes_created ON notes(created_at DESC);
 CREATE TABLE IF NOT EXISTS jobs (
@@ -180,6 +181,23 @@ CREATE INDEX IF NOT EXISTS idx_base_revisions_session
     ON base_revisions(session_id, subject, created_at DESC);
 CREATE UNIQUE INDEX IF NOT EXISTS idx_base_revisions_latest
     ON base_revisions(session_id, subject) WHERE is_latest = 1;
+CREATE TABLE IF NOT EXISTS card_revisions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    scope TEXT NOT NULL DEFAULT '',
+    part TEXT NOT NULL DEFAULT '',
+    path TEXT NOT NULL DEFAULT '',
+    reviewed_at REAL NOT NULL,
+    before_hash TEXT NOT NULL DEFAULT '',
+    after_hash TEXT NOT NULL DEFAULT '',
+    diff TEXT NOT NULL DEFAULT '',
+    changed_fields TEXT NOT NULL DEFAULT '[]',
+    source TEXT NOT NULL DEFAULT 'review',
+    evidence TEXT NOT NULL DEFAULT '[]',
+    reviewer TEXT NOT NULL DEFAULT '',
+    status TEXT NOT NULL DEFAULT 'applied'
+);
+CREATE INDEX IF NOT EXISTS idx_card_revisions_part
+    ON card_revisions(scope, part, reviewed_at DESC);
 CREATE TABLE IF NOT EXISTS advisories (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     revision_id INTEGER NOT NULL DEFAULT 0,
@@ -237,7 +255,8 @@ CREATE TABLE IF NOT EXISTS metrics (
 # Columns added after the first release; ``_migrate`` adds whichever an existing database lacks.
 _ADDED_COLUMNS: dict[str, tuple[tuple[str, str], ...]] = {
     "notes": (("session_id", "TEXT NOT NULL DEFAULT ''"),
-              ("marker_type", "TEXT NOT NULL DEFAULT ''")),
+              ("marker_type", "TEXT NOT NULL DEFAULT ''"),
+              ("category", "TEXT NOT NULL DEFAULT ''")),
     "jobs": (("attempts", "INTEGER NOT NULL DEFAULT 0"), ("claimed_at", "REAL"),
              ("finished_at", "REAL"), ("error", "TEXT NOT NULL DEFAULT ''"),
              ("processed_ts", "REAL")),
@@ -266,24 +285,22 @@ _DROPPED_TABLES: tuple[str, ...] = ("turns",)
 # compression summaries, focus statements) is bound to the session that produced it: injecting
 # another session's review as a high-weight conclusion would be actively wrong.
 _LONG_TERM_KINDS: tuple[str, ...] = (
-    "base.user_peer_card",
-    "base.ai_identity_card",
+    "base.user_card",
+    "base.ai_card",
 )
 
 # Fixed headings -> conclusion kind. The worker validates the same headings; publishing splits
 # one artifact into individually searchable rows instead of one large document.
 _ARTIFACT_SECTIONS: dict[str, tuple[tuple[str, str, str], ...]] = {
     "base": (
-        # Derived projection of the session_chunk_summary chain; never an independent source.
-        ("## Session Summary", "base.session_summary", "projection"),
-        ("## User Representation", "base.user_representation", "session"),
-        ("## User Peer Card", "base.user_peer_card", "user"),
-        ("## AI Self Representation", "base.ai_self_representation", "session"),
-        ("## AI Identity Card", "base.ai_identity_card", "agent"),
+        # The two cards are durable; the summary and the units belong to one window.
+        ("## User Card", "base.user_card", "user"),
+        ("## AI Card", "base.ai_card", "agent"),
+        ("## Window Summary", "base.window_summary", "session"),
         ("## Value Markers", "base.value_markers", "session"),
     ),
     "dialectic": (
-        # The six corrected cards live on the base layer; the dialectic artifact owns only the
+        # The corrected parts live on the base layer; the dialectic artifact owns only the
         # revision note, so the live layer injection never leaks a base card or advice.
         ("## Base Revision", "dialectic.review", "session"),
     ),
@@ -297,11 +314,10 @@ _BASE_REVISION_COLUMNS: tuple[str, ...] = (
 )
 
 _KIND_WEIGHT: dict[str, float] = {
-    "base.ai_identity_card": 1.5,
-    "base.user_peer_card": 1.5,
+    "base.user_card": 1.5,
+    "base.ai_card": 1.4,
     "dialectic.review": 1.4,
-    "base.user_representation": 1.2,
-    "base.ai_self_representation": 1.0,
+    "base.window_summary": 1.0,
     "base.value_markers": 1.0,
     "session_summary": 0.8,
     "session_chunk_summary": 0.6,
@@ -609,7 +625,7 @@ class MinirStore:
     # -- writes ---------------------------------------------------------------
 
     def remember(self, content: str, source: str = "tool", *, marker_type: str = "",
-                 session_id: str = "") -> int:
+                 category: str = "", session_id: str = "") -> int:
         """Store an explicit note; returns its row id. Also indexes it as a conclusion.
 
         ``marker_type`` turns the note into an explicit value-output marker (one of
@@ -619,9 +635,10 @@ class MinirStore:
         stamp = time.time()
         with self._lock:
             cur = self._conn.execute(
-                "INSERT INTO notes (source, content, created_at, session_id, marker_type) "
-                "VALUES (?, ?, ?, ?, ?)",
-                (source, content[:_MAX_CONTENT], stamp, session_id or "", marker_type or ""),
+                "INSERT INTO notes (source, content, created_at, session_id, marker_type, "
+                "category) VALUES (?, ?, ?, ?, ?, ?)",
+                (source, content[:_MAX_CONTENT], stamp, session_id or "", marker_type or "",
+                 category or ""),
             )
             note_id = int(cur.lastrowid)
             self._put_conclusion_locked(
@@ -900,15 +917,21 @@ class MinirStore:
         own predecessor) can never process the same row twice. ``attempts`` counts claims.
         A non-empty *session_id* scopes the claim to one session, which is what the
         pre-compression synchronous drain needs.
+
+        Claiming is strictly FIFO *within a session*: a job is only eligible once every
+        earlier job of the same session finished. That is what makes a same-turn base and
+        review safe — the base row is published before the review reads it — even when the
+        synchronous drain and the background worker compete for the queue.
         """
         with self._lock:
             if self._conn is None:
                 return []
-            # A review is queued only after its base job published, and it owns the window
-            # that base just produced. Claim it before any later base job so the review sees
-            # the live artifact and its correction can carry into the next base merge.
-            order = ("ORDER BY CASE layer WHEN 'dialectic' THEN 0 ELSE 1 END, id")
-            where = "WHERE status = 'pending'"
+            order = "ORDER BY id"
+            where = (
+                "WHERE layer IN ('base', 'dialectic') AND status = 'pending' AND NOT EXISTS ("
+                "SELECT 1 FROM jobs AS older WHERE older.session_id = jobs.session_id "
+                "AND older.id < jobs.id AND older.status IN ('pending', 'running'))"
+            )
             params: list[Any] = []
             if session_id:
                 where += " AND session_id = ?"
@@ -1267,6 +1290,20 @@ class MinirStore:
                     (session_id,)).fetchone()
         return dict(row) if row is not None else None
 
+    def latest_base_refresh_for_subject(self, subject: str) -> Optional[dict[str, Any]]:
+        """The subject's newest refresh across sessions; the base layer's cross-session baseline.
+
+        The user card and AI identity outlive a session, so a new session starts from the last
+        published card rather than from an empty one. The global card files (three-day review)
+        will outrank this; until they exist this is the inheritance path.
+        """
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM base_refreshes WHERE subject = ? "
+                "ORDER BY window_to_ts DESC, window_from_ts DESC, id DESC LIMIT 1",
+                (subject or "",)).fetchone()
+        return dict(row) if row is not None else None
+
     def base_refreshes(self, session_id: str, subject: str = "",
                        limit: int = 20) -> list[dict[str, Any]]:
         """The session's refresh history, newest first (latest flags preserved)."""
@@ -1282,6 +1319,36 @@ class MinirStore:
                     "SELECT * FROM base_refreshes WHERE session_id = ? "
                     "ORDER BY window_to_ts DESC, id DESC LIMIT ?",
                     (session_id, limit)).fetchall()
+        return [dict(row) for row in rows]
+
+    def base_refreshes_since(self, since_ts: float, *, per_session: int = 1,
+                             max_sessions: int = 20) -> list[dict[str, Any]]:
+        """Newest refresh per session published at or after *since_ts* (the review's evidence)."""
+        limit = max(1, min(500, int(max_sessions) * max(1, int(per_session)) * 5))
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT * FROM base_refreshes WHERE window_to_ts >= ? "
+                "ORDER BY window_to_ts DESC, id DESC LIMIT ?",
+                (float(since_ts), limit)).fetchall()
+        kept: list[dict[str, Any]] = []
+        counts: dict[str, int] = {}
+        for row in rows:
+            session = str(row["session_id"] or "")
+            if counts.get(session, 0) >= max(1, int(per_session)):
+                continue
+            counts[session] = counts.get(session, 0) + 1
+            kept.append(dict(row))
+            if len(kept) >= max(1, int(max_sessions)):
+                break
+        return kept
+
+    def marker_notes(self, limit: int = 50) -> list[dict[str, Any]]:
+        """Typed explicit markers, newest first (the review's second evidence source)."""
+        limit = max(1, min(200, int(limit or 50)))
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT id, marker_type, category, content, created_at FROM notes "
+                "WHERE marker_type <> '' ORDER BY created_at DESC LIMIT ?", (limit,)).fetchall()
         return [dict(row) for row in rows]
 
     def base_refresh_for_window(self, session_id: str, subject: str,
@@ -1839,6 +1906,7 @@ class MinirStore:
                 "conclusion_id": int(row.get("id") or 0),
                 "note_id": note_id,
                 "marker_type": "",
+                "category": "",
                 "key": row.get("key") or "",
                 "text": text,
                 "when": when,
@@ -1857,13 +1925,53 @@ class MinirStore:
             marks = ",".join("?" * len(note_ids))
             with self._lock:
                 marked = self._conn.execute(
-                    f"SELECT id, marker_type FROM notes WHERE id IN ({marks})", note_ids).fetchall()
-            by_id = {int(row["id"]): str(row["marker_type"] or "") for row in marked}
+                    f"SELECT id, marker_type, category FROM notes WHERE id IN ({marks})",
+                    note_ids).fetchall()
+            by_id = {int(row["id"]): (str(row["marker_type"] or ""), str(row["category"] or ""))
+                     for row in marked}
             for entry in results:
-                entry["marker_type"] = by_id.get(entry["note_id"], "")
+                entry["marker_type"], entry["category"] = by_id.get(entry["note_id"], ("", ""))
         results.sort(key=lambda item: (item["score"], -item["rank"], item["when"], item["id"]),
                      reverse=True)
         return results[:capped]
+
+    # -- card revisions (three-day review) -----------------------------------
+
+    def add_card_revision(self, scope: str, part: str, path: str, *, before_hash: str,
+                          after_hash: str, diff: str = "", changed_fields: Any = None,
+                          source: str = "review", evidence: Any = None, reviewer: str = "",
+                          status: str = "applied") -> int:
+        """Record one card-file write. The file is canonical; this row is its history."""
+        with self._lock:
+            cur = self._conn.execute(
+                "INSERT INTO card_revisions (scope, part, path, reviewed_at, before_hash, "
+                "after_hash, diff, changed_fields, source, evidence, reviewer, status) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (scope or "", part or "", path or "", time.time(), before_hash or "",
+                 after_hash or "", diff or "", json.dumps(changed_fields or []),
+                 source or "review", json.dumps(evidence or []), reviewer or "", status or "applied"))
+            self._conn.commit()
+            return int(cur.lastrowid)
+
+    def card_revisions(self, scope: str = "", part: str = "", limit: int = 20
+                       ) -> list[dict[str, Any]]:
+        """Revision history, newest first, optionally filtered by scope and part."""
+        limit = max(1, min(200, int(limit or 20)))
+        with self._lock:
+            if scope or part:
+                rows = self._conn.execute(
+                    "SELECT * FROM card_revisions WHERE scope = ? AND part = ? "
+                    "ORDER BY reviewed_at DESC, id DESC LIMIT ?",
+                    (scope or "", part or "", limit)).fetchall()
+            else:
+                rows = self._conn.execute(
+                    "SELECT * FROM card_revisions ORDER BY reviewed_at DESC, id DESC LIMIT ?",
+                    (limit,)).fetchall()
+        return [dict(row) for row in rows]
+
+    def latest_card_revision(self, scope: str, part: str) -> Optional[dict[str, Any]]:
+        rows = self.card_revisions(scope, part, limit=1)
+        return rows[0] if rows else None
 
     def stats(self) -> dict[str, Any]:
         """Row counts and on-disk size, for the ``minir_stats`` tool."""
