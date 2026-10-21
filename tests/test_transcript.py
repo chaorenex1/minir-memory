@@ -161,6 +161,29 @@ def test_a_plugin_layer_session_lands_under_its_layer_directory(persisted):
     assert data["messages"] == [{"role": "assistant", "content": "critique"}]
 
 
+def test_flush_aux_waits_for_one_custom_agent_snapshot(persisted):
+    make, root = persisted
+    buffer = make()
+
+    buffer.record_aux("researcher", "layer-1",
+                      [{"role": "user", "content": "q"}, {"role": "assistant", "content": "a"}],
+                      model="m", provider="p", toolsets=("file",), system_message="sys")
+    assert buffer.flush_aux("researcher", "layer-1") is True
+
+    path = buffer.path_for_aux("researcher", "layer-1")
+    assert path == root / "researcher" / "layer-1.json"
+    data = json.loads(path.read_text(encoding="utf-8"))
+    assert (data["layer"], data["session_id"]) == ("researcher", "layer-1")
+    assert [row["role"] for row in data["messages"]] == ["user", "assistant"]
+
+
+def test_a_hostile_agent_name_cannot_escape_the_persist_directory(persisted):
+    make, root = persisted
+    buffer = make()
+    path = buffer.path_for_aux("../../evil", "layer-1")
+    assert path is not None and path.parent == root / "evil"
+
+
 def test_a_hostile_session_id_cannot_escape_the_persist_directory(persisted):
     make, root = persisted
     buffer = make()

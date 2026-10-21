@@ -160,7 +160,7 @@ def test_the_agent_is_built_like_the_feishu_comment_agent(loop, host):
     assert agent.kwargs["skip_context_files"] is True
     assert agent.kwargs["skip_memory"] is True
     assert agent.kwargs["skip_background_review"] is True
-    assert agent.kwargs["load_soul_identity"] is True
+    assert agent.kwargs["load_soul_identity"] is False
     assert agent.kwargs["max_iterations"] == loop.MAX_ITERATIONS
     assert agent.kwargs["enabled_toolsets"] == [], "no toolset means no tools, never every tool"
     assert agent.closed is True
@@ -249,6 +249,19 @@ def test_toolsets_are_forwarded(loop, host):
     assert agent.kwargs["enabled_toolsets"] == ["file", "web"]
     assert result.toolsets == ("file", "web")
     assert result.as_dict()["toolsets"] == ["file", "web"]
+
+
+def test_a_custom_agent_can_opt_into_every_tool_and_the_host_knobs(loop, host):
+    run = loop.run("q", all_tools=True, skip_memory=False, skip_context_files=False,
+                   skip_background_review=False, load_soul_identity=True)
+
+    agent = FakeAgent.instances[-1]
+    assert agent.kwargs["enabled_toolsets"] is None, "None is the host's every-tool surface"
+    assert agent.kwargs["skip_memory"] is False
+    assert agent.kwargs["skip_context_files"] is False
+    assert agent.kwargs["skip_background_review"] is False
+    assert agent.kwargs["load_soul_identity"] is True
+    assert run.toolsets == ("*",)
 
 
 def test_every_peer_run_is_scoped_for_the_file_guard(loop, host, monkeypatch):

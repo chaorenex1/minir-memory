@@ -33,3 +33,4 @@ provides_tools:
   - minir_remember
   - minir_forget
   - minir_stats
+  - minir_agents

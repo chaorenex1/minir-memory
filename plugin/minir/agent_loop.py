@@ -11,8 +11,9 @@ builds an agent (``plugins/platforms/feishu/feishu_comment.py::_resolve_model_an
                    ``api_mode``, ``credential_pool`` (plus the gateway's fallback chain);
 * reasoning      — ``resolve_reasoning_config(config, model)`` for the *final* model, the one
                    chokepoint that makes ``reasoning_effort`` reach the adapter;
-* the agent knobs — ``max_iterations``, quiet mode, no context files, no memory, no background
-                   review fork, and the operator's soul identity loaded;
+* the agent knobs — ``max_iterations``, quiet mode, and the plugin posture: no context files,
+                   no memory, no background review fork, no operator soul identity; a custom
+                   agent route can flip each one;
 * the file scope: every run is marked with ``file_guard.aux_scope()``, so the host's file tools
                    read only under ``$HERMES_HOME`` and write only under ``minir-memory/scratch``.
 
@@ -51,7 +52,7 @@ from . import file_guard
 logger = logging.getLogger(__name__)
 
 #: Tool-call budget for one peer run — the Feishu comment agent's number.
-MAX_ITERATIONS = 15
+MAX_ITERATIONS = 30
 
 #: Constructor kwargs that come from the resolved runtime rather than from the caller — the same
 #: set the gateway forwards from ``_resolve_runtime_agent_kwargs()`` (``_runtime_agent_kwargs``),
@@ -160,7 +161,10 @@ def _prompt(message: str, context: str = "") -> str:
 def run(message: str, *, context: str = "", model: str = "", provider: str = "",
         api_mode: str = "", toolsets: Optional[Sequence[str]] = None,
         system_message: str = "", max_iterations: int = MAX_ITERATIONS,
-        project_dir: Optional[str] = None) -> AgentRun:
+        project_dir: Optional[str] = None, all_tools: bool = False,
+        skip_memory: bool = True, skip_context_files: bool = True,
+        skip_background_review: bool = True,
+        load_soul_identity: bool = False) -> AgentRun:
     """Run one agent loop on *message* and return its answer. Never leaves an agent open.
 
     ``max_iterations`` is the tool-call budget for this peer run. The default is the Feishu
@@ -169,6 +173,11 @@ def run(message: str, *, context: str = "", model: str = "", provider: str = "",
     ``project_dir`` grants read-only access to that project root. Every peer run inherits the
     cwd's git root by default (``None``); a caller passes ``""`` only to opt out, or an explicit
     path to override. Writes stay under ``minir-memory/scratch`` in every case.
+
+    The defaults are the plugin's own posture: no host memory, no project context files, no
+    background review fork and no operator soul identity, because a layer pass is not the main
+    agent. A custom-agent route (``minir_agents``) opts into memory/context/soul with the flags
+    and passes ``all_tools`` when the caller omitted ``tool_sets``.
     """
     from run_agent import AIAgent  # first: it replaces sys.path (managed environment bootstrap)
 
@@ -180,19 +189,18 @@ def run(message: str, *, context: str = "", model: str = "", provider: str = "",
     agent = AIAgent(
         model=final_model,
         **_agent_kwargs(final_provider, final_model, runtime, api_mode),
-        # The plugin's fixed toolsets are never empty (``agent_toolsets`` always adds the host
-        # ``file`` toolset plus ``minir``/``adviser``). An explicit empty list therefore means
-        # "no tools", not the host's ``None`` = every tool: the two are different requests.
-        enabled_toolsets=tools,
+        # ``None`` means every tool only when the caller explicitly asks (``all_tools``); an
+        # empty list is "no tools", and a list is exactly that surface. The plugin's own
+        # ``agent_toolsets`` always adds file/minir/adviser before it reaches here.
+        enabled_toolsets=None if all_tools else tools,
         max_iterations=max(1, int(max_iterations or MAX_ITERATIONS)),
-        # A peer run brings its own instructions and evidence: no project context files, no host
-        # memory, no background review fork. ``load_soul_identity`` stays on so the run speaks in
-        # the operator's configured voice.
+        # Defaults keep the plugin's peers separate from the main agent's memory, context and
+        # voice. The minir_agents route flips them explicitly.
         quiet_mode=True,
-        skip_context_files=True,
-        skip_memory=True,
-        skip_background_review=True,
-        load_soul_identity=True,
+        skip_context_files=bool(skip_context_files),
+        skip_memory=bool(skip_memory),
+        skip_background_review=bool(skip_background_review),
+        load_soul_identity=bool(load_soul_identity),
     )
     try:
         # A plugin agent's file tools are the host's own four, scoped by ``file_guard``: reads
@@ -208,7 +216,7 @@ def run(message: str, *, context: str = "", model: str = "", provider: str = "",
             api_calls=result.get("api_calls", 0),
             model=final_model,
             provider=final_provider,
-            toolsets=tuple(tools),
+            toolsets=("*",) if all_tools else tuple(tools),
             messages=_transcript(result),
         )
     finally:
@@ -221,9 +229,14 @@ def run(message: str, *, context: str = "", model: str = "", provider: str = "",
 async def run_async(message: str, *, context: str = "", model: str = "", provider: str = "",
                     api_mode: str = "", toolsets: Optional[Sequence[str]] = None,
                     system_message: str = "", max_iterations: int = MAX_ITERATIONS,
-                    project_dir: Optional[str] = None) -> AgentRun:
+                    project_dir: Optional[str] = None, all_tools: bool = False,
+                    skip_memory: bool = True, skip_context_files: bool = True,
+                    skip_background_review: bool = True,
+                    load_soul_identity: bool = False) -> AgentRun:
     """Await :func:`run` off the event loop (see the module docstring for why a thread)."""
-    return await asyncio.to_thread(run, message, context=context, model=model,
-                                   provider=provider, api_mode=api_mode, toolsets=toolsets,
-                                   system_message=system_message,
-                                   max_iterations=max_iterations, project_dir=project_dir)
+    return await asyncio.to_thread(
+        run, message, context=context, model=model, provider=provider, api_mode=api_mode,
+        toolsets=toolsets, system_message=system_message, max_iterations=max_iterations,
+        project_dir=project_dir, all_tools=all_tools, skip_memory=skip_memory,
+        skip_context_files=skip_context_files, skip_background_review=skip_background_review,
+        load_soul_identity=load_soul_identity)

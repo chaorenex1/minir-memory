@@ -6,7 +6,7 @@ and grow into a real provider.
 
 It keeps explicit value markers and every derived conclusion in a per-profile SQLite database,
 recalls them through an FTS5 trigram index (CJK-safe, with a token-scan fallback), and exposes
-four tools (`minir_search`, `minir_remember`, `minir_forget`, `minir_stats`). On top of that it runs
+five tools (`minir_search`, `minir_remember`, `minir_forget`, `minir_stats`, `minir_agents`). On top of that it runs
 two **independent** reasoning layers: the base layer builds the user/AI cards every 24 turns, the
 dialectic reviews them every 8 turns against its own evidence window, and corrects the newest base
 artifact (a pre-overwrite snapshot and an FTS index are kept). The review publishes a short
@@ -64,7 +64,8 @@ plugin/minir/          the deployable plugin directory (copy this to plugins/min
   worker.py            drains base and review jobs FIFO per session, publishes artifacts
   card_review.py       three-day review: four card files, validation, revisions, anchor policy
   knowledge.py         one page per unit, path-hint retrieval block
-  tools.py             the minir toolset: same four schemas, registered for plugin agents; file grant
+  tools.py             the minir toolset: same five schemas, registered for plugin agents; file grant
+  minir_agents.py      run one named custom agent and flush its transcript under sessions/
   session_summary.py   end-of-session summary agent (hand-off is its first user prompt input)
   extraction.py        idle-timer due-row runner + knowledge-page extraction agent
   file_guard.py        pre-tool-call scope for the plugin agents' file tools
@@ -170,6 +171,7 @@ be granted them explicitly (see "The `minir` toolset" below).
 | `minir_remember` | `type` (required), `content` (required) | Records an explicit value-output marker of that type (`entities`, `trajectories`, `experiences`, `tools`, `projects`), bound to the current session and mirrored into `conclusions` so FTS finds it. Returns `{stored, note_id, type, session_id}`. |
 | `minir_forget` | `type` (required), `note_id` (required) | Deletes the marker only when its stored type matches. Returns `{deleted, note_id, type}`; a wrong type or unknown id yields `deleted: false`. Conclusions have no `note_id` and cannot be deleted. |
 | `minir_stats` | none | Store counts (including `markers` per type), layer counters, the scheduler ledger, published artifacts, buffered messages, in-memory tool metrics, the session's token usage and its newest turn rows, and the database path. |
+| `minir_agents` | `agent_name` (required), `user_prompts` (required), `system_prompts`, `context_files`, `project_dir`, `tool_sets`, `skip_memory`, `skip_context_files`, `skip_background_review`, `load_soul_identity` | Runs a named in-process agent; omitting `tool_sets` grants every host tool. The full run is flushed to `sessions/<agent_name>/<layer_session_id>.json`. |
 
 Explicit markers are separate from the base layer's automatic `value_markers`: the worker keeps
 merging its own five-key inventory per refresh, while a remembered marker is a session-bound,
@@ -179,7 +181,7 @@ both public scopes.
 
 ## The `minir` toolset
 
-The four tools have two delivery paths. The memory-provider surface (`get_tool_schemas`) injects
+The five tools have two delivery paths. The memory-provider surface (`get_tool_schemas`) injects
 them into a main agent that has the host's `memory` toolset enabled. For the plugin's own agents —
 the adviser, the layer worker, the hand-off and session-summary agents, the idle extraction — the
 same schemas are registered through the plugin context under a registry toolset named `minir`.
@@ -194,6 +196,26 @@ Every in-process agent this plugin runs builds its list with `tools.agent_toolse
 appends the three to whatever the caller configured, `file` included and not left to the caller.
 The registered handlers call the live provider's `handle_tool_call`, so the registry path and
 the provider path cannot drift.
+
+## Custom agents: `minir_agents`
+
+`minir_agents` runs one named in-process agent on the gateway's model route. `agent_name` and
+`user_prompts` are required; `system_prompts` is its system message, and `context_files` are read
+under the same `file_guard` scope as the agent's own file tools, with relative paths resolved
+against `project_dir` (at most 20 files and 200 KB in total).
+
+- `tool_sets` omitted, empty or `["*"]` grants every host tool; an explicit list is passed to the
+  agent unchanged.
+- `skip_memory=False`, `skip_context_files=False`, `skip_background_review=True` and
+  `load_soul_identity=True` are the custom-agent defaults. The plugin's own layer, review,
+  extraction and adviser agents use the opposite posture: no host memory, no context files, no
+  soul identity.
+- The run's `AgentRun.messages` are recorded with `TranscriptBuffer.record_aux` and flushed
+  before the tool returns, at
+  `<HERMES_HOME>/minir-memory/sessions/<agent_name>/<layer_session_id>.json`. The path is returned
+  as `transcript_path`; `transcript_written` says whether the flush reached disk.
+- `minir_agents` may recurse when the custom agent is granted the `minir` toolset; the tool caps
+  the depth at three.
 
 ## Session end: idle timer, summary and knowledge extraction
 
@@ -501,8 +523,9 @@ three turns are skipped. The model opens a page with its file tool when the hint
 ### The transcript audit trail
 
 Completed host turns and every layer pass are mirrored to
-`$HERMES_HOME/minir-memory/sessions/`: `<session_id>.json` for the primary session and
-`<layer>/<run_id>.json` for base, dialectic, card_review and knowledge passes. All writes happen on
+`$HERMES_HOME/minir-memory/sessions/`: `<session_id>.json` for the primary session,
+`<layer>/<run_id>.json` for base, dialectic, card_review and knowledge passes, and
+`<agent_name>/<layer_session_id>.json` for `minir_agents` runs. All writes happen on
 one writer thread (temp file + `os.replace`), debounced 30 seconds or 50 messages, sharded at 2000
 messages, with a bounded queue; `flush()` runs at every boundary, `close()` joins at shutdown, and
 files older than 30 days are pruned. The JSON keeps `session_id`, `layer`, timestamps, model,

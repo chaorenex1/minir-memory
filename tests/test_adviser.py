@@ -318,4 +318,4 @@ def test_provider_registration_survives_a_refused_auxiliary_key(plugin_package):
     # The refused auxiliary key costs the adviser tools only; the plugin's own minir toolset
     # is registered before that call and must survive it.
     assert [call[1]["name"] for call in ctx.calls if call[0] == "tool"] == [
-        "minir_search", "minir_remember", "minir_forget", "minir_stats"]
+        "minir_search", "minir_remember", "minir_forget", "minir_stats", "minir_agents"]

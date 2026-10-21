@@ -1,4 +1,4 @@
-"""The plugin's own toolset — the four ``minir_*`` tools, registered for every agent.
+"""The plugin's own toolset — the five ``minir_*`` tools, registered for every agent.
 
 The memory-provider surface already hands these schemas to the main agent through
 ``MemoryProvider.get_tool_schemas``. That path only reaches an agent that has the host's
@@ -40,10 +40,11 @@ ADVISER_TOOLSET = "adviser"
 #: agent it runs, and ``file_guard`` scopes the calls while that agent runs.
 FILE_TOOLSET = "file"
 TOOL_NAMES: tuple[str, ...] = (
-    "minir_search", "minir_remember", "minir_forget", "minir_stats")
+    "minir_search", "minir_remember", "minir_forget", "minir_stats", "minir_agents")
 
 _EMOJI: dict[str, str] = {
     "minir_search": "🔎", "minir_remember": "📌", "minir_forget": "🗑️", "minir_stats": "📊",
+    "minir_agents": "🧩",
 }
 
 
@@ -97,8 +98,31 @@ _TOOL_STATS = _tool_schema(
     "counters for this session, the unified scheduler ledger (every turn/time task: runs, "
     "failures, skips, last outcome/detail), the published layer artifacts (subject + version), "
     "the final token usage of this session's turns, and the database path.")
+_TOOL_AGENTS = _tool_schema(
+    "minir_agents",
+    "Run a named in-process agent with its own system prompt, user prompt and optional context "
+    "files, then persist its full conversation to "
+    "sessions/<agent_name>/<layer_session_id>.json. Omit tool_sets to grant every host tool. "
+    "Unlike the plugin's own layer passes, this agent keeps host memory and context files and "
+    "loads the operator soul by default; all four knobs can be overridden.",
+    {"agent_name": _prop("Stable name for this agent; also its transcript folder."),
+     "system_prompts": _prop("System prompt for the agent."),
+     "user_prompts": _prop("User message or task for the agent."),
+     "context_files": _prop("Files to read and append as context; relative paths resolve "
+                            "against project_dir (at most 20 files, 200 KB total).", "array",
+                            items={"type": "string"}),
+     "project_dir": _prop("Project root the agent may read; defaults to the cwd's git root."),
+     "tool_sets": _prop("Toolset names to grant. Omitted or empty grants every host tool; "
+                        "'*' is also accepted.", "array", items={"type": "string"}),
+     "skip_memory": _prop("Skip host memory injection (default false).", "boolean"),
+     "skip_context_files": _prop("Skip host context files (default false).", "boolean"),
+     "skip_background_review": _prop("Skip the host background review fork (default true).",
+                                      "boolean"),
+     "load_soul_identity": _prop("Load the operator SOUL identity (default true).", "boolean")},
+    ("agent_name", "user_prompts"))
 
-SCHEMAS: tuple[dict[str, Any], ...] = (_TOOL_SEARCH, _TOOL_REMEMBER, _TOOL_FORGET, _TOOL_STATS)
+SCHEMAS: tuple[dict[str, Any], ...] = (
+    _TOOL_SEARCH, _TOOL_REMEMBER, _TOOL_FORGET, _TOOL_STATS, _TOOL_AGENTS)
 
 
 def agent_toolsets(base: Any = None) -> list[str]:

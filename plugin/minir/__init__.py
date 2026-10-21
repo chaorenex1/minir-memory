@@ -60,6 +60,7 @@ from . import file_guard
 from . import handoff
 from . import history as host_history
 from . import knowledge
+from . import minir_agents
 from . import scheduler
 from . import session_summary
 from . import tools as plugin_tools
@@ -1309,6 +1310,8 @@ class MinirMemoryProvider(MemoryProvider):
                                "turn_usage": self._store.turn_usage(self._session_id),
                                "tool_metrics": metrics,
                                "reasoning_enabled": self._reasoning})
+        if tool_name == "minir_agents":
+            return minir_agents.run(self, args)
         return tool_error(f"Unknown tool: {tool_name}")
 
     # -- three-day card review ------------------------------------------------

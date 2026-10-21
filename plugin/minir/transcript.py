@@ -29,9 +29,10 @@ Why the trail is shaped the way it is:
 * **Retried, then dropped.** A failed write is retried twice; a batch that still fails is
   dropped and counted. A full disk must not turn into a stuck writer.
 
-``record_aux`` is the second source: a plugin-layer run (base / dialectic / card_review) has no
-host turn to attach to, so the caller hands over the finished ``AgentRun.messages`` and the
-route that produced them. Those files live under ``persist_dir/<layer>/<session_id>.json``.
+``record_aux`` is the second source: a plugin-layer run (base / dialectic / card_review) or a
+custom ``minir_agents`` agent has no host turn to attach to, so the caller hands over the finished
+``AgentRun.messages`` and the route that produced them. Those files live under
+``persist_dir/<layer>/<session_id>.json``; a custom agent uses its name as the layer.
 
 Timestamps are epoch seconds — the same unit as ``messages[].created_at`` and
 ``history.messages.timestamp`` — so a file correlates with ``state.db`` without a conversion.
@@ -300,6 +301,36 @@ class TranscriptBuffer:
             self._flushes.append((key, event))
             self._cv.notify_all()
         return event.wait(max(0.0, float(timeout)))
+
+    def flush_aux(self, layer: str, session_id: str, *, timeout: float = 30.0) -> bool:
+        """Write one plugin-layer snapshot now; keyed by ``(layer, session)``.
+
+        ``flush(session_id)`` is the host-session key, so it would wait on nothing for an aux
+        record. This is the same acknowledgement for the ``record_aux`` namespace, and the
+        minir_agents tool uses it so the transcript is on disk before the tool returns.
+        """
+        if self._persist_dir is None:
+            return True
+        with self._cv:
+            if self._closed or self._closing:
+                return True
+            key = (_file_stem(layer, "aux"), _file_stem(session_id, "session"))
+            event = threading.Event()
+            self._flushes.append((key, event))
+            self._cv.notify_all()
+        return event.wait(max(0.0, float(timeout)))
+
+    def path_for_aux(self, layer: str, session_id: str) -> Optional[Path]:
+        """The JSON path a layer snapshot lands on, or ``None`` when memory-only.
+
+        Uses the same folding as ``record_aux``, so the returned path is the file the writer
+        will actually produce, not a guess built from the raw names.
+        """
+        if self._persist_dir is None:
+            return None
+        folder = _file_stem(layer, "aux")
+        stem = _file_stem(session_id, "session")
+        return self._persist_dir / folder / f"{stem}.json"
 
     def close(self) -> None:
         """Flush what is queued, stop the writer and join it. Idempotent."""
