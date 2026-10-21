@@ -186,10 +186,19 @@ try:
     assert adviser_entry.toolset == "adviser", "unexpected toolset: %%r" %% adviser_entry.toolset
     assert adviser_entry.is_async is True, "adviser_consult must be registered as an async handler"
 
+    # The plugin's own toolset: the same four schemas the memory provider exposes, registered
+    # under a name an agent can enable explicitly (this is what the plugin's agents use).
+    minir_entry = tool_registry.get_entry("minir_search")
+    assert minir_entry is not None, "minir_search was not registered in the tool registry"
+    assert minir_entry.toolset == "minir", "unexpected toolset: %%r" %% minir_entry.toolset
+    from toolsets import resolve_toolset
+    assert set(tools) <= set(resolve_toolset("minir")), "the minir toolset does not resolve the provider's tools"
+
     print(json.dumps({
         "discovered": len(names),
         "provider": provider.name,
         "tools": tools,
+        "minir_toolset": minir_entry.toolset,
         "recall_block_chars": len(block),
         "recall_count": getattr(status, "count", None),
         "jobs": stats["jobs"],

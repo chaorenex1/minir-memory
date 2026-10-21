@@ -1,9 +1,4 @@
-"""The window summary template: one JSON contract, one fixed markdown shape.
-
-The model returns JSON; the renderer writes the artifact section. The two forms must carry the
-same eight keys, so a missing key fails here rather than being silently dropped from the prompt
-the next base pass reads.
-"""
+"""Window summary: a model-written markdown section with a shape asset and prompt caps."""
 
 from __future__ import annotations
 
@@ -14,137 +9,80 @@ import pytest
 
 @pytest.fixture()
 def summary(plugin_package):
-    return importlib.import_module(f"{plugin_package.__name__}.window_summary")
+    return importlib.reload(plugin_package.window_summary)
 
 
-def _valid(**overrides):
-    value = {
-        "objective": "把规则接进 base 层",
-        "current_state": {"done": ["规则文件已落盘"], "doing": ["加载器校验"], "todo": []},
-        "decisions": [{"decision": "运行时读取", "reason": "改文件即生效"}],
-        "constraints": ["规则块在 OUTPUT 之前"],
-        "verified_facts": [{"fact": "预算 700 tokens", "evidence": "rule-files-draft.md 3.1"}],
-        "open_issues": [],
-        "next_actions": [{"action": "接线到 worker", "priority": "high"}],
-        "references": [{"kind": "file", "ref": "plugin/minir/rules.py"}],
-    }
-    value.update(overrides)
-    return value
+def _filled() -> str:
+    """One section with content under every heading, in the shape the template fixes."""
+    return "\n\n".join([
+        "## Window Summary",
+        "### Objective\nShip the plugin",
+        "### Current State\n#### Done\n- published the artifact",
+        "#### Doing\n- wiring B3",
+        "#### Todo",
+        "### Decisions\n- runtime rules — edit without a restart",
+        "### Constraints\n- rules before the output contract",
+        "### Verified Facts\n- pytest passes — evidence: pytest -q",
+        "### Open Issues",
+        "### Next Actions\n- [high] wire B2",
+        "### References\n- file: plugin/minir/layers.py",
+    ])
 
 
-def test_render_is_the_fixed_template(summary):
-    assert summary.render(_valid()) == (
-        "## Window Summary\n\n"
-        "### Objective\n把规则接进 base 层\n\n"
-        "### Current State\n"
-        "#### Done\n- 规则文件已落盘\n\n"
-        "#### Doing\n- 加载器校验\n\n"
-        "#### Todo\n\n"
-        "### Decisions\n- 运行时读取 — 改文件即生效\n\n"
-        "### Constraints\n- 规则块在 OUTPUT 之前\n\n"
-        "### Verified Facts\n- 预算 700 tokens — evidence: rule-files-draft.md 3.1\n\n"
-        "### Open Issues\n\n"
-        "### Next Actions\n- [high] 接线到 worker\n\n"
-        "### References\n- file: plugin/minir/rules.py"
-    )
+def test_the_template_carries_the_heading_skeleton(summary):
+    headings = [line for line in summary.load_template().splitlines() if line.startswith("#")]
+    assert headings == [
+        "## Window Summary", "### Objective", "### Current State", "#### Done", "#### Doing",
+        "#### Todo", "### Decisions", "### Constraints", "### Verified Facts", "### Open Issues",
+        "### Next Actions", "### References",
+    ]
 
 
-def test_empty_lists_keep_every_heading(summary):
-    empty = _valid(objective="", current_state={"done": [], "doing": [], "todo": []},
-                   decisions=[], constraints=[], verified_facts=[], open_issues=[],
-                   next_actions=[], references=[])
-    text = summary.render(empty)
-    for heading in ("### Objective", "### Current State", "#### Done", "#### Doing",
-                    "#### Todo", "### Decisions", "### Constraints", "### Verified Facts",
-                    "### Open Issues", "### Next Actions", "### References"):
-        assert heading in text
-    assert "N/A" not in text and "待补充" not in text
+def test_the_template_holds_no_placeholders(summary):
+    template = summary.load_template()
+    assert "{" not in template and "$" not in template
 
 
-def test_a_missing_or_extra_key_is_rejected(summary):
-    missing = _valid()
-    missing.pop("open_issues")
-    with pytest.raises(summary.WindowSummaryError, match="missing key"):
-        summary.validate(missing)
-    extra = _valid()
-    extra["history"] = []
-    with pytest.raises(summary.WindowSummaryError, match="unexpected key"):
-        summary.validate(extra)
+def test_the_empty_section_is_the_template(summary):
+    assert summary.empty_summary() == summary.load_template()
+    assert summary.is_empty(summary.empty_summary())
 
 
-def test_current_state_requires_exactly_three_arrays(summary):
-    with pytest.raises(summary.WindowSummaryError, match="missing key"):
-        summary.validate(_valid(current_state={"done": [], "doing": []}))
-    with pytest.raises(summary.WindowSummaryError, match="unexpected key"):
-        summary.validate(_valid(current_state={"done": [], "doing": [], "todo": [],
-                                               "later": []}))
+def test_validate_accepts_a_string_and_strips_it(summary):
+    assert summary.validate("  ## Window Summary\n") == "## Window Summary"
+    assert summary.validate("") == ""
 
 
-def test_priority_is_required_and_enumerated(summary):
-    with pytest.raises(summary.WindowSummaryError, match="priority"):
-        summary.validate(_valid(next_actions=[{"action": "接线"}]))
-    with pytest.raises(summary.WindowSummaryError, match="high, normal, low"):
-        summary.validate(_valid(next_actions=[{"action": "接线", "priority": "urgent"}]))
+def test_validate_rejects_a_non_string(summary):
+    for value in ({}, [], None, 0, {"objective": "x"}):
+        with pytest.raises(summary.WindowSummaryError, match="markdown string"):
+            summary.validate(value)
 
 
-def test_reference_kind_is_enumerated_and_ref_is_required(summary):
-    with pytest.raises(summary.WindowSummaryError, match="file, log, config"):
-        summary.validate(_valid(references=[{"kind": "memory", "ref": "x"}]))
-    with pytest.raises(summary.WindowSummaryError, match="must not be empty"):
-        summary.validate(_valid(references=[{"kind": "file", "ref": "  "}]))
+def test_is_empty_reads_the_lines_not_the_bytes(summary):
+    assert summary.is_empty("## Window Summary\n\n### Objective\n")
+    assert not summary.is_empty(_filled())
+    assert summary.is_empty(None)
 
 
-def test_a_verified_fact_needs_its_evidence(summary):
-    with pytest.raises(summary.WindowSummaryError, match="evidence"):
-        summary.validate(_valid(verified_facts=[{"fact": "预算 700", "evidence": ""}]))
+def test_a_missing_template_fails_loudly(summary, tmp_path, monkeypatch):
+    monkeypatch.setattr(summary, "TEMPLATE_PATH", tmp_path / "absent.md")
+    with pytest.raises(summary.WindowTemplateError, match="cannot read"):
+        summary.load_template()
+    assert not issubclass(summary.WindowTemplateError, summary.WindowSummaryError), \
+        "a broken asset must not be retried as if the model had returned a bad value"
 
 
-def test_caps_are_enforced_per_field(summary):
-    with pytest.raises(summary.WindowSummaryError, match="limit is 120"):
-        summary.validate(_valid(objective="x" * 121))
-    with pytest.raises(summary.WindowSummaryError, match="limit is 5"):
-        summary.validate(_valid(constraints=["c"] * 6))
-    with pytest.raises(summary.WindowSummaryError, match="limit is 100"):
-        summary.validate(_valid(constraints=["c" * 101]))
-    with pytest.raises(summary.WindowSummaryError, match="limit is 80"):
-        summary.validate(_valid(current_state={"done": ["d" * 81], "doing": [], "todo": []}))
-    with pytest.raises(summary.WindowSummaryError, match="limit is 4"):
-        summary.validate(_valid(decisions=[{"decision": "d", "reason": "r"}] * 5))
+def test_prompt_vars_publish_the_caps(summary):
+    for name in ("MAX_OBJECTIVE_CHARS", "MAX_STATE_ITEMS", "MAX_STATE_ITEM_CHARS",
+                 "MAX_DECISIONS", "MAX_SECTION_ITEMS", "MAX_SECTION_ITEM_CHARS",
+                 "MAX_REFERENCE_CHARS", "MAX_TOTAL_CHARS"):
+        assert summary.PROMPT_VARS[name] == getattr(summary, name)
+    assert summary.MAX_TOTAL_CHARS == 880
+    assert summary.PROMPT_VARS["PRIORITIES"] == "high, normal or low"
+    assert summary.PROMPT_VARS["REFERENCE_KINDS"] == "file, log, config, url, issue or other"
 
 
-def test_placeholders_fail_but_honest_prose_passes(summary):
-    with pytest.raises(summary.WindowSummaryError, match="placeholder"):
-        summary.validate(_valid(open_issues=["N/A"]))
-    with pytest.raises(summary.WindowSummaryError, match="placeholder"):
-        summary.validate(_valid(open_issues=["unknown: provider route"]))
-    assert summary.validate(_valid(open_issues=["无法复现的 flake"]))["open_issues"] == [
-        "无法复现的 flake"]
-
-
-def test_the_whole_summary_has_a_character_budget(summary):
-    long_items = ["一项较长的约束说明" * 10] * 5
-    with pytest.raises(summary.WindowSummaryError, match="880"):
-        summary.validate(_valid(constraints=long_items, open_issues=long_items))
-
-
-def test_render_never_truncates_it_fails(summary):
-    with pytest.raises(summary.WindowSummaryError):
-        summary.render(_valid(constraints=["x" * 200]))
-
-
-def test_parse_strips_a_code_fence(summary):
-    import json
-
-    text = "```json\n" + json.dumps(_valid(), ensure_ascii=False) + "\n```"
-    assert summary.parse(text) == summary.validate(_valid())
-
-
-def test_parse_rejects_prose(summary):
-    with pytest.raises(summary.WindowSummaryError, match="not valid JSON"):
-        summary.parse("Here is the summary: {}")
-
-
-def test_chars_counts_the_rendered_section(summary):
-    value = _valid()
-    assert summary.chars(value) == len(summary.render(value)) <= summary.MAX_TOTAL_CHARS
-    assert summary.TEMPLATE_VERSION == 1
+def test_placeholders_are_whole_values(summary):
+    assert summary.is_placeholder("N/A") and summary.is_placeholder("待补充")
+    assert not summary.is_placeholder("无法复现，暂无结论")

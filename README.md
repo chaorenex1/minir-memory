@@ -16,6 +16,13 @@ Three file-backed layers sit on top: a **three-day global card review** merges s
 durable files; a **knowledge pipeline** writes one page per marker unit and injects path hints;
 and a **transcript audit trail** mirrors host turns and layer runs as JSON (30-day retention).
 
+A fourth pass closes the loop after a conversation goes quiet: `on_session_end` records every
+turn's final token usage, captures the session's value markers and arms a 24-hour timer. Typing in
+the session again cancels it; otherwise a **session-summary agent** (the Task Handoff is its first
+user prompt input) and a **knowledge-extraction agent** turn the session into a durable summary
+and knowledge pages. The four tools are also registered as the `minir` toolset, so every agent
+this plugin runs can use the store directly.
+
 It also ships an optional **main adviser**: a fast, per-turn side channel that watches the live
 tool loop (user goal, assistant intent, tool results) and injects its advice before the next
 model request through the host's `llm_request` middleware. It is the only advice producer in the
@@ -57,11 +64,18 @@ plugin/minir/          the deployable plugin directory (copy this to plugins/min
   worker.py            drains base and review jobs FIFO per session, publishes artifacts
   card_review.py       three-day review: four card files, validation, revisions, scheduler
   knowledge.py         one page per unit, path-hint retrieval block
+  tools.py             the minir toolset: same four schemas, registered for plugin agents
+  session_summary.py   end-of-session summary agent (hand-off is its first user prompt input)
+  extraction.py        idle-timer scheduler + knowledge-page extraction agent
   file_guard.py        pre-tool-call scope for the layer passes' file tools
-  layers.py            layer cores, field validation, the four-section renderer
+  layers.py            output contracts, field validation, the four-section renderer
+  agents/              one markdown core per model pass, filled at call time (B1-B4, dialectic,
+                       both card-review halves, knowledge_render, session_summary,
+                       knowledge_extract)
   rules.py             rule-file loader: validation, override, cache, prompt assembly
   rules/               one file per contract (contract + review checks), read at call time
-  window_summary.py    eight-field summary: schema, validation, fixed Markdown template
+  window_summary.py    the summary section: template asset, prompt caps, type check
+  templates/           the fixed Window Summary shape the model fills
   handoff.py           Task Handoff template, summary-agent prompt + validation
   cadence.py           config/store-path helpers shared by the provider and the engine
   context_engine.py    audited summary compression (context.engine: minir)
@@ -146,19 +160,67 @@ process-wide active provider, since the host can construct the plugin twice.
 ## Tools
 
 The provider exposes four tools; every response is a JSON string (errors are `{"error": ...}`).
+The same four are registered as the `minir` **registry toolset**, so the plugin's own agents can
+be granted them explicitly (see "The `minir` toolset" below).
 
 | Tool | Parameters | Behaviour |
 | --- | --- | --- |
 | `minir_search` | `query` (required), `limit`, `scope`, `session_id` | Ranked FTS5 recall. Default `scope="session"`: the current session plus durable cards and notes. `scope="all"` searches every session; `session_id` targets one explicitly. `limit` defaults to `prefetch_limit` and is capped at 20. Each result carries `kind`, `when`, `source`, `session_id`, `text` (600-char excerpt) and, for a typed marker, `marker_type`. Only a typed marker exposes a forgettable `note_id`/`id`. |
 | `minir_remember` | `type` (required), `content` (required) | Records an explicit value-output marker of that type (`entities`, `trajectories`, `experiences`, `tools`, `projects`), bound to the current session and mirrored into `conclusions` so FTS finds it. Returns `{stored, note_id, type, session_id}`. |
 | `minir_forget` | `type` (required), `note_id` (required) | Deletes the marker only when its stored type matches. Returns `{deleted, note_id, type}`; a wrong type or unknown id yields `deleted: false`. Conclusions have no `note_id` and cannot be deleted. |
-| `minir_stats` | none | Store counts (including `markers` per type), layer counters, published artifacts, buffered messages, in-memory tool metrics and the database path. |
+| `minir_stats` | none | Store counts (including `markers` per type), layer counters, published artifacts, buffered messages, in-memory tool metrics, the session's token usage and its newest turn rows, and the database path. |
 
 Explicit markers are separate from the base layer's automatic `value_markers`: the worker keeps
 merging its own five-key inventory per refresh, while a remembered marker is a session-bound,
 type-tagged row that search can recall and `minir_forget` can remove. Notes mirrored from the
 host's built-in memory tools (`on_memory_write`) stay durable and untyped; they are recallable in
 both public scopes.
+
+## The `minir` toolset
+
+The four tools have two delivery paths. The memory-provider surface (`get_tool_schemas`) injects
+them into a main agent that has the host's `memory` toolset enabled. For the plugin's own agents —
+the adviser, the layer worker, the hand-off and session-summary agents, the idle extraction — the
+same schemas are registered through the plugin context under a registry toolset named `minir`.
+That toolset also carries the `adviser` toolset (read-only `adviser_session_search`), so a plugin
+agent grants both with:
+
+```python
+toolsets = ["file", "minir", "adviser"]
+```
+
+Every in-process agent this plugin runs builds its list with `tools.agent_toolsets(...)`, which
+appends both to whatever the caller configured. The registered handlers call the live provider's
+`handle_tool_call`, so the registry path and the provider path cannot drift.
+
+## Session end: idle timer, summary and knowledge extraction
+
+`on_session_end` is the real boundary (the plugin-level hook of the same name is a per-turn
+event). Four things happen there beyond the layer drain:
+
+1. **Final turn usage.** Every `post_api_request` for the bound session folds its normalized usage
+   into a `(session_id, turn_id)` row in `turn_usage`; the boundary closes those rows and stores
+   the session total in `session_usage` beside the host's own `sessions.input_tokens` /
+   `output_tokens` aggregate. `minir_stats` reports both, so a turn's final consumption is
+   auditable even after the process is gone.
+2. **A marker snapshot.** The session's explicit typed notes plus its newest base-layer
+   `value_markers` units are captured into `session_extractions` with `due_at = now + 24h`. A
+   session with no markers arms nothing; the timer is for durable sessions.
+3. **A cancellable timer.** Any user turn in that session (`on_turn_start`, `sync_turn`) deletes
+   the pending row. Opening the session is not input; typing in it is.
+4. **The due run.** A wall-clock daemon (`ExtractionScheduler`) claims due rows atomically, so a
+   timer armed in one process is honoured after a restart. For each due session it runs the
+   **session summary agent** — the Task Handoff from `handoff.summarize_agent` is the first
+   evidence block of its user message, and it writes `## Session Goal`, `## Work Done`,
+   `## Decisions`, `## Durable Knowledge` and `## Open Threads` — then the **knowledge extraction
+   agent**, which turns the summary, hand-off and markers into knowledge pages written through
+   `knowledge.write_unit` (the same front-matter, atomic write and token budget as the base
+   layer's units).
+
+`session_extraction_enabled` (default `true`) and `knowledge_idle_hours` (default `24`; `0` fires
+on the next tick) control it. Both need `reasoning_enabled: true`; with reasoning off the provider
+stays a pure store. A failed run retries once after an hour, then is parked as `failed` in
+`session_extractions` rather than retried forever.
 
 ## The two layers (base / dialectic)
 
@@ -198,35 +260,39 @@ pass count is adaptive: short windows get one synthesis, longer ones add a self-
 reconcile, capped by `dialectic_depth`. A failed or malformed pass falls back to the last valid
 one. `layer_state.version` counts refreshes; the newest review note is what `prefetch` injects.
 
-A base refresh runs **three ordered passes** on the `auxiliary.adviser` route. Each system prompt is
-assembled at call time from the layer core, the field rules in `plugin/minir/rules/*.md` and the
-output contract (`rules.build_system`); an operator override under
-`$HERMES_HOME/minir-memory/rules/` replaces a packaged file and falls back with a warning when it
-is invalid. Each pass returns **one JSON object** (no Markdown); the worker validates it against the
-same rules the reviewer reads, and only a validated object is rendered into the artifact. The
+A base refresh runs **four ordered passes** on the `auxiliary.adviser` route. Each system prompt is
+built at call time from the pass's core asset under `plugin/minir/agents/`, the rule texts that
+pass reads and the output contract; the
+rule files in `plugin/minir/rules/*.md` are passed as text (`rules.rule_text`), untransformed, and
+B3 receives the section template while B4 receives the two marker rules in its user message. An
+operator override under `$HERMES_HOME/minir-memory/rules/` replaces a packaged file and falls back
+with a warning when it is unreadable. Each pass returns **one JSON object** whose card values are
+markdown bodies (no code fence, no front-matter); the worker validates it against the same rules
+the reviewer reads, and only a validated object is rendered into the artifact. The
 adviser toolset is attached only on this route, and the tool hint carries the window bounds: a pass
 may call `adviser_session_search` with `after`/`before` for evidence inside `(from_ts, to_ts]`, but
 must not read later turns. The first user message is the only allowed outside-window evidence, and
 only on the first refresh.
 
 1. **user card** — the previous user card + this window (+ the first user message as intent anchor
-   on bootstrap) → `{"user_self": {...6 fields...}, "user_preferences": {...7 fields...}}`;
+   on bootstrap) → `{"user_self": "<markdown>", "user_preferences": "<markdown>"}`;
 2. **AI card** — the user card just derived + the previous AI card + operator identity/preference
-   files + `plugin.yaml` + this window → `{"ai_self": {...7 fields...}, "ai_identity": {...13
-   fields...}}`. `ai_self.state` is one of `idle|executing|reasoning|reviewing|blocked|done`. The
-   seven hard identity fields (`id`, `name`, `version`, `type`, `system`, `creator`, `maintainer`)
-   must appear verbatim in `plugin.yaml`; a value that does not match is dropped with a warning;
-3. **window summary + units** — the two cards + this window → `{"window_summary": {...8 keys...},
-   "value_markers": {"units": [...]}}`. Units carry one primary category (`KNOWLEDGE`, `VALUE`,
-   `INTENT`, `METHOD`, `GOVERNANCE`), one primary org (`entities`, `trajectories`, `experiences`,
-   `tools`, `projects`), a stable `topic`, and `epistemic` for `KNOWLEDGE` only. At most 16 units
-   per window, 160 characters each; a unit merges with an existing one when category, org and
-   topic all match.
+   files + `plugin.yaml` + this window → `{"ai_self": "<markdown>", "ai_identity": "<markdown>"}`.
+   Identity claims come from the operator files or the manifest; there is no field contract and no
+   verbatim check, and a fact neither source declares is left out;
+3. **window summary** — the two cards + this window → `{"window_summary": "<the section>"}`. The
+   value is one markdown section following `templates/window_summary.md`; the prompt states the
+   caps and `window_summary.validate` only checks that the value is a string;
+4. **value markers** — this window + the recorded units → `{"units": [...]}`. Units carry one
+   primary category (`KNOWLEDGE`, `VALUE`, `INTENT`, `METHOD`, `GOVERNANCE`), one primary org
+   (`entities`, `trajectories`, `experiences`, `tools`, `projects`), a stable `topic`, and
+   `epistemic` for `KNOWLEDGE` only. At most 16 units per window, 160 characters each; a unit
+   merges with an existing one when category, org and topic all match.
 
 The baseline order is **global card files -> newest row for the subject -> preset**. The four
 files under `$HERMES_HOME/minir-memory/` (see below) are the durable state once they exist; the
 session row is the horizon. With neither, the user card starts from the `software-engineer` preset
-(occupied with `occupation`, the other fields empty and `_preset` recorded) and evidence replaces
+(one markdown occupation line) and evidence replaces
 the preset without counting as a clear. The **first base job runs even with an empty window**: it
 publishes that preset baseline so the review cadence has an artifact to read. Later empty windows
 are no-ops. The user card and the AI identity are durable across sessions, while the AI
@@ -236,9 +302,9 @@ refreshing the same window twice.
 
 The six columns keep their names (the draft's column map): `user_representation` holds
 `user_self`, `user_peer_card` holds `user_preferences`, `ai_self_representation` holds `ai_self`,
-`ai_identity_card` holds `ai_identity`, `session_chunk_summary` holds the eight-field
-`window_summary` object, and `value_markers` holds `{"units": [...]}`. The same data is rendered
-into the four-section artifact and split into searchable conclusions (`base.user_card`,
+`ai_identity_card` holds `ai_identity`, `session_chunk_summary` holds the model-written
+`window_summary` markdown section, and `value_markers` holds `{"units": [...]}`. The same data is
+rendered into the four-section artifact and split into searchable conclusions (`base.user_card`,
 `base.ai_card`, `base.window_summary`, `base.value_markers`). `is_latest=1` marks the row with the
 greatest `window_to_ts` per `(session_id, subject)` — window order, not write order, so a slow
 older window that finishes late is history, never "latest". `window_from_turn`/`window_to_turn`
@@ -255,15 +321,16 @@ query terms are shorter than three characters** (common Chinese queries such as 
 trigram cannot match). The `conclusions_fts` index remains the recall index for the rendered
 sections; `base.value_markers` is indexed there too.
 
-The window summary is a **rolling state, not a log**: pass 3 receives the previous eight-field
-summary and returns the full new one (only `objective` may be empty on the first refresh). The
-artifact renders it through the fixed template (`window_summary.render`), and the same Markdown body
-is appended to the canonical chunk chain for recall. The rendered projection is never fed back into
-a prompt; the next pass 3 receives the previous summary as JSON. Older chunks stay independent rows
-with their turn range and remain searchable inside their own session, unless an explicit
-session-final summary supersedes them (a compression fold never does). The dialectic worker reads
-the active chain up to its review window and may correct the summary as a whole part; when the
-chunk row cannot be updated, the correction is not claimed.
+The window summary is a **rolling state, not a log**: pass 3 receives the previous section as
+markdown and returns the whole new section following `templates/window_summary.md` (its prompt
+states the caps; `window_summary.validate` only checks the value is a string). The section is
+stored as written and appended to the canonical chunk chain for recall; the next pass 3 reads that
+same text. Older chunks stay independent rows with their turn range and remain searchable inside
+their own session, unless an explicit session-final summary supersedes them (a compression fold
+never does). The dialectic worker reads the active chain up to its review window and may correct
+the summary as a whole part; when the chunk row cannot be updated, the correction is not claimed.
+Pass 4 is separate: it reads the same window plus the recorded unit inventory and returns
+`{"units": [...]}` only, so a malformed marker set cannot cost the summary and vice versa.
 
 ### Dialectic review, base corrections, and advices
 
@@ -367,20 +434,25 @@ first baseline for a base refresh and the only place a durable item may be delet
 
 | File | Content |
 | --- | --- |
-| `user/identity.md` | `user_self` (occupation, skills, thinking models, interests, communication, values) |
-| `user/preference.md` | `user_preferences` (communication, presentation, method, decision, technology, collaboration, taboos) |
-| `agents/<profile>/identity.md` | hard identity (`id`, `name`, `version`, `type`, `system`, `creator`, `maintainer`) + role/domains + `_sources` |
-| `agents/<profile>/preference.md` | `persona_style`, `communication_style`, `permissions`, `prohibitions` |
+| `user/identity.md` | `user_self` markdown body: who the person is |
+| `user/preference.md` | `user_preferences` markdown body: how they want the assistant to work |
+| `agents/<profile>/identity.md` | `ai_identity` markdown body: who the assistant is, duties and domains |
+| `agents/<profile>/preference.md` | `ai_preference` markdown body: voice and conduct, permissions, prohibitions |
 
 Each file is front-matter (`schema: minir-card/v1`, scope, part, generated_at, source, evidence,
-reviewer) plus a JSON body. `card_review.py` is the only writer: every pass validates all four
-objects, enforces the per-file `card_token_budget` (2000 by default) and rejects session-scoped
-fields anywhere; one invalid file fails the whole review and leaves all four files untouched.
-Every write records a `card_revisions` row (`before_hash`/`after_hash`, changed fields, evidence,
+reviewer) plus one markdown body. There is no field list and no JSON body: the body is the card,
+and an empty body is a valid empty card. `card_review.py` is the only writer: the merge runs as
+**two agent passes**, the user card (`card_review_user`) and the AI card (`card_review_ai`), each
+with its own core, rule files and output contract. Each half returns its two final card bodies and
+nothing else: the database is the change history. The two halves are joined into one write: every
+pass validates all four bodies, enforces the per-file `card_token_budget` (2000 by default) and
+requires markdown text; one invalid file fails the whole review and leaves all four files untouched.
+Every write records a `card_revisions` row (`before_hash`/`after_hash`, `changed_fields: ["body"]`,
 source). A hand edit is detected by comparing the file hash with the last revision and recorded as
-`operator_edit` before the review takes over; a legacy file with no front-matter is copied to
-`<name>.declared.md` once. Front-matter `source: operator` lines win over inference; the review
-receives the current files as its baseline.
+`operator_edit` before the review takes over; the same diff also lists the file under
+"Hand-edited since the last review" in that half's prompt, so the model knows which card carries
+operator text. A legacy file with no front-matter is copied to `<name>.declared.md` once. The
+review receives the current files as its baseline.
 
 The scheduler is wall-clock, not turn-driven: a review is due every **3 days**
 (`card_review_days`), the first anchor is written at install, the anchor advances only on success,
@@ -390,14 +462,16 @@ transcripts older than 30 days after each success.
 
 ### Knowledge pages
 
-Pass 3 units also feed a file layer: one page per `(category, org, topic)` under
+Pass 4 units also feed a file layer: one page per `(category, org, topic)` under
 `$HERMES_HOME/minir-memory/knowledge/<org>/<CATEGORY>-<slug>.md`. The filename is stable for a
 topic (CJK preserved, separators stripped, collisions hashed); a rewrite bumps `revisions` in the
 front-matter, an older `time` never overwrites a newer page, and the per-file
 `knowledge_token_budget` (2000 by default) rejects an over-long page, keeping the old one and
 writing `_failed/<CATEGORY>-<slug>.json`. The `KnowledgePipeline` consumer is a daemon thread with
 a bounded queue (512, oldest dropped with a counter); a failed unit never propagates into a base
-job.
+job. `agents/knowledge_render.md` is the page renderer's agent contract; the write path still
+renders a body from the unit itself and calls a `render` callable only when a caller supplies one,
+so nothing invokes that asset yet.
 
 Retrieval is by **path, never by content**: `prefetch()` scores the front-matter against the query
 (objects 2x, word overlap 1x, recency 0.5x), selects at most 6 paths within 700 characters and
@@ -464,8 +538,9 @@ stable across windows and leaves the evidence replaceable.
   text, so a message cannot close its block early or forge another block. Adviser-mode events are
   JSONL: one event per line, with newlines escaped, so event text cannot create prompt structure.
 - **Exact output shape** — base passes return their staged JSON keys and the dialectic pass
-  returns all eight keys. Prompts state the display-safe item counts and character limits (a
-  fixed-size card/summary section would otherwise truncate a long list); the worker keeps a wider
+  returns the same parts; pass 3's `window_summary` is one markdown section, and the B3 prompt
+  states its caps. Cards state the display-safe item counts and character limits (a
+  fixed-size card section would otherwise truncate a long list); the worker keeps a wider
   hard cap and truncates anything that exceeds it. Arrays may be empty when a sparse window
   proves nothing. A dialectic reply that leaves a field as `[unknown] …` placeholders is not a
   correction; `[]` on a listed representation card empties it. The window record and the marker
@@ -488,7 +563,7 @@ stable across windows and leaves the evidence replaceable.
 
 `adviser.py` puts a second-opinion agent inside this plugin: an `auxiliary.adviser` model route
 plus one `adviser_consult` tool that runs a **real agent loop** (its own LLM + tools) rather than a
-one-shot completion. The base layer's three passes and the independent review reuse the
+one-shot completion. The base layer's four passes and the independent review reuse the
 same route and toolset (`worker._adviser_consult`); the loop is not adviser-specific — it lives in
 `agent_loop.py` and can be reused for any one-shot peer run (a review, a summary, a critic):
 
@@ -826,6 +901,8 @@ memory:
     card_token_budget: 2000    # hard per-file budget for the four global card files
     card_review_days: 3        # days between global card reviews
     knowledge_token_budget: 2000  # hard per-file budget for one knowledge page
+    session_extraction_enabled: true  # final summary + knowledge extraction after the idle window
+    knowledge_idle_hours: 24      # quiet hours after session end before that run (0 = next tick)
 ```
 
 `memory.minir.*` is the block this plugin reads and the one `hermes memory setup` writes
@@ -834,7 +911,8 @@ hand-edited config.yaml are equivalent. Every key also has an env override —
 `MINIR_CONTEXT_CADENCE`, `MINIR_DIALECTIC_CADENCE`, `MINIR_DIALECTIC_DEPTH`,
 `MINIR_BASE_INTERVAL`, `MINIR_DIALECTIC_INTERVAL`, `MINIR_REASONING_ENABLED`,
 `MINIR_HANDOFF_ENABLED`, `MINIR_SESSION_MODE`, `MINIR_PREFETCH_LIMIT`, `MINIR_CONTENT_LANGUAGE`,
-`MINIR_CARD_TOKEN_BUDGET`, `MINIR_CARD_REVIEW_DAYS`, `MINIR_KNOWLEDGE_TOKEN_BUDGET` — and **the
+`MINIR_CARD_TOKEN_BUDGET`, `MINIR_CARD_REVIEW_DAYS`, `MINIR_KNOWLEDGE_TOKEN_BUDGET`,
+`MINIR_SESSION_EXTRACTION`, `MINIR_KNOWLEDGE_IDLE_HOURS` — and **the
 env var wins** when both are set. Layer intervals, depth and `reasoning_enabled` are read when a session opens.
 
 Every published conclusion is searchable: `notes`, the four base sections, the dialectic review,

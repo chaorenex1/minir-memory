@@ -911,12 +911,14 @@ class AdviserMode:
             session, turn_id, trigger, from_seq, to_seq, adviser=name)
         started = time.time()
         try:
-            from . import adviser, agent_loop
+            from . import adviser, agent_loop, tools
 
             route = adviser.load_config()
             # Read-only by default: the adviser toolset or a roster entry may add tools, but the
-            # base/dialectic file and terminal toolsets are never inherited.
-            toolsets = list(spec.get("toolsets") or cfg["toolsets"] or [TOOLSET])
+            # base/dialectic file and terminal toolsets are never inherited. This plugin's own
+            # toolset (minir + adviser) is always attached.
+            toolsets = tools.agent_toolsets(
+                spec.get("toolsets") or cfg["toolsets"] or [TOOLSET])
             prompt = self._prompt(session, turn_id, trigger, fresh, adviser=spec)
             model = str(spec.get("model") or route.get("model") or "")
             provider = str(route.get("provider") or "")
@@ -1007,7 +1009,7 @@ class AdviserMode:
     def consult(self, question: str, context: str = "", toolsets: Any = None,
                 session: str = "") -> dict[str, Any]:
         """Synchronous consult on the same adviser identity, route, and session context."""
-        from . import adviser, agent_loop
+        from . import adviser, agent_loop, tools
 
         route = adviser.load_config()
         session = session or str(getattr(self._provider, "_session_id", "") or "")
@@ -1017,7 +1019,8 @@ class AdviserMode:
             model=str(route.get("model") or ""),
             provider=str(route.get("provider") or ""),
             api_mode=str(route.get("api_mode") or ""),
-            toolsets=toolsets if toolsets is not None else route.get("toolsets"),
+            toolsets=tools.agent_toolsets(
+                toolsets if toolsets is not None else route.get("toolsets")),
             system_message=consult_prompt(),
         )
         return result.as_dict()
@@ -1025,7 +1028,7 @@ class AdviserMode:
     async def consult_async(self, question: str, context: str = "", toolsets: Any = None,
                             session: str = "") -> dict[str, Any]:
         """Async consult; the loop is synchronous, so this runs it off the event loop."""
-        from . import adviser, agent_loop
+        from . import adviser, agent_loop, tools
 
         route = adviser.load_config()
         session = session or str(getattr(self._provider, "_session_id", "") or "")
@@ -1035,7 +1038,8 @@ class AdviserMode:
             model=str(route.get("model") or ""),
             provider=str(route.get("provider") or ""),
             api_mode=str(route.get("api_mode") or ""),
-            toolsets=toolsets if toolsets is not None else route.get("toolsets"),
+            toolsets=tools.agent_toolsets(
+                toolsets if toolsets is not None else route.get("toolsets")),
             system_message=consult_prompt(),
         )
         return result.as_dict()

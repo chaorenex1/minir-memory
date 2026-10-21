@@ -28,24 +28,20 @@ def test_a_base_publish_hands_its_units_to_the_knowledge_pipeline(plugin_package
     def complete(task, system, prompt, **kwargs):
         if task == plugin_package.worker.DIALECTIC_LAYER_TASK:
             return "{}"
-        if "baseline_user_card" in prompt:
+        if "baseline_user_card" in prompt or "Baseline user card" in prompt:
             return json.dumps({
-                "user_self": {"occupation": "Engineer", "skills": [], "thinking_models": [],
-                              "interests": [], "communication": [], "values_motivation": []},
-                "user_preferences": {field: [] for field in (
-                    "communication", "presentation", "method", "decision", "technology",
-                    "collaboration", "taboos")},
+                "user_self": "# Who this person is\n\nAn Engineer.\n",
+                "user_preferences": "# How they want answers\n\n- Terse first.\n",
             })
-        if "plugin_yaml" in prompt:
-            return json.dumps({"ai_self": {**plugin_package.layers.empty_ai_self(),
-                                          "state": "idle"},
-                               "ai_identity": {**plugin_package.layers.empty_ai_identity(),
-                                               "name": "minir", "version": "0.8.0"}})
-        return json.dumps({"window_summary": plugin_package.window_summary.empty_summary(),
-            "value_markers": {"units": [{
+        if "baseline_ai_card" in prompt or "Baseline AI card" in prompt:
+            return json.dumps({"ai_self": "# What this task is\n\nidle.\n",
+                               "ai_identity": "# Who the assistant is\n\nminir 0.8.0.\n"})
+        if "previous_units" in prompt or "Previous knowledge units" in prompt:
+            return json.dumps({"units": [{
                 "id": "u1", "org": "tools", "category": "KNOWLEDGE", "epistemic": "fact",
                 "topic": "Docker restart policy", "content": "Use unless-stopped.",
-                "time": "2026-10-21", "relations": [], "objects": ["tools:docker"]}]}})
+                "time": "2026-10-21", "relations": [], "objects": ["tools:docker"]}]})
+        return json.dumps({"window_summary": plugin_package.window_summary.empty_summary()})
 
     transcript.add("s1", "user", "restart docker", created_at=10.0)
     store.record_job("base", "s1", 0.0, 20.0)

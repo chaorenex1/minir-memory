@@ -1,25 +1,25 @@
 ---
 id: user-self
-version: 1
+version: 2
 applies_to: [base:B1, dialectic, card_review]
-slot: fields
-max_tokens: 350
+slot: body
+max_tokens: 400
 sections: [contract, review_checks]
 ---
 
 ## CONTRACT
 
 WHAT
-Who this person is, apart from the task and from how the assistant should behave. Six optional
-fields; an empty array is a correct answer.
+Who this person is, apart from the task and from how the assistant should behave. A markdown body,
+short headings and bullets. An empty body is a correct answer.
 
-FIELDS
-- occupation: role, field, responsibility. One phrase; omit when unstated.
-- skills: languages, frameworks, infrastructure the person uses. Mark learning ones "learning".
-- thinking_models: recurring reasoning habits (systems, causal, first principles, risk).
-- interests: durable interests and fields being explored; say which when the window does.
-- communication: how they express and coordinate work. A capability, not a tone request.
-- values_motivation: what they optimise for and want to reach; never the task goal.
+COVER
+- Occupation, field or responsibility, in one phrase, when stated.
+- Skills: languages, frameworks, infrastructure actually used; mark learning ones "learning".
+- Thinking habits that recur (systems, causal, first principles, risk).
+- Durable interests, naming the field when the window does.
+- How they express and coordinate work; a capability, not a tone request.
+- What they optimise for and want to reach; never the task goal.
 
 EVIDENCE
 - Stated in the window, or shown more than once across the baseline and the window.
@@ -31,12 +31,13 @@ BOUNDARIES
 - Never infer a job title from a tool used once.
 
 QUALITY
-- At most two items per field, 80 characters each; self-contained; one fact in one field.
+- One fact per line; every line stands alone outside the window.
+- Prefer 6 to 10 sharp lines over a transcript.
 
 ## REVIEW CHECKS
 - A single example was promoted to a long-term pattern.
-- A preference about the assistant was written into communication.
+- A preference about the assistant was written here instead of user-preferences.
 - The current task goal leaked into the card.
-- One fact appears under two fields.
+- The same fact appears in both user bodies.
 - A role, employer or skill has no support in the window or baseline.
-- An item is too vague to act on.
+- A line is too vague to act on.

@@ -60,7 +60,7 @@ import re
 import threading
 import time
 from pathlib import Path
-from typing import Any, Callable, Optional
+from typing import Any, Callable, Optional, Sequence
 
 from . import card_review
 from . import file_guard
@@ -81,10 +81,10 @@ DIALECTIC_LAYER_TASK = "minir_dialectic_layer"
 _MAX_JOBS_PER_RUN = 6          # bound a catch-up burst (stale jobs from a previous process)
 _MAX_EVIDENCE_CHARS = 12_000   # window transcript handed to the model, newest messages kept
 _MAX_PROMPT_CHARS = 16_000     # whole user prompt, previous artifact included (evidence wins)
-_MAX_STATE_CHARS = 12_000      # stored artifact size; the field caps below stay under it
+_MAX_STATE_CHARS = 12_000      # stored artifact size; bodies carry no field caps, so this guards
 _MAX_ATTEMPTS = 2              # claims before a job is marked failed
 _MODEL_TIMEOUT = 60.0
-_MODEL_MAX_TOKENS = 700
+_MODEL_MAX_TOKENS = 2000
 
 # Four sections. Sub-blocks are ``###`` so ``_drop_sections`` never splits a card in half; the
 # cross-session rule drops ``### Self Representation`` from the AI card by itself.
@@ -172,24 +172,18 @@ def _response_text(response: Any) -> str:
 
 
 def _has_content(value: Any) -> bool:
-    """True when a card/part carries any non-empty value (the ``_preset`` marker is not content)."""
+    """True when a card/part carries any non-empty value."""
     if isinstance(value, dict):
-        return any(_has_content(item) for key, item in value.items() if key != "_preset")
+        return any(_has_content(item) for item in value.values())
     if isinstance(value, list):
         return any(_has_content(item) for item in value)
     return bool(str(value or "").strip())
 
 
 def _part_has_content(part: str, value: Any) -> bool:
-    """Content test per part: sources alone are not an identity card, and an empty summary is."""
-    if part == "ai_identity":
-        return _has_content({key: item for key, item in (value or {}).items()
-                             if key != layers.AI_IDENTITY_SOURCES})
-    if part == "ai_self":
-        return _has_content({key: item for key, item in (value or {}).items()
-                             if key != "state"})
+    """Content test per part: an empty summary counts as content, every other part as text."""
     if part == "window_summary":
-        return (value or {}) != summary_template.empty_summary()
+        return not summary_template.is_empty(value)
     return _has_content(value)
 
 
@@ -479,7 +473,7 @@ def _base_ai_prompt(subject: str, session: str, user_card: dict[str, Any],
                     identity: str = "", preference: str = "", plugin_yaml: str = "",
                     first: bool, from_ts: float = 0.0, to_ts: float = 0.0,
                     language: str = "en") -> str:
-    """Pass 2: the AI card, grounded in the user card just produced and the manifest."""
+    """Pass 2: the AI card, grounded in the user card just produced and the operator text."""
     parts = [
         f"Target: {subject}",
         _session_line(session),
@@ -497,7 +491,7 @@ def _base_ai_prompt(subject: str, session: str, user_card: dict[str, Any],
         parts.append("Operator-authored AI preferences (trusted):\n"
                      + data_block("operator_preferences", preference))
     if plugin_yaml.strip():
-        parts.append("Manifest (trusted; the only source for hard identity fields):\n"
+        parts.append("Manifest (trusted; the deployment facts this plugin declares):\n"
                      + data_block("plugin_yaml", plugin_yaml[:8_000]))
     return _compose_prompt(
         parts, evidence,
@@ -506,21 +500,42 @@ def _base_ai_prompt(subject: str, session: str, user_card: dict[str, Any],
 
 def _base_summary_prompt(subject: str, session: str, user_card: dict[str, Any],
                          ai_card: dict[str, Any], evidence: str, *,
-                         previous_summary: dict[str, Any], previous_units: list[dict[str, Any]],
+                         previous_summary: str, window_template: str,
                          from_ts: float = 0.0, to_ts: float = 0.0,
                          language: str = "en") -> str:
-    """Pass 3: the rolling window summary and this window's knowledge units."""
+    """Pass 3: the rolling window summary, shaped by the template passed with it."""
     parts = [
         f"Target: {subject}",
         _session_line(session),
         _window_line(from_ts, to_ts),
         _language_block(language),
+        _json_block("window_template", window_template),
         _json_block("user_card", user_card),
         _json_block("ai_card", ai_card),
         _json_block("previous_summary", previous_summary) if previous_summary
         else "Previous summary: none",
+    ]
+    return _compose_prompt(
+        parts, evidence,
+        "Return ONLY the JSON object described in the system prompt for THIS window.",
+        _MAX_PROMPT_CHARS)
+
+
+def _base_units_prompt(subject: str, session: str, evidence: str, *,
+                       previous_units: list[dict[str, Any]],
+                       markers_category: str, markers_org: str,
+                       from_ts: float = 0.0, to_ts: float = 0.0,
+                       language: str = "en") -> str:
+    """Pass 4: this window's marker units, with the marker rules passed as text."""
+    parts = [
+        f"Target: {subject}",
+        _session_line(session),
+        _window_line(from_ts, to_ts),
+        _language_block(language),
         _json_block("previous_units", {"units": previous_units or []})
         if previous_units else "Previous knowledge units: none",
+        _json_block("markers-category", markers_category),
+        _json_block("markers-org", markers_org),
     ]
     return _compose_prompt(
         parts, evidence,
@@ -564,11 +579,12 @@ def _dialectic_prompt(subject: str, previous: str, base_content: str, evidence: 
 
 
 def _read_plugin_yaml() -> str:
-    """The manifest beside this module: the only accepted source for hard identity fields."""
+    """The manifest beside this module: deployment facts for the AI identity card."""
     try:
         return (Path(__file__).with_name("plugin.yaml")).read_text(encoding="utf-8")
     except OSError as exc:
-        logger.warning("Minir plugin.yaml is unreadable (%s); hard identity fields stay empty", exc)
+        logger.warning("Minir plugin.yaml is unreadable (%s); the AI card loses manifest context",
+                       exc)
         return ""
 
 
@@ -616,7 +632,6 @@ class LayerWorker:
         self._hermes_home = str(hermes_home or "")
         self._plugin_yaml = _read_plugin_yaml()
         self._identity_digest = self._digest_sources()
-        self._rules = layer_rules.RulesLoader(hermes_home=str(hermes_home or ""))
         self._depth = max(1, min(3, int(depth or 2)))
         self._on_units = on_units
         # Resolved here, not as a default argument: a host (or a test) may replace the module
@@ -687,13 +702,13 @@ class LayerWorker:
         one-shot client under *task_key* rather than leaving the layer unrefreshed.
         """
         try:
-            from . import adviser, agent_loop, session_search
+            from . import adviser, agent_loop, session_search, tools
 
             cfg = adviser.load_config()
             # Fixed surface: the host's file tools (scoped by ``file_guard``) plus this
-            # plugin's session search. Never the operator's adviser toolsets and never None,
-            # which the host reads as "every tool".
-            toolsets = ["file", session_search.TOOLSET]
+            # plugin's session search and its own toolset. Never the operator's adviser
+            # toolsets and never None, which the host reads as "every tool".
+            toolsets = tools.agent_toolsets(["file", session_search.TOOLSET])
             with file_guard.aux_scope():
                 result = agent_loop.run(
                     prompt, model=str(cfg.get("model") or ""),
@@ -778,12 +793,14 @@ class LayerWorker:
         return self._complete("minir_card_review", system, prompt,
                               max_tokens=9000, timeout=180)
 
-    def _system(self, layer: str, pass_id: str, consumer: str, core: str, output: str) -> str:
-        """Assemble one pass's system prompt: layer core, rule files, output contract."""
-        system, digest = layer_rules.build_system(
-            layer, pass_id, consumer, core=core, output=output, loader=self._rules)
-        logger.debug("Minir %s:%s assembled with rules %s", layer, pass_id, digest)
-        return system
+    def _rule(self, rule_id: str) -> str:
+        """One rule file's body, read at call time (operator override first)."""
+        return layer_rules.rule_text(rule_id, hermes_home=self._hermes_home)
+
+    def _system(self, core: str, output: str, rules: Sequence[str] = ()) -> str:
+        """One pass's system prompt: its core, the rule texts it reads, its output contract."""
+        parts = [core.strip(), *(rule.strip() for rule in rules), output.strip()]
+        return "\n\n".join(part for part in parts if part)
 
     def _consult_validated(self, system: str, prompt: str,
                            validator: Callable[[Any], Any], *, label: str) -> Any:
@@ -827,53 +844,59 @@ class LayerWorker:
         }
         if first and not _has_content(user_baseline["user_self"]):
             user_baseline["user_self"] = layers.preset_user_self(self._language)
-        user_system = self._system("base", "B1", "contract", layers.CORE_B1, layers.OUTPUT_B1)
+        user_system = self._system(layers.load_core("b1_user_card"), layers.OUTPUT_B1,
+                                   [self._rule("user-self"), self._rule("user-preferences")])
         user_card = self._consult_validated(
             user_system,
             _base_user_prompt(subject, session, user_baseline, evidence, first,
                               from_ts=from_ts, to_ts=to_ts, first_message=first_message,
                               language=self._language, source=source),
             layers.validate_user_card, label="base user pass")
-        preset_occupation = layers.preset_user_self(self._language)["occupation"]
-        if user_card["user_self"].get("_preset") \
-                and user_card["user_self"]["occupation"] != preset_occupation:
-            user_card["user_self"].pop("_preset")
 
         ai_baseline = {}
         if _has_content(baseline.get("ai_self")) or _has_content(baseline.get("ai_identity")):
             ai_baseline = {"ai_self": baseline.get("ai_self") or {},
                            "ai_identity": baseline.get("ai_identity") or {}}
-        ai_system = self._system("base", "B2", "contract", layers.CORE_B2, layers.OUTPUT_B2)
+        ai_system = self._system(layers.load_core("b2_ai_card"), layers.OUTPUT_B2,
+                                 [self._rule("ai-self"), self._rule("ai-identity")])
         ai_card = self._consult_validated(
             ai_system,
             _base_ai_prompt(subject, session, user_card, ai_baseline, evidence,
                             identity=self._identity, preference=self._preference,
                             plugin_yaml=self._plugin_yaml, first=first,
                             from_ts=from_ts, to_ts=to_ts, language=self._language),
-            lambda value: layers.validate_ai_card(value, self._plugin_yaml),
+            lambda value: layers.validate_ai_card(value),
             label="base AI pass")
         if (not self._identity_changed()
                 and _part_has_content("ai_identity", baseline.get("ai_identity") or {})):
             # Sources unchanged: the previous identity card stands, whatever the pass echoed.
             ai_card["ai_identity"] = baseline["ai_identity"]
 
-        summary_system = self._system("base", "B3", "contract", layers.CORE_B3, layers.OUTPUT_B3)
-        summary_pass = self._consult_validated(
+        summary_system = self._system(layers.load_core("b3_window_summary"), layers.OUTPUT_B3)
+        summary = self._consult_validated(
             summary_system,
             _base_summary_prompt(subject, session, user_card, ai_card, evidence,
-                                 previous_summary=baseline.get("window_summary") or {},
-                                 previous_units=baseline.get("units") or [],
+                                 previous_summary=baseline.get("window_summary") or "",
+                                 window_template=summary_template.load_template(),
                                  from_ts=from_ts, to_ts=to_ts, language=self._language),
-            lambda value: layers.validate_summary_pass(value, baseline.get("units") or []),
-            label="base summary pass")
-        summary = summary_pass["window_summary"]
-        units = summary_pass["units"]
+            layers.validate_summary_pass,
+            label="base summary pass")["window_summary"]
+        units_system = self._system(layers.load_core("b4_value_markers"), layers.OUTPUT_B4)
+        units = self._consult_validated(
+            units_system,
+            _base_units_prompt(subject, session, evidence,
+                               previous_units=baseline.get("units") or [],
+                               markers_category=self._rule("markers-category"),
+                               markers_org=self._rule("markers-org"),
+                               from_ts=from_ts, to_ts=to_ts, language=self._language),
+            lambda value: layers.validate_units(value, previous=baseline.get("units") or []),
+            label="base units pass")
         # A valid reply with everything empty is a sparse window: nothing durable to publish.
         if not (_part_has_content("user_self", user_card["user_self"])
                 or _part_has_content("user_preferences", user_card["user_preferences"])
                 or _part_has_content("ai_self", ai_card["ai_self"])
                 or _part_has_content("ai_identity", ai_card["ai_identity"])
-                or units or summary != summary_template.empty_summary()):
+                or units or not summary_template.is_empty(summary)):
             logger.info("Minir base refresh for %s produced no durable content; skipping publish",
                         subject)
             return "", {}, ""
@@ -883,7 +906,7 @@ class LayerWorker:
             summary=summary, units=units)
         if not _valid_artifact(content):
             raise LayerMergeError(f"base refresh for {subject} assembled an invalid artifact")
-        summary_md = summary_template.render(summary)
+        summary_md = summary
         chunk_text = summary_md.split("\n", 1)[1].strip()
         parts = {
             "user_representation": json.dumps(user_card["user_self"], ensure_ascii=False),
@@ -1158,13 +1181,14 @@ class LayerWorker:
                      "user_preferences": baseline.get("user_preferences") or {}}
         ai_baseline = {"ai_self": baseline.get("ai_self") or {},
                        "ai_identity": baseline.get("ai_identity") or {}}
-        system = self._system("base", "B2", "contract", layers.CORE_B2, layers.OUTPUT_B2)
+        system = self._system(layers.load_core("b2_ai_card"), layers.OUTPUT_B2,
+                              [self._rule("ai-self"), self._rule("ai-identity")])
         ai_card = self._consult_validated(
             system,
             _base_ai_prompt(self.user_subject(), "", user_card, ai_baseline, "",
                             identity=self._identity, preference=self._preference,
                             plugin_yaml=self._plugin_yaml, first=False, language=self._language),
-            lambda value: layers.validate_ai_card(value, self._plugin_yaml),
+            lambda value: layers.validate_ai_card(value),
             label="identity refresh")
         identity = ai_card["ai_identity"]
         if not _part_has_content("ai_identity", identity):
@@ -1285,7 +1309,7 @@ class LayerWorker:
         # (``add_chunk_summary`` is idempotent by session + from_ts and returns 0 when the
         # chain is already superseded). If it cannot be updated, do not claim it changed.
         if "window_summary" in changed_parts:
-            body = summary_template.render(corrected["window_summary"]).split("\n", 1)[1].strip()
+            body = summary_template.validate(corrected["window_summary"]).split("\n", 1)[1].strip()
             chunk_version = self._store.add_chunk_summary(
                 session, float(base_row["window_from_ts"]), float(base_row["window_to_ts"]),
                 body, from_turn=base_row.get("window_from_turn"),
@@ -1338,8 +1362,10 @@ class LayerWorker:
                                raw_chars: Optional[int] = None) -> dict[str, Any]:
         """Synthesize, self-audit, reconcile; return the latest valid review object."""
         prior = (previous or {}).get("content", "")
-        system = self._system("dialectic", "review", "review_checks",
-                              layers.CORE_DIALECTIC, layers.OUTPUT_DIALECTIC)
+        system = self._system(
+            layers.load_core("dialectic"), layers.OUTPUT_DIALECTIC,
+            [self._rule("user-self"), self._rule("user-preferences"),
+             self._rule("ai-self"), self._rule("ai-identity")])
         prompt = _dialectic_prompt(
             subject, prior, base_content, evidence, identity=self._identity,
             preference=self._preference, chunks=chunks, cold=cold, language=self._language,
@@ -1373,7 +1399,7 @@ class LayerWorker:
             if not payload:
                 continue
             try:
-                return layers.validate_review(payload, self._plugin_yaml)
+                return layers.validate_review(payload)
             except layers.LayerContractError as exc:
                 logger.debug("Minir dialectic pass rejected (%s)", exc)
         raise LayerMergeError(f"{DIALECTIC_LAYER} merge for {subject} returned no usable JSON "

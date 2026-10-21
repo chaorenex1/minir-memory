@@ -1,7 +1,7 @@
 ---
 id: markers-org
 version: 1
-applies_to: [base:B3]
+applies_to: [base:B4]
 slot: fields
 max_tokens: 400
 sections: [contract, review_checks]

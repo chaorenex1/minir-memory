@@ -123,16 +123,18 @@ def test_run_frames_the_message_and_forwards_the_route(adviser, host):
     assert data == RUN
     (call,) = host["sync_calls"]
     assert call == {"message": "Ship it?", "context": "tests pass", "model": "some/other",
-                    "provider": "openrouter", "api_mode": "", "toolsets": ["file"],
+                    "provider": "openrouter", "api_mode": "",
+                    "toolsets": ["file", "minir", "adviser"],
                     "system_message": adviser._ADVISER_BRIEF}
 
 
 def test_tool_toolsets_beat_the_configured_ones(adviser, host):
+    """An explicit override replaces the configured list; the plugin toolset is always added."""
     host["config"]["auxiliary"][ADVISER] = {"toolsets": ["web"]}
 
     adviser.run("q", toolsets=["file"])
 
-    assert host["sync_calls"][0]["toolsets"] == ["file"]
+    assert host["sync_calls"][0]["toolsets"] == ["file", "minir", "adviser"]
 
 
 def test_empty_config_passes_empty_route_overrides(adviser, host):
@@ -296,7 +298,7 @@ def test_manifest_declares_every_registered_adviser_tool(adviser):
                 break
 
     assert registered == {"adviser_consult", "adviser_session_search"}
-    assert set(declared) == registered
+    assert registered <= set(declared)
 
 
 def test_provider_registration_survives_a_refused_auxiliary_key(plugin_package):
@@ -310,4 +312,7 @@ def test_provider_registration_survives_a_refused_auxiliary_key(plugin_package):
                          "pre_llm_call", "post_llm_call", "post_tool_call", "pre_tool_call",
                          "pre_verify", "on_interim_message", "post_api_request",
                          "api_request_error"]
-    assert ctx.calls == []
+    # The refused auxiliary key costs the adviser tools only; the plugin's own minir toolset
+    # is registered before that call and must survive it.
+    assert [call[1]["name"] for call in ctx.calls if call[0] == "tool"] == [
+        "minir_search", "minir_remember", "minir_forget", "minir_stats"]

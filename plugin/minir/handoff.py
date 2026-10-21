@@ -82,7 +82,7 @@ def normalize(text: str) -> str:
     return candidate[:_MAX_SUMMARY_CHARS].rstrip()
 
 
-def _run_with_timeout(run: Callable[[], Any], timeout: float) -> Any:
+def run_with_timeout(run: Callable[[], Any], timeout: float) -> Any:
     """Run *run* on a daemon thread and stop waiting after *timeout* (``None`` on timeout)."""
     box: dict[str, Any] = {}
 
@@ -142,7 +142,7 @@ def summarize_agent(chunk: str, review: str, *, previous: str = "", session_id: 
     prompt = "\n\n".join(parts)
 
     def run() -> str:
-        from . import adviser, agent_loop, session_search
+        from . import adviser, agent_loop, session_search, tools
 
         cfg = adviser.load_config()
         toolsets = [str(tool) for tool in (cfg.get("toolsets") or []) if str(tool).strip()]
@@ -150,12 +150,13 @@ def summarize_agent(chunk: str, review: str, *, previous: str = "", session_id: 
             toolsets.append(session_search.TOOLSET)
         result = agent_loop.run(
             prompt, model=str(cfg.get("model") or ""),
-            provider=str(cfg.get("provider") or ""), toolsets=toolsets,
+            provider=str(cfg.get("provider") or ""),
+            toolsets=tools.agent_toolsets(toolsets),
             system_message=system_prompt())
         return str(result.answer or "")
 
     try:
-        text = _run_with_timeout(run, timeout)
+        text = run_with_timeout(run, timeout)
         return normalize(text or "")
     except Exception:
         return ""

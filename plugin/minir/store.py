@@ -36,8 +36,8 @@
   compression chunks, and final session summaries. ``conclusions_fts`` is an FTS5 trigram index
   over it (CJK-safe); when FTS5 is unavailable, ``search()`` falls back to the token scan.
   ``session_chunk_summary`` is the canonical local-compression chain; each row records the time
-  and session-turn range it covers. The base artifact renders its rolling ``## Window Summary``
-  from the pass's JSON and appends the same body to the chain; older (including superseded)
+  and session-turn range it covers. The base artifact stores the pass's ``## Window Summary``
+  markdown as written and appends the same body to the chain; older (including superseded)
   chunks stay as independent rows and remain searchable inside their own session.
 * ``metrics`` — aggregated tool counters, flushed in batches rather than per call.
 
@@ -249,6 +249,58 @@ CREATE TABLE IF NOT EXISTS metrics (
     max_ms REAL NOT NULL DEFAULT 0,
     errors INTEGER NOT NULL DEFAULT 0,
     updated_at REAL NOT NULL
+);
+CREATE TABLE IF NOT EXISTS session_extractions (
+    session_id TEXT PRIMARY KEY,
+    status TEXT NOT NULL DEFAULT 'pending',
+    due_at REAL NOT NULL,
+    markers TEXT NOT NULL DEFAULT '{}',
+    window_from_ts REAL NOT NULL DEFAULT 0,
+    window_to_ts REAL NOT NULL DEFAULT 0,
+    turns INTEGER NOT NULL DEFAULT 0,
+    attempts INTEGER NOT NULL DEFAULT 0,
+    pages INTEGER NOT NULL DEFAULT 0,
+    summary_chars INTEGER NOT NULL DEFAULT 0,
+    error TEXT NOT NULL DEFAULT '',
+    created_at REAL NOT NULL,
+    updated_at REAL NOT NULL,
+    started_at REAL,
+    finished_at REAL
+);
+CREATE INDEX IF NOT EXISTS idx_session_extractions_due
+    ON session_extractions(status, due_at);
+CREATE TABLE IF NOT EXISTS turn_usage (
+    session_id TEXT NOT NULL,
+    turn_id TEXT NOT NULL,
+    model TEXT NOT NULL DEFAULT '',
+    api_calls INTEGER NOT NULL DEFAULT 0,
+    prompt_tokens INTEGER NOT NULL DEFAULT 0,
+    completion_tokens INTEGER NOT NULL DEFAULT 0,
+    total_tokens INTEGER NOT NULL DEFAULT 0,
+    cache_read_tokens INTEGER NOT NULL DEFAULT 0,
+    cache_write_tokens INTEGER NOT NULL DEFAULT 0,
+    reasoning_tokens INTEGER NOT NULL DEFAULT 0,
+    first_at REAL NOT NULL,
+    updated_at REAL NOT NULL,
+    final_at REAL,
+    PRIMARY KEY (session_id, turn_id)
+);
+CREATE INDEX IF NOT EXISTS idx_turn_usage_session
+    ON turn_usage(session_id, updated_at DESC);
+CREATE TABLE IF NOT EXISTS session_usage (
+    session_id TEXT PRIMARY KEY,
+    turns INTEGER NOT NULL DEFAULT 0,
+    api_calls INTEGER NOT NULL DEFAULT 0,
+    prompt_tokens INTEGER NOT NULL DEFAULT 0,
+    completion_tokens INTEGER NOT NULL DEFAULT 0,
+    total_tokens INTEGER NOT NULL DEFAULT 0,
+    cache_read_tokens INTEGER NOT NULL DEFAULT 0,
+    cache_write_tokens INTEGER NOT NULL DEFAULT 0,
+    reasoning_tokens INTEGER NOT NULL DEFAULT 0,
+    host_prompt_tokens INTEGER NOT NULL DEFAULT 0,
+    host_completion_tokens INTEGER NOT NULL DEFAULT 0,
+    host_total_tokens INTEGER NOT NULL DEFAULT 0,
+    finalized_at REAL NOT NULL
 );
 """
 
@@ -1973,6 +2025,234 @@ class MinirStore:
         rows = self.card_revisions(scope, part, limit=1)
         return rows[0] if rows else None
 
+    # -- session finalisation: idle timer + per-turn usage ---------------------
+
+    def session_markers(self, session_id: str, limit: int = 50) -> list[dict[str, Any]]:
+        """Typed explicit markers written by one session, oldest first (the extraction input)."""
+        limit = max(1, min(200, int(limit or 50)))
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT id, marker_type, category, content, created_at FROM notes "
+                "WHERE session_id = ? AND marker_type <> '' ORDER BY created_at, id LIMIT ?",
+                (str(session_id or ""), limit)).fetchall()
+        return [dict(row) for row in rows]
+
+    def schedule_extraction(self, session_id: str, *, due_at: float, markers: str = "{}",
+                            window_from_ts: float = 0.0, window_to_ts: float = 0.0,
+                            turns: int = 0) -> None:
+        """Arm (or re-arm) one session's idle timer; re-ending a session resets its attempt count."""
+        session = str(session_id or "")
+        if not session:
+            return
+        stamp = time.time()
+        with self._lock:
+            self._conn.execute(
+                "INSERT INTO session_extractions "
+                "(session_id, status, due_at, markers, window_from_ts, window_to_ts, turns, "
+                "attempts, pages, summary_chars, error, created_at, updated_at, started_at, "
+                "finished_at) VALUES (?, 'pending', ?, ?, ?, ?, ?, 0, 0, 0, '', ?, ?, NULL, NULL) "
+                "ON CONFLICT(session_id) DO UPDATE SET status = 'pending', "
+                "due_at = excluded.due_at, markers = excluded.markers, "
+                "window_from_ts = excluded.window_from_ts, "
+                "window_to_ts = excluded.window_to_ts, turns = excluded.turns, attempts = 0, "
+                "pages = 0, summary_chars = 0, error = '', "
+                "updated_at = excluded.updated_at, started_at = NULL, finished_at = NULL",
+                (session, float(due_at), str(markers or "{}"), float(window_from_ts),
+                 float(window_to_ts), max(0, int(turns or 0)), stamp, stamp))
+            self._conn.commit()
+
+    def cancel_extraction(self, session_id: str) -> int:
+        """Cancel a *pending* timer because the operator typed in the session again."""
+        with self._lock:
+            cur = self._conn.execute(
+                "DELETE FROM session_extractions WHERE session_id = ? AND status = 'pending'",
+                (str(session_id or ""),))
+            self._conn.commit()
+            return int(cur.rowcount or 0)
+
+    def extraction(self, session_id: str) -> Optional[dict[str, Any]]:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM session_extractions WHERE session_id = ?",
+                (str(session_id or ""),)).fetchone()
+        return dict(row) if row is not None else None
+
+    def due_extractions(self, now: float, limit: int = 5) -> list[dict[str, Any]]:
+        limit = max(1, min(20, int(limit or 5)))
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT * FROM session_extractions WHERE status = 'pending' AND due_at <= ? "
+                "ORDER BY due_at, session_id LIMIT ?",
+                (float(now), limit)).fetchall()
+        return [dict(row) for row in rows]
+
+    def claim_extraction(self, session_id: str, *, now: Optional[float] = None) -> bool:
+        """pending -> running atomically; False when another process already claimed it."""
+        stamp = time.time() if now is None else float(now)
+        with self._lock:
+            cur = self._conn.execute(
+                "UPDATE session_extractions SET status = 'running', started_at = ?, "
+                "updated_at = ? WHERE session_id = ? AND status = 'pending'",
+                (stamp, stamp, str(session_id or "")))
+            self._conn.commit()
+            return bool(cur.rowcount)
+
+    def finish_extraction(self, session_id: str, *, pages: int = 0,
+                          summary_chars: int = 0) -> None:
+        stamp = time.time()
+        with self._lock:
+            self._conn.execute(
+                "UPDATE session_extractions SET status = 'done', pages = ?, summary_chars = ?, "
+                "error = '', finished_at = ?, updated_at = ? WHERE session_id = ?",
+                (max(0, int(pages or 0)), max(0, int(summary_chars or 0)), stamp, stamp,
+                 str(session_id or "")))
+            self._conn.commit()
+
+    def fail_extraction(self, session_id: str, error: str, *,
+                        retry_at: Optional[float] = None, max_attempts: int = 2) -> str:
+        """Record a failed run: retry once when *retry_at* is given, then park it as failed."""
+        session = str(session_id or "")
+        stamp = time.time()
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT attempts FROM session_extractions WHERE session_id = ?",
+                (session,)).fetchone()
+            attempts = int(row["attempts"] or 0) + 1 if row is not None else 1
+            retry = retry_at is not None and attempts < max(1, int(max_attempts))
+            self._conn.execute(
+                "UPDATE session_extractions SET attempts = ?, status = ?, due_at = ?, error = ?, "
+                "updated_at = ?, finished_at = ? WHERE session_id = ?",
+                (attempts, "pending" if retry else "failed",
+                 float(retry_at) if retry else stamp, str(error or "")[:1_000], stamp,
+                 None if retry else stamp, session))
+            self._conn.commit()
+        return "retried" if retry else "failed"
+
+    def pending_extraction_count(self) -> int:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT COUNT(*) AS n FROM session_extractions "
+                "WHERE status IN ('pending', 'running')").fetchone()
+        return int(row["n"] or 0)
+
+    def record_turn_usage(self, session_id: str, turn_id: str, *,
+                          prompt_tokens: int = 0, completion_tokens: int = 0,
+                          total_tokens: int = 0, cache_read_tokens: int = 0,
+                          cache_write_tokens: int = 0, reasoning_tokens: int = 0,
+                          api_calls: int = 1, model: str = "") -> None:
+        """Fold one API request's usage into its turn's running total."""
+        session = str(session_id or "")
+        turn = str(turn_id or "")
+        if not session or not turn:
+            return
+        stamp = time.time()
+        with self._lock:
+            self._conn.execute(
+                "INSERT INTO turn_usage (session_id, turn_id, model, api_calls, prompt_tokens, "
+                "completion_tokens, total_tokens, cache_read_tokens, cache_write_tokens, "
+                "reasoning_tokens, first_at, updated_at, final_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL) "
+                "ON CONFLICT(session_id, turn_id) DO UPDATE SET "
+                "model = CASE WHEN excluded.model <> '' THEN excluded.model "
+                "ELSE turn_usage.model END, "
+                "api_calls = turn_usage.api_calls + excluded.api_calls, "
+                "prompt_tokens = turn_usage.prompt_tokens + excluded.prompt_tokens, "
+                "completion_tokens = turn_usage.completion_tokens + excluded.completion_tokens, "
+                "total_tokens = turn_usage.total_tokens + excluded.total_tokens, "
+                "cache_read_tokens = turn_usage.cache_read_tokens + excluded.cache_read_tokens, "
+                "cache_write_tokens = turn_usage.cache_write_tokens + excluded.cache_write_tokens, "
+                "reasoning_tokens = turn_usage.reasoning_tokens + excluded.reasoning_tokens, "
+                "updated_at = excluded.updated_at, final_at = NULL",
+                (session, turn, str(model or "")[:120], max(0, int(api_calls or 0)),
+                 max(0, int(prompt_tokens or 0)), max(0, int(completion_tokens or 0)),
+                 max(0, int(total_tokens or 0)), max(0, int(cache_read_tokens or 0)),
+                 max(0, int(cache_write_tokens or 0)), max(0, int(reasoning_tokens or 0)),
+                 stamp, stamp))
+            self._conn.commit()
+
+    def finalize_session_usage(self, session_id: str) -> dict[str, Any]:
+        """Close every turn row for the session and return the per-session totals."""
+        session = str(session_id or "")
+        stamp = time.time()
+        with self._lock:
+            self._conn.execute(
+                "UPDATE turn_usage SET final_at = ? WHERE session_id = ? AND final_at IS NULL",
+                (stamp, session))
+            row = self._conn.execute(
+                "SELECT COUNT(*) AS turns, COALESCE(SUM(api_calls), 0) AS api_calls, "
+                "COALESCE(SUM(prompt_tokens), 0) AS prompt_tokens, "
+                "COALESCE(SUM(completion_tokens), 0) AS completion_tokens, "
+                "COALESCE(SUM(total_tokens), 0) AS total_tokens, "
+                "COALESCE(SUM(cache_read_tokens), 0) AS cache_read_tokens, "
+                "COALESCE(SUM(cache_write_tokens), 0) AS cache_write_tokens, "
+                "COALESCE(SUM(reasoning_tokens), 0) AS reasoning_tokens "
+                "FROM turn_usage WHERE session_id = ?", (session,)).fetchone()
+            self._conn.commit()
+        return {key: int(row[key] or 0) for key in (
+            "turns", "api_calls", "prompt_tokens", "completion_tokens", "total_tokens",
+            "cache_read_tokens", "cache_write_tokens", "reasoning_tokens")} if row else {}
+
+    def record_session_usage(self, session_id: str, totals: dict[str, Any], *,
+                             host: Optional[dict[str, Any]] = None) -> None:
+        """Store one session's final usage, with the host's own aggregate beside it."""
+        session = str(session_id or "")
+        if not session:
+            return
+        values = totals or {}
+        host_row = host or {}
+
+        def number(source: dict[str, Any], key: str, default: Any = 0) -> int:
+            try:
+                return max(0, int(source.get(key) if source.get(key) is not None else default))
+            except (TypeError, ValueError):
+                return 0
+
+        stamp = time.time()
+        with self._lock:
+            self._conn.execute(
+                "INSERT INTO session_usage (session_id, turns, api_calls, prompt_tokens, "
+                "completion_tokens, total_tokens, cache_read_tokens, cache_write_tokens, "
+                "reasoning_tokens, host_prompt_tokens, host_completion_tokens, "
+                "host_total_tokens, finalized_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
+                "ON CONFLICT(session_id) DO UPDATE SET turns = excluded.turns, "
+                "api_calls = excluded.api_calls, prompt_tokens = excluded.prompt_tokens, "
+                "completion_tokens = excluded.completion_tokens, "
+                "total_tokens = excluded.total_tokens, "
+                "cache_read_tokens = excluded.cache_read_tokens, "
+                "cache_write_tokens = excluded.cache_write_tokens, "
+                "reasoning_tokens = excluded.reasoning_tokens, "
+                "host_prompt_tokens = excluded.host_prompt_tokens, "
+                "host_completion_tokens = excluded.host_completion_tokens, "
+                "host_total_tokens = excluded.host_total_tokens, "
+                "finalized_at = excluded.finalized_at",
+                (session, number(values, "turns"), number(values, "api_calls"),
+                 number(values, "prompt_tokens"), number(values, "completion_tokens"),
+                 number(values, "total_tokens"), number(values, "cache_read_tokens"),
+                 number(values, "cache_write_tokens"), number(values, "reasoning_tokens"),
+                 number(host_row, "input_tokens", number(host_row, "prompt_tokens")),
+                 number(host_row, "output_tokens", number(host_row, "completion_tokens")),
+                 number(host_row, "total_tokens",
+                        number(host_row, "input_tokens") + number(host_row, "output_tokens")),
+                 stamp))
+            self._conn.commit()
+
+    def session_usage(self, session_id: str) -> dict[str, Any]:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM session_usage WHERE session_id = ?",
+                (str(session_id or ""),)).fetchone()
+        return dict(row) if row is not None else {}
+
+    def turn_usage(self, session_id: str, limit: int = 20) -> list[dict[str, Any]]:
+        """This session's per-turn usage, newest first (the final value is what on_session_end wrote)."""
+        limit = max(1, min(100, int(limit or 20)))
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT * FROM turn_usage WHERE session_id = ? "
+                "ORDER BY updated_at DESC, turn_id DESC LIMIT ?",
+                (str(session_id or ""), limit)).fetchall()
+        return [dict(row) for row in rows]
+
     def stats(self) -> dict[str, Any]:
         """Row counts and on-disk size, for the ``minir_stats`` tool."""
         with self._lock:
@@ -1995,6 +2275,15 @@ class MinirStore:
             reviews = self._conn.execute("SELECT COUNT(*) AS n FROM adviser_reviews").fetchone()["n"]
             conclusions = self._conn.execute("SELECT COUNT(*) AS n FROM conclusions").fetchone()["n"]
             metrics = self._conn.execute("SELECT COUNT(*) AS n FROM metrics").fetchone()["n"]
+            turn_rows = self._conn.execute(
+                "SELECT COUNT(*) AS n FROM turn_usage").fetchone()["n"]
+            extractions = self._conn.execute(
+                "SELECT COUNT(*) AS n FROM session_extractions").fetchone()["n"]
+            pending_extractions = self._conn.execute(
+                "SELECT COUNT(*) AS n FROM session_extractions "
+                "WHERE status IN ('pending', 'running')").fetchone()["n"]
+            usage_sessions = self._conn.execute(
+                "SELECT COUNT(*) AS n FROM session_usage").fetchone()["n"]
         try:
             size = self.path.stat().st_size
         except OSError:
@@ -2006,6 +2295,9 @@ class MinirStore:
                 "adviser_reviews": int(reviews),
                 "conclusions": int(conclusions),
                 "metrics": int(metrics), "fts": bool(self._fts),
+                "turn_usage": int(turn_rows), "session_extractions": int(extractions),
+                "pending_extractions": int(pending_extractions),
+                "usage_sessions": int(usage_sessions),
                 "db_path": str(self.path), "db_bytes": size}
 
     def record_metrics(self, entries: dict[str, dict[str, Any]]) -> None:

@@ -1,26 +1,26 @@
 ---
 id: user-preferences
-version: 1
+version: 2
 applies_to: [base:B1, dialectic, card_review]
-slot: fields
-max_tokens: 350
+slot: body
+max_tokens: 400
 sections: [contract, review_checks]
 ---
 
 ## CONTRACT
 
 WHAT
-How this person wants the assistant to work. Seven optional fields. A constraint that held for one
-turn is scene, not preference.
+How this person wants the assistant to work. A markdown body. A constraint that held for one turn
+is scene, not preference.
 
-FIELDS
-- communication: language, tone, length, level of detail.
-- presentation: conclusion or analysis first; lists or tables; code or prose.
-- method: plan first, staged delivery, verify before advancing, smallest reversible change.
-- decision: which criterion wins: evidence, cost, speed or robustness.
-- technology: toolchain, runtime, deployment environment, version-control habits.
-- collaboration: how much the assistant drives, when it confirms, how often it reports.
-- taboos: expressions, proposals or operations they reject. Name the trigger.
+COVER
+- Language, tone, length, level of detail.
+- Shape of an answer: conclusion or analysis first; lists or tables; code or prose.
+- Method: plan first, staged delivery, verify before advancing, smallest reversible change.
+- Decision rule: which criterion wins, evidence, cost, speed or robustness.
+- Toolchain, runtime, deployment environment, version-control habits.
+- Collaboration: how much the assistant drives, when it confirms, how often it reports.
+- Taboos: expressions, proposals or operations they reject. Name the trigger.
 
 EVIDENCE
 - A stated preference wins. Without one, require two consistent demonstrations and rule out the
@@ -33,12 +33,12 @@ BOUNDARIES
 - Do not turn an environment constraint into a personal preference.
 
 QUALITY
-- At most two items per field, 80 characters each; every item can change the next action.
+- Every line changes the next action; a line that changes nothing is noise.
 
 ## REVIEW CHECKS
 - A preference was inferred from a single turn.
 - A capability was written as a preference, or the reverse.
 - A scene constraint was recorded as a standing preference.
-- A taboo item has no trigger word or scenario.
-- An item conflicts with the operator-declared material.
-- An item is too vague to guide the next action.
+- A taboo line has no trigger word or scenario.
+- A line conflicts with the operator-declared material.
+- A line is too vague to guide the next action.

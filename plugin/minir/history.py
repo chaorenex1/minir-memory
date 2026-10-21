@@ -235,6 +235,42 @@ def profile_name(state_db: Any, session_id: str) -> str:
         connection.close()
 
 
+def session_totals(state_db: Any, session_id: str) -> dict[str, Any]:
+    """The host's own final token counters for one session (``{}`` when unavailable).
+
+    ``sessions.input_tokens``/``output_tokens`` are the provider-confirmed aggregates the host
+    updates after every API call; at a session boundary they are the authoritative total, even
+    for calls this plugin never observed. ``cache_read_tokens`` is a subset of the input count,
+    not an extra bucket.
+    """
+    path = Path(str(state_db)) if state_db else None
+    if path is None or not session_id:
+        return {}
+    connection = _connect(path)
+    if connection is None:
+        return {}
+    try:
+        columns = _columns(connection, "sessions")
+        if not {"id", "input_tokens", "output_tokens"} <= columns:
+            return {}
+        wanted = [name for name in ("input_tokens", "output_tokens", "cache_read_tokens",
+                                    "cache_write_tokens", "reasoning_tokens", "api_call_count",
+                                    "message_count")
+                  if name in columns]
+        row = connection.execute(
+            "SELECT " + ", ".join(wanted) + " FROM sessions WHERE id = ?",
+            (str(session_id),)).fetchone()
+        if row is None:
+            return {}
+        totals = {name: int(row[name] or 0) for name in wanted}
+        totals["total_tokens"] = totals.get("input_tokens", 0) + totals.get("output_tokens", 0)
+        return totals
+    except sqlite3.Error:
+        return {}
+    finally:
+        connection.close()
+
+
 def identity_paths(hermes_home: Any, profile: str) -> tuple[Path, Path]:
     """``$HERMES_HOME/minir-memory/agents/<profile>/{identity,preference}.md``."""
     safe = _PROFILE_RE.sub("_", str(profile or "default").strip()).strip("._") or "default"

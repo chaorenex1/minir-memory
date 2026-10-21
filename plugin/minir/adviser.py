@@ -32,7 +32,7 @@ import json
 import logging
 from typing import Any
 
-from . import agent_loop, session_search
+from . import agent_loop, session_search, tools
 from .adviser_prompts import consult_prompt
 
 logger = logging.getLogger(__name__)
@@ -100,7 +100,8 @@ def run(question: str, context: str = "", toolsets: Any = None) -> dict[str, Any
     return agent_loop.run(
         question, context=context, model=route["model"], provider=route["provider"],
         api_mode=route["api_mode"],
-        toolsets=toolsets if toolsets is not None else route["toolsets"],
+        toolsets=tools.agent_toolsets(
+            toolsets if toolsets is not None else route["toolsets"]),
         system_message=_ADVISER_BRIEF,
     ).as_dict()
 
@@ -111,7 +112,8 @@ async def run_async(question: str, context: str = "", toolsets: Any = None) -> d
     result = await agent_loop.run_async(
         question, context=context, model=route["model"], provider=route["provider"],
         api_mode=route["api_mode"],
-        toolsets=toolsets if toolsets is not None else route["toolsets"],
+        toolsets=tools.agent_toolsets(
+            toolsets if toolsets is not None else route["toolsets"]),
         system_message=_ADVISER_BRIEF,
     )
     return result.as_dict()

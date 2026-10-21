@@ -16,39 +16,39 @@ def _no_model_call(*args, **kwargs):
 
 def _base_user_json():
     return json.dumps({
-        "user_self": {"occupation": "Engineer", "skills": ["Python"], "thinking_models": [],
-                      "interests": [], "communication": ["direct"], "values_motivation": []},
-        "user_preferences": {"communication": [], "presentation": [], "method": [],
-                             "decision": [], "technology": [], "collaboration": [],
-                             "taboos": []},
+        "user_self": "## Self\n\n- Occupation: Engineer\n- Skills: Python\n- Communication: direct",
+        "user_preferences": "",
     })
 
 
 def _base_ai_json():
     return json.dumps({
-        "ai_self": {"positioning": "executor", "current_task": "ship the plugin",
-                    "current_goal": "", "known": ["the window is the evidence"], "unknown": [],
-                    "state": "executing", "uncertainty": []},
-        "ai_identity": {"id": "", "name": "minir", "version": "0.8.0", "type": "",
-                        "role_duties": ["maintain the memory layer"], "domains_level": [],
-                        "persona_style": [], "communication_style": [], "permissions": [],
-                        "prohibitions": [], "system": "", "creator": "", "maintainer": "",
-                        "_sources": ["plugin.yaml"]},
+        "ai_self": ("## Self\n\n- Positioning: executor\n- Task: ship the plugin\n"
+                    "- Known: the window is the evidence\n- State: executing"),
+        "ai_identity": ("## Identity\n\n- Name: minir\n- Version: 0.8.0\n"
+                        "- Duties: maintain the memory layer"),
     })
+
+
+def _summary_section():
+    """The markdown section a base refresh returns, in the template's shape."""
+    return "\n\n".join([
+        "## Window Summary",
+        "### Objective\ndeploy on Windows",
+        "### Current State\n#### Done\n- deployed",
+        "#### Doing",
+        "#### Todo",
+        "### Decisions",
+        "### Constraints",
+        "### Verified Facts\n- it runs — evidence: smoke test",
+        "### Open Issues",
+        "### Next Actions\n- [high] verify",
+        "### References",
+    ])
 
 
 def _summary_json():
-    return json.dumps({
-        "window_summary": {
-            "objective": "deploy on Windows",
-            "current_state": {"done": ["deployed"], "doing": [], "todo": []},
-            "decisions": [], "constraints": [],
-            "verified_facts": [{"fact": "it runs", "evidence": "smoke test"}],
-            "open_issues": [], "next_actions": [{"action": "verify", "priority": "high"}],
-            "references": [],
-        },
-        "value_markers": {"units": []},
-    })
+    return json.dumps({"window_summary": _summary_section()})
 
 
 def _base_reply(prompt):
@@ -57,22 +57,21 @@ def _base_reply(prompt):
         return _base_user_json()
     if "baseline_ai_card" in prompt or "plugin_yaml" in prompt:
         return _base_ai_json()
+    if "previous_units" in prompt or "Previous knowledge units" in prompt:
+        return json.dumps({"units": []})
     return _summary_json()
 
 
 def _dialectic_json(*, changed=False, fields=None, peer=None):
-    preferences = {"communication": peer if peer is not None else ["wants evidence"],
-                   "presentation": [], "method": [], "decision": [], "technology": [],
-                   "collaboration": [], "taboos": []}
+    lines = "\n".join(f"- {item}" for item in (peer if peer is not None else ["wants evidence"]))
     ai_card = json.loads(_base_ai_json())
     return json.dumps({
         "user_card": {
-            "user_self": {"occupation": "Engineer", "skills": [], "thinking_models": [],
-                          "interests": [], "communication": [], "values_motivation": []},
-            "user_preferences": preferences,
+            "user_self": "## Self\n\n- Occupation: Engineer",
+            "user_preferences": "## Preferences\n\n" + lines,
         },
         "ai_card": ai_card,
-        "window_summary": json.loads(_summary_json())["window_summary"],
+        "window_summary": _summary_section(),
         "base_changed": {"changed": bool(changed), "fields": list(fields or [])},
         "changes": [],
         "prunings": [],

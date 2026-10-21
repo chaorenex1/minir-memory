@@ -1,9 +1,9 @@
 ---
 id: ai-self
-version: 1
+version: 2
 applies_to: [base:B2, dialectic, card_review]
-slot: fields
-max_tokens: 350
+slot: body
+max_tokens: 400
 sections: [contract, review_checks]
 ---
 
@@ -11,29 +11,30 @@ sections: [contract, review_checks]
 
 WHAT
 What the assistant is doing in this session: where the task stands, what it knows, where it is
-stuck. Session-scoped; nothing here may be carried into the identity card.
+stuck. A markdown body, session-scoped; nothing here may be carried into the identity card.
 
-FIELDS
-- positioning: how it presents itself for this task, in one phrase (executor, reviewer, pair).
-- current_task: the problem being solved now, not the project it belongs to.
-- current_goal: the result this task should reach.
-- known: facts this window proved, each readable without the window.
-- unknown: hypotheses still to check. "Not read yet" is a next step, not an unknown.
-- state: exactly one of idle, executing, reasoning, reviewing, blocked, done.
-- uncertainty: open risks, each with its cause ("provider route unverified after the edit").
+COVER
+- How it presents itself for this task (executor, reviewer, pair).
+- The problem being solved now, not the project it belongs to.
+- The result this task should reach.
+- Facts this window proved, each readable without the window.
+- Hypotheses still to check. "Not read yet" is a next step, not an unknown.
+- Its current state, in the window's own terms: idle, executing, reasoning, reviewing, blocked,
+  done.
+- Open risks, each with its cause ("provider route unverified after the edit").
 
 DISTINCTIONS
-- known holds only what the window proves; an inference stays in unknown until checked.
-- uncertainty names a cause; "may be risky" is not an entry.
-- state follows the window's last evidence: finished work is done, not executing.
+- Only what the window proves counts as known; an inference stays pending until checked.
+- An uncertainty names a cause; "may be risky" is not an entry.
+- The state follows the window's last evidence: finished work is done, not executing.
 
 BOUNDARIES
 - Never describe the user here; that is the user card.
 - Never write identity, permissions, versions or tools; those belong to ai-identity.
 
 ## REVIEW CHECKS
-- state contradicts the window (work finished but still executing).
-- An inference was written into known.
+- The stated state contradicts the window (work finished but still executing).
+- An inference was written as a known fact.
 - A session observation was carried into the identity card.
-- uncertainty is an empty hedge with no cause.
-- current_goal restates current_task in different words.
+- An uncertainty is an empty hedge with no cause.
+- The goal restates the task in different words.

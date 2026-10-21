@@ -534,7 +534,7 @@ def test_one_advice_target_vocabulary(plugin_package):
     assert set(mode.DELIVERED_TARGET_NAMES) == set(names)
     for name in names:
         assert name in mode._review_brief({}), name
-    assert "ADVICE TARGETS" not in plugin_package.layers.CORE_DIALECTIC, \
+    assert "ADVICE TARGETS" not in plugin_package.layers.load_core("dialectic"), \
         "the dialectic no longer emits advice"
     parsed = mode.parse_review(json.dumps({"action": "advise", "advices": [
         {"severity": "concern", "target": "not_a_target", "text": "x"}]}))

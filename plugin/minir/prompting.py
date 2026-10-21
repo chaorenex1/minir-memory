@@ -36,7 +36,11 @@ RESERVED_LABELS: frozenset[str] = frozenset({
     "previous_value_markers",
     "provider_memory_context",
     "self_audit_correction",
+    "session_handoff",
+    "session_summary",
+    "token_usage",
     "user_cards_this_window",
+    "value_markers",
 })
 _TAG_RE = re.compile(
     r"<\s*/?\s*(?:" + "|".join(map(re.escape, sorted(RESERVED_LABELS))) + r")\b[^>]*>",

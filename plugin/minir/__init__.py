@@ -53,9 +53,13 @@ from tools.registry import tool_error
 
 from . import adviser
 from . import card_review
+from . import extraction
 from . import file_guard
+from . import handoff
 from . import history as host_history
 from . import knowledge
+from . import session_summary
+from . import tools as plugin_tools
 from .adviser_mode import AdviserMode
 from .adviser_prompts import MAIN_CONSULT_SECTION
 from .prompting import (
@@ -97,6 +101,7 @@ _DB_FILENAME = "memory.db"
 _DEFAULT_PREFETCH_LIMIT = 5
 _MAX_BLOCK_CHARS = 2000           # recall block injected into the prompt is truncated to this
 _MAX_LAYER_CHARS = 1200           # layer artifacts injected next to it are capped separately
+_MAX_MARKER_SNAPSHOT = 16_000     # session markers stored with the idle timer are capped here
 _MAX_TOOL_EXCERPT = 600           # text excerpt returned by the minir_search tool
 _MAX_AUTHOR_CACHE = 64            # per-session last-seen author, bounded like the turn counter
 _COMPRESSION_GATE_TTL = 300.0     # seconds a crashed compression may pause periodic scheduling
@@ -105,6 +110,12 @@ _PRE_COMPRESS_TIMEOUT = 120.0     # synchronous base -> dialectic budget before 
 # dialectic review (injected separately by ``_layer_block``), chunk summaries and compression
 # summaries — stays explicit-recall through ``minir_search``.
 _PREFETCH_KINDS = frozenset({"note"})
+
+#: A session is not "finished" until it has been quiet this long. The operator can resume it
+#: inside the window; typing again cancels the pending extraction.
+_DEFAULT_KNOWLEDGE_IDLE_HOURS = 24.0
+_DEFAULT_SESSION_EXTRACTION = True
+_EXTRACTION_TICK_SECONDS = 60.0
 
 _ACTIVE_PROVIDER: Optional["MinirMemoryProvider"] = None
 """The provider instance ``initialize`` actually opened.
@@ -175,6 +186,14 @@ def _as_interval(value: Any, default: int) -> int:
         return default
 
 
+def _as_positive_int(value: Any, default: int = 1) -> int:
+    """Counted value -> integer >= 1 (a missing host counter still counts as one request)."""
+    try:
+        return max(1, int(value))
+    except (TypeError, ValueError):
+        return default
+
+
 class MinirMemoryProvider(MemoryProvider):
     """Local-first memory: notes + layer conclusions in SQLite, FTS recall, no transcripts."""
 
@@ -218,6 +237,20 @@ class MinirMemoryProvider(MemoryProvider):
         self._knowledge_token_budget = max(200, _env_int(
             "MINIR_KNOWLEDGE_TOKEN_BUDGET",
             int(self._config.get("knowledge_token_budget") or 2000)))
+        # Idle finalisation: at session end the value markers are captured and a timer armed.
+        # A user turn inside the window cancels it; when it fires, the session summary and the
+        # knowledge pages are extracted.
+        self._session_extraction = _coerce_bool(
+            os.environ.get("MINIR_SESSION_EXTRACTION"),
+            _coerce_bool(self._config.get("session_extraction_enabled"),
+                         _DEFAULT_SESSION_EXTRACTION))
+        try:
+            idle_hours = float(os.environ.get(
+                "MINIR_KNOWLEDGE_IDLE_HOURS",
+                self._config.get("knowledge_idle_hours", _DEFAULT_KNOWLEDGE_IDLE_HOURS)))
+        except (TypeError, ValueError):
+            idle_hours = _DEFAULT_KNOWLEDGE_IDLE_HOURS
+        self._knowledge_idle_seconds = max(0.0, float(idle_hours)) * 3600.0
         # Layer reasoning: the worker calls the host's auxiliary model to turn each queued job
         # into a layer artifact. On by default (the layers are the point of the provider);
         # ``reasoning_enabled: false`` keeps minir a pure store with no model calls at all.
@@ -237,6 +270,7 @@ class MinirMemoryProvider(MemoryProvider):
         self._preference = ""
         self._worker: Optional[LayerWorker] = None
         self._card_scheduler: Optional[card_review.CardReviewScheduler] = None
+        self._extraction_scheduler: Optional[extraction.ExtractionScheduler] = None
         self._knowledge: Optional[knowledge.KnowledgePipeline] = None
         self._recent_knowledge: list[list[str]] = []
         self._transcript = TranscriptBuffer(
@@ -305,6 +339,12 @@ class MinirMemoryProvider(MemoryProvider):
             period=float(self._card_review_days) * 24 * 3600)
         if self._reasoning:
             self._card_scheduler.start()
+        # The idle timer must survive a process: rows are in SQLite, so a session that ended in
+        # a previous process is picked up on the first tick here.
+        self._extraction_scheduler = extraction.ExtractionScheduler(
+            self._store, self._run_session_extraction, tick=_EXTRACTION_TICK_SECONDS)
+        if self._reasoning and self._session_extraction:
+            self._extraction_scheduler.start()
         # Configure before opening the session: intervals/mode apply to sessions opened later
         # (an already-running session keeps the cadence it started with).
         TRACKER.configure(base_interval=self._base_interval,
@@ -386,6 +426,14 @@ class MinirMemoryProvider(MemoryProvider):
              "description": "Hard per-file budget for one knowledge page",
              "type": "integer", "default": "2000", "minimum": 200,
              "env_var": "MINIR_KNOWLEDGE_TOKEN_BUDGET"},
+            {"key": "session_extraction_enabled",
+             "description": "Summarize a session and extract its knowledge after it goes idle",
+             "type": "boolean", "default": "true", "choices": ["true", "false"],
+             "env_var": "MINIR_SESSION_EXTRACTION"},
+            {"key": "knowledge_idle_hours",
+             "description": "Quiet hours after session end before the final summary and knowledge extraction",
+             "type": "number", "default": "24", "minimum": 0,
+             "env_var": "MINIR_KNOWLEDGE_IDLE_HOURS"},
             {"key": "session_mode", "description": "Mode stamped on each newly opened session",
              "type": "text", "default": DEFAULT_SESSION_MODE, "env_var": "MINIR_SESSION_MODE"},
         ]
@@ -630,6 +678,7 @@ class MinirMemoryProvider(MemoryProvider):
             return  # nothing consumes the transcript when the layers are off
         session = session_id or self._session_id
         author, author_id = self._turn_author(turn_author, session)
+        self._cancel_session_extraction(session)
         try:
             self._transcript.add_turn(session, user_content, assistant_content,
                                       author=author, author_id=author_id)
@@ -677,6 +726,9 @@ class MinirMemoryProvider(MemoryProvider):
             return
         try:
             self._cache_author(kwargs)
+            # A real user turn is the one signal that this session is live again. Cancel a
+            # pending idle extraction before the compression gate can suppress the rest.
+            self._cancel_session_extraction(self._session_id)
             if self._store.compression_gate_active(self._session_id):
                 return  # compression owns this window; periodic dispatch resumes afterwards
             self._dispatch(TRACKER.tick(self._session_id, turn_number))
@@ -751,18 +803,253 @@ class MinirMemoryProvider(MemoryProvider):
             logger.warning("Minir pre-compression layer refresh failed: %s", exc)
 
     def on_session_end(self, messages: Optional[list[dict[str, Any]]] = None) -> None:
-        """Real session boundary: flush the un-reasoned tail once, then stop counting.
+        """Real session boundary: flush the un-reasoned tail once, finalise usage, arm the timer.
 
         The host queues this ahead of ``on_session_switch`` on one serialized worker, so the
         counter always reflects every turn of the ending session. ``tail()`` is watermark-based
         and therefore a no-op when the tail is already covered — a ``/new`` reaches this
         method, ``on_session_finalize`` and ``on_session_reset`` for the same boundary.
+
+        Finalisation itself never depends on the flush: a failed boundary drain must not lose the
+        session's token accounting or its idle timer.
         """
+        session = self._session_id
         try:
-            self._flush_boundary(self._session_id, close=True)
-            self._adviser_mode.session_end(self._session_id)
+            self._flush_boundary(session, close=True)
         except Exception as exc:
-            logger.warning("Minir on_session_end failed: %s", exc)
+            logger.warning("Minir on_session_end flush failed: %s", exc)
+        self._finish_session(session)
+
+    def _finish_session(self, session: str) -> None:
+        """Boundary finalisation: per-turn usage, adviser state, then the idle timer."""
+        if not session:
+            return
+        try:
+            totals = self._finalize_session_usage(session)
+            logger.info("Minir session %s final usage: turns=%s api_calls=%s tokens=%s",
+                        session, totals.get("turns", 0), totals.get("api_calls", 0),
+                        totals.get("total_tokens", 0))
+        except Exception as exc:
+            logger.warning("Minir usage finalisation failed: %s", exc)
+        try:
+            self._adviser_mode.session_end(session)
+        except Exception as exc:
+            logger.debug("Minir adviser session end failed: %s", exc)
+        self._schedule_session_extraction(session)
+
+    # -- session finalisation: usage + idle knowledge extraction --------------
+
+    def record_api_usage(self, session_id: str, turn_id: str, usage: Any, *,
+                         api_calls: Any = 1, model: str = "") -> None:
+        """Fold one ``post_api_request`` usage payload into its turn's running total.
+
+        Keyed by the host's ``turn_id``, so the final per-turn consumption survives the many
+        API calls one turn can make. Calls for another session (a delegate, a cron run) are not
+        this provider's accounting and are ignored.
+        """
+        if self._store is None or not session_id or not turn_id:
+            return
+        if self._session_id and str(session_id) != self._session_id:
+            return
+        payload = usage if isinstance(usage, dict) else {}
+        if not payload:
+            return
+
+        def number(*keys: str) -> int:
+            for key in keys:
+                value = payload.get(key)
+                if value is None:
+                    continue
+                try:
+                    return max(0, int(value))
+                except (TypeError, ValueError):
+                    return 0
+            return 0
+
+        prompt = number("prompt_tokens", "input_tokens")
+        completion = number("completion_tokens", "output_tokens")
+        try:
+            self._store.record_turn_usage(
+                str(session_id), str(turn_id), prompt_tokens=prompt,
+                completion_tokens=completion,
+                total_tokens=number("total_tokens") or (prompt + completion),
+                cache_read_tokens=number("cache_read_tokens"),
+                cache_write_tokens=number("cache_write_tokens"),
+                reasoning_tokens=number("reasoning_tokens"),
+                api_calls=_as_positive_int(api_calls), model=model)
+        except Exception as exc:  # accounting must never break an API response
+            logger.debug("Minir turn usage write failed: %s", exc)
+
+    def _finalize_session_usage(self, session: str) -> dict[str, Any]:
+        """Close the turn rows and store the session total beside the host's own aggregate."""
+        if self._store is None or not session:
+            return {}
+        totals = self._store.finalize_session_usage(session)
+        host = host_history.session_totals(self._state_db, session)
+        self._store.record_session_usage(session, totals, host=host)
+        return {**totals, "host_total_tokens": int(host.get("total_tokens") or 0)}
+
+    def _session_marker_snapshot(self, session: str) -> dict[str, Any]:
+        """The markers this session produced, plus what the final summary agent will need."""
+        snapshot: dict[str, Any] = {"notes": [], "units": [], "summary": "",
+                                    "turn_usage": [], "window_from_ts": 0.0,
+                                    "window_to_ts": 0.0}
+        if self._store is None or not session:
+            return snapshot
+        try:
+            notes = self._store.session_markers(session)
+            # Bound each note: a marker's text can be large, and the snapshot is evidence for
+            # one extraction run, not an archive of the note table.
+            snapshot["notes"] = [
+                {"id": note.get("id"), "marker_type": note.get("marker_type"),
+                 "category": note.get("category"),
+                 "content": str(note.get("content") or "")[:400],
+                 "created_at": note.get("created_at")}
+                for note in notes[-50:]]
+        except Exception as exc:
+            logger.debug("Minir marker snapshot failed: %s", exc)
+        try:
+            base = self._store.latest_base_refresh(session) or {}
+            snapshot["window_from_ts"] = float(base.get("window_from_ts") or 0.0)
+            snapshot["window_to_ts"] = float(base.get("window_to_ts") or 0.0)
+            units: Any = []
+            raw = str(base.get("value_markers") or "").strip()
+            if raw:
+                try:
+                    parsed = json.loads(raw)
+                    units = parsed.get("units") if isinstance(parsed, dict) else parsed
+                except ValueError:
+                    units = []
+            if isinstance(units, list):
+                snapshot["units"] = units[:16]
+            summary = self._store.newest_conclusion("session_summary", session_id=session)
+            snapshot["summary"] = str((summary or {}).get("content") or "")[:4_000]
+            snapshot["turn_usage"] = self._store.turn_usage(session, limit=50)
+        except Exception as exc:
+            logger.debug("Minir base artifact snapshot failed: %s", exc)
+        return snapshot
+
+    @staticmethod
+    def _encode_marker_snapshot(snapshot: dict[str, Any]) -> str:
+        """Serialize the marker snapshot, shrinking its lists rather than cutting JSON mid-string."""
+        notes = list(snapshot.get("notes") or [])
+        units = list(snapshot.get("units") or [])
+        usage = list(snapshot.get("turn_usage") or [])
+        payload = json.dumps(snapshot, ensure_ascii=False)
+        for note_cap, unit_cap, usage_cap in ((30, 16, 20), (20, 12, 10), (10, 6, 5), (0, 0, 0)):
+            if len(payload) <= _MAX_MARKER_SNAPSHOT:
+                break
+            snapshot["notes"] = notes[-note_cap:] if note_cap else []
+            snapshot["units"] = units[:unit_cap]
+            snapshot["turn_usage"] = usage[:usage_cap]
+            payload = json.dumps(snapshot, ensure_ascii=False)
+        return payload
+
+    def _schedule_session_extraction(self, session: str) -> None:
+        """Arm the idle timer with this session's marker snapshot; cancelled by a later turn."""
+        if self._store is None or not session:
+            return
+        if self._agent_context not in ("", "primary"):
+            return  # a subagent/cron session is not a conversation the operator returns to
+        if not self._reasoning or not self._session_extraction:
+            return
+        try:
+            snapshot = self._session_marker_snapshot(session)
+            if not (snapshot.get("notes") or snapshot.get("units")):
+                # No value markers, nothing to time: the session was not durable enough to
+                # spend a summary + extraction run on.
+                logger.debug("Minir extraction skipped for %s: no value markers", session)
+                return
+            window_to = max(float(snapshot.get("window_to_ts") or 0.0),
+                            host_history.latest_ts(self._state_db, session), time.time())
+            payload = self._encode_marker_snapshot(snapshot)
+            self._store.schedule_extraction(
+                session, due_at=time.time() + self._knowledge_idle_seconds,
+                markers=payload,
+                window_from_ts=float(snapshot.get("window_from_ts") or 0.0),
+                window_to_ts=window_to,
+                turns=len(snapshot.get("turn_usage") or []))
+            logger.info("Minir extraction armed for %s in %.0fs", session,
+                        self._knowledge_idle_seconds)
+        except Exception as exc:
+            logger.warning("Minir extraction schedule failed: %s", exc)
+
+    def _cancel_session_extraction(self, session: str) -> None:
+        """A user typed in the session: the idle timer must not fire."""
+        if self._store is None or not session:
+            return
+        try:
+            removed = self._store.cancel_extraction(session)
+            if removed:
+                logger.info("Minir extraction cancelled for %s (session is live)", session)
+        except Exception as exc:
+            logger.debug("Minir extraction cancel failed: %s", exc)
+
+    def _session_handoff(self, session: str, window_end: float) -> str:
+        """Build the audited Task Handoff from the session's published artifacts."""
+        if self._store is None:
+            return ""
+        base = self._store.latest_base_refresh(session) or {}
+        chunk = str(base.get("session_chunk_summary") or "").strip()
+        review_row = self._store.newest_conclusion("dialectic.review", session_id=session)
+        review = str((review_row or {}).get("content") or "").strip()
+        previous_row = self._store.newest_conclusion("session_summary", session_id=session)
+        previous = str((previous_row or {}).get("content") or "").strip()
+        if not (chunk or review or previous):
+            return ""
+        try:
+            text = handoff.summarize_agent(
+                chunk, review, previous=previous, session_id=session,
+                before=window_end or time.time(), timeout=_PRE_COMPRESS_TIMEOUT)
+        except Exception as exc:
+            logger.debug("Minir session hand-off agent failed: %s", exc)
+            text = ""
+        return text or chunk or review or previous
+
+    def _run_session_extraction(self, row: dict[str, Any]) -> dict[str, int]:
+        """Run one due session: final summary (hand-off in), then knowledge pages."""
+        if self._store is None or self._knowledge is None:
+            raise RuntimeError("extraction pipeline is not initialized")
+        session = str(row.get("session_id") or "")
+        try:
+            snapshot = json.loads(str(row.get("markers") or "{}"))
+        except (TypeError, ValueError):
+            snapshot = {}
+        if not isinstance(snapshot, dict):
+            snapshot = {}
+        usage = (self._store.session_usage(session)
+                 or {"turns": len(snapshot.get("turn_usage") or [])})
+        window_end = float(row.get("window_to_ts") or 0.0)
+        handoff_text = self._session_handoff(session, window_end)
+        summary_text = session_summary.summarize_agent(
+            session_id=session, handoff=handoff_text, markers=snapshot, usage=usage,
+            window_end=window_end)
+        if not summary_text and handoff_text:
+            # The hand-off is a real audited record; using it beats losing the session summary.
+            summary_text = handoff_text
+        if summary_text:
+            self._store.put_conclusion(
+                "session_summary", f"session_summary:{session}:final", summary_text,
+                session_id=session, subject="session",
+                evidence=json.dumps(["session_handoff"] if handoff_text else [],
+                                    ensure_ascii=False),
+                status="active", to_ts=window_end or None)
+        pages = extraction.extract_pages(
+            session_id=session, summary=summary_text, handoff=handoff_text,
+            markers=snapshot, usage=usage)
+        written = 0
+        for page in pages:
+            page["source_session"] = session
+            page["source_artifact"] = f"session_extraction:{session}"
+            result = knowledge.write_unit(
+                page, language=str(self._config.get("content_language") or "en"),
+                budget=self._knowledge_token_budget, root=self._knowledge.root)
+            status = str(result.get("status") or "failed")
+            if status in {"created", "updated"}:
+                written += 1
+            else:
+                logger.debug("Minir extraction page %s: %s", page.get("topic"), status)
+        return {"pages": written, "summary_chars": len(summary_text)}
 
     def _flush_boundary(self, session_id: str, *, close: bool = False) -> None:
         """Boundary drain: the counted dialectic tail, plus whatever content no job covered.
@@ -888,10 +1175,19 @@ class MinirMemoryProvider(MemoryProvider):
         if worker is not None:
             worker.kick(spawn=spawn_context_thread)
             worker.stop()  # bounded join: the store cannot close under a draining job
+        # A process exit is also an end of the bound session: close its token accounting and
+        # arm the idle timer (idempotent when on_session_end already did both).
+        try:
+            self._finalize_session_usage(self._session_id)
+        except Exception as exc:
+            logger.debug("Minir shutdown usage finalisation failed: %s", exc)
+        self._schedule_session_extraction(self._session_id)
         self._adviser_mode.session_end(self._session_id)
         self._adviser_mode.stop()  # no review may touch the store after this point
         if self._card_scheduler is not None:
             self._card_scheduler.stop()  # it writes files and rows: join before store.close()
+        if self._extraction_scheduler is not None:
+            self._extraction_scheduler.stop()  # no new extraction may start under close()
         if self._knowledge is not None:
             self._knowledge.stop()      # drain queued units while the filesystem still exists
         self._transcript.close()        # last writer join: no JSON may be half-written
@@ -913,7 +1209,8 @@ class MinirMemoryProvider(MemoryProvider):
     # -- tools ----------------------------------------------------------------
 
     def get_tool_schemas(self) -> list[dict[str, Any]]:
-        return [_TOOL_SEARCH, _TOOL_REMEMBER, _TOOL_FORGET, _TOOL_STATS]
+        """The same schemas the ``minir`` registry toolset registers (one source in tools.py)."""
+        return list(plugin_tools.SCHEMAS)
 
     def handle_tool_call(self, tool_name: str, args: dict[str, Any], **kwargs) -> str:
         """Dispatch one of this provider's tools. Must return a JSON string."""
@@ -991,6 +1288,8 @@ class MinirMemoryProvider(MemoryProvider):
                                "buffered_messages": len(self._transcript.messages(self._session_id)),
                                "prefetch_limit": self._prefetch_limit,
                                "dialectic_depth": self._dialectic_depth,
+                               "session_usage": self._store.session_usage(self._session_id),
+                               "turn_usage": self._store.turn_usage(self._session_id),
                                "tool_metrics": metrics,
                                "reasoning_enabled": self._reasoning})
         return tool_error(f"Unknown tool: {tool_name}")
@@ -1005,8 +1304,7 @@ class MinirMemoryProvider(MemoryProvider):
             self._store, self._hermes_home, self._profile,
             complete=self._worker.review_cards, since=since,
             plugin_yaml=self._worker._plugin_yaml,
-            language=str(self._config.get("content_language") or "en"),
-            loader=self._worker._rules, budget=self._card_token_budget)
+            language=str(self._config.get("content_language") or "en"))
         self._transcript.prune()  # the review is the retention clock: 30 days
         return revisions
 
@@ -1129,55 +1427,6 @@ class MinirMemoryProvider(MemoryProvider):
         return "\n".join(lines)
 
 
-def _tool_schema(name: str, description: str, properties: Optional[dict[str, Any]] = None,
-                 required: tuple[str, ...] = ()) -> dict[str, Any]:
-    return {"name": name, "description": description,
-            "parameters": {"type": "object", "properties": properties or {}, "required": list(required)}}
-
-
-def _prop(description: str, type_: str = "string", **extra: Any) -> dict[str, Any]:
-    return {"type": type_, **extra, "description": description}
-
-
-_TOOL_SEARCH = _tool_schema(
-    "minir_search",
-    "Search Minir's long-term memory for stored value markers and derived conclusions — "
-    "user/AI cards, adviser reviews, session summaries and notes. Minir keeps no "
-    "transcripts; this searches the conclusions derived from them. The default scope is the "
-    "current session plus durable cards and notes; set scope='all' to search across sessions.",
-    {"query": _prop("What to search for."),
-     "limit": _prop("Maximum results to return (default: the provider's prefetch limit).", "integer"),
-     "scope": _prop("Recall scope: 'session' (default) or 'all' for cross-session search.",
-                    "string", enum=["session", "all"]),
-     "session_id": _prop("Optional session to search instead of the current one "
-                         "(ignored when scope='all').")},
-    ("query",))
-_TOOL_REMEMBER = _tool_schema(
-    "minir_remember",
-    "Record a new value-output marker: one semantic category, one organisational type, the "
-    "statement itself.",
-    {"type": _prop("Value-marker organisational type.", "string",
-                   enum=list(VALUE_MARKER_TYPES)),
-     "category": _prop("Semantic category.", "string", enum=list(NOTE_CATEGORIES)),
-     "content": _prop("The value-output marker to remember.")},
-    ("type", "category", "content"))
-_TOOL_FORGET = _tool_schema(
-    "minir_forget",
-    "Delete an old value-output marker by its note_id and type. Use only the note_id returned "
-    "for a typed marker result (kind='note' with marker_type) or by minir_remember; untyped "
-    "notes and conclusions have no note_id and cannot be forgotten. The type must match the "
-    "marker or nothing is deleted.",
-    {"type": _prop("Value-marker type the marker was stored with.", "string",
-                   enum=list(VALUE_MARKER_TYPES)),
-     "note_id": _prop("Id of the marker to delete.", "integer")},
-    ("type", "note_id"))
-_TOOL_STATS = _tool_schema(
-    "minir_stats",
-    "Report Minir store statistics — note/marker/session/job counts, the base + dialectic layer "
-    "counters for this session, the published layer artifacts (subject + version), and the "
-    "database path.")
-
-
 def register(ctx) -> None:
     """Entry point the Hermes loader calls: the provider plus its plugin-hook observers.
 
@@ -1198,6 +1447,14 @@ def register(ctx) -> None:
     """
     provider = MinirMemoryProvider()
     ctx.register_memory_provider(provider)
+    # The plugin's own toolset: the four minir_* tools registered under ``minir`` so any agent
+    # this plugin runs can be granted them (the provider surface alone only reaches the main
+    # agent's ``memory`` toolset). The lookup is per call, because the host may initialize the
+    # other instance it constructed.
+    try:
+        plugin_tools.register(ctx, provider, resolve=lambda: _resolve_provider(provider))
+    except Exception as exc:
+        logger.warning("Minir toolset registration failed: %s", exc)
     # The hooks close over the provider instance: only it knows the bound session, the agent
     # context (primary vs subagent) and the cached review. Module-level handlers with no state
     # would inject another session's review or start a model job for every subagent.
@@ -1423,10 +1680,14 @@ def _on_interim_message(session_id: str = "", turn_id: str = "", text: Any = Non
 
 def _on_post_api_request(session_id: str = "", turn_id: str = "", api_request_id: str = "",
                          assistant_message: Any = None, assistant_tool_call_count: Any = 0,
+                         usage: Any = None, model: str = "",
                          provider: Optional[MinirMemoryProvider] = None, **kwargs) -> None:
-    """Record intent and confirm that a request's staged advice actually left the process."""
+    """Record intent, confirm delivery, and fold this request's token usage into its turn."""
     resolved = _resolve_provider(provider)
     if resolved is not None:
+        # One hook call is one API request; the payload's api_call_count is the turn's running
+        # counter, not a delta, so adding it would square-count a multi-call turn.
+        resolved.record_api_usage(session_id, turn_id, usage, api_calls=1, model=model)
         resolved._adviser_mode.on_post_api_request(
             session_id=session_id, turn_id=turn_id, api_request_id=api_request_id,
             assistant_message=assistant_message,

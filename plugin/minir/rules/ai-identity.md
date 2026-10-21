@@ -1,34 +1,29 @@
 ---
 id: ai-identity
-version: 1
+version: 2
 applies_to: [base:B2, dialectic, card_review]
-slot: fields
-max_tokens: 450
+slot: body
+max_tokens: 500
 sections: [contract, review_checks]
 ---
 
 ## CONTRACT
 
 WHAT
-Who the assistant is in this profile and what it may do. Seven hard fields the profile declares,
-six soft fields the operator describes.
+Who this assistant is in this profile and what it may do. A markdown body: identity and conduct,
+durable across sessions, with no task detail.
 
-HARD FIELDS
-- id, name, version, type, system, creator, maintainer: one value each, at most 40 characters.
-- Each value must appear verbatim in plugin.yaml; code checks it as a substring of that file.
-  Absent there means empty here. Never reconstruct a hard field from memory or from the window.
+COVER
+- Who it is: name, version, type, system, creator, maintainer, when declared.
+- What it is responsible for, and the domains it works in, with the depth reached.
+- Its voice and the manner the operator asked for; how it phrases and structures answers.
+- What it may do, and what it must not do. Restate operator text; never widen a permission or
+  narrow a prohibition.
 
-SOFT FIELDS
-- role_duties: what this assistant is responsible for.
-- domains_level: domains and the depth reached in each.
-- persona_style: voice and manner the operator asked for.
-- communication_style: how it should phrase and structure answers.
-- permissions: what it may do. Restate operator text; never widen it.
-- prohibitions: what it must not do. Restate operator text; never narrow it.
-
-SOURCES
-- _sources lists the file paths supplied to this pass, in the order read. A path that was not
-  supplied must not appear.
+GROUNDING
+- Identity claims come from the operator files or the manifest. A fact neither declares stays out.
+- Never reconstruct a version, a creator or a permission from memory or from the window.
+- An omitted line is better than a fabricated one.
 
 PROVENANCE
 - A front-matter `source` of review marks the periodic review's conclusion: same rank as a
@@ -37,13 +32,11 @@ PROVENANCE
 
 BOUNDARIES
 - No tools, completed work, session observations or user traits.
-- No permission, capability or prohibition the operator did not write; an invented version
-  number is worse than an empty field.
+- No permission, capability or prohibition the operator did not write.
 
 ## REVIEW CHECKS
-- A hard field cannot be found verbatim in plugin.yaml.
+- A version, a creator or a maintainer the operator never declared.
 - A permission or prohibition was added that the operator never wrote.
 - A session observation (a tool used, work done) was written into the identity.
-- _sources is empty, or names a file the pass was not given.
 - A review-sourced line is used as if the operator had declared it.
-- A hard field carries more than one value or exceeds 40 characters.
+- A line describes the task or the user instead of the assistant.

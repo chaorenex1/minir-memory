@@ -1,0 +1,153 @@
+"""The plugin's own toolset — the four ``minir_*`` tools, registered for every agent.
+
+The memory-provider surface already hands these schemas to the main agent through
+``MemoryProvider.get_tool_schemas``. That path only reaches an agent that has the host's
+``memory`` toolset enabled. This module registers the same functions under a registry toolset
+named ``minir`` so the plugin's own agents (the adviser, the layer worker, the hand-off and
+session-summary agents, the idle knowledge extraction) can be granted them explicitly:
+
+    enabled_toolsets = ["file", "adviser", "minir"]
+
+One schema source, two delivery paths: :data:`SCHEMAS` is what ``get_tool_schemas`` returns and
+what :func:`register` puts in the registry. The handlers delegate to the live provider's
+``handle_tool_call`` so there is one implementation of every tool and no drift between the two
+surfaces.
+
+Registering a tool through the plugin context requires it to be listed under
+``provides_tools`` in ``plugin.yaml``; the host validator rejects an undeclared registration.
+"""
+
+from __future__ import annotations
+
+import logging
+from typing import Any, Callable, Optional
+
+from tools.registry import tool_error
+
+from .layers import CATEGORIES
+from .store import VALUE_MARKER_TYPES
+
+logger = logging.getLogger(__name__)
+
+TOOLSET = "minir"
+ADVISER_TOOLSET = "adviser"
+TOOL_NAMES: tuple[str, ...] = (
+    "minir_search", "minir_remember", "minir_forget", "minir_stats")
+
+_EMOJI: dict[str, str] = {
+    "minir_search": "🔎", "minir_remember": "📌", "minir_forget": "🗑️", "minir_stats": "📊",
+}
+
+
+def _tool_schema(name: str, description: str, properties: Optional[dict[str, Any]] = None,
+                 required: tuple[str, ...] = ()) -> dict[str, Any]:
+    return {"name": name, "description": description,
+            "parameters": {"type": "object", "properties": properties or {},
+                           "required": list(required)}}
+
+
+def _prop(description: str, type_: str = "string", **extra: Any) -> dict[str, Any]:
+    return {"type": type_, **extra, "description": description}
+
+
+_TOOL_SEARCH = _tool_schema(
+    "minir_search",
+    "Search Minir's long-term memory for stored value markers and derived conclusions — "
+    "user/AI cards, adviser reviews, session summaries and notes. Minir keeps no "
+    "transcripts; this searches the conclusions derived from them. The default scope is the "
+    "current session plus durable cards and notes; set scope='all' to search across sessions.",
+    {"query": _prop("What to search for."),
+     "limit": _prop("Maximum results to return (default: the provider's prefetch limit).",
+                    "integer"),
+     "scope": _prop("Recall scope: 'session' (default) or 'all' for cross-session search.",
+                    "string", enum=["session", "all"]),
+     "session_id": _prop("Optional session to search instead of the current one "
+                         "(ignored when scope='all').")},
+    ("query",))
+_TOOL_REMEMBER = _tool_schema(
+    "minir_remember",
+    "Record a new value-output marker: one semantic category, one organisational type, the "
+    "statement itself.",
+    {"type": _prop("Value-marker organisational type.", "string",
+                   enum=list(VALUE_MARKER_TYPES)),
+     "category": _prop("Semantic category.", "string", enum=list(CATEGORIES)),
+     "content": _prop("The value-output marker to remember.")},
+    ("type", "category", "content"))
+_TOOL_FORGET = _tool_schema(
+    "minir_forget",
+    "Delete an old value-output marker by its note_id and type. Use only the note_id returned "
+    "for a typed marker result (kind='note' with marker_type) or by minir_remember; untyped "
+    "notes and conclusions have no note_id and cannot be forgotten. The type must match the "
+    "marker or nothing is deleted.",
+    {"type": _prop("Value-marker type the marker was stored with.", "string",
+                   enum=list(VALUE_MARKER_TYPES)),
+     "note_id": _prop("Id of the marker to delete.", "integer")},
+    ("type", "note_id"))
+_TOOL_STATS = _tool_schema(
+    "minir_stats",
+    "Report Minir store statistics — note/marker/session/job counts, the base + dialectic layer "
+    "counters for this session, the published layer artifacts (subject + version), the final "
+    "token usage of this session's turns, and the database path.")
+
+SCHEMAS: tuple[dict[str, Any], ...] = (_TOOL_SEARCH, _TOOL_REMEMBER, _TOOL_FORGET, _TOOL_STATS)
+
+
+def agent_toolsets(base: Any = None) -> list[str]:
+    """*base* plus this plugin's toolsets, order kept, duplicates dropped.
+
+    Every in-process agent this plugin runs gets both surfaces: ``minir`` for the store tools and
+    ``adviser`` for the read-only session search (and the adviser entry point). ``None`` becomes
+    just the two, never ``None`` — the host reads ``None`` as "every tool".
+    """
+    if isinstance(base, str):
+        base = [base]
+    toolsets = [str(tool) for tool in (base or []) if str(tool).strip()]
+    for name in (TOOLSET, ADVISER_TOOLSET):
+        if name not in toolsets:
+            toolsets.append(name)
+    return toolsets
+
+
+def register(ctx: Any, provider: Any = None,
+             resolve: Optional[Callable[[], Any]] = None) -> list[str]:
+    """Register the four tools in the ``minir`` toolset; returns the names actually added.
+
+    ``resolve`` is the live-provider lookup (the host can construct this plugin twice). It is
+    called per tool call, not at registration, so a provider initialized after this call is still
+    the one that serves the tools. A host context without ``register_tool`` (an older collector,
+    the Noop engine collector) is left untouched.
+    """
+    register_tool = getattr(ctx, "register_tool", None)
+    if not callable(register_tool):
+        logger.debug("minir tools: plugin context has no register_tool; provider surface only")
+        return []
+
+    lookup = resolve or (lambda: provider)
+    registered: list[str] = []
+    for schema in SCHEMAS:
+        name = str(schema["name"])
+
+        def handler(args: dict[str, Any], _name: str = name, **_kwargs: Any) -> str:
+            return _dispatch(_name, args, lookup)
+
+        try:
+            register_tool(
+                name=name, toolset=TOOLSET, schema=schema, handler=handler,
+                is_async=False, description=str(schema.get("description") or "")[:120],
+                emoji=_EMOJI.get(name, "🧠"),
+            )
+            registered.append(name)
+        except Exception as exc:  # one refused tool must not cost the other three
+            logger.warning("minir tool %s registration failed: %s", name, exc)
+    return registered
+
+
+def _dispatch(name: str, args: dict[str, Any], lookup: Callable[[], Any]) -> str:
+    """Route one registry-tool call to the live memory provider's own implementation."""
+    try:
+        provider = lookup()
+    except Exception as exc:  # a lookup failure is reported, never raised into the tool loop
+        return tool_error(f"Minir provider lookup failed: {exc}")
+    if provider is None or getattr(provider, "_store", None) is None:
+        return tool_error("Minir is not initialized")
+    return provider.handle_tool_call(name, dict(args or {}))

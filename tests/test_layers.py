@@ -26,10 +26,7 @@ def _review(layers, **over):
                       "user_preferences": layers.empty_user_preferences()},
         "ai_card": {"ai_self": layers.empty_ai_self(),
                     "ai_identity": layers.empty_ai_identity()},
-        "window_summary": {
-            "objective": "", "current_state": {"done": [], "doing": [], "todo": []},
-            "decisions": [], "constraints": [], "verified_facts": [], "open_issues": [],
-            "next_actions": [], "references": []},
+        "window_summary": "## Window Summary",
         "base_changed": {"changed": False, "fields": []},
         "changes": [], "prunings": [],
     }
@@ -37,14 +34,12 @@ def _review(layers, **over):
     return value
 
 
-def test_identity_hard_fields_must_be_declared_in_the_manifest(layers):
-    manifest = "name: minir\nversion: 0.8.0\n"
-    card = layers.empty_ai_identity()
-    card.update({"name": "minir", "version": "0.8.0", "creator": "someone", "type": "plugin"})
-    cleaned = layers.validate_ai_identity(card, manifest)
-    assert cleaned["name"] == "minir" and cleaned["version"] == "0.8.0"
-    assert cleaned["creator"] == "" and cleaned["type"] == "", \
-        "a value the manifest does not declare is dropped, not trusted"
+def test_an_identity_body_is_accepted_as_markdown(layers):
+    body = "# Identity\n\n- Name: minir\n- Version: 9.9"
+    assert layers.validate_ai_identity(body) == body
+    assert layers.validate_ai_identity("") == "", "an empty body is a valid empty card"
+    with pytest.raises(layers.LayerContractError, match="must be a string"):
+        layers.validate_ai_identity({"name": "minir"})
 
 
 def test_a_knowledge_unit_needs_an_epistemic_value(layers):
@@ -98,9 +93,50 @@ def test_a_change_scope_must_match_its_part(layers):
         layers.validate_review(_review(layers, changes=[change]))
 
 
-def test_a_preset_is_valid_but_an_unknown_one_is_not(layers):
-    card = layers.preset_user_self("en")
-    assert layers.validate_user_self(card)["_preset"] == layers.PRESET_ID
-    card["_preset"] = "astronaut"
-    with pytest.raises(layers.LayerContractError, match="unknown preset"):
-        layers.validate_user_self(card)
+def test_the_preset_is_a_markdown_seed_and_placeholders_are_refused(layers):
+    seed = layers.preset_user_self("en")
+    assert "Software Development Engineer" in seed
+    assert layers.validate_user_self(seed) == seed
+    assert "软件开发工程师" in layers.preset_user_self("zh")
+    with pytest.raises(layers.LayerContractError, match="placeholder"):
+        layers.validate_user_self("N/A")
+
+
+def test_the_b3_core_is_a_text_asset(layers):
+    """A missing prompt asset fails the pass; there is no empty-prompt fallback."""
+    core = layers.load_core("b3_window_summary")
+    assert core.startswith("PROMPT_VERSION: 1.0.0\n")
+    assert "You close one base refresh" in core
+    assert "<window_template>" in core
+    assert "value_markers" not in core and "units" not in core.lower(), \
+        "markers belong to the units pass and the output contract"
+    with pytest.raises(layers.AgentPromptError, match="cannot read agent prompt"):
+        layers.load_core("no_such_pass")
+
+
+PROMPT_ASSETS = ("b1_user_card", "b2_ai_card", "b3_window_summary", "b4_value_markers",
+                 "dialectic", "card_review_user", "card_review_ai", "knowledge_render")
+
+
+@pytest.mark.parametrize("name", PROMPT_ASSETS)
+def test_every_prompt_asset_loads_with_a_version(layers, name):
+    """One agent per pass: a versioned core, no unresolved placeholder, real content."""
+    core = layers.load_core(name)
+    assert core.startswith("PROMPT_VERSION: "), name
+    assert "$" not in core, f"{name} still carries an unresolved placeholder"
+    assert len(core) > 500, name
+    assert "ROLE" in core, f"{name} does not state its role"
+
+
+def test_the_b3_core_states_the_caps_it_is_given(layers, plugin_package):
+    """Every placeholder is filled from the constant that owns it; none reaches the model raw."""
+    core = layers.load_core("b3_window_summary")
+    summary = plugin_package.window_summary
+    assert "$" not in core
+    assert f"at most {summary.MAX_OBJECTIVE_CHARS} characters" in core
+    assert f"at most {summary.MAX_STATE_ITEMS} items each" in core
+    assert f"at most {summary.MAX_TOTAL_CHARS} characters" in core
+    priorities = ", ".join(summary.PRIORITIES[:-1]) + " or " + summary.PRIORITIES[-1]
+    kinds = ", ".join(summary.REFERENCE_KINDS[:-1]) + " or " + summary.REFERENCE_KINDS[-1]
+    assert priorities in core, "the priority enum the prompt states is missing"
+    assert kinds in core, "the reference-kind enum the prompt states is missing"

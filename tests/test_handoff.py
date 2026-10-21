@@ -21,7 +21,7 @@ def test_the_summary_thread_keeps_the_callers_context(plugin_package):
 
     token = scope.set("profile-a")
     try:
-        assert plugin_package.handoff._run_with_timeout(_run, 2.0) == "ok"
+        assert plugin_package.handoff.run_with_timeout(_run, 2.0) == "ok"
     finally:
         scope.reset(token)
     assert seen["scope"] == "profile-a"
@@ -32,7 +32,7 @@ def test_a_failure_still_comes_back_to_the_caller(plugin_package):
         raise ValueError("route down")
 
     try:
-        plugin_package.handoff._run_with_timeout(_run, 2.0)
+        plugin_package.handoff.run_with_timeout(_run, 2.0)
     except ValueError as exc:
         assert str(exc) == "route down"
     else:  # pragma: no cover - the assertion below is the real check
