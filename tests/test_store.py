@@ -342,7 +342,7 @@ def _refresh(store, session="s1", subject="user:ada", *, from_ts, to_ts,
         window_from_turn=from_turn, window_to_turn=to_turn,
         user_representation=f"[goal] need at {from_ts}",
         user_peer_card=peer, ai_self_representation=f"[done] window {from_ts}",
-        ai_identity_card="direct", session_chunk_summary=summary,
+        ai_identity_card="direct", window_summary=summary,
         value_markers=markers)
 
 
@@ -355,7 +355,7 @@ def test_base_refreshes_keep_history_and_exactly_one_latest(store):
     assert latest["id"] == second and latest["is_latest"] == 1
     assert (latest["window_from_ts"], latest["window_to_ts"]) == (10.0, 20.0)
     assert (latest["window_from_turn"], latest["window_to_turn"]) == (3, 4)
-    assert latest["session_chunk_summary"] == "second window"
+    assert latest["window_summary"] == "second window"
     assert latest["user_peer_card"] == "terse, no emoji"
 
     history = store.base_refreshes("s1", "user:ada")
@@ -381,7 +381,7 @@ def test_the_same_refresh_window_updates_in_place(store):
     again = _refresh(store, from_ts=0.0, to_ts=10.0, summary="retried attempt")
     assert again == first
     assert len(store.base_refreshes("s1")) == 1
-    assert store.latest_base_refresh("s1")["session_chunk_summary"] == "retried attempt"
+    assert store.latest_base_refresh("s1")["window_summary"] == "retried attempt"
 
 
 def test_claims_are_fifo_within_a_session(store):
@@ -463,7 +463,8 @@ def test_an_older_window_revision_does_not_replace_the_live_artifact(store):
     assert json.loads(history[-1]["user_peer_card"]) == ["corrected old peer"]
 
 
-def test_legacy_base_refreshes_gain_value_markers_and_fts(plugin_package, tmp_path):
+def test_legacy_base_refreshes_rename_the_window_summary_and_gain_value_markers_and_fts(
+        plugin_package, tmp_path):
     path = tmp_path / "mem" / "memory.db"
     path.parent.mkdir(parents=True)
     connection = sqlite3.connect(str(path))
@@ -493,9 +494,28 @@ def test_legacy_base_refreshes_gain_value_markers_and_fts(plugin_package, tmp_pa
     reopened = plugin_package.store.MinirStore(path)
     try:
         row = reopened.latest_base_refresh("s1", "user:ada")
+        assert "session_chunk_summary" not in row
+        assert row["window_summary"] == "- old summary"
         assert row["value_markers"] == ""
         hits = reopened.search_base_refreshes("legacy")
         assert hits and hits[0]["user_peer_card"] == "- legacy tool"
+    finally:
+        reopened.close()
+
+
+def test_legacy_session_chunk_summary_kind_is_renamed(plugin_package, tmp_path):
+    path = tmp_path / "mem" / "memory.db"
+    first = plugin_package.store.MinirStore(path)
+    try:
+        first.put_conclusion("session_chunk_summary", "chunk:s1:0:10", "window body",
+                             session_id="s1", subject="session")
+    finally:
+        first.close()
+    reopened = plugin_package.store.MinirStore(path)
+    try:
+        row = reopened.get_conclusion("window_summary", "chunk:s1:0:10")
+        assert row is not None and row["content"] == "window body"
+        assert reopened.get_conclusion("session_chunk_summary", "chunk:s1:0:10") is None
     finally:
         reopened.close()
 

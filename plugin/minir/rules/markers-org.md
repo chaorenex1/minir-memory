@@ -1,7 +1,7 @@
 ---
 id: markers-org
 version: 1
-applies_to: [base:B4]
+applies_to: [base:B4, knowledge_render]
 slot: fields
 max_tokens: 400
 sections: [contract, review_checks]
@@ -33,11 +33,11 @@ OBJECTS
   primary org is not repeated.
 
 RELATIONS
-- Only units from this window: supersedes, caused_by, part_of, contradicts. A target outside the
+- Only markers from this window: supersedes, caused_by, part_of, contradicts. A target outside the
   window cannot be resolved and is dropped.
 
 BOUNDARIES
-- One primary org; two means two units or one wrong choice.
+- One primary org; two means two markers or one wrong choice.
 - Never duplicate content under two orgs for findability.
 
 ## REVIEW CHECKS

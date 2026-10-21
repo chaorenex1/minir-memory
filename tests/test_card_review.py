@@ -138,7 +138,7 @@ def test_load_global_cards_merges_the_ai_files(cards, store, tmp_path):
     home = str(tmp_path / "hermes")
     module.write_cards(store, home, "default", payload())
     loaded = module.load_global_cards(home, "default")
-    assert "Engineer" in loaded["user_self"]
+    assert "Engineer" in loaded["user_self_representation"]
     assert "Terse first" in loaded["user_preferences"]
     assert "minir 0.8.0" in loaded["ai_identity"]
     assert "maintain memory" in loaded["ai_identity"]
@@ -146,50 +146,67 @@ def test_load_global_cards_merges_the_ai_files(cards, store, tmp_path):
         "the AI part is the identity body plus the preference body"
 
 
-def test_each_review_half_has_its_own_agent_rules_and_output(cards, plugin_package, store,
-                                                             tmp_path):
+def test_each_review_file_has_its_own_agent_rule_and_output(cards, plugin_package, store,
+                                                            tmp_path):
     module = plugin_package.card_review
     home = str(tmp_path / "hermes")
-    user_system, user_prompt = module.build_prompt(
-        store, home, "default", since=0.0, scope="user", plugin_yaml=PLUGIN_YAML)
-    ai_system, ai_prompt = module.build_prompt(
-        store, home, "default", since=0.0, scope="ai", plugin_yaml=PLUGIN_YAML)
-    assert "You maintain the user half" in user_system
-    assert "You maintain the AI half" in ai_system
-    assert "Who this person is" in user_system, "the user-self rule was not applied"
-    assert "Who this assistant is in this profile" in ai_system, \
-        "the ai-identity rule was not applied"
-    assert '"user_identity"' in user_system and '"ai_identity"' not in user_system
-    assert '"ai_identity"' in ai_system and '"user_identity"' not in ai_system
-    assert "plugin.yaml" not in user_system, "the manifest is the AI half's grounding source"
-    assert "Current user cards" in user_prompt and "Current AI cards" in ai_prompt
-    assert "Manifest" not in user_prompt and "Manifest" in ai_prompt
+    cases = (
+        ("user_identity", "You maintain the user side", "Who this person is", "user_identity", False),
+        ("user_preference", "You maintain the user side", "How this person wants the assistant",
+         "user_preference", False),
+        ("ai_identity", "You maintain the AI side", "Who this assistant is in this profile",
+         "ai_identity", True),
+        ("ai_preference", "You maintain the AI side", "Who this assistant is in this profile",
+         "ai_preference", True),
+    )
+    for scope, core_text, rule_text, key, has_manifest in cases:
+        system, prompt = module.build_prompt(
+            store, home, "default", since=0.0, scope=scope, plugin_yaml=PLUGIN_YAML)
+        assert core_text in system
+        assert rule_text in system, f"{scope} did not get its rule"
+        assert f'"{key}"' in system, f"{scope} did not get its output contract"
+        assert "Current user card" in prompt or "Current AI card" in prompt
+        assert ("Manifest" in prompt) is has_manifest
+
+
+def _scope_key(scope):
+    return {
+        "user_identity": "user_identity",
+        "user_preference": "user_preference",
+        "ai_identity": "ai_identity",
+        "ai_preference": "ai_preference",
+    }[scope]
 
 
 def _reply(payload, scope):
-    if scope == "user":
-        return json.dumps({
-            "user_identity": payload["user_identity"],
-            "user_preference": payload["user_preference"],
-        })
-    return json.dumps({
-        "ai_identity": payload["ai_identity"],
-        "ai_preference": payload["ai_preference"],
-    })
+    key = _scope_key(scope)
+    return json.dumps({key: payload[key]})
 
 
-def test_run_review_calls_both_halves_and_lets_the_database_record_history(cards, store, tmp_path):
+def _scope_from_system(system):
+    for scope, key in (
+        ("user_identity", "user_identity"),
+        ("user_preference", "user_preference"),
+        ("ai_identity", "ai_identity"),
+        ("ai_preference", "ai_preference"),
+    ):
+        if f'"{key}"' in system:
+            return scope
+    raise AssertionError("the system prompt names no single card key")
+
+
+def test_run_review_calls_four_files_and_lets_the_database_record_history(cards, store, tmp_path):
     module, payload = cards
     scopes: list[str] = []
 
     def complete(system, prompt):
-        scope = "user" if "You maintain the user half" in system else "ai"
+        scope = _scope_from_system(system)
         scopes.append(scope)
         return _reply(payload(), scope)
 
     revisions = module.run_review(store, str(tmp_path / "hermes"), "default",
                                   complete=complete, since=0.0, plugin_yaml=PLUGIN_YAML)
-    assert scopes == ["user", "ai"], "the review runs one agent per half"
+    assert scopes == list(module.CARD_SCOPE_ORDER), "the review runs one agent per file"
     assert len(revisions) == 4
     identity = store.latest_card_revision("user", "identity")
     assert json.loads(identity["changed_fields"]) == ["body"]
@@ -201,7 +218,7 @@ def test_an_audit_array_is_a_format_failure(cards, store, tmp_path):
     module, payload = cards
 
     def complete(system, prompt):
-        scope = "user" if "You maintain the user half" in system else "ai"
+        scope = _scope_from_system(system)
         reply = json.loads(_reply(payload(), scope))
         reply["changes"] = [{"scope": scope, "part": "identity", "op": "add"}]
         return json.dumps(reply)
@@ -218,23 +235,23 @@ def test_build_prompt_flags_a_hand_edited_card(cards, store, tmp_path):
     path = module.card_paths(home, "default")[module.USER_SELF]
     path.write_text(path.read_text(encoding="utf-8").replace("Engineer", "Operator"),
                     encoding="utf-8")
-    _system, user_prompt = module.build_prompt(store, home, "default", since=0.0, scope="user",
-                                               plugin_yaml=PLUGIN_YAML)
+    _system, user_prompt = module.build_prompt(store, home, "default", since=0.0,
+                                               scope="user_identity", plugin_yaml=PLUGIN_YAML)
     assert "Hand-edited since the last review" in user_prompt
     assert "user/identity" in user_prompt
-    _ai_system, ai_prompt = module.build_prompt(store, home, "default", since=0.0, scope="ai",
-                                                plugin_yaml=PLUGIN_YAML)
+    _ai_system, ai_prompt = module.build_prompt(store, home, "default", since=0.0,
+                                                scope="ai_identity", plugin_yaml=PLUGIN_YAML)
     assert "Hand-edited since the last review" not in ai_prompt, \
-        "each half is told about its own files only"
+        "each file is told about its own body only"
 
 
 def test_a_missing_body_fails_the_review(cards, store, tmp_path):
     module, payload = cards
 
     def complete(system, prompt):
-        scope = "user" if "You maintain the user half" in system else "ai"
+        scope = _scope_from_system(system)
         reply = json.loads(_reply(payload(), scope))
-        reply.pop("user_identity" if scope == "user" else "ai_identity")
+        reply.pop(_scope_key(scope))
         return json.dumps(reply)
 
     with pytest.raises(module.CardReviewError, match="missing"):

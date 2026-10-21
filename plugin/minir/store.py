@@ -35,7 +35,7 @@
   four base-layer sections, the base revision note, local
   compression chunks, and final session summaries. ``conclusions_fts`` is an FTS5 trigram index
   over it (CJK-safe); when FTS5 is unavailable, ``search()`` falls back to the token scan.
-  ``session_chunk_summary`` is the canonical local-compression chain; each row records the time
+  ``window_summary`` is the canonical local-compression chain; each row records the time
   and session-turn range it covers. The base artifact stores the pass's ``## Window Summary``
   markdown as written and appends the same body to the chain; older (including superseded)
   chunks stay as independent rows and remain searchable inside their own session.
@@ -145,7 +145,7 @@ CREATE TABLE IF NOT EXISTS base_refreshes (
     user_peer_card TEXT NOT NULL DEFAULT '',
     ai_self_representation TEXT NOT NULL DEFAULT '',
     ai_identity_card TEXT NOT NULL DEFAULT '',
-    session_chunk_summary TEXT NOT NULL DEFAULT '',
+    window_summary TEXT NOT NULL DEFAULT '',
     value_markers TEXT NOT NULL DEFAULT '',
     is_latest INTEGER NOT NULL DEFAULT 1,
     created_at REAL NOT NULL
@@ -169,7 +169,7 @@ CREATE TABLE IF NOT EXISTS base_revisions (
     user_peer_card TEXT NOT NULL DEFAULT '',
     ai_self_representation TEXT NOT NULL DEFAULT '',
     ai_identity_card TEXT NOT NULL DEFAULT '',
-    session_chunk_summary TEXT NOT NULL DEFAULT '',
+    window_summary TEXT NOT NULL DEFAULT '',
     value_markers TEXT NOT NULL DEFAULT '',
     advices TEXT NOT NULL DEFAULT '[]',
     changed_fields TEXT NOT NULL DEFAULT '[]',
@@ -345,7 +345,7 @@ _LONG_TERM_KINDS: tuple[str, ...] = (
 # one artifact into individually searchable rows instead of one large document.
 _ARTIFACT_SECTIONS: dict[str, tuple[tuple[str, str, str], ...]] = {
     "base": (
-        # The two cards are durable; the summary and the units belong to one window.
+        # The two cards are durable; the summary and the value markers belong to one window.
         ("## User Card", "base.user_card", "user"),
         ("## AI Card", "base.ai_card", "agent"),
         ("## Window Summary", "base.window_summary", "session"),
@@ -362,7 +362,7 @@ _ARTIFACT_SECTIONS: dict[str, tuple[tuple[str, str, str], ...]] = {
 # plus ``advices``; the FTS index covers all seven.
 _BASE_REVISION_COLUMNS: tuple[str, ...] = (
     "user_representation", "user_peer_card", "ai_self_representation",
-    "ai_identity_card", "session_chunk_summary", "value_markers",
+    "ai_identity_card", "window_summary", "value_markers",
 )
 
 _KIND_WEIGHT: dict[str, float] = {
@@ -372,7 +372,7 @@ _KIND_WEIGHT: dict[str, float] = {
     "base.window_summary": 1.0,
     "base.value_markers": 1.0,
     "session_summary": 0.8,
-    "session_chunk_summary": 0.6,
+    "window_summary": 0.6,
     "note": 0.7,
 }
 
@@ -461,6 +461,33 @@ class MinirStore:
         """
         for table in _DROPPED_TABLES:
             self._conn.execute(f"DROP TABLE IF EXISTS {table}")
+        # The window summary used to be called ``session_chunk_summary`` in both the live and the
+        # snapshot table. Rename it in place; the FTS tables are rebuilt later because their
+        # external-content schemas still name the old column.
+        for table in ("base_refreshes", "base_revisions"):
+            present = {row["name"] for row in self._conn.execute(f"PRAGMA table_info({table})")}
+            if "session_chunk_summary" in present and "window_summary" not in present:
+                self._conn.execute(
+                    f"ALTER TABLE {table} RENAME COLUMN session_chunk_summary TO window_summary")
+            elif "session_chunk_summary" in present and "window_summary" in present:
+                self._conn.execute(
+                    f"UPDATE {table} SET window_summary = session_chunk_summary "
+                    "WHERE (window_summary IS NULL OR window_summary = '') "
+                    "AND session_chunk_summary IS NOT NULL AND session_chunk_summary <> ''")
+        # One kind for the compression chain. Ignore a collision with a row already migrated.
+        self._conn.execute(
+            "UPDATE OR IGNORE conclusions SET kind = 'window_summary' "
+            "WHERE kind = 'session_chunk_summary'")
+        # Old snapshots and changed_fields lists named the parts by their pre-rename keys.
+        self._conn.execute(
+            "UPDATE base_revisions SET changed_fields = "
+            "REPLACE(REPLACE(REPLACE(changed_fields, "
+            "'\"user_self\"', '\"user_self_representation\"'), "
+            "'\"ai_self\"', '\"ai_self_representation\"'), "
+            "'\"session_chunk_summary\"', '\"window_summary\"') "
+            "WHERE changed_fields LIKE '%\"user_self\"%' "
+            "OR changed_fields LIKE '%\"ai_self\"%' "
+            "OR changed_fields LIKE '%\"session_chunk_summary\"%'")
         # The rolling base Session Summary is a projection of the chunk chain now; an older
         # independent conclusion must not compete with it in FTS recall.
         self._conn.execute(
@@ -544,7 +571,7 @@ class MinirStore:
         shorter than three characters fall back to a scan in ``search_base_refreshes``.
         """
         columns = ("user_representation", "user_peer_card", "ai_self_representation",
-                   "ai_identity_card", "session_chunk_summary", "value_markers")
+                   "ai_identity_card", "window_summary", "value_markers")
         row = self._conn.execute(
             "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'base_refreshes_fts'"
         ).fetchone()
@@ -601,7 +628,7 @@ class MinirStore:
         immutable audit copy, so the index never needs a second text copy.
         """
         columns = ("user_representation", "user_peer_card", "ai_self_representation",
-                   "ai_identity_card", "session_chunk_summary", "value_markers", "advices")
+                   "ai_identity_card", "window_summary", "value_markers", "advices")
         row = self._conn.execute(
             "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'base_revisions_fts'"
         ).fetchone()
@@ -816,7 +843,7 @@ class MinirStore:
         """
         with self._lock:
             existing = self._conn.execute(
-                "SELECT key, status FROM conclusions WHERE kind = 'session_chunk_summary' "
+                "SELECT key, status FROM conclusions WHERE kind = 'window_summary' "
                 "AND session_id = ? AND from_ts = ? ORDER BY id DESC LIMIT 1",
                 (session_id, float(from_ts))).fetchone()
             if existing is not None and existing["status"] == "superseded":
@@ -824,7 +851,7 @@ class MinirStore:
             key = (str(existing["key"]) if existing is not None else
                    f"chunk:{session_id}:{float(from_ts):.6f}:{float(to_ts):.6f}")
             version = self._put_conclusion_locked(
-                "session_chunk_summary", key, content, session_id=session_id,
+                "window_summary", key, content, session_id=session_id,
                 subject="session", evidence=evidence, status="active",
                 from_ts=float(from_ts), to_ts=float(to_ts),
                 from_turn=from_turn, to_turn=to_turn)
@@ -837,7 +864,7 @@ class MinirStore:
         marks = ",".join("?" * len(statuses))
         with self._lock:
             rows = self._conn.execute(
-                "SELECT * FROM conclusions WHERE kind = 'session_chunk_summary' "
+                "SELECT * FROM conclusions WHERE kind = 'window_summary' "
                 f"AND session_id = ? AND status IN ({marks}) ORDER BY from_ts, id",
                 (session_id, *statuses)).fetchall()
         return [dict(row) for row in rows]
@@ -847,7 +874,7 @@ class MinirStore:
         with self._lock:
             row = self._conn.execute(
                 "SELECT MAX(to_ts) AS ts FROM conclusions "
-                "WHERE kind = 'session_chunk_summary' AND session_id = ?",
+                "WHERE kind = 'window_summary' AND session_id = ?",
                 (session_id,)).fetchone()
         return float(row["ts"]) if row is not None and row["ts"] is not None else 0.0
 
@@ -863,7 +890,7 @@ class MinirStore:
         with self._lock:
             row = self._conn.execute(
                 "SELECT from_turn, to_turn FROM conclusions "
-                "WHERE kind = 'session_chunk_summary' AND session_id = ? "
+                "WHERE kind = 'window_summary' AND session_id = ? "
                 "AND from_ts = ? ORDER BY id DESC LIMIT 1",
                 (session_id, float(from_ts))).fetchone()
         if row is None:
@@ -875,7 +902,7 @@ class MinirStore:
         with self._lock:
             row = self._conn.execute(
                 "SELECT MAX(to_turn) AS turn FROM conclusions "
-                "WHERE kind = 'session_chunk_summary' AND session_id = ? AND to_ts <= ?",
+                "WHERE kind = 'window_summary' AND session_id = ? AND to_ts <= ?",
                 (session_id, float(before_ts))).fetchone()
         value = row["turn"] if row is not None else None
         return int(value) if value is not None else 0
@@ -906,7 +933,7 @@ class MinirStore:
         with self._lock:
             cur = self._conn.execute(
                 "UPDATE conclusions SET status = 'superseded', updated_at = ? "
-                "WHERE kind = 'session_chunk_summary' AND session_id = ? AND status = 'active'",
+                "WHERE kind = 'window_summary' AND session_id = ? AND status = 'active'",
                 (time.time(), session_id))
             self._conn.commit()
             return int(cur.rowcount)
@@ -1252,7 +1279,7 @@ class MinirStore:
                          window_to_ts: float, window_from_turn: Optional[int],
                          window_to_turn: Optional[int], user_representation: str,
                          user_peer_card: str, ai_self_representation: str,
-                         ai_identity_card: str, session_chunk_summary: str,
+                         ai_identity_card: str, window_summary: str,
                          value_markers: str = "") -> int:
         """Record one base-layer refresh window; ``is_latest`` follows window order.
 
@@ -1269,7 +1296,7 @@ class MinirStore:
         values = (session_key, subject_key, float(window_from_ts), float(window_to_ts),
                   window_from_turn, window_to_turn, user_representation or "",
                   user_peer_card or "", ai_self_representation or "", ai_identity_card or "",
-                  session_chunk_summary or "", value_markers or "", now)
+                  window_summary or "", value_markers or "", now)
         with self._lock:
             if not self._conn.in_transaction:
                 self._conn.execute("BEGIN IMMEDIATE")
@@ -1302,7 +1329,7 @@ class MinirStore:
                 self._conn.execute(
                     "INSERT INTO base_refreshes (session_id, subject, window_from_ts, window_to_ts, "
                     "window_from_turn, window_to_turn, user_representation, user_peer_card, "
-                    "ai_self_representation, ai_identity_card, session_chunk_summary, "
+                    "ai_self_representation, ai_identity_card, window_summary, "
                     "value_markers, is_latest, created_at) "
                     "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
                     "ON CONFLICT(session_id, subject, window_from_ts) DO UPDATE SET "
@@ -1313,7 +1340,7 @@ class MinirStore:
                     "user_peer_card = excluded.user_peer_card, "
                     "ai_self_representation = excluded.ai_self_representation, "
                     "ai_identity_card = excluded.ai_identity_card, "
-                    "session_chunk_summary = excluded.session_chunk_summary, "
+                    "window_summary = excluded.window_summary, "
                     "value_markers = excluded.value_markers, "
                     "is_latest = excluded.is_latest, created_at = excluded.created_at",
                     (*values[:12], is_latest, values[12]))
@@ -1444,14 +1471,14 @@ class MinirStore:
                     "INSERT INTO base_revisions (session_id, subject, base_refresh_id, "
                     "window_from_ts, window_to_ts, window_from_turn, window_to_turn, "
                     "user_representation, user_peer_card, ai_self_representation, "
-                    "ai_identity_card, session_chunk_summary, value_markers, advices, "
+                    "ai_identity_card, window_summary, value_markers, advices, "
                     "changed_fields, source_job_id, is_latest, created_at) "
                     "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?)",
                     (session_id, subject, int(row["id"]), float(row["window_from_ts"]),
                      float(row["window_to_ts"]), row["window_from_turn"], row["window_to_turn"],
                      row["user_representation"], row["user_peer_card"],
                      row["ai_self_representation"], row["ai_identity_card"],
-                     row["session_chunk_summary"], row["value_markers"],
+                     row["window_summary"], row["value_markers"],
                      # The dialectic no longer produces advice; the column keeps revision
                      # history readable for rows written before the merge.
                      "[]", json.dumps(changed_fields), int(source_job_id),
@@ -1807,7 +1834,7 @@ class MinirStore:
             return []
         capped = max(1, min(int(limit), 20))
         columns = ("user_representation", "user_peer_card", "ai_self_representation",
-                   "ai_identity_card", "session_chunk_summary", "value_markers")
+                   "ai_identity_card", "window_summary", "value_markers")
         filters: list[str] = []
         filter_params: list[Any] = []
         if session_id:
@@ -1909,7 +1936,7 @@ class MinirStore:
         rows: list[dict[str, Any]] = []
         # Historical chunk summaries stay recallable inside their own session after a final
         # summary supersedes them; the visibility predicate keeps them from leaking elsewhere.
-        status = "(c.status = 'active' OR c.kind = 'session_chunk_summary')"
+        status = "(c.status = 'active' OR c.kind = 'window_summary')"
         fts_terms = [term for term in terms if len(term) >= 3]
         if self._fts and fts_terms:
             match = " OR ".join(f'"{term.replace(chr(34), chr(34) * 2)}"' for term in fts_terms)

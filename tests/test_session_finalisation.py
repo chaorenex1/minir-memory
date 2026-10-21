@@ -136,7 +136,7 @@ def test_a_session_without_markers_arms_no_timer(make_provider):
 def test_the_marker_snapshot_is_shrunk_without_breaking_json(plugin_package):
     snapshot = {
         "notes": [{"content": "n" * 400} for _ in range(50)],
-        "units": [{"content": "u" * 160} for _ in range(16)],
+        "value_markers": [{"content": "u" * 160} for _ in range(16)],
         "summary": "s" * 4_000,
         "turn_usage": [{"turn_id": str(index)} for index in range(50)],
         "window_from_ts": 0.0, "window_to_ts": 0.0,
@@ -163,13 +163,13 @@ def test_a_new_user_turn_cancels_the_idle_timer(make_provider):
 
 def test_the_scheduler_runs_a_due_session(provider, plugin_package, monkeypatch, tmp_path):
     provider._store.schedule_extraction(
-        "s-due", due_at=0, markers=json.dumps({"notes": [], "units": []}), window_to_ts=1.0)
+        "s-due", due_at=0, markers=json.dumps({"notes": [], "value_markers": []}), window_to_ts=1.0)
     provider._store.add_base_refresh(
         "s-due", "user:default", window_from_ts=0.0, window_to_ts=1.0,
         window_from_turn=0, window_to_turn=1, user_representation="",
         user_peer_card="", ai_self_representation="", ai_identity_card="",
-        session_chunk_summary="## Window Summary\n- did things",
-        value_markers=json.dumps({"units": []}))
+        window_summary="## Window Summary\n- did things",
+        value_markers=json.dumps({"value_markers": []}))
     seen: dict = {}
 
     monkeypatch.setattr(plugin_package.handoff, "summarize_agent",
@@ -211,6 +211,36 @@ def test_a_failed_extraction_retries_once_then_parks(provider, plugin_package):
     row = provider._store.extraction("s-fail")
     assert row["status"] == "failed" and row["attempts"] == 2
     assert "model down" in row["error"]
+
+
+def test_the_page_pass_reads_the_marker_rules(plugin_package, monkeypatch, tmp_path):
+    """The page pass classifies its own pages, so the marker rules are in its system prompt.
+
+    The profile override is the text under test: it proves the rules are read at assembly time
+    and that ``hermes_home`` reaches the loader, not only the packaged copy.
+    """
+    monkeypatch.delenv(plugin_package.rules.OVERRIDE_ENV, raising=False)
+    override = tmp_path / "minir-memory" / "rules"
+    override.mkdir(parents=True)
+    (override / "markers-org.md").write_text(
+        "## CONTRACT\n\nOVERRIDE MARKER ORG\n", encoding="utf-8")
+    seen: dict = {}
+
+    class _Run:
+        answer = ""
+
+    def fake_run(message, **kwargs):
+        seen["system"] = kwargs.get("system_message")
+        return _Run()
+
+    monkeypatch.setattr(plugin_package.agent_loop, "run", fake_run)
+    plugin_package.extraction.extract_pages(
+        session_id="s1", summary=SUMMARY, handoff="HANDOFF BODY", hermes_home=str(tmp_path))
+
+    system = seen["system"]
+    assert "OVERRIDE MARKER ORG" in system, "the profile override must reach the page pass"
+    assert "KNOWLEDGE: facts, definitions, mechanisms, measurements." in system
+    assert system.rstrip().endswith("no prose."), "the output contract closes the system prompt"
 
 
 def test_the_summary_agent_receives_the_session_handoff(plugin_package, monkeypatch):

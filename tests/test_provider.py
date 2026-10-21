@@ -16,14 +16,14 @@ def _no_model_call(*args, **kwargs):
 
 def _base_user_json():
     return json.dumps({
-        "user_self": "## Self\n\n- Occupation: Engineer\n- Skills: Python\n- Communication: direct",
+        "user_self_representation": "## Self\n\n- Occupation: Engineer\n- Skills: Python\n- Communication: direct",
         "user_preferences": "",
     })
 
 
 def _base_ai_json():
     return json.dumps({
-        "ai_self": ("## Self\n\n- Positioning: executor\n- Task: ship the plugin\n"
+        "ai_self_representation": ("## Self\n\n- Positioning: executor\n- Task: ship the plugin\n"
                     "- Known: the window is the evidence\n- State: executing"),
         "ai_identity": ("## Identity\n\n- Name: minir\n- Version: 0.8.0\n"
                         "- Duties: maintain the memory layer"),
@@ -57,8 +57,8 @@ def _base_reply(prompt):
         return _base_user_json()
     if "baseline_ai_card" in prompt or "plugin_yaml" in prompt:
         return _base_ai_json()
-    if "previous_units" in prompt or "Previous knowledge units" in prompt:
-        return json.dumps({"units": []})
+    if "previous_value_markers" in prompt or "Previous knowledge value markers" in prompt:
+        return json.dumps({"value_markers": []})
     return _summary_json()
 
 
@@ -67,7 +67,7 @@ def _dialectic_json(*, changed=False, fields=None, peer=None):
     ai_card = json.loads(_base_ai_json())
     return json.dumps({
         "user_card": {
-            "user_self": "## Self\n\n- Occupation: Engineer",
+            "user_self_representation": "## Self\n\n- Occupation: Engineer",
             "user_preferences": "## Preferences\n\n" + lines,
         },
         "ai_card": ai_card,

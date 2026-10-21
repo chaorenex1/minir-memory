@@ -147,8 +147,8 @@ def test_render_callable_supplies_the_body_and_language(knowledge, tmp_path):
 def test_queue_drops_the_oldest_and_counts_it(knowledge, tmp_path):
     pipeline = knowledge.KnowledgePipeline(str(tmp_path), autostart=False, queue_size=2)
     try:
-        units = [_unit(id=f"k{index}", topic=f"topic {index}") for index in range(5)]
-        assert pipeline.enqueue_from_refresh("s1", units) == 5
+        value_markers = [_unit(id=f"k{index}", topic=f"topic {index}") for index in range(5)]
+        assert pipeline.enqueue_from_refresh("s1", value_markers) == 5
         assert pipeline.pending == 2
         assert pipeline.dropped == 3
         assert pipeline.stats()["dropped"] == 3

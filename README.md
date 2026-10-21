@@ -72,8 +72,7 @@ plugin/minir/          the deployable plugin directory (copy this to plugins/min
   scheduler.py         one clock for turn and time tasks, with a per-task ledger and logs
   layers.py            output contracts, field validation, the four-section renderer
   agents/              one markdown core per model pass, filled at call time (B1-B4, dialectic,
-                       both card-review halves, knowledge_render, session_summary,
-                       knowledge_extract)
+                       four card-review passes, knowledge_render, session_summary)
   rules.py             rule-file loader: validation, override, cache, prompt assembly
   rules/               one file per contract (contract + review checks), read at call time
   window_summary.py    the summary section: template asset, prompt caps, type check
@@ -173,7 +172,7 @@ be granted them explicitly (see "The `minir` toolset" below).
 | `minir_stats` | none | Store counts (including `markers` per type), layer counters, the scheduler ledger, published artifacts, buffered messages, in-memory tool metrics, the session's token usage and its newest turn rows, and the database path. |
 | `minir_agents` | `agent_name` (required), `user_prompts` (required), `system_prompts`, `context_files`, `project_dir`, `tool_sets`, `skip_memory`, `skip_context_files`, `skip_background_review`, `load_soul_identity` | Runs a named in-process agent; omitting `tool_sets` grants every host tool. The full run is flushed to `sessions/<agent_name>/<layer_session_id>.json`. |
 
-Explicit markers are separate from the base layer's automatic `value_markers`: the worker keeps
+Explicit markers are separate from the base layer's automatic value markers: the worker keeps
 merging its own five-key inventory per refresh, while a remembered marker is a session-bound,
 type-tagged row that search can recall and `minir_forget` can remove. Notes mirrored from the
 host's built-in memory tools (`on_memory_write`) stay durable and untyped; they are recallable in
@@ -228,7 +227,7 @@ event). Four things happen there beyond the layer drain:
    `output_tokens` aggregate. `minir_stats` reports both, so a turn's final consumption is
    auditable even after the process is gone.
 2. **A marker snapshot.** The session's explicit typed notes plus its newest base-layer
-   `value_markers` units are captured into `session_extractions` with `due_at = now + 24h`. A
+   value markers are captured into `session_extractions` with `due_at = now + 24h`. A
    session with no markers arms nothing; the timer is for durable sessions.
 3. **A cancellable timer.** Any user turn in that session (`on_turn_start`, `sync_turn`) deletes
    the pending row. Opening the session is not input; typing in it is.
@@ -240,7 +239,7 @@ event). Four things happen there beyond the layer drain:
    `## Decisions`, `## Durable Knowledge` and `## Open Threads` — then the **knowledge extraction
    agent**, which turns the summary, hand-off and markers into knowledge pages written through
    `knowledge.write_unit` (the same front-matter, atomic write and token budget as the base
-   layer's units).
+   layer's value markers).
 
 `session_extraction_enabled` (default `true`) and `knowledge_idle_hours` (default `24`; `0` fires
 on the next tick) control it. Both need `reasoning_enabled: true`; with reasoning off the provider
@@ -317,18 +316,18 @@ must not read later turns. The first user message is the only allowed outside-wi
 only on the first refresh.
 
 1. **user card** — the previous user card + this window (+ the first user message as intent anchor
-   on bootstrap) → `{"user_self": "<markdown>", "user_preferences": "<markdown>"}`;
+   on bootstrap) → `{"user_self_representation": "<markdown>", "user_preferences": "<markdown>"}`;
 2. **AI card** — the user card just derived + the previous AI card + operator identity/preference
-   files + `plugin.yaml` + this window → `{"ai_self": "<markdown>", "ai_identity": "<markdown>"}`.
+   files + `plugin.yaml` + this window → `{"ai_self_representation": "<markdown>", "ai_identity": "<markdown>"}`.
    Identity claims come from the operator files or the manifest; there is no field contract and no
    verbatim check, and a fact neither source declares is left out;
 3. **window summary** — the two cards + this window → `{"window_summary": "<the section>"}`. The
    value is one markdown section following `templates/window_summary.md`; the prompt states the
    caps and `window_summary.validate` only checks that the value is a string;
-4. **value markers** — this window + the recorded units → `{"units": [...]}`. Units carry one
+4. **value markers** — this window + the recorded value markers → `{"value_markers": [...]}`. Markers carry one
    primary category (`KNOWLEDGE`, `VALUE`, `INTENT`, `METHOD`, `GOVERNANCE`), one primary org
    (`entities`, `trajectories`, `experiences`, `tools`, `projects`), a stable `topic`, and
-   `epistemic` for `KNOWLEDGE` only. At most 16 units per window, 160 characters each; a unit
+   `epistemic` for `KNOWLEDGE` only. At most 16 value markers per window, 160 characters each; a marker
    merges with an existing one when category, org and topic all match.
 
 The baseline order is **global card files -> newest row for the subject -> preset**. The four
@@ -338,14 +337,14 @@ session row is the horizon. With neither, the user card starts from the `softwar
 the preset without counting as a clear. The **first base job runs even with an empty window**: it
 publishes that preset baseline so the review cadence has an artifact to read. Later empty windows
 are no-ops. The user card and the AI identity are durable across sessions, while the AI
-self-representation, the window summary and the units are session-bound and drop on a session
+self-representation, the window summary and the value markers are session-bound and drop on a session
 change (`previous_content`). An exact repeat dispatch returns the existing job instead of
 refreshing the same window twice.
 
-The six columns keep their names (the draft's column map): `user_representation` holds
-`user_self`, `user_peer_card` holds `user_preferences`, `ai_self_representation` holds `ai_self`,
-`ai_identity_card` holds `ai_identity`, `session_chunk_summary` holds the model-written
-`window_summary` markdown section, and `value_markers` holds `{"units": [...]}`. The same data is
+The base row keeps `user_representation` for `user_self_representation`, `user_peer_card` for
+`user_preferences`, the same-named `ai_self_representation` and `ai_identity_card` for `ai_identity`,
+`window_summary` for the summary section, and `value_markers` for
+`{"value_markers": [...]}`. The same data is
 rendered into the four-section artifact and split into searchable conclusions (`base.user_card`,
 `base.ai_card`, `base.window_summary`, `base.value_markers`). `is_latest=1` marks the row with the
 greatest `window_to_ts` per `(session_id, subject)` — window order, not write order, so a slow
@@ -371,8 +370,8 @@ same text. Older chunks stay independent rows with their turn range and remain s
 their own session, unless an explicit session-final summary supersedes them (a compression fold
 never does). The dialectic worker reads the active chain up to its review window and may correct
 the summary as a whole part; when the chunk row cannot be updated, the correction is not claimed.
-Pass 4 is separate: it reads the same window plus the recorded unit inventory and returns
-`{"units": [...]}` only, so a malformed marker set cannot cost the summary and vice versa.
+Pass 4 is separate: it reads the same window plus the recorded value marker inventory and returns
+`{"value_markers": [...]}` only, so a malformed marker set cannot cost the summary and vice versa.
 
 ### Dialectic review, base corrections, and advices
 
@@ -476,7 +475,7 @@ first baseline for a base refresh and the only place a durable item may be delet
 
 | File | Content |
 | --- | --- |
-| `user/identity.md` | `user_self` markdown body: who the person is |
+| `user/identity.md` | `user_self_representation` markdown body: who the person is |
 | `user/preference.md` | `user_preferences` markdown body: how they want the assistant to work |
 | `agents/<profile>/identity.md` | `ai_identity` markdown body: who the assistant is, duties and domains |
 | `agents/<profile>/preference.md` | `ai_preference` markdown body: voice and conduct, permissions, prohibitions |
@@ -484,15 +483,16 @@ first baseline for a base refresh and the only place a durable item may be delet
 Each file is front-matter (`schema: minir-card/v1`, scope, part, generated_at, source, evidence,
 reviewer) plus one markdown body. There is no field list and no JSON body: the body is the card,
 and an empty body is a valid empty card. `card_review.py` is the only writer: the merge runs as
-**two agent passes**, the user card (`card_review_user`) and the AI card (`card_review_ai`), each
-with its own core, rule files and output contract. Each half returns its two final card bodies and
-nothing else: the database is the change history. The two halves are joined into one write: every
-pass validates all four bodies, enforces the per-file `card_token_budget` (2000 by default) and
-requires markdown text; one invalid file fails the whole review and leaves all four files untouched.
+**four single-file passes**, one for each global card file. The two user files share
+`card_review_user`; the two AI files share `card_review_ai`. Each pass reads one rule file and
+returns one final card body and nothing else: the database is the change history. The four passes
+are joined into one write, and the write validates all four bodies, enforces the per-file
+`card_token_budget` (2000 by default) and requires markdown text; one invalid file fails the whole
+review and leaves all four files untouched.
 Every write records a `card_revisions` row (`before_hash`/`after_hash`, `changed_fields: ["body"]`,
 source). A hand edit is detected by comparing the file hash with the last revision and recorded as
 `operator_edit` before the review takes over; the same diff also lists the file under
-"Hand-edited since the last review" in that half's prompt, so the model knows which card carries
+"Hand-edited since the last review" in that file's prompt, so the model knows which card carries
 operator text. A legacy file with no front-matter is copied to `<name>.declared.md` once. The
 review receives the current files as its baseline.
 
@@ -504,16 +504,17 @@ transcripts older than 30 days after each success.
 
 ### Knowledge pages
 
-Pass 4 units also feed a file layer: one page per `(category, org, topic)` under
+Pass 4 value markers also feed a file layer: one page per `(category, org, topic)` under
 `$HERMES_HOME/minir-memory/knowledge/<org>/<CATEGORY>-<slug>.md`. The filename is stable for a
 topic (CJK preserved, separators stripped, collisions hashed); a rewrite bumps `revisions` in the
 front-matter, an older `time` never overwrites a newer page, and the per-file
 `knowledge_token_budget` (2000 by default) rejects an over-long page, keeping the old one and
 writing `_failed/<CATEGORY>-<slug>.json`. The `KnowledgePipeline` consumer is a daemon thread with
-a bounded queue (512, oldest dropped with a counter); a failed unit never propagates into a base
-job. `agents/knowledge_render.md` is the page renderer's agent contract; the write path still
-renders a body from the unit itself and calls a `render` callable only when a caller supplies one,
-so nothing invokes that asset yet.
+a bounded queue (512, oldest dropped with a counter); a failed marker never propagates into a base
+job. `agents/knowledge_render.md` is the page renderer's agent contract: the idle-session extraction
+pass runs it, with `rules/markers-category.md` and `rules/markers-org.md` appended to its system
+prompt, to write pages from a finished session. The marker-to-page write path still renders a body
+from the unit itself and calls a `render` callable only when a caller supplies one.
 
 Retrieval is by **path, never by content**: `prefetch()` scores the front-matter against the query
 (objects 2x, word overlap 1x, recency 0.5x), selects at most 6 paths within 700 characters and

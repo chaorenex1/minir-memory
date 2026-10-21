@@ -66,9 +66,9 @@ sections: [contract, review_checks]
 | base B3 | markers-category, markers-org | CONTRACT | 900 tokens |
 | dialectic | 四份卡规则 | REVIEW CHECKS | 450 tokens |
 | card_review | 四份卡规则 | CONTRACT | 1200 tokens |
-| knowledge_render | 无 | — | 0 |
+| knowledge_render | markers-category, markers-org | 全文 | 900 tokens |
 
-dialectic 不读 markers 规则，因为它不写 markers（分层草稿 2.3）。复盘读四份卡规则的全文，因为它是唯一允许剪枝的角色，需要完整判定标准而不是缺陷清单。
+dialectic 不读 markers 规则，因为它不写 markers（分层草稿 2.3）。复盘读四份卡规则的全文，因为它是唯一允许剪枝的角色，需要完整判定标准而不是缺陷清单。knowledge_render 读 markers 全文，因为合并后的这个 pass 自己决定页面的 category 与 org，不再由 B4 代劳。
 
 ### 3.2 组装函数
 

@@ -2,9 +2,9 @@
 
 The base layer keeps a session snapshot of the cards; this layer merges what several sessions
 proved into four profile-global files, and records every write as a revision. The file is the
-current state, the database is its history. The merge runs as two half-passes: the user card and
-the AI card each have their own agent prompt and their own provenance arrays, and code joins the
-halves.
+current state, the database is its history. The merge runs as four single-file passes: the global
+user identity, user preference, AI identity and AI preference files each have their own rule and
+output contract, and code joins the four results.
 
 Two rules shape the module:
 
@@ -65,15 +65,27 @@ PART_CARD: dict[str, str] = {
     AI_IDENTITY: "ai-card", AI_PREFERENCE: "ai-card",
 }
 
-# One agent per half: which parts it writes, which rule files it reads, which prompt asset runs it.
+# One agent per file: each pass writes exactly one global card body, reads its own rule file, and
+# returns one key. Code joins the four passes before the all-or-nothing write.
 CARD_SCOPE_PARTS: dict[str, tuple[str, ...]] = {
-    "user": (USER_SELF, USER_PREFERENCE),
-    "ai": (AI_IDENTITY, AI_PREFERENCE),
+    "user_identity": (USER_SELF,),
+    "user_preference": (USER_PREFERENCE,),
+    "ai_identity": (AI_IDENTITY,),
+    "ai_preference": (AI_PREFERENCE,),
 }
 CARD_SCOPE_RULES: dict[str, tuple[str, ...]] = {
-    "user": ("user-self", "user-preferences"),
-    "ai": ("ai-self", "ai-identity"),
+    "user_identity": ("user-self",),
+    "user_preference": ("user-preferences",),
+    "ai_identity": ("ai-identity",),
+    "ai_preference": ("ai-identity",),
 }
+CARD_SCOPE_CORE: dict[str, str] = {
+    "user_identity": "card_review_user",
+    "user_preference": "card_review_user",
+    "ai_identity": "card_review_ai",
+    "ai_preference": "card_review_ai",
+}
+CARD_SCOPE_ORDER: tuple[str, ...] = tuple(CARD_SCOPE_PARTS)
 
 _FRONT_MATTER_RE = re.compile(r"^---\n(.*?)\n---\n?", re.DOTALL)
 
@@ -186,13 +198,13 @@ def load_global_cards(hermes_home: str, profile: str) -> dict[str, Any]:
     if not str(hermes_home or "").strip():
         return {}
     paths = card_paths(hermes_home, profile)
-    user_self = read_card(paths[USER_SELF])[1]
+    user_self_representation = read_card(paths[USER_SELF])[1]
     user_preference = read_card(paths[USER_PREFERENCE])[1]
     ai_identity = read_card(paths[AI_IDENTITY])[1]
     ai_preference = read_card(paths[AI_PREFERENCE])[1]
     cards: dict[str, Any] = {}
-    if user_self:
-        cards["user_self"] = user_self
+    if user_self_representation:
+        cards["user_self_representation"] = user_self_representation
     if user_preference:
         cards["user_preferences"] = user_preference
     identity = "\n\n".join(text for text in (ai_identity, ai_preference) if text)
@@ -272,29 +284,44 @@ def _changed_body(old_text: str, new_text: str) -> list[str]:
 
 # -- the review pass -----------------------------------------------------------
 
-OUTPUT_USER = """OUTPUT
+OUTPUT_USER_IDENTITY = """OUTPUT
 Return exactly one JSON object:
-{
-  "user_identity": "<markdown body>",
-  "user_preference": "<markdown body>"
-}
-Both values are the final global card bodies: complete markdown, not objects, not patches. An empty
-string is a valid empty card. No audit arrays, no front-matter, no code fence, no extra key. Code
-records the change history itself.
+{"user_identity": "<markdown body>"}
+The value is the final global identity card body: complete markdown, not an object, not a patch.
+An empty string is a valid empty card. No audit arrays, no front-matter, no code fence, no extra
+key. Code records the change history itself.
 """
 
-OUTPUT_AI = """OUTPUT
+OUTPUT_USER_PREFERENCE = """OUTPUT
 Return exactly one JSON object:
-{
-  "ai_identity": "<markdown body>",
-  "ai_preference": "<markdown body>"
-}
-Both values are the final global card bodies: complete markdown, not objects, not patches. An empty
-string is a valid empty card. No audit arrays, no front-matter, no code fence, no extra key. Code
-records the change history itself.
+{"user_preference": "<markdown body>"}
+The value is the final global preference card body: complete markdown, not an object, not a patch.
+An empty string is a valid empty card. No audit arrays, no front-matter, no code fence, no extra
+key. Code records the change history itself.
 """
 
-CARD_SCOPE_OUTPUT: dict[str, str] = {"user": OUTPUT_USER, "ai": OUTPUT_AI}
+OUTPUT_AI_IDENTITY = """OUTPUT
+Return exactly one JSON object:
+{"ai_identity": "<markdown body>"}
+The value is the final global identity card body: complete markdown, not an object, not a patch.
+An empty string is a valid empty card. No audit arrays, no front-matter, no code fence, no extra
+key. Code records the change history itself.
+"""
+
+OUTPUT_AI_PREFERENCE = """OUTPUT
+Return exactly one JSON object:
+{"ai_preference": "<markdown body>"}
+The value is the final global preference card body: complete markdown, not an object, not a patch.
+An empty string is a valid empty card. No audit arrays, no front-matter, no code fence, no extra
+key. Code records the change history itself.
+"""
+
+CARD_SCOPE_OUTPUT: dict[str, str] = {
+    "user_identity": OUTPUT_USER_IDENTITY,
+    "user_preference": OUTPUT_USER_PREFERENCE,
+    "ai_identity": OUTPUT_AI_IDENTITY,
+    "ai_preference": OUTPUT_AI_PREFERENCE,
+}
 
 
 def _hand_edited(store: Any, paths: dict[str, Path],
@@ -317,8 +344,9 @@ def _hand_edited(store: Any, paths: dict[str, Path],
 
 def build_prompt(store: Any, hermes_home: str, profile: str, since: float, *, scope: str,
                  plugin_yaml: str, language: str = "en") -> tuple[str, str]:
-    """One half's system prompt and user message: its files, the evidence, its markers."""
+    """One file's system prompt and user message: its card, the evidence, its markers."""
     parts_for_scope = CARD_SCOPE_PARTS[scope]
+    side = PART_SCOPE[parts_for_scope[0]]
     paths = card_paths(hermes_home, profile)
     current = []
     for part in parts_for_scope:
@@ -340,7 +368,7 @@ def build_prompt(store: Any, hermes_home: str, profile: str, since: float, *, sc
             "user_preferences": _load(row.get("user_peer_card")),
             "ai_card": _load(row.get("ai_self_representation")),
             "identity": _load(row.get("ai_identity_card")),
-            "markers": _load(row.get("value_markers")),
+            "value_markers": _load_value_markers(row.get("value_markers")),
         }, ensure_ascii=False)
         if size + len(block) > _MAX_EVIDENCE_CHARS and blocks:
             blocks.append('{"truncated": true}')
@@ -348,10 +376,11 @@ def build_prompt(store: Any, hermes_home: str, profile: str, since: float, *, sc
         blocks.append(block)
         size += len(block)
     markers = store.marker_notes(limit=50) if hasattr(store, "marker_notes") else []
+    side_label = "AI" if side == "ai" else "user"
     parts = [
         "Target profile: " + _safe_profile(profile),
         f"Value language (field names stay English): {language or 'en'}",
-        f"Current {'user' if scope == 'user' else 'AI'} cards (canonical, merge into them):\n"
+        f"Current {side_label} card (canonical, merge into it):\n"
         + ("\n\n".join(current) if current else "(none: this is the first review)"),
         "Base artifacts published since the last review (oldest first; derived drafts):\n"
         + ("\n".join(reversed(blocks)) if blocks else "(none)"),
@@ -364,12 +393,12 @@ def build_prompt(store: Any, hermes_home: str, profile: str, since: float, *, sc
     if edited:
         parts.append("Hand-edited since the last review (operator text; keep unless the evidence "
                      "is explicit):\n" + "\n".join(edited))
-    if scope == "ai":
+    if side == "ai":
         parts.append("Manifest (trusted; the deployment facts this plugin declares):\n"
                      + (plugin_yaml or "(unavailable)"))
     rules = [layer_rules.rule_text(rule_id, hermes_home=hermes_home)
              for rule_id in CARD_SCOPE_RULES[scope]]
-    core = layers.load_core(f"card_review_{scope}")
+    core = layers.load_core(CARD_SCOPE_CORE[scope])
     system = "\n\n".join([core.strip(), *rules, CARD_SCOPE_OUTPUT[scope].strip()])
     return system, "\n\n".join(parts)
 
@@ -381,31 +410,44 @@ def _load(value: Any) -> Any:
         return {}
 
 
+def _load_value_markers(value: Any) -> Any:
+    """Read the marker array from new and legacy column JSON."""
+    data = _load(value)
+    if isinstance(data, dict):
+        markers = data.get("value_markers")
+        if markers is None:
+            markers = data.get("units")
+        return markers if isinstance(markers, list) else []
+    return data if isinstance(data, list) else []
+
+
 def run_review(store: Any, hermes_home: str, profile: str, *, complete: Callable[[str, str], str],
                since: float, plugin_yaml: str = "", language: str = "en",
                reviewer: str = "model") -> list[int]:
-    """Two half-passes (user card, AI card), one validation boundary, one write.
+    """Four single-file passes, one validation boundary, one write.
 
-    Each half has its own agent and prompt and returns its two final card bodies; the database's
-    card_revisions rows are the change history. The card files are still published together: a
-    malformed AI half cannot leave the user half rewritten.
+    Each pass writes one global card body and reads one rule file; the database's card_revisions
+    rows are the change history. The four files are published together: a malformed pass cannot
+    leave the other three rewritten.
     """
     cards: dict[str, Any] = {}
-    for scope in ("user", "ai"):
+    for scope in CARD_SCOPE_ORDER:
+        expected = CARD_SCOPE_PARTS[scope]
         system, body = build_prompt(store, hermes_home, profile, since, scope=scope,
                                     plugin_yaml=plugin_yaml, language=language)
         payload = _json_object(complete(system, body))
         if not payload:
-            raise CardReviewError(f"the {scope} card reviewer did not return a JSON object")
-        extra = sorted(set(payload) - set(CARD_SCOPE_PARTS[scope]))
+            raise CardReviewError(
+                f"the {scope} card reviewer did not return a JSON object (missing {expected[0]})")
+        extra = sorted(set(payload) - set(expected))
         if extra:
             raise CardReviewError(
                 f"the {scope} card reviewer returned unexpected key(s): {', '.join(extra)}")
-        missing = [part for part in CARD_SCOPE_PARTS[scope] if part not in payload]
+        missing = [part for part in expected if part not in payload]
         if missing:
             raise CardReviewError(
                 f"the {scope} card reviewer is missing {', '.join(missing)}")
-        cards.update({part: payload[part] for part in CARD_SCOPE_PARTS[scope]})
+        cards.update({part: payload[part] for part in expected})
     return write_cards(store, hermes_home, profile, cards, reviewer=reviewer)
 
 

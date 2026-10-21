@@ -794,8 +794,8 @@ class KnowledgePipeline:
 
     # -- producer --------------------------------------------------------------
 
-    def enqueue_from_refresh(self, session_id: str, units: Iterable[Mapping[str, Any]]) -> int:
-        """Queue the units this refresh produced that are new or whose content changed.
+    def enqueue_from_refresh(self, session_id: str, value_markers: Iterable[Mapping[str, Any]]) -> int:
+        """Queue the markers this refresh produced that are new or whose content changed.
 
         File existence plus the stored content fingerprint answer "already produced?"; there is no
         extra table to migrate. Every failure — a malformed unit, an unreadable page, a full
@@ -803,7 +803,7 @@ class KnowledgePipeline:
         """
         enqueued = 0
         try:
-            for unit in list(units or ()):
+            for unit in list(value_markers or ()):
                 if self._stopped:
                     break
                 if not isinstance(unit, Mapping):

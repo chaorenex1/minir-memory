@@ -26,19 +26,20 @@ from .window_summary import WindowSummaryError
 # Every card part is markdown text: the model writes the body, the code only frames it. Empty is a
 # valid card, so nothing here is a field contract; CARD_TEXT_LIMIT stops a runaway body.
 CARD_TEXT_LIMIT = 8000
-USER_PARTS: tuple[str, ...] = ("user_self", "user_preferences")
-AI_PARTS: tuple[str, ...] = ("ai_self", "ai_identity")
+USER_PARTS: tuple[str, ...] = ("user_self_representation", "user_preferences")
+AI_PARTS: tuple[str, ...] = ("ai_self_representation", "ai_identity")
 
 CATEGORIES: tuple[str, ...] = ("KNOWLEDGE", "VALUE", "INTENT", "METHOD", "GOVERNANCE")
 ORGS: tuple[str, ...] = ("entities", "trajectories", "experiences", "tools", "projects")
 EPISTEMIC: tuple[str, ...] = ("fact", "inference", "hypothesis", "prediction")
 RELATION_TYPES: tuple[str, ...] = ("supersedes", "caused_by", "part_of", "contradicts")
 PART_NAMES: tuple[str, ...] = (
-    "user_self", "user_preferences", "ai_self", "ai_identity", "window_summary",
+    "user_self_representation", "user_preferences",
+    "ai_self_representation", "ai_identity", "window_summary",
 )
 PART_SCOPES: dict[str, str] = {
-    "user_self": "user_card", "user_preferences": "user_card",
-    "ai_self": "ai_card", "ai_identity": "ai_card",
+    "user_self_representation": "user_card", "user_preferences": "user_card",
+    "ai_self_representation": "ai_card", "ai_identity": "ai_card",
     "window_summary": "window_summary",
 }
 CHANGE_OPS: tuple[str, ...] = ("add", "update", "remove")
@@ -101,7 +102,7 @@ def load_core(name: str) -> str:
 OUTPUT_B1 = """OUTPUT
 Return exactly one JSON object:
 {
-  "user_self": "<markdown body>",
+  "user_self_representation": "<markdown body>",
   "user_preferences": "<markdown body>"
 }
 Both values are markdown text, not objects: the body as you want it in the file. An empty string is
@@ -111,7 +112,7 @@ a valid empty card. No code fence, no extra keys.
 OUTPUT_B2 = """OUTPUT
 Return exactly one JSON object:
 {
-  "ai_self": "<markdown body>",
+  "ai_self_representation": "<markdown body>",
   "ai_identity": "<markdown body>"
 }
 Both values are markdown text, not objects: the body as you want it in the file. An empty string is
@@ -125,19 +126,19 @@ No prose, no code fence, no extra keys.
 """
 
 OUTPUT_B4 = """OUTPUT
-Return exactly one JSON object, the units array described above and nothing else:
-{"units": [<unit objects>]}
+Return exactly one JSON object, the `value_markers` array described above and nothing else:
+{"value_markers": [<unit objects>]}
 No prose, no code fence, no extra keys.
 """
 
 OUTPUT_DIALECTIC = """OUTPUT
 Return exactly one JSON object:
 {
-  "user_card": {"user_self": "<markdown body>", "user_preferences": "<markdown body>"},
-  "ai_card": {"ai_self": "<markdown body>", "ai_identity": "<markdown body>"},
+  "user_card": {"user_self_representation": "<markdown body>", "user_preferences": "<markdown body>"},
+  "ai_card": {"ai_self_representation": "<markdown body>", "ai_identity": "<markdown body>"},
   "window_summary": "## Window Summary ... the same template as the base pass, filled in",
   "base_changed": {"changed": false, "fields": []},
-  "changes": [{"scope": "user_card", "part": "user_self", "op": "update",
+  "changes": [{"scope": "user_card", "part": "user_self_representation", "op": "update",
                "reason": "", "sessions": []}],
   "prunings": []
 }
@@ -201,8 +202,8 @@ def validate_card_body(value: Any, path: str, limit: int = CARD_TEXT_LIMIT) -> s
     return text
 
 
-def validate_user_self(value: Any) -> str:
-    return validate_card_body(value, "user_self")
+def validate_user_self_representation(value: Any) -> str:
+    return validate_card_body(value, "user_self_representation")
 
 
 def validate_user_preferences(value: Any) -> str:
@@ -219,26 +220,26 @@ def validate_ai_card(value: Any) -> dict[str, str]:
     return {part: validate_card_body(data[part], f"ai_card.{part}") for part in AI_PARTS}
 
 
-def validate_ai_self(value: Any) -> str:
-    return validate_card_body(value, "ai_self")
+def validate_ai_self_representation(value: Any) -> str:
+    return validate_card_body(value, "ai_self_representation")
 
 
 def validate_ai_identity(value: Any) -> str:
     return validate_card_body(value, "ai_identity")
 
 
-def validate_units(value: Any, *, previous: Any = None) -> list[dict[str, Any]]:
-    """The marker units: one primary category, one primary org, one stable topic each."""
-    data = _keys(value, "value_markers", ("units",))
-    units = data["units"]
-    if not isinstance(units, list):
-        _fail("value_markers.units", "must be an array")
-    if len(units) > MAX_UNITS:
-        _fail("value_markers.units", f"has {len(units)} units, limit is {MAX_UNITS}")
+def validate_value_markers(value: Any, *, previous: Any = None) -> list[dict[str, Any]]:
+    """The value markers: one primary category, one primary org, one stable topic each."""
+    data = _keys(value, "value_markers", ("value_markers",))
+    value_markers = data["value_markers"]
+    if not isinstance(value_markers, list):
+        _fail("value_markers", "must be an array")
+    if len(value_markers) > MAX_UNITS:
+        _fail("value_markers", f"has {len(value_markers)} markers, limit is {MAX_UNITS}")
     cleaned: list[dict[str, Any]] = []
     seen_ids: set[str] = set()
-    for index, entry in enumerate(units):
-        path = f"value_markers.units[{index}]"
+    for index, entry in enumerate(value_markers):
+        path = f"value_markers[{index}]"
         data_unit = _keys(entry, path, ("id", "org", "category", "topic", "content", "time",
                                         "relations", "objects"),
                           optional=("epistemic",))
@@ -271,7 +272,7 @@ def validate_units(value: Any, *, previous: Any = None) -> list[dict[str, Any]]:
             if rel["type"] not in RELATION_TYPES:
                 _fail(f"{rel_path}.type", f"must be one of {', '.join(RELATION_TYPES)}")
             ref = _string(rel["ref"], f"{rel_path}.ref", 40, allow_empty=False)
-            if ref not in {unit["id"] for unit in units if isinstance(unit, dict)}:
+            if ref not in {unit["id"] for unit in value_markers if isinstance(unit, dict)}:
                 _fail(f"{rel_path}.ref", f"references {ref!r}, which is not in this window")
             clean_relations.append({"type": rel["type"], "ref": ref})
         objects = data_unit["objects"]
@@ -298,14 +299,14 @@ def validate_units(value: Any, *, previous: Any = None) -> list[dict[str, Any]]:
     return _merge_units(cleaned, previous)
 
 
-def _merge_units(units: list[dict[str, Any]], previous: Any) -> list[dict[str, Any]]:
+def _merge_units(value_markers: list[dict[str, Any]], previous: Any) -> list[dict[str, Any]]:
     """Same category + org + topic is one unit: new evidence replaces the old body, time, links."""
     merged: dict[tuple[str, str, str], dict[str, Any]] = {}
     for unit in previous or []:
         if isinstance(unit, dict):
             key = (str(unit.get("category")), str(unit.get("org")), str(unit.get("topic")))
             merged[key] = unit
-    for unit in units:
+    for unit in value_markers:
         merged[(unit["category"], unit["org"], unit["topic"])] = unit
     return list(merged.values())
 
@@ -358,16 +359,16 @@ def validate_review(value: Any) -> dict[str, Any]:
     if data["prunings"] != []:
         _fail("prunings", "the dialectic may not prune; return an empty array")
     return {
-        "user_self": validate_user_self(user_card["user_self"]),
+        "user_self_representation": validate_user_self_representation(user_card["user_self_representation"]),
         "user_preferences": validate_user_preferences(user_card["user_preferences"]),
-        "ai_self": validate_ai_self(ai_card["ai_self"]),
+        "ai_self_representation": validate_ai_self_representation(ai_card["ai_self_representation"]),
         "ai_identity": validate_ai_identity(ai_card["ai_identity"]),
         "window_summary": summary,
         "changed": list(fields),
     }
 
 
-def empty_user_self() -> str:
+def empty_user_self_representation() -> str:
     return ""
 
 
@@ -375,7 +376,7 @@ def empty_user_preferences() -> str:
     return ""
 
 
-def empty_ai_self() -> str:
+def empty_ai_self_representation() -> str:
     return ""
 
 
@@ -383,7 +384,7 @@ def empty_ai_identity() -> str:
     return ""
 
 
-def preset_user_self(language: str = "en") -> str:
+def preset_user_self_representation(language: str = "en") -> str:
     """First-refresh baseline: one occupation line; the first real window replaces the body."""
     key = "zh" if str(language or "").lower().startswith("zh") else "en"
     heading, label = ("## 自我描述", "职业") if key == "zh" else ("## Self", "Occupation")
@@ -399,29 +400,35 @@ def artifact_from_columns(row: dict[str, Any] | None) -> dict[str, Any]:
             return default
         return value if isinstance(value, type(default)) else default
 
-    units = load("value_markers", {}).get("units") if row else None
+    raw_markers = load("value_markers", {}) if row else {}
+    if isinstance(raw_markers, dict):
+        value_markers = raw_markers.get("value_markers")
+        if value_markers is None:
+            value_markers = raw_markers.get("units")
+    else:
+        value_markers = raw_markers
     return {
-        "user_self": load("user_representation", ""),
+        "user_self_representation": load("user_representation", ""),
         "user_preferences": load("user_peer_card", ""),
-        "ai_self": load("ai_self_representation", ""),
+        "ai_self_representation": load("ai_self_representation", ""),
         "ai_identity": load("ai_identity_card", ""),
-        "window_summary": load("session_chunk_summary", ""),
-        "units": units if isinstance(units, list) else [],
+        "window_summary": load("window_summary", ""),
+        "value_markers": value_markers if isinstance(value_markers, list) else [],
     }
 
 
-def render_user_card(user_self: str, preferences: str) -> str:
+def render_user_card(user_self_representation: str, preferences: str) -> str:
     return "\n\n".join([
         "## User Card",
-        _section("Self Representation", user_self),
+        _section("Self Representation", user_self_representation),
         _section("Preferences", preferences),
     ])
 
 
-def render_ai_card(ai_self: str, identity: str) -> str:
+def render_ai_card(ai_self_representation: str, identity: str) -> str:
     return "\n\n".join([
         "## AI Card",
-        _section("Self Representation", ai_self),
+        _section("Self Representation", ai_self_representation),
         _section("Identity", identity),
     ])
 
@@ -431,28 +438,28 @@ def _section(title: str, text: str) -> str:
     return f"### {title}\n\n{body}" if body else f"### {title}"
 
 
-def render_markers(units: list[dict[str, Any]]) -> str:
+def render_markers(value_markers: list[dict[str, Any]]) -> str:
     lines: list[str] = []
-    for unit in units:
+    for unit in value_markers:
         tag = f"{unit['category']}:{unit['epistemic']}" if unit["epistemic"] else unit["category"]
         lines.append(f"- [{tag}/{unit['org']}] {unit['topic']} — {unit['content']}")
     heading = "## Value Markers"
     return heading + ("\n" + "\n".join(lines) if lines else "")
 
 
-def render_artifact(*, user_self: dict[str, Any], user_preferences: dict[str, Any],
-                    ai_self: dict[str, Any], ai_identity: dict[str, Any],
-                    summary: str, units: list[dict[str, Any]]) -> str:
+def render_artifact(*, user_self_representation: dict[str, Any], user_preferences: dict[str, Any],
+                    ai_self_representation: dict[str, Any], ai_identity: dict[str, Any],
+                    summary: str, value_markers: list[dict[str, Any]]) -> str:
     """The four-section artifact, in the order the parser and the cross-session rules expect."""
     try:
         summary_md = summary_template.validate(summary)
     except WindowSummaryError as exc:
         raise LayerContractError(str(exc)) from exc
     return "\n\n".join([
-        render_user_card(user_self, user_preferences),
-        render_ai_card(ai_self, ai_identity),
+        render_user_card(user_self_representation, user_preferences),
+        render_ai_card(ai_self_representation, ai_identity),
         summary_md,
-        render_markers(units),
+        render_markers(value_markers),
     ])
 
 

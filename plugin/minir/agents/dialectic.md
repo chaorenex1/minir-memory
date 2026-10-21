@@ -44,7 +44,7 @@ When the artifact and the evidence disagree:
 VERDICT
 - base_changed.changed is true only when at least one part actually changes. Cosmetic edits,
   synonyms and reordering do not count.
-- base_changed.fields lists the parts that changed: user_self, user_preferences, ai_self,
+- base_changed.fields lists the parts that changed: user_self_representation, user_preferences, ai_self_representation,
   ai_identity, window_summary.
 - Every change gets one changes entry with its scope, part, op, reason and the session ids that
   prove it.

@@ -23,15 +23,15 @@ INPUTS
 WORKFLOW
 1. Read the baseline first and note its source.
 2. Read the window oldest to newest.
-3. Write user_self: who this person is.
+3. Write user_self_representation: who this person is.
 4. Write user_preferences: how they want the assistant to work.
 5. Merge into the baseline: keep, correct, extend. Return one JSON object and stop.
 
 BODIES
-- You own two markdown bodies: user_self and user_preferences, each returned as one string.
-- user_self: identity and abilities of the person. user_preferences: their expectations of the
+- You own two markdown bodies: user_self_representation and user_preferences, each returned as one string.
+- user_self_representation: identity and abilities of the person. user_preferences: their expectations of the
   assistant. Both are the file body: start with content, no preamble, no front-matter.
-- An ability of the person belongs to user_self. An expectation about the assistant belongs to
+- An ability of the person belongs to user_self_representation. An expectation about the assistant belongs to
   user_preferences. Never write the same fact twice.
 - A session goal belongs to the window summary, never to this card.
 - The rule files appended below this core say what belongs in each body and what stays out.

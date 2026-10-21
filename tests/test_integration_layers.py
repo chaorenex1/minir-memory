@@ -1,4 +1,4 @@
-"""Cross-module wiring: units -> knowledge, knowledge -> prefetch, runs -> transcripts."""
+"""Cross-module wiring: value_markers -> knowledge, knowledge -> prefetch, runs -> transcripts."""
 
 from __future__ import annotations
 
@@ -30,14 +30,14 @@ def test_a_base_publish_hands_its_units_to_the_knowledge_pipeline(plugin_package
             return "{}"
         if "baseline_user_card" in prompt or "Baseline user card" in prompt:
             return json.dumps({
-                "user_self": "# Who this person is\n\nAn Engineer.\n",
+                "user_self_representation": "# Who this person is\n\nAn Engineer.\n",
                 "user_preferences": "# How they want answers\n\n- Terse first.\n",
             })
         if "baseline_ai_card" in prompt or "Baseline AI card" in prompt:
-            return json.dumps({"ai_self": "# What this task is\n\nidle.\n",
+            return json.dumps({"ai_self_representation": "# What this task is\n\nidle.\n",
                                "ai_identity": "# Who the assistant is\n\nminir 0.8.0.\n"})
-        if "previous_units" in prompt or "Previous knowledge units" in prompt:
-            return json.dumps({"units": [{
+        if "previous_value_markers" in prompt or "Previous knowledge value markers" in prompt:
+            return json.dumps({"value_markers": [{
                 "id": "u1", "org": "tools", "category": "KNOWLEDGE", "epistemic": "fact",
                 "topic": "Docker restart policy", "content": "Use unless-stopped.",
                 "time": "2026-10-21", "relations": [], "objects": ["tools:docker"]}]})
@@ -47,7 +47,7 @@ def test_a_base_publish_hands_its_units_to_the_knowledge_pipeline(plugin_package
     store.record_job("base", "s1", 0.0, 20.0)
     instance = plugin_package.worker.LayerWorker(
         store, transcript, complete=complete,
-        on_units=lambda session, units: captured.append((session, units)))
+        on_value_markers=lambda session, value_markers: captured.append((session, value_markers)))
     assert instance.run_once() == 1
     assert captured and captured[0][0] == "s1"
     assert captured[0][1][0]["topic"] == "Docker restart policy"

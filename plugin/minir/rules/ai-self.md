@@ -1,7 +1,7 @@
 ---
 id: ai-self
 version: 2
-applies_to: [base:B2, dialectic, card_review]
+applies_to: [base:B2, dialectic]
 slot: body
 max_tokens: 400
 sections: [contract, review_checks]

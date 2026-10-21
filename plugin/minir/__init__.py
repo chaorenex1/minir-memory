@@ -338,7 +338,7 @@ class MinirMemoryProvider(MemoryProvider):
             depth=self._dialectic_depth,
             content_language=str(self._config.get("content_language") or "en"),
             hermes_home=self._hermes_home,
-            on_units=(self._knowledge.enqueue_from_refresh
+            on_value_markers=(self._knowledge.enqueue_from_refresh
                       if self._knowledge is not None else None))
         self._card_scheduler = card_review.CardReviewScheduler(
             self._store, self._run_card_review, subject=self._worker.user_subject(),
@@ -905,7 +905,7 @@ class MinirMemoryProvider(MemoryProvider):
 
     def _session_marker_snapshot(self, session: str) -> dict[str, Any]:
         """The markers this session produced, plus what the final summary agent will need."""
-        snapshot: dict[str, Any] = {"notes": [], "units": [], "summary": "",
+        snapshot: dict[str, Any] = {"notes": [], "value_markers": [], "summary": "",
                                     "turn_usage": [], "window_from_ts": 0.0,
                                     "window_to_ts": 0.0}
         if self._store is None or not session:
@@ -926,16 +926,21 @@ class MinirMemoryProvider(MemoryProvider):
             base = self._store.latest_base_refresh(session) or {}
             snapshot["window_from_ts"] = float(base.get("window_from_ts") or 0.0)
             snapshot["window_to_ts"] = float(base.get("window_to_ts") or 0.0)
-            units: Any = []
+            value_markers: Any = []
             raw = str(base.get("value_markers") or "").strip()
             if raw:
                 try:
                     parsed = json.loads(raw)
-                    units = parsed.get("units") if isinstance(parsed, dict) else parsed
+                    if isinstance(parsed, dict):
+                        value_markers = parsed.get("value_markers")
+                        if value_markers is None:
+                            value_markers = parsed.get("units")
+                    else:
+                        value_markers = parsed
                 except ValueError:
-                    units = []
-            if isinstance(units, list):
-                snapshot["units"] = units[:16]
+                    value_markers = []
+            if isinstance(value_markers, list):
+                snapshot["value_markers"] = value_markers[:16]
             summary = self._store.newest_conclusion("session_summary", session_id=session)
             snapshot["summary"] = str((summary or {}).get("content") or "")[:4_000]
             snapshot["turn_usage"] = self._store.turn_usage(session, limit=50)
@@ -947,14 +952,14 @@ class MinirMemoryProvider(MemoryProvider):
     def _encode_marker_snapshot(snapshot: dict[str, Any]) -> str:
         """Serialize the marker snapshot, shrinking its lists rather than cutting JSON mid-string."""
         notes = list(snapshot.get("notes") or [])
-        units = list(snapshot.get("units") or [])
+        value_markers = list(snapshot.get("value_markers") or [])
         usage = list(snapshot.get("turn_usage") or [])
         payload = json.dumps(snapshot, ensure_ascii=False)
         for note_cap, unit_cap, usage_cap in ((30, 16, 20), (20, 12, 10), (10, 6, 5), (0, 0, 0)):
             if len(payload) <= _MAX_MARKER_SNAPSHOT:
                 break
             snapshot["notes"] = notes[-note_cap:] if note_cap else []
-            snapshot["units"] = units[:unit_cap]
+            snapshot["value_markers"] = value_markers[:unit_cap]
             snapshot["turn_usage"] = usage[:usage_cap]
             payload = json.dumps(snapshot, ensure_ascii=False)
         return payload
@@ -969,7 +974,7 @@ class MinirMemoryProvider(MemoryProvider):
             return
         try:
             snapshot = self._session_marker_snapshot(session)
-            if not (snapshot.get("notes") or snapshot.get("units")):
+            if not (snapshot.get("notes") or snapshot.get("value_markers")):
                 # No value markers, nothing to time: the session was not durable enough to
                 # spend a summary + extraction run on.
                 logger.debug("Minir extraction skipped for %s: no value markers", session)
@@ -1004,7 +1009,7 @@ class MinirMemoryProvider(MemoryProvider):
         if self._store is None:
             return ""
         base = self._store.latest_base_refresh(session) or {}
-        chunk = str(base.get("session_chunk_summary") or "").strip()
+        chunk = str(base.get("window_summary") or "").strip()
         review_row = self._store.newest_conclusion("dialectic.review", session_id=session)
         review = str((review_row or {}).get("content") or "").strip()
         previous_row = self._store.newest_conclusion("session_summary", session_id=session)
@@ -1050,7 +1055,7 @@ class MinirMemoryProvider(MemoryProvider):
                 status="active", to_ts=window_end or None)
         pages = extraction.extract_pages(
             session_id=session, summary=summary_text, handoff=handoff_text,
-            markers=snapshot, usage=usage)
+            markers=snapshot, usage=usage, hermes_home=self._hermes_home)
         written = 0
         for page in pages:
             page["source_session"] = session
@@ -1206,7 +1211,7 @@ class MinirMemoryProvider(MemoryProvider):
         self._adviser_mode.stop()  # no review may touch the store after this point
         self._scheduler.stop()     # no scheduled job may touch the store after this point
         if self._knowledge is not None:
-            self._knowledge.stop()      # drain queued units while the filesystem still exists
+            self._knowledge.stop()      # drain queued value markers while the filesystem still exists
         self._transcript.close()        # last writer join: no JSON may be half-written
         self.flush_metrics()
         # Only now that no drain is in flight: a queued boundary job must still find its window.

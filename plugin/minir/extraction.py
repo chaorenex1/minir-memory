@@ -9,9 +9,10 @@ When the timer fires, the provider's callback runs two agents in order:
 
 1. :mod:`session_summary` — the Task Handoff produced by :mod:`handoff` is the first input of
    its user message, and it writes the session's final summary;
-2. :func:`extract_pages` here — the summary, hand-off, value markers and token usage go in, and
-   the agent returns knowledge pages with a body each. The caller writes them through
-   :func:`minir.knowledge.write_unit`, so the page budget and atomic-write rules still apply.
+2. :func:`extract_pages` here — the summary, hand-off, value markers and token usage go in, the
+   marker rules are appended to its system prompt, and the agent returns knowledge pages with a
+   body each. The caller writes them through :func:`minir.knowledge.write_unit`, so the page
+   budget and atomic-write rules still apply.
 
 The unified scheduler polls it on a wall-clock cadence, not a turn counter: it must fire with
 no live session. Rows live in SQLite, so a timer set in one process is still honoured after a
@@ -28,6 +29,7 @@ import time
 from typing import Any, Callable, Optional
 
 from . import agent_loop, layers, tools
+from . import rules as layer_rules
 from .prompting import data_block
 
 logger = logging.getLogger(__name__)
@@ -42,6 +44,11 @@ MAX_OBJECTS = 5
 MAX_RELATIONS = 3
 MAX_SUMMARY = 160
 
+#: The marker rules are the authority for category, org, topic, objects and relations. This pass
+#: classifies the pages it writes, so it reads the same two files the marker pass reads instead of
+#: carrying a second, drifting copy of the taxonomy in its own prompt.
+MARKER_RULES: tuple[str, ...] = ("markers-category", "markers-org")
+
 _THINK_RE = re.compile(r"<think\b[^>]*>.*?</think\s*>", re.DOTALL | re.IGNORECASE)
 _FENCE_RE = re.compile(r"^\s*```[a-zA-Z]*\s*|\s*```\s*$")
 _H1_RE = re.compile(r"^#\s+.*?(?:\r?\n|$)")
@@ -51,8 +58,12 @@ _OUTPUT_RULE = (
     "fence, no prose.")
 
 
-def system_prompt() -> str:
-    return f"{layers.load_core('knowledge_extract')}"
+def system_prompt(hermes_home: str = "") -> str:
+    """The page pass's prompt: its core, then the marker rules it classifies pages by."""
+    parts = [layers.load_core("knowledge_render")]
+    parts.extend(layer_rules.rule_text(rule_id, hermes_home=hermes_home)
+                 for rule_id in MARKER_RULES)
+    return "\n\n".join(part.strip() for part in parts if part.strip())
 
 
 def _flatten(text: Any) -> str:
@@ -167,7 +178,8 @@ def build_prompt(*, session_id: str, summary: str, handoff: str, markers: Any,
 
 
 def extract_pages(*, session_id: str, summary: str, handoff: str, markers: Any = None,
-                  usage: Any = None, timeout: float = 120.0) -> list[dict[str, Any]]:
+                  usage: Any = None, hermes_home: str = "",
+                  timeout: float = 120.0) -> list[dict[str, Any]]:
     """Run the extraction agent; returns validated pages (``[]`` on any failure)."""
     prompt = build_prompt(session_id=session_id, summary=summary, handoff=handoff,
                           markers=markers, usage=usage)
@@ -181,7 +193,7 @@ def extract_pages(*, session_id: str, summary: str, handoff: str, markers: Any =
             provider=str(cfg.get("provider") or ""),
             api_mode=str(cfg.get("api_mode") or ""),
             toolsets=tools.agent_toolsets(cfg.get("toolsets")),
-            system_message=f"{system_prompt()}\n\n{_OUTPUT_RULE}")
+            system_message=f"{system_prompt(hermes_home)}\n\n{_OUTPUT_RULE}")
         return str(result.answer or "")
 
     try:

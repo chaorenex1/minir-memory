@@ -120,11 +120,11 @@ _DIALECTIC_TOOL_HINT = (
 # Review part -> the base column it replaces. Whole-part replacement: the review returns the
 # corrected part in full, and the version fence decides whether the write lands.
 _PART_COLUMNS: dict[str, str] = {
-    "user_self": "user_representation",
+    "user_self_representation": "user_representation",
     "user_preferences": "user_peer_card",
-    "ai_self": "ai_self_representation",
+    "ai_self_representation": "ai_self_representation",
     "ai_identity": "ai_identity_card",
-    "window_summary": "session_chunk_summary",
+    "window_summary": "window_summary",
 }
 
 def call_model(task: str, system: str, prompt: str, *, timeout: float = _MODEL_TIMEOUT,
@@ -244,12 +244,12 @@ def _base_parts(row: dict[str, Any], changes: dict[str, Any]) -> dict[str, Any]:
 def _render_base_artifact(parts: dict[str, Any]) -> str:
     """Rebuild the four-section artifact from logical parts (used after a review)."""
     return layers.render_artifact(
-        user_self=parts.get("user_self") or layers.empty_user_self(),
+        user_self_representation=parts.get("user_self_representation") or layers.empty_user_self_representation(),
         user_preferences=parts.get("user_preferences") or layers.empty_user_preferences(),
-        ai_self=parts.get("ai_self") or layers.empty_ai_self(),
+        ai_self_representation=parts.get("ai_self_representation") or layers.empty_ai_self_representation(),
         ai_identity=parts.get("ai_identity") or layers.empty_ai_identity(),
         summary=parts.get("window_summary") or summary_template.empty_summary(),
-        units=parts.get("units") or [],
+        value_markers=parts.get("value_markers") or [],
     )
 
 
@@ -520,19 +520,19 @@ def _base_summary_prompt(subject: str, session: str, user_card: dict[str, Any],
         _MAX_PROMPT_CHARS)
 
 
-def _base_units_prompt(subject: str, session: str, evidence: str, *,
-                       previous_units: list[dict[str, Any]],
-                       markers_category: str, markers_org: str,
-                       from_ts: float = 0.0, to_ts: float = 0.0,
-                       language: str = "en") -> str:
-    """Pass 4: this window's marker units, with the marker rules passed as text."""
+def _base_value_markers_prompt(subject: str, session: str, evidence: str, *,
+                               previous_value_markers: list[dict[str, Any]],
+                               markers_category: str, markers_org: str,
+                               from_ts: float = 0.0, to_ts: float = 0.0,
+                               language: str = "en") -> str:
+    """Pass 4: this window's value markers, with the marker rules passed as text."""
     parts = [
         f"Target: {subject}",
         _session_line(session),
         _window_line(from_ts, to_ts),
         _language_block(language),
-        _json_block("previous_units", {"units": previous_units or []})
-        if previous_units else "Previous knowledge units: none",
+        _json_block("previous_value_markers", {"value_markers": previous_value_markers or []})
+        if previous_value_markers else "Previous knowledge value markers: none",
         _json_block("markers-category", markers_category),
         _json_block("markers-org", markers_org),
     ]
@@ -617,7 +617,7 @@ class LayerWorker:
                  content_language: str = "en", hermes_home: str = "",
                  complete: Optional[Callable[..., str]] = None,
                  consult: Optional[Callable[[str, str], str]] = None,
-                 on_units: Optional[Callable[[str, list[dict[str, Any]]], None]] = None):
+                 on_value_markers: Optional[Callable[[str, list[dict[str, Any]]], None]] = None):
         self._store = store
         self._transcript = transcript
         self._enabled = bool(enabled)
@@ -632,7 +632,7 @@ class LayerWorker:
         self._plugin_yaml = _read_plugin_yaml()
         self._identity_digest = self._digest_sources()
         self._depth = max(1, min(3, int(depth or 2)))
-        self._on_units = on_units
+        self._on_value_markers = on_value_markers
         # Resolved here, not as a default argument: a host (or a test) may replace the module
         # function before the provider builds its worker.
         self._complete: Callable[..., str] = complete if callable(complete) else call_model
@@ -830,18 +830,18 @@ class LayerWorker:
                           first_message: str = "", from_ts: float = 0.0,
                           to_ts: float = 0.0, source: str = "session"
                           ) -> tuple[str, dict[str, str], str]:
-        """Three-pass base refresh: user card, AI card, window summary plus units.
+        """Four-pass base refresh: user card, AI card, window summary plus value markers.
 
         Each pass returns its complete part. The artifact is rendered from validated objects, so
         a malformed reply cannot reach the next prompt, and the card the dialectic reviews is the
         exact card the base pass published.
         """
         user_baseline = {
-            "user_self": baseline.get("user_self") or {},
+            "user_self_representation": baseline.get("user_self_representation") or {},
             "user_preferences": baseline.get("user_preferences") or {},
         }
-        if first and not _has_content(user_baseline["user_self"]):
-            user_baseline["user_self"] = layers.preset_user_self(self._language)
+        if first and not _has_content(user_baseline["user_self_representation"]):
+            user_baseline["user_self_representation"] = layers.preset_user_self_representation(self._language)
         user_system = self._system(layers.load_core("b1_user_card"), layers.OUTPUT_B1,
                                    [self._rule("user-self"), self._rule("user-preferences")])
         user_card = self._consult_validated(
@@ -852,8 +852,8 @@ class LayerWorker:
             layers.validate_user_card, label="base user pass")
 
         ai_baseline = {}
-        if _has_content(baseline.get("ai_self")) or _has_content(baseline.get("ai_identity")):
-            ai_baseline = {"ai_self": baseline.get("ai_self") or {},
+        if _has_content(baseline.get("ai_self_representation")) or _has_content(baseline.get("ai_identity")):
+            ai_baseline = {"ai_self_representation": baseline.get("ai_self_representation") or {},
                            "ai_identity": baseline.get("ai_identity") or {}}
         ai_system = self._system(layers.load_core("b2_ai_card"), layers.OUTPUT_B2,
                                  [self._rule("ai-self"), self._rule("ai-identity")])
@@ -879,40 +879,41 @@ class LayerWorker:
                                  from_ts=from_ts, to_ts=to_ts, language=self._language),
             layers.validate_summary_pass,
             label="base summary pass")["window_summary"]
-        units_system = self._system(layers.load_core("b4_value_markers"), layers.OUTPUT_B4)
-        units = self._consult_validated(
-            units_system,
-            _base_units_prompt(subject, session, evidence,
-                               previous_units=baseline.get("units") or [],
-                               markers_category=self._rule("markers-category"),
-                               markers_org=self._rule("markers-org"),
-                               from_ts=from_ts, to_ts=to_ts, language=self._language),
-            lambda value: layers.validate_units(value, previous=baseline.get("units") or []),
-            label="base units pass")
+        value_markers_system = self._system(layers.load_core("b4_value_markers"), layers.OUTPUT_B4)
+        value_markers = self._consult_validated(
+            value_markers_system,
+            _base_value_markers_prompt(subject, session, evidence,
+                                       previous_value_markers=baseline.get("value_markers") or [],
+                                       markers_category=self._rule("markers-category"),
+                                       markers_org=self._rule("markers-org"),
+                                       from_ts=from_ts, to_ts=to_ts, language=self._language),
+            lambda value: layers.validate_value_markers(
+                value, previous=baseline.get("value_markers") or []),
+            label="base value markers pass")
         # A valid reply with everything empty is a sparse window: nothing durable to publish.
-        if not (_part_has_content("user_self", user_card["user_self"])
+        if not (_part_has_content("user_self_representation", user_card["user_self_representation"])
                 or _part_has_content("user_preferences", user_card["user_preferences"])
-                or _part_has_content("ai_self", ai_card["ai_self"])
+                or _part_has_content("ai_self_representation", ai_card["ai_self_representation"])
                 or _part_has_content("ai_identity", ai_card["ai_identity"])
-                or units or not summary_template.is_empty(summary)):
+                or value_markers or not summary_template.is_empty(summary)):
             logger.info("Minir base refresh for %s produced no durable content; skipping publish",
                         subject)
             return "", {}, ""
         content = layers.render_artifact(
-            user_self=user_card["user_self"], user_preferences=user_card["user_preferences"],
-            ai_self=ai_card["ai_self"], ai_identity=ai_card["ai_identity"],
-            summary=summary, units=units)
+            user_self_representation=user_card["user_self_representation"], user_preferences=user_card["user_preferences"],
+            ai_self_representation=ai_card["ai_self_representation"], ai_identity=ai_card["ai_identity"],
+            summary=summary, value_markers=value_markers)
         if not _valid_artifact(content):
             raise LayerMergeError(f"base refresh for {subject} assembled an invalid artifact")
         summary_md = summary
         chunk_text = summary_md.split("\n", 1)[1].strip()
         parts = {
-            "user_representation": json.dumps(user_card["user_self"], ensure_ascii=False),
+            "user_representation": json.dumps(user_card["user_self_representation"], ensure_ascii=False),
             "user_peer_card": json.dumps(user_card["user_preferences"], ensure_ascii=False),
-            "ai_self_representation": json.dumps(ai_card["ai_self"], ensure_ascii=False),
+            "ai_self_representation": json.dumps(ai_card["ai_self_representation"], ensure_ascii=False),
             "ai_identity_card": json.dumps(ai_card["ai_identity"], ensure_ascii=False),
-            "session_chunk_summary": json.dumps(summary, ensure_ascii=False),
-            "value_markers": json.dumps({"units": units}, ensure_ascii=False),
+            "window_summary": json.dumps(summary, ensure_ascii=False),
+            "value_markers": json.dumps({"value_markers": value_markers}, ensure_ascii=False),
         }
         return content, parts, chunk_text
 
@@ -1076,18 +1077,18 @@ class LayerWorker:
                                                   session_id=session,
                                                   ai_subject=self.dialectic_subject())
             logger.info("Minir %s layer published %s v%d for job #%s", layer, subject, version, job_id)
-        units: list[dict[str, Any]] = []
+        value_markers: list[dict[str, Any]] = []
         for record in refreshes:
             subject = str(record.pop("subject"))
             self._store.add_base_refresh(session, subject, **record)
             try:
-                units.extend(json.loads(str(record.get("value_markers") or "{}")).get("units")
+                value_markers.extend(json.loads(str(record.get("value_markers") or "{}")).get("value_markers")
                              or [])
             except (json.JSONDecodeError, AttributeError, TypeError):
                 pass
-        if layer == BASE_LAYER and units and self._on_units is not None:
+        if layer == BASE_LAYER and value_markers and self._on_value_markers is not None:
             try:
-                self._on_units(session, units)
+                self._on_value_markers(session, value_markers)
             except Exception as exc:  # the knowledge pipeline must not fail a base job
                 logger.warning("Minir knowledge enqueue failed: %s", exc)
         self._store.complete_job(job_id, end)
@@ -1175,9 +1176,9 @@ class LayerWorker:
         summary are not re-derived because the window holds no evidence about them.
         """
         baseline = layers.artifact_from_columns(previous_row)
-        user_card = {"user_self": baseline.get("user_self") or {},
+        user_card = {"user_self_representation": baseline.get("user_self_representation") or {},
                      "user_preferences": baseline.get("user_preferences") or {}}
-        ai_baseline = {"ai_self": baseline.get("ai_self") or {},
+        ai_baseline = {"ai_self_representation": baseline.get("ai_self_representation") or {},
                        "ai_identity": baseline.get("ai_identity") or {}}
         system = self._system(layers.load_core("b2_ai_card"), layers.OUTPUT_B2,
                               [self._rule("ai-self"), self._rule("ai-identity")])
@@ -1211,22 +1212,22 @@ class LayerWorker:
         empty; the first real window fills it.
         """
         cards = global_cards or {}
-        user_self = cards.get("user_self") or layers.preset_user_self(self._language)
+        user_self_representation = cards.get("user_self_representation") or layers.preset_user_self_representation(self._language)
         user_preferences = cards.get("user_preferences") or layers.empty_user_preferences()
         ai_identity = cards.get("ai_identity") or layers.empty_ai_identity()
         parts = {
-            "user_representation": json.dumps(user_self, ensure_ascii=False),
+            "user_representation": json.dumps(user_self_representation, ensure_ascii=False),
             "user_peer_card": json.dumps(user_preferences, ensure_ascii=False),
-            "ai_self_representation": json.dumps(layers.empty_ai_self(), ensure_ascii=False),
+            "ai_self_representation": json.dumps(layers.empty_ai_self_representation(), ensure_ascii=False),
             "ai_identity_card": json.dumps(ai_identity, ensure_ascii=False),
-            "session_chunk_summary": json.dumps(summary_template.empty_summary(),
+            "window_summary": json.dumps(summary_template.empty_summary(),
                                                 ensure_ascii=False),
-            "value_markers": json.dumps({"units": []}, ensure_ascii=False),
+            "value_markers": json.dumps({"value_markers": []}, ensure_ascii=False),
         }
         content = layers.render_artifact(
-            user_self=user_self, user_preferences=user_preferences,
-            ai_self=layers.empty_ai_self(), ai_identity=ai_identity,
-            summary=summary_template.empty_summary(), units=[])
+            user_self_representation=user_self_representation, user_preferences=user_preferences,
+            ai_self_representation=layers.empty_ai_self_representation(), ai_identity=ai_identity,
+            summary=summary_template.empty_summary(), value_markers=[])
         if not _valid_artifact(content):
             raise LayerMergeError(f"preset baseline for {subject} assembled an invalid artifact")
         record = {"subject": subject,
@@ -1313,7 +1314,7 @@ class LayerWorker:
                 body, from_turn=base_row.get("window_from_turn"),
                 to_turn=base_row.get("window_to_turn"))
             if not chunk_version:
-                changes.pop("session_chunk_summary", None)
+                changes.pop("window_summary", None)
                 changed_parts.remove("window_summary")
         # Version fence: the correction belongs to the base row this review read. If a newer
         # base published while the review was running, discard the whole review rather than
