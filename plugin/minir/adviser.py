@@ -1,14 +1,18 @@
-"""adviser — the auxiliary model route the plugin's agents call.
+"""adviser — the auxiliary model routes the plugin's agents call.
 
-The route (``auxiliary.adviser``) is owned here: ``ctx.register_auxiliary_task("adviser")``
-creates the config block, its model-picker entry and the ``AUXILIARY_ADVISER_*`` env bridge, and
-``agent_loop`` consumes it for every peer run. This module also registers the read-only host
-session search, which now lives in the ``minir`` toolset (``minir_hermes_session_search``).
+Four routes are owned here: ``auxiliary.adviser`` for the adviser chain, and three for the layer
+passes — ``auxiliary.minir_dialectic`` (base B1-B3 and the dialectic review share it),
+``auxiliary.minir_card_view`` (the three-day card review) and ``auxiliary.minir_knowledge``
+(idle-session knowledge extraction). ``ctx.register_auxiliary_task`` creates each config block,
+its model-picker entry and the ``AUXILIARY_<KEY>_*`` env bridge; ``agent_loop`` and the one-shot
+client consume them by key. This module also registers the read-only host session search, which
+now lives in the ``minir`` toolset (``minir_hermes_session_search``).
 
 There is no model-visible consult tool: the reviewer's synchronous entry point was deleted with
 its schema, handler, dynamic registration, prompt section and toolset. ``AdviserMode.consult``
 remains a programmatic entry for callers inside this process; the similarly named
-``worker._adviser_consult`` is the layer passes' internal route and stays.
+``worker._adviser_consult`` is the layer passes' internal route and stays, now on
+``auxiliary.minir_dialectic``.
 
 Everything is lazy: importing this module never touches the host's config, credentials, or model
 client, so the memory provider keeps loading when the adviser is never used.
@@ -24,20 +28,34 @@ from . import file_guard, session_search
 logger = logging.getLogger(__name__)
 
 TASK_KEY = "adviser"          # must be alnum/underscore; must not collide with a built-in aux task
+DIALECTIC_TASK = "minir_dialectic"
+CARD_VIEW_TASK = "minir_card_view"
+KNOWLEDGE_TASK = "minir_knowledge"
 
-# Plugin-owned keys layered under the user's ``auxiliary.adviser`` block. ``provider``/``model``
+#: The plugin's routes in picker order: (key, display name, what runs on it). Base and dialectic
+#: share one key on purpose: one model serves both, and only the prompt and output cap differ.
+AUX_TASKS: tuple[tuple[str, str, str], ...] = (
+    (TASK_KEY, "Adviser",
+     "Second-opinion adviser: model route for the memory plugin's in-process agent loop."),
+    (DIALECTIC_TASK, "Minir dialectic",
+     "Base passes (user card, AI card, window summary, value markers) and the dialectic review."),
+    (CARD_VIEW_TASK, "Minir card view", "Three-day card review; long context, no tools."),
+    (KNOWLEDGE_TASK, "Minir knowledge", "Idle-session knowledge page extraction."),
+)
+
+# Plugin-owned keys layered under the user's ``auxiliary.<task>`` block. ``provider``/``model``
 # pass straight through to ``agent_loop``; everything else (credentials, reasoning, budget) is
 # resolved by the loop itself.
 _CFG_DEFAULTS: dict[str, Any] = {"toolsets": []}
 
 
-def load_config() -> dict[str, Any]:
-    """Effective ``auxiliary.adviser`` config: plugin defaults < user config."""
+def load_config(task_key: str = TASK_KEY) -> dict[str, Any]:
+    """Effective ``auxiliary.<task_key>`` config: plugin defaults < user config."""
     try:
         from hermes_cli.config import load_config_readonly
 
         aux = (load_config_readonly() or {}).get("auxiliary") or {}
-        cfg = dict(aux.get(TASK_KEY) or {}) if isinstance(aux, dict) else {}
+        cfg = dict(aux.get(task_key) or {}) if isinstance(aux, dict) else {}
     except Exception:  # health: allow BLE001 -- a config read must never break the tool
         logger.debug("adviser: auxiliary config read failed", exc_info=True)
         cfg = {}
@@ -98,11 +116,14 @@ def register(ctx, provider: Any = None) -> None:
                      "search, session browse, transcript read, message window, stats."),
         emoji="🗂️",
     )
-    # The route is separate from the tool: a host that refuses the auxiliary key (another plugin
-    # owns it) still gets the read-only search, because the tool above already landed.
-    ctx.register_auxiliary_task(
-        TASK_KEY,
-        display_name="Adviser",
-        description="Second-opinion adviser: model route for the memory plugin's in-process agent loop.",
-        defaults={"toolsets": []},
-    )
+    # The routes are separate from the tool: a host that refuses an auxiliary key (another
+    # plugin owns it) still gets the read-only search, because the tool above already landed.
+    # Each key is registered on its own so one refusal cannot cost the other three.
+    for key, display_name, description in AUX_TASKS:
+        try:
+            ctx.register_auxiliary_task(
+                key, display_name=display_name, description=description,
+                defaults=dict(_CFG_DEFAULTS),
+            )
+        except Exception as exc:  # health: allow BLE001 -- one refused key costs one route
+            logger.warning("adviser: host refused the auxiliary key %s (%s)", key, exc)

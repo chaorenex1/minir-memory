@@ -26,36 +26,37 @@
 <tools>               可用工具与可读路径（不是命令，只是能力声明）
 ```
 
-## 0.5 模型路由：每层一个 auxiliary
+## 0.5 模型路由：三类 pass 三条 auxiliary
 
-现状是四层共用 `auxiliary.adviser` 一个路由（adviser.py:40、180）。分层之后各层的成本、上下文长度、工具需求差得太远，共用一个路由只能取最贵或最差的那一端。
+现状是四层共用 `auxiliary.adviser` 一个路由（`adviser.load_config` / `adviser.register`）。各 pass 的成本、上下文长度、工具需求差得太远，共用一个路由只能取最贵或最差的那一端。按层拆成四条又切错了边界：base 的每个 pass 输出很小、dialectic 要做判断，但两者的窗口与工具需求相同，拆两条只会让同一会话在两种档位之间来回切。所以按 pass 类别分三条：
 
-改成四个 auxiliary task，每个对应一个配置块：
-
-| 层 | task key | 配置块 | 默认 toolsets | 输出上限 | 典型模型档位 |
+| pass | task key | 配置块 | 默认 toolsets | 输出上限 | 典型模型档位 |
 | --- | --- | --- | --- | --- | --- |
-| base | `minir_base` | `auxiliary.minir_base` | file, session_search | 每 pass 2000 | 中档，短输出高频 |
+| base B1 用户卡 | `minir_dialectic` | `auxiliary.minir_dialectic` | file, session_search | 2000 | 中高档，与 dialectic 同档 |
+| base B2 AI 卡 | `minir_dialectic` | 同上 | file, session_search | 2000 | 同上 |
+| base B3 窗口摘要 | `minir_dialectic` | 同上 | file, session_search | 2000 | 同上 |
+| base B3 value markers | `minir_dialectic` | 同上 | file, session_search | 2000 | 同上 |
 | dialectic | `minir_dialectic` | `auxiliary.minir_dialectic` | file, session_search | 2000 | 中高档，要做判断 |
-| card_review | `minir_card_review` | `auxiliary.minir_card_review` | file | 9000 | 长上下文，三天一次 |
+| card_view | `minir_card_view` | `auxiliary.minir_card_view` | 无 | 9000 | 长上下文，三天一次 |
 | knowledge | `minir_knowledge` | `auxiliary.minir_knowledge` | 无 | 2500 | 便宜快速，一主题一次 |
 
-- 命名规则按宿主要求：字母数字下划线，不与内置 aux task 冲突（adviser.py:40 的注释）。四个 task 共用一个调用实现，按 task 取配置，不各写一套循环。注册侧把 `adviser.register` 扩成注册四个 task，各自带插件默认值；`auxiliary.adviser` 那条与 adviser 链路保持原样。
+- 命名规则按宿主要求：字母数字下划线，不与内置 aux task 冲突（见 `adviser.TASK_KEY` 的注释）。三个 task 共用一个调用实现，按 task 取配置，不各写一套循环。注册侧在 `adviser` 之外再注册三个 task，各自带插件默认值，一个 key 被宿主拒绝不影响另外两个；`auxiliary.adviser` 那条与 adviser 链路保持原样。
+- base 的四个 pass 与 dialectic 共用 `minir_dialectic`：两边的差异只留在输出上限与提示词，不再各配 provider/model。per-pass 的 `max_tokens` 是代码常量，不来自配置。
+- 工具由代码固定，配置只做加法：`tools.agent_toolsets` 总补 file / minir / skills，所以 `auxiliary.minir_dialectic.toolsets` 收窄不了 base 与 dialectic 的授权，只给读取配置的 pass（knowledge）追加。复盘是一次 one-shot 调用，不开工具。
+- one-shot 回退沿用同一批 task key（`minir_dialectic` / `minir_card_view` / `minir_knowledge`）：现存的 `minir_base_layer`、`minir_dialectic_layer` 两个回退 key 删除，不留第二套名字。
+- `card_view` 只是这条 pass 的 aux key：`card_review` 层名、`card_review.py`、`CARD_SCOPE_*` 与 `card_revisions` 表都不改名。
 
 ```yaml
 auxiliary:
   adviser: { ... }                 # 保留，adviser 链路照旧
-  minir_base:
-    provider: <provider>
-    model: <mid-tier-model>
-    toolsets: [file, session_search]
   minir_dialectic:
     provider: <provider>
     model: <strong-model>
     toolsets: [file, session_search]
-  minir_card_review:
+  minir_card_view:
     provider: <provider>
     model: <long-context-model>
-    toolsets: [file]
+    toolsets: []
   minir_knowledge:
     provider: <provider>
     model: <cheap-fast-model>
@@ -64,8 +65,8 @@ auxiliary:
 
 规则：
 
-- 缺 `auxiliary.minir_*` 时回退到 `auxiliary.adviser`，首次回退记一条 warn。这样老配置升级后不会立刻停摆，但日志里能看见该补配置了。
-- `auxiliary.adviser` 也缺：该层作业失败，记 `aux_missing`，不无限重试。
+- 缺 `auxiliary.minir_*` 不是错误：`agent_loop` 拿到空 model/provider，用 gateway 的默认模型；one-shot 回退由宿主的 auto chain 解析（主模型优先）。要把一条路由钉住，就必须写这个块。
+- 路由本身失败（宿主模块缺失、配置错、provider 故障）时，该 pass 回退到 `worker.call_model` 的同一个 key；两段都失败则该层作业失败、保留上一版 artifact，不无限重试。
 - 密钥只在宿主配置里，插件不读、不记、不写。日志只记 provider 与 model 名。
 - 并发上限 3：layer worker 一条、review scheduler 一条、knowledge consumer 一条。其余排队，不各开线程池。
 - 每次调用记 `layer`、`aux_task`、`provider`、`model`、`est_tokens`、`latency_ms`、`outcome`；artifact 元数据里记 `produced_by = <aux_task>/<model>`，回滚时能定位是哪条路由产出的。
@@ -88,7 +89,7 @@ auxiliary:
 
 把当前窗口的事实转成四份卡内容，写进**会话 artifact**。它不写全局文件，不改历史 artifact，不做复盘。
 
-模型路由：`auxiliary.minir_base`，B1/B2/B3 共用一条路由，三个 pass 串行。
+模型路由：`auxiliary.minir_dialectic`，B1/B2/B3 共用这一条（与 dialectic 层同一条），三个 pass 串行。
 
 | pass | 负责 section | 不负责 |
 | --- | --- | --- |
@@ -386,7 +387,7 @@ extra key.
 
 对最新已发布的 base artifact 做常驻校订：用 base 尚未覆盖的证据纠正正文、补空段、把窗口摘要推进到当前。它就地写回 artifact，受版本栅栏保护。它不做复盘，不写文件，不删条目。
 
-模型路由：`auxiliary.minir_dialectic`。它需要判断力，但输出小，比 base 用更强的档位是合理的。
+模型路由：`auxiliary.minir_dialectic`，与 base 的三个 pass 共用。它需要判断力，但输出小；共用一条路由意味着两层同档位，base 不再单独配更便宜的模型。
 
 ### 2.2 输入
 
@@ -493,7 +494,7 @@ prunings. The three sections are complete replacements, not patches. No prose.
 
 把三天的会话卡合并成四份全局卡文件。它是唯一允许剪枝的角色，也是唯一写全局卡的角色。它不写会话 artifact，不写知识文件。
 
-模型路由：`auxiliary.minir_card_review`。输入是 20 份 artifact 加四份文件，长上下文比低价格更重要。
+模型路由：`auxiliary.minir_card_view`。输入是 20 份 artifact 加四份文件，长上下文比低价格更重要。
 
 ### 3.2 输入
 

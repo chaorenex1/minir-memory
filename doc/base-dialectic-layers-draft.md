@@ -140,7 +140,7 @@
 | 产物预算 | 3900 / 4000 字符（worker.py:77、store.py:64） | 40 字段 | 预算重排 |
 | 用户卡首次 | 无预设，13 字段全空 | 软件工程师预设：1 个 occupation 初值 + 12 个空字段 | prompt、校验 |
 | FILE 工具 | toolsets 缺省 = 全部工具（agent_loop.py:147）；file 取决于配置 | 固定 file 四项 + 读写范围守卫 | toolset、hook |
-| 模型路由 | 四层共用 `auxiliary.adviser` | 每层一条 `auxiliary.minir_*`，可各自换模型 | 配置、worker 调用 |
+| 模型路由 | 四层共用 `auxiliary.adviser` | 按 pass 类别三条 `auxiliary.minir_*`（base 与 dialectic 共用 `minir_dialectic`，复盘 `minir_card_view`，知识 `minir_knowledge`），可各自换模型 | 配置、worker 调用 |
 | 卡存储 | 只有 DB artifact | 四份 md 为当前状态，DB 记 revision | 文件层 + 表 |
 | 复盘 | 无 | 3 天墙钟、跨会话、允许剪枝 | 新 layer、worker 分支 |
 | 卡作用域 | 只有会话级 artifact | 会话快照在 DB，全局卡在四个 md | store、prompt |

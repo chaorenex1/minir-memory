@@ -169,7 +169,7 @@ def worker(plugin_package, store, transcript):
 
     def complete(task, system, prompt, **kwargs):
         calls.append({"task": task, "system": system, "prompt": prompt})
-        if task == plugin_package.worker.DIALECTIC_LAYER_TASK:
+        if "dialectic reviewer" in system:
             return _dialectic_json()
         if "baseline_user_card" in prompt:
             return _user_json()
@@ -687,10 +687,10 @@ def test_call_model_passes_the_task_key_and_returns_the_text(plugin_package, mon
     fake = _FakeAuxiliary(content="## Identity\n- x")
     _install_fake_aux(plugin_package, monkeypatch, fake)
     text = plugin_package.worker.call_model(
-        plugin_package.worker.BASE_LAYER_TASK, "SYS", "USER", timeout=12.5, max_tokens=64)
+        plugin_package.worker.DIALECTIC_TASK, "SYS", "USER", timeout=12.5, max_tokens=64)
     assert text == "## Identity\n- x"
     call = fake.calls[0]
-    assert call["task"] == "minir_base_layer"
+    assert call["task"] == "minir_dialectic"
     assert [message["role"] for message in call["messages"]] == ["system", "user"]
     assert [message["content"] for message in call["messages"]] == ["SYS", "USER"]
     assert (call["temperature"], call["max_tokens"], call["timeout"]) == (0, 64, 12.5)
@@ -1003,13 +1003,16 @@ def test_a_broken_window_template_fails_the_job_without_a_format_retry(
 
 
 @pytest.mark.real_adviser_route
-def test_base_refresh_runs_on_the_adviser_route_with_the_plugin_toolset(
+def test_base_refresh_runs_on_the_dialectic_route_with_the_plugin_toolset(
         plugin_package, store, transcript, monkeypatch):
     requests: list[dict] = []
+    route_keys: list[str] = []
 
-    monkeypatch.setattr(plugin_package.adviser, "load_config",
-                        lambda: {"provider": "deepseek", "model": "deepseek-v4-flash",
-                                 "toolsets": ["file"]})
+    def load_config(task_key=plugin_package.adviser.TASK_KEY):
+        route_keys.append(task_key)
+        return {"provider": "deepseek", "model": "deepseek-v4-flash", "toolsets": ["file"]}
+
+    monkeypatch.setattr(plugin_package.adviser, "load_config", load_config)
 
     def run(message, **kwargs):
         requests.append({"message": message, **kwargs})
@@ -1022,6 +1025,8 @@ def test_base_refresh_runs_on_the_adviser_route_with_the_plugin_toolset(
     _dispatch(store, transcript, SESSION, BASE, 0.0, 20.0)
     assert instance.run_once() == 1
     assert len(requests) == 4, "user cards, AI cards, the summary, then the value_markers"
+    assert set(route_keys) == {plugin_package.adviser.DIALECTIC_TASK}, \
+        "every base pass reads the one route base shares with the dialectic"
     for request in requests:
         assert request["provider"] == "deepseek"
         assert request["model"] == "deepseek-v4-flash"
@@ -1134,19 +1139,19 @@ def test_a_base_job_does_not_queue_the_review(plugin_package, store, transcript)
         return (_dialectic_json(
                     user_preferences="## Preferences\n\n- Communication: Ships on Fridays only.",
                     changed=True, fields=["user_preferences"])
-                if task == plugin_package.worker.DIALECTIC_LAYER_TASK
+                if "dialectic reviewer" in system
                 else _reply_for(prompt))
 
     transcript.add(SESSION, "user", "ship it", created_at=10.0)
     _dispatch(store, transcript, SESSION, BASE, 0.0, 20.0)
     instance = plugin_package.worker.LayerWorker(store, transcript, complete=complete)
     assert instance.run_once() == 1
-    assert calls == [plugin_package.worker.BASE_LAYER_TASK] * 4
+    assert calls == [plugin_package.worker.DIALECTIC_TASK] * 4
     assert store.pending_jobs() == [], "no review was queued by the base job"
 
     _dispatch(store, transcript, SESSION, DIALECTIC, 0.0, 20.0)
     assert instance.run_once() == 1
-    assert calls[-1] == plugin_package.worker.DIALECTIC_LAYER_TASK
+    assert calls[-1] == plugin_package.worker.DIALECTIC_TASK
     note = store.layer_state(DIALECTIC, "agent:default:minir")["content"]
     assert note.startswith("## Base Revision") and "user_preferences" in note
     assert store.pending_advisories(SESSION) == [], "the dialectic produces no advice"
@@ -1181,7 +1186,7 @@ def test_dialectic_revision_snapshots_the_old_base_and_applies_the_change(
     direct = "## Preferences\n\n- Communication: direct"
 
     def complete(task, system, prompt, **kwargs):
-        if task == plugin_package.worker.DIALECTIC_LAYER_TASK:
+        if "dialectic reviewer" in system:
             return _dialectic_json(user_preferences=terse, changed=True,
                                    fields=["user_preferences"])
         if "baseline_user_card" in prompt:
@@ -1210,7 +1215,7 @@ def test_dialectic_revision_snapshots_the_old_base_and_applies_the_change(
 
 def test_an_unchanged_review_creates_no_revision(plugin_package, store, transcript):
     def complete(task, system, prompt, **kwargs):
-        if task == plugin_package.worker.DIALECTIC_LAYER_TASK:
+        if "dialectic reviewer" in system:
             return _dialectic_json(changed=True, fields=["user_preferences"])
         return _reply_for(prompt)
 
@@ -1226,7 +1231,7 @@ def test_an_unchanged_review_creates_no_revision(plugin_package, store, transcri
 def test_a_listed_empty_part_is_refused(plugin_package, store, transcript):
     """The dialectic may correct, not clear: an empty listed body fails the review."""
     def complete(task, system, prompt, **kwargs):
-        if task == plugin_package.worker.DIALECTIC_LAYER_TASK:
+        if "dialectic reviewer" in system:
             return _dialectic_json(user_preferences="", changed=True,
                                    fields=["user_preferences"])
         if "baseline_user_card" in prompt:
@@ -1247,7 +1252,7 @@ def test_a_listed_empty_part_is_refused(plugin_package, store, transcript):
 
 def test_an_empty_part_outside_a_listed_change_is_ignored(plugin_package, store, transcript):
     def complete(task, system, prompt, **kwargs):
-        if task == plugin_package.worker.DIALECTIC_LAYER_TASK:
+        if "dialectic reviewer" in system:
             return _dialectic_json(user_preferences="")  # empty, but base_changed omits it
         if "baseline_user_card" in prompt:
             return _user_json(user_preferences=_user_prefs())
@@ -1285,13 +1290,14 @@ def test_a_sparse_base_window_is_reviewed_without_inventing_cards(plugin_package
 
 def test_a_review_whose_base_moved_is_discarded(plugin_package, store, transcript):
     """Version fence: a newer base published mid-review discards the whole correction."""
-    seen: list[str] = []
+    reviews = 0
     newer = "## Preferences\n\n- Communication: newer base"
     mutated = "## Preferences\n\n- Communication: mutated"
 
     def complete(task, system, prompt, **kwargs):
-        seen.append(task)
-        if task == plugin_package.worker.DIALECTIC_LAYER_TASK:
+        nonlocal reviews
+        if "dialectic reviewer" in system:
+            reviews += 1
             # The base layer publishes a newer window while this review is in flight.
             moved = store.latest_base_refresh(SESSION, "user:default")
             store.add_base_refresh(
@@ -1320,7 +1326,7 @@ def test_a_review_whose_base_moved_is_discarded(plugin_package, store, transcrip
     assert dialectic_worker.run_once() == 1
 
     after = store.latest_base_refresh(SESSION, "user:default")
-    assert seen.count("minir_dialectic_layer") == 1
+    assert reviews == 1, "one review ran; its stale correction was discarded"
     assert after["id"] != before["id"], "the newer base is the live artifact"
     assert json.loads(after["user_peer_card"]) == newer
     assert store.base_revisions(SESSION) == [], "a stale review writes nothing"
@@ -1372,8 +1378,13 @@ def test_dialectic_route_appends_the_plugin_toolset_explicitly(
                  else _reply_for(message))
         return type("Run", (), {"answer": reply})()
 
-    monkeypatch.setattr(plugin_package.adviser, "load_config",
-                        lambda: {"provider": "deepseek", "model": "m", "toolsets": []})
+    route_keys: list[str] = []
+
+    def load_config(task_key=plugin_package.adviser.TASK_KEY):
+        route_keys.append(task_key)
+        return {"provider": "deepseek", "model": "m", "toolsets": []}
+
+    monkeypatch.setattr(plugin_package.adviser, "load_config", load_config)
     monkeypatch.setattr(plugin_package.agent_loop, "run", run)
     transcript.add(SESSION, "user", "grounded by history", created_at=10.0)
     _dispatch(store, transcript, SESSION, BASE, 0.0, 20.0)
@@ -1382,10 +1393,25 @@ def test_dialectic_route_appends_the_plugin_toolset_explicitly(
     assert instance.run_once() == 2
 
     assert len(requests) == 5, "four base passes then one dialectic pass"
+    assert set(route_keys) == {plugin_package.adviser.DIALECTIC_TASK}
     dialectic = requests[-1]
     assert "minir" in dialectic["toolsets"]
     assert "dialectic reviewer" in dialectic["system_message"]
     assert "Base artifact for this window" in dialectic["message"]
+
+
+def test_the_card_review_rides_the_card_view_route(plugin_package, store, transcript):
+    """The three-day review is one no-tool call on its own key, not the layer route."""
+    calls: list[dict] = []
+
+    def complete(task, system, prompt, **kwargs):
+        calls.append({"task": task, "system": system, "prompt": prompt, **kwargs})
+        return "{}"
+
+    instance = plugin_package.worker.LayerWorker(store, transcript, complete=complete)
+    assert instance.review_cards("SYS", "PROMPT") == "{}"
+    assert calls == [{"task": "minir_card_view", "system": "SYS", "prompt": "PROMPT",
+                      "max_tokens": 9000, "timeout": 180}]
 
 
 # -- the four-section artifact -------------------------------------------------
@@ -1429,7 +1455,7 @@ def test_an_unchanged_identity_source_keeps_the_previous_identity(
     replies = {"identity": _identity(persona="measured")}
 
     def complete(task, system, prompt, **kwargs):
-        if task == plugin_package.worker.DIALECTIC_LAYER_TASK:
+        if "dialectic reviewer" in system:
             return _dialectic_json()
         if "baseline_user_card" in prompt:
             return _user_json()
@@ -1587,7 +1613,7 @@ def test_a_profile_rule_override_reaches_the_pass_system_prompt(
 def test_an_empty_part_echo_is_not_a_revision(plugin_package, store, transcript):
     """The base row stores an empty body as a JSON string; an empty echo is not a change."""
     def complete(task, system, prompt, **kwargs):
-        if task == plugin_package.worker.DIALECTIC_LAYER_TASK:
+        if "dialectic reviewer" in system:
             return _dialectic_json(user_preferences="", changed=True,
                                    fields=["user_preferences"])
         if "baseline_user_card" in prompt:

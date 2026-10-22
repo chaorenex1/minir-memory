@@ -39,11 +39,12 @@ def adviser(plugin_package, host):
 class FakeCtx:
     """The plugin-context surface ``adviser.register`` uses, with the calls recorded."""
 
-    def __init__(self, fail_aux: bool = False):
+    def __init__(self, fail_aux: bool = False, refuse: str = ""):
         self.calls: list[tuple[str, dict]] = []
         self.memory_providers: list[object] = []
         self.hooks: list[str] = []
         self.fail_aux = fail_aux
+        self.refuse = refuse
 
     def register_memory_provider(self, provider):
         self.memory_providers.append(provider)
@@ -52,7 +53,7 @@ class FakeCtx:
         self.hooks.append(name)
 
     def register_auxiliary_task(self, key, **kwargs):
-        if self.fail_aux:
+        if self.fail_aux or key == self.refuse:
             raise ValueError("another plugin's key")
         self.calls.append(("auxiliary_task", {"key": key, **kwargs}))
 
@@ -69,6 +70,17 @@ def test_config_reads_the_adviser_block(adviser, host):
 
     assert adviser.load_config() == {"toolsets": ["file"], "provider": "openrouter",
                                      "model": "some/other"}
+
+
+def test_each_layer_route_reads_its_own_block(adviser, host):
+    """Base, the review and extraction pin independently; the adviser block is not a fallback."""
+    host["config"]["auxiliary"][adviser.DIALECTIC_TASK] = {"model": "strong"}
+    host["config"]["auxiliary"][adviser.KNOWLEDGE_TASK] = {"model": "cheap"}
+
+    assert adviser.load_config(adviser.DIALECTIC_TASK) == {"toolsets": [], "model": "strong"}
+    assert adviser.load_config(adviser.KNOWLEDGE_TASK) == {"toolsets": [], "model": "cheap"}
+    assert adviser.load_config(adviser.CARD_VIEW_TASK) == {"toolsets": []}
+    assert adviser.load_config() == {"toolsets": []}
 
 
 def test_missing_config_keeps_the_plugin_defaults(adviser, monkeypatch):
@@ -92,23 +104,39 @@ def test_the_consult_tool_is_gone(adviser):
         assert not hasattr(adviser, symbol), symbol
 
 
-def test_register_declares_the_route_and_the_session_search(adviser):
+def test_register_declares_the_routes_and_the_session_search(adviser):
     ctx = FakeCtx()
 
     adviser.register(ctx)
 
-    (tool_kind, tool), (kind, entry) = ctx.calls
-    assert (kind, entry["key"]) == ("auxiliary_task", "adviser")
-    assert entry["display_name"] == "Adviser"
-    assert entry["defaults"] == {"toolsets": []}
-    assert (tool_kind, tool["name"], tool["toolset"]) == (
-        "tool", "minir_hermes_session_search", "minir")
+    tools = [entry for kind, entry in ctx.calls if kind == "tool"]
+    routes = [entry for kind, entry in ctx.calls if kind == "auxiliary_task"]
+    assert [route["key"] for route in routes] == [
+        "adviser", "minir_dialectic", "minir_card_view", "minir_knowledge"]
+    assert [route["display_name"] for route in routes] == [
+        "Adviser", "Minir dialectic", "Minir card view", "Minir knowledge"]
+    assert all(route["defaults"] == {"toolsets": []} for route in routes)
+    assert len(tools) == 1
+    tool = tools[0]
+    assert (tool["name"], tool["toolset"]) == ("minir_hermes_session_search", "minir")
     assert tool["schema"]["name"] == "minir_hermes_session_search"
     assert tool["is_async"] is False
     assert tool["schema"]["parameters"]["properties"]["mode"]["enum"] == [
         "search", "sessions", "messages", "around", "stats"]
     # The handler injects the caller class and platform; it is not the bare module function.
     assert callable(tool["handler"])
+
+
+def test_one_refused_key_costs_only_that_route(adviser):
+    """A key another plugin owns loses its route, not the other three or the search."""
+    ctx = FakeCtx(refuse="minir_card_view")
+
+    adviser.register(ctx)
+
+    assert [entry["key"] for kind, entry in ctx.calls if kind == "auxiliary_task"] == [
+        "adviser", "minir_dialectic", "minir_knowledge"]
+    assert [entry["name"] for kind, entry in ctx.calls if kind == "tool"] == [
+        "minir_hermes_session_search"]
 
 
 def test_manifest_declares_every_registered_adviser_tool(adviser, plugin_package):

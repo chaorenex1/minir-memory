@@ -99,7 +99,7 @@ def test_no_conversation_content_is_persisted_anywhere(plugin_package, make_prov
     monkeypatch.setenv("MINIR_REASONING_ENABLED", "true")
     monkeypatch.setattr(plugin_package.worker, "call_model", lambda task, system, prompt, **kwargs: (
         _dialectic_json()
-        if task == plugin_package.worker.DIALECTIC_LAYER_TASK else
+        if "dialectic reviewer" in system else
         _base_reply(prompt)))
     provider = make_provider({"base_interval": 1, "dialectic_interval": 1})
     provider.on_turn_start(1, "m")
@@ -458,7 +458,7 @@ def test_pre_compress_pauses_scheduling_and_resets_both_layers(plugin_package, m
     monkeypatch.setattr(plugin_package.worker, "call_model", lambda task, system, prompt, **kwargs: (
         _dialectic_json(peer=["wants evidence", "no emoji"], changed=True,
                         fields=["user_preferences"])
-        if task == plugin_package.worker.DIALECTIC_LAYER_TASK
+        if "dialectic reviewer" in system
         else _base_reply(prompt)))
     provider = make_provider({"base_interval": 2, "dialectic_interval": 2})
     for turn in range(1, 4):
@@ -485,7 +485,7 @@ def test_pre_compress_drains_base_and_dependent_dialectic(plugin_package, make_p
     monkeypatch.setattr(plugin_package.worker, "call_model", lambda task, system, prompt, **kwargs: (
         _dialectic_json(peer=["wants evidence", "no emoji"], changed=True,
                         fields=["user_preferences"])
-        if task == plugin_package.worker.DIALECTIC_LAYER_TASK
+        if "dialectic reviewer" in system
         else _base_reply(prompt)))
 
     provider = make_provider({"base_interval": 50, "dialectic_interval": 10})
@@ -711,7 +711,7 @@ def test_layer_reasoning_runs_end_to_end(plugin_package, make_provider, monkeypa
     monkeypatch.setenv("MINIR_REASONING_ENABLED", "true")
     monkeypatch.setattr(plugin_package.worker, "call_model", lambda task, system, prompt, **kw: (
         _dialectic_json(peer=["no emoji"], changed=True, fields=["user_preferences"])
-        if task == plugin_package.worker.DIALECTIC_LAYER_TASK else
+        if "dialectic reviewer" in system else
         _base_reply(prompt)))
 
     provider = make_provider({"base_interval": 1, "dialectic_interval": 1}, agent_identity="Masía")
@@ -903,7 +903,7 @@ def test_layers_reason_from_host_history_and_publish_searchable_sections(
     monkeypatch.setattr(plugin_package.worker, "call_model", lambda task, system, prompt, **kw: (
         _dialectic_json(peer=["wants evidence", "no emoji"], changed=True,
                         fields=["user_preferences"])
-        if task == plugin_package.worker.DIALECTIC_LAYER_TASK else
+        if "dialectic reviewer" in system else
         _base_reply(prompt)))
     provider = make_provider({"base_interval": 1, "dialectic_interval": 1})
     state_path = tmp_path / "state.db"

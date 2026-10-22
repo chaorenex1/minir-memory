@@ -4,7 +4,7 @@ One job = "reason over session S's history in ``(from_ts, to_ts]``" (see ``store
 This module is what turns that row into a published layer artifact:
 
 * **base layer** — one artifact for this profile's user, built in three staged JSON passes on
-  the ``auxiliary.adviser`` agent route: user representation + user peer card (from the previous
+  the ``auxiliary.minir_dialectic`` agent route: user representation + user peer card (from the previous
   cards and this window, plus the first user message as intent anchor on bootstrap), AI
   self-representation + AI identity card (from the user cards, the previous AI cards and this
   window), then a local summary + value markers (entities/trajectories/experiences/tools/
@@ -21,7 +21,7 @@ This module is what turns that row into a published layer artifact:
   ``dialectic_depth``.
 
 The window's messages come from the host's ``state.db`` (read-only) plus the in-memory
-``TranscriptBuffer`` for turns the host has not committed yet. On the adviser route the passes
+``TranscriptBuffer`` for turns the host has not committed yet. On the agent route the passes
 are told to call ``minir_hermes_session_search`` with the window bounds when they need more evidence
 (the dialectic pass may also read earlier turns for drift); the one-shot fallback has no tools
 and never receives that instruction. No transcript
@@ -43,12 +43,12 @@ honest:
   fails the job, leaves the previous version in place and keeps the content watermark put, so the
   next job of that layer still owns the window.
 
-Base and dialectic passes run through ``agent_loop.run`` on the ``auxiliary.adviser`` route with
-the `minir` toolset attached explicitly (so a pass can ground itself with
-``minir_hermes_session_search``); if that route is unavailable the pass falls back to the host's
-one-shot auxiliary client under ``minir_base_layer`` / ``minir_dialectic_layer``. Imports are lazy
-and every failure is contained: a layer refresh must never break a turn, and the worker is a
-daemon thread the provider coalesces.
+Base and dialectic passes run through ``agent_loop.run`` on the ``auxiliary.minir_dialectic``
+route with the `minir` toolset attached explicitly (so a pass can ground itself with
+``minir_hermes_session_search``); they share that one route because only the prompt and the
+output cap differ. If the route is unavailable the pass falls back to the host's one-shot
+auxiliary client under the same key. Imports are lazy and every failure is contained: a layer
+refresh must never break a turn, and the worker is a daemon thread the provider coalesces.
 """
 
 from __future__ import annotations
@@ -62,11 +62,14 @@ import time
 from pathlib import Path
 from typing import Any, Callable, Optional, Sequence
 
+from . import adviser
 from . import card_review
 from . import history as host_history
 from . import layers
 from . import rules as layer_rules
 from . import window_summary as summary_template
+# The routes' keys are owned by ``adviser``; base and dialectic deliberately share one.
+from .adviser import CARD_VIEW_TASK, DIALECTIC_TASK
 from .prompting import data_block
 from .store import MinirStore
 from .transcript import HOST_LAYER, TranscriptBuffer
@@ -74,9 +77,6 @@ from . import transcript_prompt
 from .turn_counter import BASE_LAYER, DIALECTIC_LAYER
 
 logger = logging.getLogger(__name__)
-
-BASE_LAYER_TASK = "minir_base_layer"
-DIALECTIC_LAYER_TASK = "minir_dialectic_layer"
 
 _MAX_JOBS_PER_RUN = 6          # bound a catch-up burst (stale jobs from a previous process)
 _MAX_EVIDENCE_CHARS = 12_000   # window transcript handed to the model, newest messages kept
@@ -649,22 +649,22 @@ class LayerWorker:
         # Resolved here, not as a default argument: a host (or a test) may replace the module
         # function before the provider builds its worker.
         self._complete: Callable[..., str] = complete if callable(complete) else call_model
-        # Base and dialectic refreshes run as real adviser agent loops (``auxiliary.adviser``
-        # route + the minir toolset). An injected ``complete`` keeps tests and bare checkouts
-        # on the one-shot path they can stub; production without an injection uses the adviser.
-        # The two routes differ only in the fallback task key when the loop cannot run.
+        # Base and dialectic refreshes run as real agent loops on ``auxiliary.minir_dialectic``
+        # (the minir toolset attached). An injected ``complete`` keeps tests and bare checkouts
+        # on the one-shot path they can stub; production without an injection uses the loop.
+        # Both passes share the route, so they also share its one-shot fallback key.
         if callable(consult):
             self._consult = consult
             self._dialectic_consult = consult
         elif callable(complete):
-            self._consult = lambda system, prompt: complete(BASE_LAYER_TASK, system, prompt)
+            self._consult = lambda system, prompt: complete(DIALECTIC_TASK, system, prompt)
             self._dialectic_consult = lambda system, prompt: complete(
-                DIALECTIC_LAYER_TASK, system, prompt)
+                DIALECTIC_TASK, system, prompt)
         else:
             self._consult = lambda system, prompt: self._adviser_consult(
-                system, prompt, BASE_LAYER_TASK, _BASE_TOOL_HINT)
+                system, prompt, BASE_LAYER, _BASE_TOOL_HINT)
             self._dialectic_consult = lambda system, prompt: self._adviser_consult(
-                system, prompt, DIALECTIC_LAYER_TASK, _DIALECTIC_TOOL_HINT)
+                system, prompt, DIALECTIC_LAYER, _DIALECTIC_TOOL_HINT)
         self._lock = threading.Lock()
         self._thread: Optional[threading.Thread] = None
 
@@ -704,21 +704,19 @@ class LayerWorker:
         return self._consult(system, retry)
 
     def _adviser_consult(self, system: str, prompt: str,
-                         task_key: str = BASE_LAYER_TASK,
+                         layer: str = BASE_LAYER,
                          tool_hint: str = _BASE_TOOL_HINT) -> str:
-        """One refresh pass on the ``auxiliary.adviser`` agent route.
+        """One refresh pass on the ``auxiliary.minir_dialectic`` agent route.
 
         The minir toolset is always attached explicitly: ``agent_loop`` does not add it,
         so a caller that skipped this step would silently lose ``minir_hermes_session_search``.
         A failed route (host module absent, bad config, provider outage) falls back to the
-        one-shot client under *task_key* rather than leaving the layer unrefreshed.
+        one-shot client under the same key rather than leaving the layer unrefreshed.
         """
         try:
-            from . import adviser, agent_loop, session_search, tools
+            from . import agent_loop, session_search, tools
 
-            cfg = adviser.load_config()
-            layer_name = {"minir_base_layer": BASE_LAYER,
-                          "minir_dialectic_layer": DIALECTIC_LAYER}.get(task_key, "aux")
+            cfg = adviser.load_config(DIALECTIC_TASK)
             # Fixed surface: the host's file tools (granted by ``agent_toolsets``, scoped by
             # ``agent_loop``) plus this plugin's session search and its own toolset. Never the
             # operator's adviser toolsets and never None, which the host reads as "every tool".
@@ -728,13 +726,13 @@ class LayerWorker:
                 provider=str(cfg.get("provider") or ""),
                 api_mode=str(cfg.get("api_mode") or ""), toolsets=toolsets,
                 system_message=f"{system}\n\n{tool_hint}",
-                layer=layer_name)
-            self._record_aux(task_key, system, result, cfg, toolsets)
+                layer=layer)
+            self._record_aux(layer, system, result, cfg, toolsets)
             return str(result.answer or "")
         except Exception as exc:
-            logger.warning("Minir %s adviser route failed (%s); falling back to the one-shot client",
-                           task_key, exc)
-            return self._complete(task_key, system, prompt)
+            logger.warning("Minir %s agent route failed (%s); falling back to the one-shot client",
+                           layer, exc)
+            return self._complete(DIALECTIC_TASK, system, prompt)
 
     def _first_user_message(self, session: str) -> str:
         """The session's first user turn via ``minir_hermes_session_search`` (bounded, read-only)."""
@@ -786,14 +784,12 @@ class LayerWorker:
                        ensure_ascii=False),
             ai_subject=self.dialectic_subject())
 
-    def _record_aux(self, task_key: str, system: str, result: Any, cfg: dict[str, Any],
+    def _record_aux(self, layer: str, system: str, result: Any, cfg: dict[str, Any],
                     toolsets: list[str]) -> None:
         """Persist the pass's own trace: the caller's transcript is the host's, not ours."""
         messages = tuple(getattr(result, "messages", ()) or ())
         if not messages:
             return
-        layer = {"minir_base_layer": BASE_LAYER, "minir_dialectic_layer": DIALECTIC_LAYER,
-                 "minir_card_review": "card_review"}.get(task_key, "aux")
         try:
             self._transcript.record_aux(
                 layer, f"{layer}-{int(time.time() * 1000)}", messages,
@@ -804,7 +800,7 @@ class LayerWorker:
 
     def review_cards(self, system: str, prompt: str) -> str:
         """One three-day review pass. No tools: the files and evidence are already inline."""
-        return self._complete("minir_card_review", system, prompt,
+        return self._complete(CARD_VIEW_TASK, system, prompt,
                               max_tokens=9000, timeout=180)
 
     def _rule(self, rule_id: str) -> str:

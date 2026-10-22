@@ -378,8 +378,8 @@ def _no_real_adviser_route(plugin_package, monkeypatch, request):
         return
     worker = plugin_package.worker
 
-    def _consult(self, system, prompt, task_key=worker.BASE_LAYER_TASK, tool_hint=""):
-        return self._complete(task_key, system, prompt)
+    def _consult(self, system, prompt, layer=worker.BASE_LAYER, tool_hint=""):
+        return self._complete(worker.DIALECTIC_TASK, system, prompt)
 
     monkeypatch.setattr(worker.LayerWorker, "_adviser_consult", _consult)
 

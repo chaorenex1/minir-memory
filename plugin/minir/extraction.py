@@ -200,7 +200,7 @@ def extract_pages(*, session_id: str, summary: str, handoff: str, markers: Any =
     def run() -> str:
         from . import adviser
 
-        cfg = adviser.load_config()
+        cfg = adviser.load_config(adviser.KNOWLEDGE_TASK)
         result = agent_loop.run(
             prompt, model=str(cfg.get("model") or ""),
             provider=str(cfg.get("provider") or ""),

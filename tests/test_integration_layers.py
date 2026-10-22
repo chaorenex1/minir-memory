@@ -26,7 +26,7 @@ def test_a_base_publish_hands_its_units_to_the_knowledge_pipeline(plugin_package
     captured: list[tuple[str, list[dict]]] = []
 
     def complete(task, system, prompt, **kwargs):
-        if task == plugin_package.worker.DIALECTIC_LAYER_TASK:
+        if "dialectic reviewer" in system:
             return "{}"
         if "baseline_user_card" in prompt or "Baseline user card" in prompt:
             return json.dumps({
@@ -69,7 +69,7 @@ def test_prefetch_injects_only_a_knowledge_path_block(plugin_package, make_provi
 def test_an_aux_run_writes_its_own_transcript(plugin_package, store, transcript, tmp_path):
     instance = plugin_package.worker.LayerWorker(store, transcript)
     result = SimpleNamespace(answer="{}", messages=({"role": "user", "content": "hi"},))
-    instance._record_aux("minir_base_layer", "system", result,
+    instance._record_aux(plugin_package.worker.BASE_LAYER, "system", result,
                         {"model": "m", "provider": "p"}, ["file", "adviser"])
     transcript.flush()
     deadline = time.time() + 2.0

@@ -117,7 +117,7 @@ plugin/minir/          the deployable plugin directory (copy this to plugins/min
   cadence.py           config/store-path helpers shared by the provider and the engine
   context_engine.py    audited summary compression (context.engine: minir)
   agent_loop.py        one-shot in-process AIAgent runs — sync + async (Feishu-shaped)
-  adviser.py           adviser route: auxiliary task registration + the host session search tool
+  adviser.py           auxiliary routes: task registration (adviser + three layer routes) + host session search
   adviser_prompts.py   one adviser core plus the CONSULT/REVIEW mode contracts
   adviser_mode.py      the only advice producer: event ring, review, guard, delivery channels
   host_bridge.py       optional bridge to hermes_cli.plugin_runtime (steer / continuation)
@@ -334,7 +334,7 @@ only through `minir_search(scope="all")`, never by automatic injection. Advice h
 
 | Layer | Models | Artifact sections | Subject key |
 | --- | --- | --- | --- |
-| base | this profile's user: window + previous cards, three staged JSON passes on `auxiliary.adviser` | `## User Card`, `## AI Card`, `## Window Summary`, `## Value Markers` | `user:<id>` |
+| base | this profile's user: window + previous cards, three staged JSON passes on `auxiliary.minir_dialectic` | `## User Card`, `## AI Card`, `## Window Summary`, `## Value Markers` | `user:<id>` |
 | dialectic | the live base artifact + its own evidence window; reviews drift and replaces whole parts | `## Base Revision` only (cards stay on the base layer, no advice) | `agent:<profile>:<identity>` |
 
 The review's **evidence** window starts at its own watermark and ends at the live edge; the base
@@ -352,7 +352,7 @@ pass count is adaptive: short windows get one synthesis, longer ones add a self-
 reconcile, capped by `dialectic_depth`. A failed or malformed pass falls back to the last valid
 one. `layer_state.version` counts refreshes; the newest review note is what `prefetch` injects.
 
-A base refresh runs **four ordered passes** on the `auxiliary.adviser` route. Each system prompt is
+A base refresh runs **four ordered passes** on the `auxiliary.minir_dialectic` route. Each system prompt is
 built at call time from the pass's core asset under `plugin/minir/agents/`, the rule texts that
 pass reads and the output contract; the
 rule files in `plugin/minir/rules/*.md` are passed as text (`rules.rule_text`), untransformed, and
@@ -553,7 +553,7 @@ review receives the current files as its baseline.
 The scheduler is wall-clock, not turn-driven: a review is due every **3 days**
 (`card_review_days`), the first anchor is written at install, the anchor advances only on success,
 and a failure retries after 30 minutes, 2 hours and 6 hours before waiting for the next period.
-It runs on the `minir_card_review` route with no tools (files and evidence are inline).
+It runs on the `minir_card_view` route with no tools (files and evidence are inline).
 
 ### Knowledge pages
 
@@ -599,12 +599,12 @@ nothing is replayed. `minir_stats` reports the stream table with row and byte co
 
 ### Where the model call comes from
 
-Base and dialectic passes run through `agent_loop.run` on the `auxiliary.adviser` route with a
-**fixed** toolset built by `tools.agent_toolsets(...)`: the host's `file` toolset, this plugin's
-`minir` toolset (which carries `minir_hermes_session_search` and `minir_aiagent_search`) and
-`skills`. Operator-
-configured adviser toolsets are not used, and the list is never `None`: `agent_loop.run` passes
-the list it was given, so an empty list means no tools while `None` would mean every tool.
+Base and dialectic passes run through `agent_loop.run` on the `auxiliary.minir_dialectic` route
+with a **fixed** toolset built by `tools.agent_toolsets(...)`: the host's `file` toolset, this
+plugin's `minir` toolset (which carries `minir_hermes_session_search` and `minir_aiagent_search`)
+and `skills`. Operator-configured toolsets are additive defaults, never a widening: the list is
+never `None`, because `agent_loop.run` passes the list it was given, so an empty list means no
+tools while `None` would mean every tool.
 `agent_loop.run` marks every peer run with `file_guard.aux_scope()` and passes the project root
 (the nearest `.git` above the cwd), so a `pre_tool_call` guard scopes the file tools for every
 plugin agent: reads stay under `$HERMES_HOME` and the project root, minus secret files and
@@ -614,22 +614,22 @@ evidence:
 
 ```yaml
 auxiliary:
-  adviser:
+  minir_dialectic:
     provider: deepseek
-    model: deepseek-v4-flash
-    toolsets: [file]        # 'adviser' is appended automatically
+    model: deepseek-v4-pro
+    toolsets: [file]        # file/minir/skills are always appended
 ```
 
-If the adviser route cannot run (host module absent, bad config, provider outage), the pass falls
-back to `worker.call_model`, which imports `agent.auxiliary_client.call_llm` lazily. Each layer
-uses its own task key (`minir_base_layer` / `minir_dialectic_layer`), the global review uses
-`minir_card_review`, so each can still be pinned independently:
+If the agent route cannot run (host module absent, bad config, provider outage), the pass falls
+back to `worker.call_model`, which imports `agent.auxiliary_client.call_llm` lazily, under the
+same key. Base and dialectic share one route on purpose: one model serves both, and only the
+prompt and the output cap differ. The three routes are pinned independently:
 
 ```yaml
 auxiliary:
-  minir_base_layer:      {provider: deepseek, model: deepseek-v4-flash, timeout: 60}
-  minir_dialectic_layer: {provider: deepseek, model: deepseek-v4-pro,   timeout: 90}
-  minir_card_review:     {provider: deepseek, model: deepseek-v4-pro,   timeout: 180}
+  minir_dialectic:  {provider: deepseek, model: deepseek-v4-pro,   timeout: 90}
+  minir_card_view:  {provider: deepseek, model: deepseek-v4-pro,   timeout: 180}
+  minir_knowledge:  {provider: deepseek, model: deepseek-v4-flash, timeout: 120}
 ```
 
 Without those blocks the host's normal auto chain applies (main model first), exactly as
@@ -677,11 +677,12 @@ stable across windows and leaves the evidence replaceable.
 
 ## The adviser auxiliary (optional agent loop)
 
-`adviser.py` owns an `auxiliary.adviser` model route that runs a **real agent loop** (its own LLM and
-tools) rather than a one-shot completion. The base layer's four passes and the independent
-review reuse the same route (`worker._adviser_consult`); the loop is not adviser-specific — it
-lives in `agent_loop.py` and can be reused for any one-shot peer run (a review, a summary, a
-critic):
+`adviser.py` owns the plugin's auxiliary routes, and the loop they feed runs a **real agent loop**
+(its own LLM and tools) rather than a one-shot completion. The base layer's four passes and the
+independent review share `auxiliary.minir_dialectic` (`worker._adviser_consult`); the adviser chain
+keeps `auxiliary.adviser`, the card review uses `auxiliary.minir_card_view` and knowledge
+extraction `auxiliary.minir_knowledge`. The loop is not route-specific: it lives in
+`agent_loop.py` and can be reused for any one-shot peer run (a review, a summary, a critic):
 
 ```python
 from . import agent_loop
@@ -722,8 +723,9 @@ and an explicit `enabled_toolsets`, call `run_conversation(prompt, system_messag
 `async def` in `run_agent`/`agent.conversation_loop`); the blocking HTTP and tool subprocesses stay
 off the event loop, and `close()` still happens in the thread that built the agent.
 
-`adviser.py` is a thin route owner: it registers the `auxiliary.adviser` block
-(`provider`/`model`/`toolsets`) and the read-only host session search, while
+`adviser.py` is a thin route owner: it registers the four auxiliary blocks (`adviser` plus
+`minir_dialectic` / `minir_card_view` / `minir_knowledge`, each with
+`provider`/`model`/`toolsets`) and the read-only host session search, while
 `adviser_mode.AdviserMode.consult()` supplies the shared `ADVISER_CORE + MODE_CONSULT` system
 message for the worker's internal synchronous path. There is no model-visible consult tool: its
 schema, handler, dynamic registration, prompt section and toolset were deleted. The host session

@@ -228,6 +228,7 @@ def test_the_page_pass_reads_the_marker_rules(plugin_package, monkeypatch, tmp_p
     (override / "markers-org.md").write_text(
         "## CONTRACT\n\nOVERRIDE MARKER ORG\n", encoding="utf-8")
     seen: dict = {}
+    route_keys: list[str] = []
 
     class _Run:
         answer = ""
@@ -236,11 +237,18 @@ def test_the_page_pass_reads_the_marker_rules(plugin_package, monkeypatch, tmp_p
         seen["system"] = kwargs.get("system_message")
         return _Run()
 
+    def fake_config(task_key=plugin_package.adviser.TASK_KEY):
+        route_keys.append(task_key)
+        return {"model": "", "provider": "", "toolsets": []}
+
     monkeypatch.setattr(plugin_package.agent_loop, "run", fake_run)
+    monkeypatch.setattr(plugin_package.adviser, "load_config", fake_config)
     plugin_package.extraction.extract_pages(
         session_id="s1", summary=SUMMARY, handoff="HANDOFF BODY", hermes_home=str(tmp_path))
 
     system = seen["system"]
+    assert route_keys == [plugin_package.adviser.KNOWLEDGE_TASK], \
+        "the page pass rides its own route, not the adviser chain"
     assert "OVERRIDE MARKER ORG" in system, "the profile override must reach the page pass"
     assert "GOVERNANCE: what binds a subject." in system
     assert system.rstrip().endswith("no prose."), "the output contract closes the system prompt"
