@@ -111,6 +111,6 @@ def test_the_prompt_assets_declare_the_blocks_the_builders_emit(plugin_package):
         assert block in text, name
         assert "coverage" in text, name
     assert "<session_transcript>" in (base / "knowledge_render.md").read_text(encoding="utf-8")
-    reviewer = plugin_package.adviser_mode.review_prompt(severities="", budget="", targets="")
+    reviewer = plugin_package.adviser_mode.review_prompt()
     assert "minir_hermes_session_search" in reviewer
     assert "adviser_consult" not in reviewer

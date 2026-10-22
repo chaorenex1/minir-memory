@@ -34,15 +34,19 @@ from dataclasses import dataclass, field
 from typing import Any, Optional
 
 from .adviser_guard import DEFAULT_BUDGET, EmissionGuard, GuardVerdict, key_for
-from .adviser_prompts import boundary_guidance, consult_prompt, review_prompt
+from .adviser_prompts import (
+    boundary_guidance,
+    consult_prompt,
+    prompt_section,
+    review_prompt,
+)
+from .rules import rule_text
 from .transcript import HOST_LAYER
 from . import host_bridge
 from .prompting import (
     ACTION_TARGETS,
     ADVICE_TARGETS,
     ARTIFACT_TARGETS,
-    advice_severity_section,
-    advice_target_section,
     data_block,
 )
 
@@ -154,8 +158,8 @@ _DEFAULTS: dict[str, Any] = {
     "watchdog_roster": True,
 }
 
-def _review_brief(cfg: dict[str, Any]) -> str:
-    """The reviewer contract plus the limits this run actually enforces."""
+def _review_brief(cfg: dict[str, Any], *, hermes_home: str = "") -> str:
+    """The reviewer contract, the live budget, and the two rule bodies."""
     try:
         max_advices = max(1, min(int(cfg.get("max_advices") or MAX_ADVICES), 8))
     except (TypeError, ValueError):
@@ -167,16 +171,16 @@ def _review_brief(cfg: dict[str, Any]) -> str:
     floor = str(cfg.get("severity_floor") or "concern").strip().lower()
     if floor not in SEVERITY_ORDER:
         floor = "concern"
+    budget = prompt_section(
+        "review_budget", hermes_home=hermes_home,
+        MAX_ADVICES=max_advices, MAX_NOTES=max_notes, FLOOR=floor)
     return review_prompt(
-        severities=advice_severity_section(),
-        budget=(
-            f"REVIEW BUDGET: return at most {max_advices} advice objects; at most "
-            f"{max_notes} are accepted per review update (a blocker is always published and "
-            f"does not count against that budget). Severity floor: {floor}; omit anything "
-            "below it. If nothing is wrong, return exactly {\"action\": \"silent\"} — no "
-            "acknowledgements, no restating what the agent already knows."
+        hermes_home=hermes_home,
+        budget=budget,
+        rules=(
+            rule_text("advice_target", hermes_home=hermes_home),
+            rule_text("advice_judgment", hermes_home=hermes_home),
         ),
-        targets=advice_target_section(),
     )
 
 
@@ -793,6 +797,9 @@ class AdviserMode:
 
     def _store(self) -> Any:
         return getattr(self._provider, "_store", None)
+
+    def _hermes_home(self) -> str:
+        return str(getattr(self._provider, "_hermes_home", "") or "")
 
     def _primary(self, session_id: str = "") -> str:
         provider = self._provider
@@ -1432,7 +1439,8 @@ class AdviserMode:
             # 5 iterations: one search round, up to two page reads, then the object.
             result = agent_loop.run(
                 prompt, model=model, provider=provider, toolsets=toolsets,
-                system_message=_review_brief(cfg), max_iterations=5,
+                system_message=_review_brief(cfg, hermes_home=self._hermes_home()),
+                max_iterations=5,
                 project_dir=adviser.project_dir(route), read_only=True,
                 history=runtime.messages or None,
                 session_id=_host_session_id(session, name),
@@ -1446,7 +1454,9 @@ class AdviserMode:
                 # candidate stays pending either way.
                 retry = agent_loop.run(
                     _repair_prompt(prompt), model=model, provider=provider,
-                    toolsets=toolsets, system_message=_review_brief(cfg), max_iterations=1,
+                    toolsets=toolsets,
+                    system_message=_review_brief(cfg, hermes_home=self._hermes_home()),
+                    max_iterations=1,
                     project_dir=adviser.project_dir(route), read_only=True,
                     history=runtime.messages or None,
                     session_id=_host_session_id(session, name),
@@ -1545,7 +1555,7 @@ class AdviserMode:
         try:
             record("adviser", adviser_session, merged, model=result.model,
                    provider=result.provider, toolsets=result.toolsets,
-                   system_message=_review_brief(cfg),
+                   system_message=_review_brief(cfg, hermes_home=self._hermes_home()),
                    usage=getattr(result, "usage", {}) or {})
             flush = getattr(transcript, "flush_aux", None)
             if callable(flush):
@@ -1633,7 +1643,7 @@ class AdviserMode:
             api_mode=str(route.get("api_mode") or ""),
             toolsets=tools.agent_toolsets(
                 toolsets if toolsets is not None else route.get("toolsets")),
-            system_message=consult_prompt(),
+            system_message=consult_prompt(hermes_home=self._hermes_home()),
             project_dir=adviser.project_dir(route),
             layer="adviser",
         )
@@ -1654,7 +1664,7 @@ class AdviserMode:
             api_mode=str(route.get("api_mode") or ""),
             toolsets=tools.agent_toolsets(
                 toolsets if toolsets is not None else route.get("toolsets")),
-            system_message=consult_prompt(),
+            system_message=consult_prompt(hermes_home=self._hermes_home()),
             project_dir=adviser.project_dir(route),
             layer="adviser",
         )
@@ -1866,7 +1876,8 @@ class AdviserMode:
         selected = selected[:max(1, int(cfg["max_advices"]))]
         if not selected:
             return 0
-        guidance = (boundary_guidance(current, int(cfg["boundary_every"]))
+        guidance = (boundary_guidance(current, int(cfg["boundary_every"]),
+                                      hermes_home=self._hermes_home())
                     if turn_end else "")
         block, included = render_block(
             selected, int(cfg["max_chars"]), current_turn=current, guidance=guidance)

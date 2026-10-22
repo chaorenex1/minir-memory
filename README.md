@@ -118,12 +118,12 @@ plugin/minir/          the deployable plugin directory (copy this to plugins/min
   context_engine.py    audited summary compression (context.engine: minir)
   agent_loop.py        one-shot in-process AIAgent runs — sync + async (Feishu-shaped)
   adviser.py           auxiliary routes: task registration (adviser + three layer routes) + host session search
-  adviser_prompts.py   one adviser core plus the CONSULT/REVIEW mode contracts
+  adviser_prompts.py   adviser prompt loader: prompts/adviser sections + rule bodies
   adviser_mode.py      the only advice producer: event ring, review, guard, delivery channels
   host_bridge.py       optional bridge to hermes_cli.plugin_runtime (steer / continuation)
   host-patches/        git patch series for the host control surface + manifest.json
   session_search.py    read-only multi-shape search over the host's session store (state.db)
-  prompts/             operator-supplied Task Handoff template
+  prompts/             operator handoff template + prompts/adviser prompt sections
 tests/                 pytest suite: contract, store, transcript, provider, counting, worker, engine
 scripts/install.py               copy the plugin + apply/verify the host patch series
 scripts/install_host_patches.py  apply/check/revert the series on a hermes-agent checkout

@@ -525,8 +525,38 @@ def test_parse_review_keeps_artifact_targets(plugin_package):
 
 def test_review_prompt_carries_artifact_advice(plugin_package):
     brief = plugin_package.adviser_mode._review_brief({})
-    assert "ARTIFACT ADVICE" in brief
+    assert "Artifact targets:" in brief
     assert "changes the artifact" in brief
+
+
+def test_review_brief_appends_both_rule_files(plugin_package):
+    brief = plugin_package.adviser_mode._review_brief({})
+    assert "PARALLEL RULES" in brief, "advice_target rule body is missing"
+    assert "SEVERITY CEILINGS BY TARGET" in brief, "advice_judgment rule body is missing"
+    assert "，记忆引用:" in brief, "the knowledge citation contract is missing"
+    assert "$MAX_ADVICES" not in brief, "the budget template was not filled"
+
+
+def test_review_and_consult_prompts_read_the_operator_override(plugin_package, tmp_path):
+    prompts = tmp_path / "minir-memory" / "prompts" / "adviser"
+    prompts.mkdir(parents=True)
+    (prompts / "core.md").write_text("OVERRIDE CORE", encoding="utf-8")
+    (prompts / "review.md").write_text("OVERRIDE REVIEW", encoding="utf-8")
+    (prompts / "consult.md").write_text("OVERRIDE CONSULT", encoding="utf-8")
+    brief = plugin_package.adviser_mode._review_brief({}, hermes_home=str(tmp_path))
+    assert brief.startswith("OVERRIDE CORE")
+    assert "OVERRIDE REVIEW" in brief
+    consult = plugin_package.adviser_prompts.consult_prompt(hermes_home=str(tmp_path))
+    assert consult == "OVERRIDE CORE\n\nOVERRIDE CONSULT"
+
+
+def test_a_missing_packaged_prompt_fails_loud(plugin_package, tmp_path, monkeypatch):
+    monkeypatch.setattr(plugin_package.adviser_prompts, "PACKAGE_PROMPTS_DIR", tmp_path)
+    try:
+        plugin_package.adviser_prompts.prompt_text("core")
+    except plugin_package.adviser_prompts.AdviserPromptError:
+        return
+    raise AssertionError("a missing packaged prompt must raise AdviserPromptError")
 
 
 def test_one_advice_target_vocabulary(plugin_package):

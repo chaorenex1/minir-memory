@@ -42,12 +42,13 @@ where = ["plugin"]
 include = ["minir*"]
 
 # Files the plugin reads from disk at runtime: the manifest (discovery/validation), the
-# Task Handoff template (`handoff.py`), the agent prompts (`layers.load_core`), the field
-# rules (`rules.py`) and the Window Summary shape (`window_summary.py`) all resolve them
-# next to their module.
+# Task Handoff template (`handoff.py`), the agent prompts (`layers.load_core`), the adviser
+# prompt sections (`adviser_prompts.py`), the field rules (`rules.py`) and the Window Summary
+# shape (`window_summary.py`) all resolve them next to their module.
 [tool.setuptools.package-data]
-minir = ["plugin.yaml", "prompts/*.md", "agents/*.md", "templates/*.md", "rules/*.md",
-         "host-patches/*.patch", "host-patches/manifest.json"]
+minir = ["plugin.yaml", "prompts/*.md", "prompts/adviser/*.md", "agents/*.md",
+         "templates/*.md", "rules/*.md", "host-patches/*.patch",
+         "host-patches/manifest.json"]
 
 [tool.setuptools.exclude-package-data]
 minir = ["__pycache__/*", "*.py[cod]"]
