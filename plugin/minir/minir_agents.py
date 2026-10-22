@@ -10,10 +10,10 @@ The run's full conversation is handed to :class:`~minir.transcript.TranscriptBuf
 before this tool returns, so the answer and the audit file agree. The path follows the buffer's
 aux namespace::
 
-    <HERMES_HOME>/minir-memory/sessions/<agent_name>/<layer_session_id>.json
+    <HERMES_HOME>/minir-memory/sessions/<platform>/<agent_name>/<layer_session_id>.jsonl
 
 ``layer_session_id`` is the provider session that called the tool. If the provider has no session
-id (early/manual call), a timestamped name is used instead of a shared ``session.json``.
+id (early/manual call), a timestamped name is used instead of a shared ``session.jsonl``.
 """
 
 from __future__ import annotations
@@ -161,6 +161,16 @@ def run(provider: Any, args: dict[str, Any]) -> str:
         context, context_count = _context_files(provider, args, project)
     except ValueError as exc:
         return tool_error(str(exc))
+    session_id = str(getattr(provider, "_session_id", "") or "").strip()
+    if not session_id:
+        session_id = f"{name}-{int(time.time() * 1000)}"
+    transcript = getattr(provider, "_transcript", None)
+    history: list[dict[str, Any]] = []
+    if transcript is not None:
+        try:  # this agent's own earlier runs, read back from its stream
+            history = transcript.read_aux(name, session_id)
+        except Exception:
+            logger.debug("minir_agents history read failed", exc_info=True)
     token = _DEPTH.set(depth + 1)
     try:
         result = agent_loop.run(
@@ -170,6 +180,9 @@ def run(provider: Any, args: dict[str, Any]) -> str:
             toolsets=toolsets,
             all_tools=all_tools,
             project_dir=str(project) if project else "",
+            history=history or None,
+            layer=name,
+            history_session=session_id,
             # A custom agent is closer to the main agent than to a layer pass: memory, context
             # files and soul on by default, background review fork still off.
             skip_memory=_flag(args, "skip_memory", False),
@@ -183,10 +196,6 @@ def run(provider: Any, args: dict[str, Any]) -> str:
     finally:
         _DEPTH.reset(token)
 
-    session_id = str(getattr(provider, "_session_id", "") or "").strip()
-    if not session_id:
-        session_id = f"{name}-{int(time.time() * 1000)}"
-    transcript = getattr(provider, "_transcript", None)
     path = transcript.path_for_aux(name, session_id) if transcript is not None else None
     written = False
     transcript_error = ""

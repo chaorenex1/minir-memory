@@ -137,6 +137,9 @@ completed ──→ pending        （重开，清 done_at）
 
 ### 6.1 目标格式
 
+> 本节已被 `doc/transcript-jsonl-draft.md` 取代：最终路径多一层 `<platform>`，part 只增不删，
+> 内存缓存与 `last_cache` 标记也在该稿定义。下面的旧版描述仅保留作历史记录。
+
 ```
 <persist_dir>/<layer>/<session_id>.jsonl
 <persist_dir>/<layer>/<session_id>.part2.jsonl
@@ -144,7 +147,7 @@ completed ──→ pending        （重开，清 done_at）
 
 - 一行一条消息，字段沿用现有消息字典，加 `v` 与 `seq`；aux 记录各占一行，带 `kind:"aux"`。
 - 从整文件重写改为逐条追加：现有 30 秒 / 50 条的重写节奏（`DEBOUNCE_SECONDS`、`DEBOUNCE_MESSAGES`）不再需要。
-- 轮转仍是 2000 条一个文件（`MESSAGES_PER_FILE`）；写满开 `part2`；超过两个 part 删除最旧整份。现有语义是 4000 条后最早一端滑掉，删整份达成同样效果且不必重写存活文件。
+- 轮转仍是 2000 条一个文件（`MESSAGES_PER_FILE` → `EVENTS_PER_PART`）；写满开 `part2`。**删除最旧整份的旧规则作废**：最终契约永久保留，读接口按 `seq` 跨 part 续读。
 - 追加失败仍重试两次后丢弃并计数：审计用途，宁可少一条，不阻塞会话。
 - 追加前若文件不以 `\n` 结尾先补换行。
 

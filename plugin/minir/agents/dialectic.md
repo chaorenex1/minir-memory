@@ -14,8 +14,9 @@ INPUTS
 - <chunk_summaries>: the session's canonical chunk chain, derived drafts.
 - <operator_identity>, <operator_preferences>: operator declarations. Authoritative, never
   "corrected" by inference.
-- <conversation_window>: every message after the artifact's window, up to now. Nothing else is
-  evidence.
+- <dialectic_transcript>: every event after the artifact's window, up to now, as a transcript
+  digest: user/assistant/tool lines and a final `[coverage]` line. Nothing else is evidence; a
+  tool result the digest elided is not evidence either.
 
 JOBS
 Yours are exactly three:

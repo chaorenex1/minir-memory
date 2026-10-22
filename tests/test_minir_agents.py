@@ -48,12 +48,15 @@ def test_a_custom_agent_defaults_to_all_tools_and_the_host_knobs(provider, fake_
     assert kwargs["project_dir"], "a custom agent gets the cwd's project root by default"
 
     path = Path(data["transcript_path"])
-    assert path == tmp_path / "minir-memory" / "sessions" / "researcher" / "session-test.json"
+    assert path == (tmp_path / "minir-memory" / "sessions" / "cli" / "researcher"
+                    / "session-test.jsonl")
     assert data["transcript_written"] is True
-    stored = json.loads(path.read_text(encoding="utf-8"))
-    assert stored["session_id"] == "session-test"
-    assert stored["layer"] == "researcher"
-    assert [row["role"] for row in stored["messages"]] == ["user", "assistant"]
+    stored = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+    assert stored[0]["session_id"] == "session-test"
+    assert stored[0]["layer"] == "researcher"
+    assert [row["role"] for row in stored
+            if row["kind"] == "msg" and row["role"] != "system"] == ["user", "assistant"]
+    assert kwargs["layer"] == "researcher" and kwargs["history_session"] == "session-test"
 
 
 def test_explicit_tool_sets_are_forwarded_without_the_plugin_appending(provider, fake_run):

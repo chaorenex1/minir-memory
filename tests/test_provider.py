@@ -1066,8 +1066,7 @@ def test_system_prompt_block_gates_adviser_sections(plugin_package, make_provide
     only = make_provider({"adviser_mode": {"enabled": True, "mode": "adviser_only"}})
     assert "[adviser-only mode" in only.system_prompt_block()
 
-    consult = make_provider({"adviser_mode": {"enabled": False}})
-    consult._adviser_consult_registered = True
-    consult_block = consult.system_prompt_block()
-    assert "## adviser_consult" in consult_block
-    assert "ADVICE SEVERITY" not in consult_block
+    disabled = make_provider({"adviser_mode": {"enabled": False}})
+    disabled_block = disabled.system_prompt_block()
+    assert "# Advisers" not in disabled_block
+    assert "## adviser_consult" not in disabled_block

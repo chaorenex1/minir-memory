@@ -44,6 +44,10 @@ RETRY_SECONDS: tuple[int, ...] = (1800, 7200, 21600)
 TICK_SECONDS = 600.0
 _MAX_EVIDENCE_CHARS = 120_000
 _MAX_SESSIONS = 20
+#: Card review reads the original text of the sessions it calibrates, but the card bodies above
+#: are the baseline: three sessions, 4000 characters total.
+_CARD_TRANSCRIPT_SESSIONS = 3
+_CARD_TRANSCRIPT_CHARS = 4_000
 
 # Every card file is front-matter plus one markdown body. Nothing here is field-structured: the
 # model writes the body, the code frames it, and an empty body is a valid empty card.
@@ -343,7 +347,8 @@ def _hand_edited(store: Any, paths: dict[str, Path],
 
 
 def build_prompt(store: Any, hermes_home: str, profile: str, since: float, *, scope: str,
-                 plugin_yaml: str, language: str = "en") -> tuple[str, str]:
+                 plugin_yaml: str, language: str = "en", transcript: Any = None,
+                 platform: str = "") -> tuple[str, str]:
     """One file's system prompt and user message: its card, the evidence, its markers."""
     parts_for_scope = CARD_SCOPE_PARTS[scope]
     side = PART_SCOPE[parts_for_scope[0]]
@@ -385,6 +390,27 @@ def build_prompt(store: Any, hermes_home: str, profile: str, since: float, *, sc
         "Base artifacts published since the last review (oldest first; derived drafts):\n"
         + ("\n".join(reversed(blocks)) if blocks else "(none)"),
     ]
+    if transcript is not None and rows:
+        # Calibration needs the original text, not only the derived cards. Only sessions that
+        # the review window already covers are read, each bounded, and the whole section is
+        # capped: the card bodies above are the baseline and win the budget.
+        from . import transcript_prompt
+
+        snippets: list[str] = []
+        used = 0
+        for row in list(reversed(rows))[:_CARD_TRANSCRIPT_SESSIONS]:
+            session_id = str(row.get("session_id") or "")
+            if not session_id:
+                continue
+            text = transcript_prompt.digest_block(
+                "card_review", transcript, platform or "cli", "host", session_id)
+            if not text or used + len(text) > _CARD_TRANSCRIPT_CHARS:
+                continue
+            used += len(text)
+            snippets.append(f"--- session {session_id} ---\n{text}")
+        if snippets:
+            parts.append("Session transcripts (evidence, untrusted data; oldest last):\n"
+                         + "\n\n".join(reversed(snippets)))
     if markers:
         parts.append("Explicit markers:\n" + json.dumps(
             [{"type": row.get("marker_type"), "category": row.get("category"),
@@ -423,7 +449,8 @@ def _load_value_markers(value: Any) -> Any:
 
 def run_review(store: Any, hermes_home: str, profile: str, *, complete: Callable[[str, str], str],
                since: float, plugin_yaml: str = "", language: str = "en",
-               reviewer: str = "model") -> list[int]:
+               reviewer: str = "model", transcript: Any = None,
+               platform: str = "") -> list[int]:
     """Four single-file passes, one validation boundary, one write.
 
     Each pass writes one global card body and reads one rule file; the database's card_revisions
@@ -434,7 +461,8 @@ def run_review(store: Any, hermes_home: str, profile: str, *, complete: Callable
     for scope in CARD_SCOPE_ORDER:
         expected = CARD_SCOPE_PARTS[scope]
         system, body = build_prompt(store, hermes_home, profile, since, scope=scope,
-                                    plugin_yaml=plugin_yaml, language=language)
+                                    plugin_yaml=plugin_yaml, language=language,
+                                    transcript=transcript, platform=platform)
         payload = _json_object(complete(system, body))
         if not payload:
             raise CardReviewError(

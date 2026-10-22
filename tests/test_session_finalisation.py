@@ -61,15 +61,19 @@ def test_an_uninitialized_provider_is_reported_not_raised(plugin_package):
 
 
 def test_the_provider_and_the_toolset_share_one_schema_source(provider, plugin_package):
+    """The provider surface is the five store tools; the layer-scoped search is agent-only."""
     assert [schema["name"] for schema in provider.get_tool_schemas()] == \
-        list(plugin_package.plugin_tools.TOOL_NAMES)
+        [schema["name"] for schema in plugin_package.plugin_tools.SCHEMAS]
     assert provider.get_tool_schemas()[0] is plugin_package.plugin_tools.SCHEMAS[0]
+    assert "minir_aiagent_search" not in [schema["name"]
+                                          for schema in provider.get_tool_schemas()]
 
 
 def test_agent_toolsets_always_carry_the_plugin_surfaces(plugin_package):
-    assert plugin_package.plugin_tools.agent_toolsets(["file"]) == ["file", "minir", "adviser", "skills"]
-    assert plugin_package.plugin_tools.agent_toolsets(None) == ["file", "minir", "adviser", "skills"]
-    assert plugin_package.plugin_tools.agent_toolsets("web") == ["web", "file", "minir", "adviser", "skills"]
+    expected = ["file", "minir", "skills"]
+    assert plugin_package.plugin_tools.agent_toolsets(["file"]) == expected
+    assert plugin_package.plugin_tools.agent_toolsets(None) == expected
+    assert plugin_package.plugin_tools.agent_toolsets("web") == ["web", *expected]
 
 
 def test_session_end_finalises_each_turns_token_usage(make_provider):
@@ -264,7 +268,7 @@ def test_the_summary_agent_receives_the_session_handoff(plugin_package, monkeypa
     assert text == SUMMARY
     assert "HANDOFF BODY" in seen["message"]
     assert "<session_handoff>" in seen["message"]
-    assert {"minir", "adviser"} <= set(seen["toolsets"])
+    assert {"minir"} <= set(seen["toolsets"])
     assert "## Durable Knowledge" in seen["system"]
 
 
@@ -289,4 +293,4 @@ def test_the_hand_off_agent_also_gets_the_plugin_toolset(plugin_package, monkeyp
 
     plugin_package.handoff.summarize_agent("chunk", "review", session_id="s1")
 
-    assert {"minir", "adviser"} <= set(seen["toolsets"])
+    assert {"minir"} <= set(seen["toolsets"])

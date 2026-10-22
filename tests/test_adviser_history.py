@@ -63,12 +63,14 @@ def test_reviewer_runs_read_only_and_records_the_run(plugin_package, make_provid
     assert _review(provider) is True
     assert seen.get("read_only") is True
 
-    files = list((tmp_path / "minir-memory" / "sessions" / "adviser").glob("*.json"))
+    files = list((tmp_path / "minir-memory" / "sessions" / "cli" / "adviser").glob("*.jsonl"))
     assert len(files) == 1
-    data = json.loads(files[0].read_text(encoding="utf-8"))
-    assert data["session_id"] == f"{SESSION}--default"
-    assert data["usage"] == {"total_tokens": 120, "estimated_cost_usd": 0.0012}
-    assert [row["role"] for row in data["messages"]] == ["user", "assistant"]
+    rows = [json.loads(line) for line in files[0].read_text(encoding="utf-8").splitlines()]
+    messages = [row for row in rows if row["kind"] == "msg" and row["role"] != "system"]
+    run_end = [row for row in rows if row["kind"] == "run_end"]
+    assert rows[0]["session_id"] == f"{SESSION}--default"
+    assert run_end[-1]["usage"] == {"total_tokens": 120, "estimated_cost_usd": 0.0012}
+    assert [row["role"] for row in messages] == ["user", "assistant"]
 
     usage = provider._adviser_mode.usage_stats(SESSION)
     assert usage["default"]["tokens"] == 120
@@ -85,12 +87,13 @@ def test_a_second_review_appends_to_the_same_adviser_history(plugin_package, mak
     _event(provider, "two")
     assert _review(provider) is True
 
-    path = next((tmp_path / "minir-memory" / "sessions" / "adviser").glob("*.json"))
-    data = json.loads(path.read_text(encoding="utf-8"))
+    path = next((tmp_path / "minir-memory" / "sessions" / "cli" / "adviser").glob("*.jsonl"))
+    rows = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+    messages = [row for row in rows if row["kind"] == "msg" and row["role"] != "system"]
     # Two runs, two message pairs each: the file is the adviser's conversation, not one review.
-    assert [row["role"] for row in data["messages"]] == [
+    assert [row["role"] for row in messages] == [
         "user", "assistant", "user", "assistant"]
-    assert data["messages"][0]["content"] != data["messages"][2]["content"]
+    assert messages[0].get("text") != messages[2].get("text")
 
 
 def test_watchdog_roster_merges_and_config_overrides(plugin_package, make_provider, monkeypatch):

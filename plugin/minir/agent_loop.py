@@ -47,7 +47,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import Any, Optional, Sequence
 
-from . import file_guard
+from . import agent_history, file_guard
 
 logger = logging.getLogger(__name__)
 
@@ -94,9 +94,9 @@ _USAGE_KEYS = (
 )
 #: Tools a read-only peer must not hold. Writes are already path-scoped to scratch; a reviewer
 #: still should not spend its budget mutating scratch or believe it can fix what it finds. The
-#: memory write/spawn/consult surfaces are stripped too: a reviewer reads and advises only.
+#: memory write/spawn surfaces are stripped too: a reviewer reads and advises only.
 READ_ONLY_DROPPED_TOOLS = frozenset({
-    "write_file", "patch", "minir_remember", "minir_forget", "minir_agents", "adviser_consult",
+    "write_file", "patch", "minir_remember", "minir_forget", "minir_agents",
     "skill_manage",
 })
 
@@ -144,6 +144,29 @@ def _transcript(result: dict[str, Any]) -> tuple[dict[str, Any], ...]:
             if isinstance(converted, Mapping):
                 rows.append(dict(converted))
     return tuple(rows)
+
+
+def _with_reasoning(rows: tuple[dict[str, Any], ...],
+                    reasoning: Any) -> tuple[dict[str, Any], ...]:
+    """Attach a top-level ``reasoning_content`` to the run's last assistant message.
+
+    Layer thinking is new capture: ``agent_loop`` never read the field before, so an aux stream
+    had no reasoning source even when the host returned it. The field stays on the message (the
+    transcript store writes it as its own ``reasoning`` row); an explicit ``reasoning`` message
+    is appended only when the run produced no assistant row to carry it.
+    """
+    text = str(reasoning or "").strip()
+    if not text:
+        return rows
+    for index in range(len(rows) - 1, -1, -1):
+        row = dict(rows[index])
+        if str(row.get("role") or "") != "assistant":
+            continue
+        if not (row.get("reasoning_content") or row.get("reasoning")):
+            row["reasoning_content"] = text
+        rows = rows[:index] + (row,) + rows[index + 1:]
+        return rows
+    return rows + ({"role": "reasoning", "content": text},)
 
 
 def _resolve_model_and_runtime() -> tuple[str, dict[str, Any]]:
@@ -208,7 +231,7 @@ def run(message: str, *, context: str = "", model: str = "", provider: str = "",
         project_dir: Optional[str] = None, all_tools: bool = False,
         read_only: bool = False,
         history: Optional[Sequence[Mapping[str, Any]]] = None,
-        session_id: str = "",
+        session_id: str = "", layer: str = "", history_session: str = "",
         skip_memory: bool = True, skip_context_files: bool = True,
         skip_background_review: bool = True,
         load_soul_identity: bool = False) -> AgentRun:
@@ -232,6 +255,10 @@ def run(message: str, *, context: str = "", model: str = "", provider: str = "",
     background review fork and no operator soul identity, because a layer pass is not the main
     agent. A custom-agent route (``minir_agents``) opts into memory/context/soul with the flags
     and passes ``all_tools`` when the caller omitted ``tool_sets``.
+
+    ``layer`` binds the run to one transcript stream (``minir_agent_layer`` contextvar), so
+    ``minir_aiagent_search`` can only read the caller's own history. An empty value leaves the
+    tool unbound, which makes it refuse the call instead of reading every layer.
     """
     from run_agent import AIAgent  # first: it replaces sys.path (managed environment bootstrap)
 
@@ -274,17 +301,25 @@ def run(message: str, *, context: str = "", model: str = "", provider: str = "",
         # gets the guard, not only the layer worker.
         system = str(system_message or "").strip() or None
         root = project_dir if project_dir is not None else str(file_guard.project_root() or "")
-        with file_guard.aux_scope(root):
-            result = agent.run_conversation(
-                _prompt(message, context), system_message=system,
-                conversation_history=conversation or None)
+        token = (agent_history.layer_context(layer, history_session)
+                 if str(layer or "").strip() else None)
+        try:
+            with file_guard.aux_scope(root):
+                result = agent.run_conversation(
+                    _prompt(message, context), system_message=system,
+                    conversation_history=conversation or None)
+        finally:
+            if token is not None:
+                agent_history.reset_layer(token)
+        messages = _with_reasoning(
+            _transcript(result), result.get("reasoning_content") or result.get("reasoning"))
         return AgentRun(
             answer=(result.get("final_response") or "").strip(),
             api_calls=result.get("api_calls", 0),
             model=final_model,
             provider=final_provider,
             toolsets=("*",) if all_tools else tuple(tools),
-            messages=_transcript(result),
+            messages=messages,
             usage=_usage(result),
         )
     finally:
@@ -300,7 +335,7 @@ async def run_async(message: str, *, context: str = "", model: str = "", provide
                     project_dir: Optional[str] = None, all_tools: bool = False,
                     read_only: bool = False,
                     history: Optional[Sequence[Mapping[str, Any]]] = None,
-                    session_id: str = "",
+                    session_id: str = "", layer: str = "", history_session: str = "",
                     skip_memory: bool = True, skip_context_files: bool = True,
                     skip_background_review: bool = True,
                     load_soul_identity: bool = False) -> AgentRun:
@@ -309,7 +344,8 @@ async def run_async(message: str, *, context: str = "", model: str = "", provide
         run, message, context=context, model=model, provider=provider, api_mode=api_mode,
         toolsets=toolsets, system_message=system_message, max_iterations=max_iterations,
         project_dir=project_dir, all_tools=all_tools, read_only=read_only,
-        history=history, session_id=session_id,
+        history=history, session_id=session_id, layer=layer,
+        history_session=history_session,
         skip_memory=skip_memory,
         skip_context_files=skip_context_files, skip_background_review=skip_background_review,
         load_soul_identity=load_soul_identity)

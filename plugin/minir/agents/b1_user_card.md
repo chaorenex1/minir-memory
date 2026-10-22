@@ -15,8 +15,10 @@ INPUTS
   refresh. "Baseline source:" says where it came from: global, session or preset.
 - <first_user_message>: first refresh only, the session's opening request. The one allowed piece
   of outside-window evidence.
-- <conversation_window>: this session's messages, oldest to newest. The only evidence for new
-  facts.
+- <base_user_transcript>: this window's transcript digest, oldest to newest. One line per event,
+  `[coverage]` last; an elision carries its original character count. The coverage line says which
+  sequence range the block covers, so never claim to have read the whole session. The only
+  evidence for new facts.
 - "Window:" and "Session:" order and scope the evidence. They are not facts.
 - "Value language" fixes the language of the values; keys stay English.
 

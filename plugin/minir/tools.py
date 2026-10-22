@@ -1,12 +1,15 @@
-"""The plugin's own toolset — the five ``minir_*`` tools, registered for every agent.
+"""The plugin's own toolset — the five store tools plus the two agent-facing searches.
 
-The memory-provider surface already hands these schemas to the main agent through
+The memory-provider surface already hands five schemas to the main agent through
 ``MemoryProvider.get_tool_schemas``. That path only reaches an agent that has the host's
 ``memory`` toolset enabled. This module registers the same functions under a registry toolset
 named ``minir`` so the plugin's own agents (the adviser, the layer worker, the hand-off and
 session-summary agents, the idle knowledge extraction) can be granted them explicitly:
 
-    enabled_toolsets = ["file", "adviser", "minir"]
+    enabled_toolsets = ["file", "minir", "skills"]
+
+It also registers ``minir_aiagent_search`` (the caller's own transcript stream) and
+``minir_hermes_session_search`` is registered by ``adviser.register`` into the same toolset.
 
 One schema source, two delivery paths: :data:`SCHEMAS` is what ``get_tool_schemas`` returns and
 what :func:`register` puts in the registry. The handlers delegate to the live provider's
@@ -30,18 +33,19 @@ from tools.registry import tool_error
 
 from .layers import CATEGORIES
 from .store import VALUE_MARKER_TYPES
+from . import agent_history
 
 logger = logging.getLogger(__name__)
 
 TOOLSET = "minir"
 SKILL_TOOLSET= "skills"
-ADVISER_TOOLSET = "adviser"
 #: The host's four file tools (``read_file``, ``write_file``, ``patch``, ``search_files``).
 #: This plugin does not re-register them: it grants the host toolset to every in-process
 #: agent it runs, and ``file_guard`` scopes the calls while that agent runs.
 FILE_TOOLSET = "file"
 TOOL_NAMES: tuple[str, ...] = (
-    "minir_search", "minir_remember", "minir_forget", "minir_stats", "minir_agents")
+    "minir_search", "minir_remember", "minir_forget", "minir_stats", "minir_agents",
+    "minir_aiagent_search")
 
 _EMOJI: dict[str, str] = {
     "minir_search": "🔎", "minir_remember": "📌", "minir_forget": "🗑️", "minir_stats": "📊",
@@ -129,17 +133,16 @@ SCHEMAS: tuple[dict[str, Any], ...] = (
 def agent_toolsets(base: Any = None) -> list[str]:
     """*base* plus this plugin's fixed toolsets, order kept, duplicates dropped.
 
-    Every in-process agent this plugin runs gets all four surfaces: the host's ``file``
-    toolset, ``minir`` for the store tools, ``adviser`` for the read-only session search
-    (and the adviser entry point), and ``skills`` so a reviewer can consult a loaded skill.
-    ``file`` is granted here, not left to the caller, so a route that configures no toolsets
-    still gets the file surface ``file_guard`` scopes; ``None`` becomes the four, never
-    ``None`` — the host reads ``None`` as "every tool".
+    Every in-process agent this plugin runs gets three surfaces: the host's ``file`` toolset,
+    ``minir`` for the store tools and the layer-scoped transcript search, and ``skills`` so a
+    reviewer can consult a loaded skill. ``file`` is granted here, not left to the caller, so a
+    route that configures no toolsets still gets the file surface ``file_guard`` scopes;
+    ``None`` becomes the three, never ``None`` — the host reads ``None`` as "every tool".
     """
     if isinstance(base, str):
         base = [base]
     toolsets = [str(tool) for tool in (base or []) if str(tool).strip()]
-    for name in (FILE_TOOLSET, TOOLSET, ADVISER_TOOLSET,SKILL_TOOLSET):
+    for name in (FILE_TOOLSET, TOOLSET, SKILL_TOOLSET):
         if name not in toolsets:
             toolsets.append(name)
     return toolsets
@@ -147,7 +150,7 @@ def agent_toolsets(base: Any = None) -> list[str]:
 
 def register(ctx: Any, provider: Any = None,
              resolve: Optional[Callable[[], Any]] = None) -> list[str]:
-    """Register the four tools in the ``minir`` toolset; returns the names actually added.
+    """Register the five store tools plus the agent transcript search; returns the names added.
 
     ``resolve`` is the live-provider lookup (the host can construct this plugin twice). It is
     called per tool call, not at registration, so a provider initialized after this call is still
@@ -176,6 +179,24 @@ def register(ctx: Any, provider: Any = None,
             registered.append(name)
         except Exception as exc:  # one refused tool must not cost the other three
             logger.warning("minir tool %s registration failed: %s", name, exc)
+
+    def history_handler(args: dict[str, Any], **_kwargs: Any) -> str:
+        try:
+            live = lookup()
+        except Exception as exc:  # a lookup failure is reported, never raised into the tool loop
+            return tool_error(f"Minir provider lookup failed: {exc}")
+        return agent_history.handle(args, provider=live)
+
+    try:
+        register_tool(
+            name=agent_history.TOOL_NAME, toolset=TOOLSET, schema=agent_history.SCHEMA,
+            handler=history_handler, is_async=False,
+            description="Read the calling layer's own transcript stream.",
+            emoji="🗂️",
+        )
+        registered.append(agent_history.TOOL_NAME)
+    except Exception as exc:
+        logger.warning("minir tool %s registration failed: %s", agent_history.TOOL_NAME, exc)
     return registered
 
 

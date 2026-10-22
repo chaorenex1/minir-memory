@@ -14,21 +14,24 @@ artifact (a pre-overwrite snapshot and an FTS index are kept). The review publis
 
 Three file-backed layers sit on top: a **three-day global card review** merges sessions into four
 durable files; a **knowledge pipeline** writes one page per marker unit and injects path hints;
-and a **transcript audit trail** mirrors host turns and layer runs as JSON (30-day retention).
+and a **transcript event store** records host turns and layer runs as JSONL (append-only,
+permanent, one event per line).
 
 A fourth pass closes the loop after a conversation goes quiet: `on_session_end` records every
 turn's final token usage, captures the session's value markers and arms a 24-hour timer. Typing in
 the session again cancels it; otherwise a **session-summary agent** (the Task Handoff is its first
 user prompt input) and a **knowledge-extraction agent** turn the session into a durable summary
-and knowledge pages. The four tools are also registered as the `minir` toolset, so every agent
-this plugin runs can use the store directly.
+and knowledge pages. The five store tools are also registered as the `minir` toolset, so every agent
+this plugin runs can use the store directly; the same toolset carries the layer-scoped transcript
+search.
 
 It also ships an optional **main adviser**: a fast, per-turn side channel that watches the live
 tool loop (user goal, assistant intent, tool results) and injects its advice before the next
 model request through the host's `llm_request` middleware. It is the only advice producer in the
 provider: the dialectic corrects memory, the adviser advises the turn, and there is one
-review → emission guard → ledger → delivery chain. `adviser_consult` is the same adviser's
-synchronous entry point, not a separate personality. Unlike the dialectic layer it never writes
+review → emission guard → ledger → delivery chain. There is no model-visible consult tool: the
+synchronous consult route is internal to the worker (`worker._adviser_consult`), so the main agent
+cannot call the adviser as a tool. Unlike the dialectic layer the adviser never writes
 base cards or revisions. It is controlled by configuration only
 (`memory.minir.adviser_mode.enabled`; there is no `/adviser` command).
 
@@ -63,10 +66,10 @@ review_mode); config `roster` entries override it field by field.
 **SQLite holds no transcripts.** The worker reads `(from_ts, to_ts]` messages from
 `$HERMES_HOME/state.db` read-only (plus the in-process buffer for turns not yet committed) and
 persists only what the layers *derived* from them plus notes you asked to keep. What the provider
-does keep is a separate **audit trail** of JSON files under
-`$HERMES_HOME/minir-memory/sessions/` (host turns and layer runs, 30-day retention, no recall from
-it). Derived content may quote or reference the messages it reasoned over — it is a derived
-artifact, not a redacted one — but the recall store never copies the conversation itself. Because
+does keep is a separate **transcript event store** of JSONL files under
+`$HERMES_HOME/minir-memory/sessions/` (host turns and layer runs, append-only and permanent, with
+no recall from it). Derived content may quote or reference the messages it reasoned over — it is a
+derived artifact, not a redacted one — but the recall store never copies the conversation itself. Because
 the host store is the source of truth, a job queued before a restart can still be completed; only
 when no `state.db` exists are inherited jobs expired.
 
@@ -87,12 +90,15 @@ plugin/minir/          the deployable plugin directory (copy this to plugins/min
   __init__.py          register(ctx) + MinirMemoryProvider + the engine export
   store.py             SQLite storage: notes, conclusions + FTS5, base revisions, jobs, metrics
   history.py           read-only host history, profile resolution, identity files
-  transcript.py        bounded turn window + async JSON audit mirror (sessions/)
+  transcript.py        bounded turn window + the permanent JSONL event store (sessions/)
+  transcript_process.py per-process locks, first/last-process verdicts, cache replay
+  transcript_prompt.py per-pass transcript digest renderer (plain text, coverage line)
   turn_counter.py      base / dialectic layer turn counters + job windows
   worker.py            drains base and review jobs FIFO per session, publishes artifacts
   card_review.py       three-day review: four card files, validation, revisions, anchor policy
   knowledge.py         one page per unit, path-hint retrieval block
-  tools.py             the minir toolset: same five schemas, registered for plugin agents; file grant
+  tools.py             the minir toolset: store tools + agent transcript search; file/skills grant
+  agent_history.py     minir_aiagent_search: the caller's own layer stream, layer from contextvar
   minir_agents.py      run one named custom agent and flush its transcript under sessions/
   session_summary.py   end-of-session summary agent (hand-off is its first user prompt input)
   extraction.py        idle-timer due-row runner + knowledge-page extraction agent
@@ -109,7 +115,7 @@ plugin/minir/          the deployable plugin directory (copy this to plugins/min
   cadence.py           config/store-path helpers shared by the provider and the engine
   context_engine.py    audited summary compression (context.engine: minir)
   agent_loop.py        one-shot in-process AIAgent runs — sync + async (Feishu-shaped)
-  adviser.py           adviser route + tool adapter: adviser_consult delegates to the main adviser
+  adviser.py           adviser route: auxiliary task registration + the host session search tool
   adviser_prompts.py   one adviser core plus the CONSULT/REVIEW mode contracts
   adviser_mode.py      the only advice producer: event ring, review, guard, delivery channels
   host_bridge.py       optional bridge to hermes_cli.plugin_runtime (steer / continuation)
@@ -192,8 +198,8 @@ process-wide active provider, since the host can construct the plugin twice.
 
 ## Tools
 
-The provider exposes four tools; every response is a JSON string (errors are `{"error": ...}`).
-The same four are registered as the `minir` **registry toolset**, so the plugin's own agents can
+The provider exposes five store tools; every response is a JSON string (errors are `{"error": ...}`).
+The same five are registered as the `minir` **registry toolset**, so the plugin's own agents can
 be granted them explicitly (see "The `minir` toolset" below).
 
 | Tool | Parameters | Behaviour |
@@ -210,17 +216,26 @@ type-tagged row that search can recall and `minir_forget` can remove. Notes mirr
 host's built-in memory tools (`on_memory_write`) stay durable and untyped; they are recallable in
 both public scopes.
 
+Two further tools exist only in the agent-facing `minir` registry toolset (not in the provider's
+main-agent surface):
+
+| Tool | Scope | Behaviour |
+| --- | --- | --- |
+| `minir_hermes_session_search` | host caller: its own platform's sources; agent caller: the current host session only | Read-only FTS5/browse/transcript/window/stats over `state.db`. `platform="*"` disables the default source filter; the envelope echoes the filter it applied. |
+| `minir_aiagent_search` | the calling layer only | Reads the caller's own JSONL stream (`messages`/`search`/`around`/`stats`) through the transcript buffer. No layer argument: the layer is bound per agent run, and an unbound call is refused. Every answer echoes `coverage`, `source` and `dropped_before`. |
+
 ## The `minir` toolset
 
-The five tools have two delivery paths. The memory-provider surface (`get_tool_schemas`) injects
-them into a main agent that has the host's `memory` toolset enabled. For the plugin's own agents —
-the adviser, the layer worker, the hand-off and session-summary agents, the idle extraction — the
-same schemas are registered through the plugin context under a registry toolset named `minir`.
-That toolset also carries the `adviser` toolset (read-only `adviser_session_search`) and the
-host's `file` toolset, so a plugin agent grants all three with:
+The five store tools have two delivery paths. The memory-provider surface (`get_tool_schemas`)
+injects them into a main agent that has the host's `memory` toolset enabled. For the plugin's own
+agents — the adviser, the layer worker, the hand-off and session-summary agents, the idle
+extraction — the same schemas are registered through the plugin context under a registry toolset
+named `minir`, together with `minir_hermes_session_search` and `minir_aiagent_search`. That
+toolset also carries the host's `file` toolset and `skills`, so a plugin agent grants all three
+with:
 
 ```python
-toolsets = ["file", "minir", "adviser"]
+toolsets = ["file", "minir", "skills"]
 ```
 
 Every in-process agent this plugin runs builds its list with `tools.agent_toolsets(...)`, which
@@ -342,8 +357,8 @@ operator override under `$HERMES_HOME/minir-memory/rules/` replaces a packaged f
 with a warning when it is unreadable. Each pass returns **one JSON object** whose card values are
 markdown bodies (no code fence, no front-matter); the worker validates it against the same rules
 the reviewer reads, and only a validated object is rendered into the artifact. The
-adviser toolset is attached only on this route, and the tool hint carries the window bounds: a pass
-may call `adviser_session_search` with `after`/`before` for evidence inside `(from_ts, to_ts]`, but
+`minir` toolset is attached on this route, and the tool hint carries the window bounds: a pass
+may call `minir_hermes_session_search` with `after`/`before` for evidence inside `(from_ts, to_ts]`, but
 must not read later turns. The first user message is the only allowed outside-window evidence, and
 only on the first refresh.
 
@@ -410,7 +425,7 @@ Pass 4 is separate: it reads the same window plus the recorded value marker inve
 The dialectic prompt receives the session's **live** base artifact (the newest published row; a
 catch-up drain may have moved past its own window), the previous review note, the operator files,
 the chunk chain up to that window, and the window's messages (tool rows included). It may call
-`adviser_session_search` with `before=<window end>` to inspect earlier history for drift; it never
+`minir_hermes_session_search` with `before=<window end>` to inspect earlier history for drift; it never
 reads later turns. It reviews whole parts: the user card, the AI card and the window summary. Its
 system prompt is assembled from the layer core plus the four card **review checks** in
 `plugin/minir/rules/`, so the reviewer reads the same contract the writer was given. It lists a
@@ -531,8 +546,7 @@ review receives the current files as its baseline.
 The scheduler is wall-clock, not turn-driven: a review is due every **3 days**
 (`card_review_days`), the first anchor is written at install, the anchor advances only on success,
 and a failure retries after 30 minutes, 2 hours and 6 hours before waiting for the next period.
-It runs on the `minir_card_review` route with no tools (files and evidence are inline) and prunes
-transcripts older than 30 days after each success.
+It runs on the `minir_card_review` route with no tools (files and evidence are inline).
 
 ### Knowledge pages
 
@@ -553,29 +567,42 @@ Retrieval is by **path, never by content**: `prefetch()` scores the front-matter
 injects them as `[knowledge — retrieve on demand] ... [end knowledge]`. Paths selected in the last
 three turns are skipped. The model opens a page with its file tool when the hint is relevant.
 
-### The transcript audit trail
+### The transcript event store
 
-Completed host turns and every layer pass are mirrored to
-`$HERMES_HOME/minir-memory/sessions/`: `<session_id>.json` for the primary session,
-`<layer>/<run_id>.json` for base, dialectic, card_review and knowledge passes, and
-`<agent_name>/<layer_session_id>.json` for `minir_agents` runs. All writes happen on
-one writer thread (temp file + `os.replace`), debounced 30 seconds or 50 messages, sharded at 2000
-messages, with a bounded queue; `flush()` runs at every boundary, `close()` joins at shutdown, and
-files older than 30 days are pruned. The JSON keeps `session_id`, `layer`, timestamps, model,
-provider, toolsets, system message and `messages`; it is an audit trail, not a recall source.
+Completed host turns and every layer pass are appended to
+`$HERMES_HOME/minir-memory/sessions/<platform>/<layer>/<session_id>.jsonl`: one JSON object per
+line, one line per event, never rewritten, compressed or deleted. Host streams use the `host`
+layer; base, dialectic, card_review, adviser and `minir_agents` runs use their own layer
+directory, partitioned by the `platform` the host passed to `initialize`. Parts rotate at 2000
+lines (`<session_id>.partN.jsonl`) and reads continue across them by `seq`.
+
+Each row carries `v`, `seq`, `ts`/`iso`, `platform`/`layer`/`session_id`, `turn`/`step`, `role`
+(`user`/`system`/`assistant`/`tool`/`reasoning`), `kind` (`msg`/`aux`/`run_start`/`run_end`/`gap`/
+`marker`), `run_id`, `redacted`, and the role's own fields (`text`, `tool_calls`, `usage`,
+`tool_call_id`, `result`, `fp`, ...). Bodies are full: the 4000-character cut and whitespace
+collapse survive only in the in-memory window the layer worker reads.
+
+Reads go through `TranscriptBuffer.read_events` (memory first, the stream's own file for rows the
+bounded cache no longer holds) and report `source` (`buffer`/`disk`/`mixed`) plus `coverage`.
+`sync_turn` appends only the tail after the last `fp` fingerprint; a compaction that removed the
+anchor writes a `gap` row instead of silently replaying. A clean close appends one
+`marker{marker:"last_cache"}` row per stream this process wrote, and the first process after a
+full shutdown replays that range. A crash skips the marker: the appended rows are still readable,
+nothing is replayed. `minir_stats` reports the stream table with row and byte counts.
 
 ### Where the model call comes from
 
 Base and dialectic passes run through `agent_loop.run` on the `auxiliary.adviser` route with a
 **fixed** toolset built by `tools.agent_toolsets(...)`: the host's `file` toolset, this plugin's
-`minir` toolset and its `adviser` toolset (which carries `adviser_session_search`). Operator-
+`minir` toolset (which carries `minir_hermes_session_search` and `minir_aiagent_search`) and
+`skills`. Operator-
 configured adviser toolsets are not used, and the list is never `None`: `agent_loop.run` passes
 the list it was given, so an empty list means no tools while `None` would mean every tool.
 `agent_loop.run` marks every peer run with `file_guard.aux_scope()` and passes the project root
 (the nearest `.git` above the cwd), so a `pre_tool_call` guard scopes the file tools for every
 plugin agent: reads stay under `$HERMES_HOME` and the project root, minus secret files and
 `.git` metadata; writes only under `minir-memory/scratch/`. Each pass is prompted to call
-`adviser_session_search` with the session id and window from its prompt when it needs more
+`minir_hermes_session_search` with the session id and window from its prompt when it needs more
 evidence:
 
 ```yaml
@@ -613,7 +640,9 @@ stable across windows and leaves the evidence replaceable.
   window (untrusted evidence) > previous cards, reviews, chunk summaries and drafts (derived
   drafts). A derived item is never evidence for itself; current evidence beats a previous item.
 - **Data, not instructions** — `prompting.data_block()` wraps every non-system input in a named
-  tag (`<conversation_window>`, `<previous_user_cards>`, `<base_layer_artifact>`,
+  tag (`<base_user_transcript>`, `<base_ai_transcript>`, `<window_summary_transcript>`,
+  `<value_markers_transcript>`, `<dialectic_transcript>`, `<previous_user_cards>`,
+  `<base_layer_artifact>`,
   `<live_turn_events>`, …). Reserved tags appearing inside a payload are rewritten as literal
   text, so a message cannot close its block early or forge another block. Adviser-mode events are
   JSONL: one event per line, with newlines escaped, so event text cannot create prompt structure.
@@ -641,11 +670,11 @@ stable across windows and leaves the evidence replaceable.
 
 ## The adviser auxiliary (optional agent loop)
 
-`adviser.py` puts a second-opinion agent inside this plugin: an `auxiliary.adviser` model route
-plus one `adviser_consult` tool that runs a **real agent loop** (its own LLM + tools) rather than a
-one-shot completion. The base layer's four passes and the independent review reuse the
-same route and toolset (`worker._adviser_consult`); the loop is not adviser-specific — it lives in
-`agent_loop.py` and can be reused for any one-shot peer run (a review, a summary, a critic):
+`adviser.py` owns an `auxiliary.adviser` model route that runs a **real agent loop** (its own LLM and
+tools) rather than a one-shot completion. The base layer's four passes and the independent
+review reuse the same route (`worker._adviser_consult`); the loop is not adviser-specific — it
+lives in `agent_loop.py` and can be reused for any one-shot peer run (a review, a summary, a
+critic):
 
 ```python
 from . import agent_loop
@@ -686,16 +715,13 @@ and an explicit `enabled_toolsets`, call `run_conversation(prompt, system_messag
 `async def` in `run_agent`/`agent.conversation_loop`); the blocking HTTP and tool subprocesses stay
 off the event loop, and `close()` still happens in the thread that built the agent.
 
-`adviser.py` is now a thin adapter: it owns the `auxiliary.adviser` block
-(`provider`/`model`/`toolsets`) and the tool entry, while `adviser_mode.AdviserMode.consult()`
-supplies the shared `ADVISER_CORE + MODE_CONSULT` system message and the same session context
-as review. `register(ctx, provider)` binds the tool to that instance; `handle(args,
-provider=...)` and `handle_async(args, provider=...)` delegate to `consult`/`consult_async`, and
-fall back to the standalone `run` for direct callers. The registered handler is an async
-closure with `is_async=True` — the host bridges that for sync callers
-(`tools.registry.dispatch` → `_run_async`) and awaits it on a gateway loop, so one consult does not
-stall other conversations. The pairing matters: an async handler with `is_async=False` would hand a
-coroutine to the result normaliser.
+`adviser.py` is a thin route owner: it registers the `auxiliary.adviser` block
+(`provider`/`model`/`toolsets`) and the read-only host session search, while
+`adviser_mode.AdviserMode.consult()` supplies the shared `ADVISER_CORE + MODE_CONSULT` system
+message for the worker's internal synchronous path. There is no model-visible consult tool: its
+schema, handler, dynamic registration, prompt section and toolset were deleted. The host session
+search is registered synchronously (`is_async=False`); its handler injects the caller class and
+platform, so a model cannot pick another layer or widen the filter by argument.
 
 ```yaml
 auxiliary:
@@ -706,12 +732,13 @@ auxiliary:
 ```
 
 `register()` adds both surfaces next to the memory provider — `ctx.register_auxiliary_task("adviser")`
-for the config block/picker entry and `ctx.register_tool(...)` for `adviser_consult` — and the tools are
+for the config block/picker entry and `ctx.register_tool(...)` for
+`minir_hermes_session_search` — and the tools are
 declared under `provides_tools:` in `plugin.yaml`, which is what `hermes plugins validate` checks.
 
-### Session search (`adviser_session_search`)
+### Session search (`minir_hermes_session_search`)
 
-The same `adviser` toolset also exposes `adviser_session_search`: read-only, stdlib-only recall over
+The `minir` toolset exposes `minir_hermes_session_search`: read-only, stdlib-only recall over
 the host's own `$HERMES_HOME/state.db` (`session_search.py`). Nothing is copied; every answer is the
 host's rows, bounded per message. Five shapes, selected by `mode` or inferred from the arguments:
 
@@ -732,13 +759,22 @@ open the other filters. `profile: work` reads `$HERMES_HOME/profiles/work/state.
 active profile. Time bounds accept epoch seconds, ISO date/datetime, or `7d`/`24h`/`2w`; results
 report `total`, `has_more` and `next_offset` so a caller can page without guessing.
 
+The default scope is the caller's platform: a host caller sees only sessions whose
+`sessions.source` maps to the `platform` the host passed to `initialize` (`cli`, `tui`, `desktop`,
+`telegram`, `feishu`, ...; the map lives in `session_search._PLATFORM_SOURCES`). `platform="*"`
+disables the default filter, an explicit `platform` selects another surface's sources, and an
+agent caller is scoped to the current host session unconditionally (its `platform` argument is
+ignored, not rejected). The envelope echoes the filter it applied, and an empty filtered result
+says whether the store has rows at all.
+
 The handler is synchronous (`is_async=False`): one bounded SQLite read with no model call. It returns
 the same `{"success": true, "data": …}` / `{"success": false, "error": {"type", "message"}}` envelope
-as `adviser_consult`, and never raises into the tool loop.
+as every other tool, and never raises into the tool loop.
 
 Registration is deliberately *optional*: if the host refuses the auxiliary key (another plugin owns
 it), the warning is logged and the memory provider still loads, because the provider is why the
-directory is imported at all. The key is process-wide, so a standalone `adviser` plugin cannot stay
+directory is imported at all; the session search is registered before the key, so it survives that
+refusal too. The key is process-wide, so a standalone `adviser` plugin cannot stay
 installed next to this one — the second registration is refused (route) or ignored (tool name).
 
 Why a private `AIAgent` instead of `ctx.subagent_lifecycle.launch()`: the adviser is a **peer** of the
@@ -757,7 +793,7 @@ One ordering trap, documented in `agent_loop.run`: `run_agent` bootstraps the ma
 The dialectic layer is slow and window-scoped: it corrects the long-term user/AI cards after a
 base refresh. Adviser mode is the fast loop: it watches the current turn and nudges the main
 agent before its next model request. The two share the `auxiliary.adviser` route, the
-`adviser_session_search` toolset, the `advisories` ledger and severity/dedupe rules, but not
+`minir_hermes_session_search` toolset, the `advisories` ledger and severity/dedupe rules, but not
 write authority:
 
 | | dialectic layer | adviser mode |
@@ -830,7 +866,7 @@ records the final answer. Tool rows keep the full result up to the per-field cap
 kept without a per-field cap. The delta budget is 24k of whole events: the oldest events drop
 first, and one oversized event is kept whole. Each review continues that
 adviser's own `AdvisorRuntime` through `conversation_history`, so it can build on its earlier
-tool reads instead of re-deriving them. It may call `adviser_session_search` to ground a claim.
+tool reads instead of re-deriving them. It may call `minir_hermes_session_search` to ground a claim.
 Its system block is composed dynamically from
 `memory.minir.adviser_mode.enabled`: severity, all 11 advice targets (definition + usage),
 the severity × target handling matrix, the nit-report table, and the language rule. When the mode
@@ -910,8 +946,8 @@ window has consumed **95% of the configured threshold** (`last_prompt_tokens >=
    unreasoned window, drains the base and review jobs **synchronously** (base first), resets both
    layer counters to the current turn, and leaves the gate in place.
 2. `compress()` reads the prepared chunk and dialectic review, runs a real **summary agent** on
-   the `auxiliary.adviser` route with the `adviser` toolset, and produces the final
-   `session_summary`. The agent may call `adviser_session_search` with `before=<window end>`,
+   the `auxiliary.adviser` route with the `minir` toolset, and produces the final
+   `session_summary`. The agent may call `minir_hermes_session_search` with `before=<window end>`,
    `include_inactive=True` and `include_compacted=True`; it never reads later turns. Its system
    prompt is the operator Task Handoff template (`prompts/session_handoff.md`, override with
    `MINIR_SUMMARY_TEMPLATE`) plus the audit rules.
@@ -926,7 +962,7 @@ window has consumed **95% of the configured threshold** (`last_prompt_tokens >=
 ```
 
 The summary message is an **assistant** row and carries no folded-uid list. Recovery is through
-`minir_search` and `adviser_session_search`; the old carrier/`select_context()` /
+`minir_search` and `minir_hermes_session_search`; the old carrier/`select_context()` /
 `minir_context_recall` path is gone.
 
 ### Gate, counters, and resume
@@ -952,10 +988,10 @@ second one in the head.
 ### Synthetic rows do not recurse
 
 The assistant summary and the first-compression notice are derived rows. `history.read_messages`,
-`latest_ts`, and `adviser_session_search` filter the `[minir summary` and
+`latest_ts`, and `minir_hermes_session_search` filter the `[minir summary` and
 `[minir memory notice` prefixes role-agnostically, so a later base/dialectic window cannot treat
 the model's own summary as real assistant evidence and summarize it again. With
-`include_synthetic=True`, `adviser_session_search` can still expose those rows explicitly.
+`include_synthetic=True`, `minir_hermes_session_search` can still expose those rows explicitly.
 
 `reasoning_enabled: false` skips the summary agent and the layer worker; `compress()` then folds
 to the prepared chunk/review (or the previous summary) so the window still shrinks.
@@ -1026,6 +1062,9 @@ memory:
     session_mode: default      # mode stamped on each newly opened session
     prefetch_limit: 5          # memory items injected per turn
     content_language: en       # language for card/knowledge prose; field names stay English
+    buffer_streams: 20         # transcript streams cached in memory (current session pinned)
+    buffer_events_per_stream: 4000  # per-stream cache cap; the JSONL file keeps everything
+    buffer_bytes: 268435456    # total cache budget in bytes (oldest streams evict first)
     card_token_budget: 2000    # hard per-file budget for the four global card files
     card_review_days: 3        # days between global card reviews
     knowledge_token_budget: 2000  # hard per-file budget for one knowledge page
@@ -1049,8 +1088,10 @@ hand-edited config.yaml are equivalent. Most keys also have an env override —
 `MINIR_BASE_INTERVAL`, `MINIR_DIALECTIC_INTERVAL`, `MINIR_REASONING_ENABLED`,
 `MINIR_HANDOFF_ENABLED`, `MINIR_SESSION_MODE`, `MINIR_PREFETCH_LIMIT`, `MINIR_CONTENT_LANGUAGE`,
 `MINIR_CARD_TOKEN_BUDGET`, `MINIR_CARD_REVIEW_DAYS`, `MINIR_KNOWLEDGE_TOKEN_BUDGET`,
-`MINIR_SESSION_EXTRACTION`, `MINIR_KNOWLEDGE_IDLE_HOURS` — and **the
-env var wins** when both are set. Layer intervals, depth and `reasoning_enabled` are read when a session opens.
+`MINIR_SESSION_EXTRACTION`, `MINIR_KNOWLEDGE_IDLE_HOURS`, `MINIR_BUFFER_STREAMS`,
+`MINIR_BUFFER_EVENTS`, `MINIR_BUFFER_BYTES` — and **the
+env var wins** when both are set. Layer intervals, depth, `reasoning_enabled` and the transcript
+cache budget are read when a session opens.
 
 Every published conclusion is searchable: `notes`, the four base sections, the dialectic review,
 local compression chunks, and the final `session_summary` of each compression. The index uses

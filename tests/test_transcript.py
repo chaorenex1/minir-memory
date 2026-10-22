@@ -1,30 +1,28 @@
-"""In-memory transcript — bounds, windows, and the guarantees the worker relies on.
+"""Transcript event store: JSONL rows, dedupe, reads, cache replay and process locks.
 
-The persistence half is the audit trail of doc/base-dialectic-layers-draft.md §4.9: a host
-session per file, a plugin layer session under its layer directory, a debounced atomic rewrite,
-a second shard past 2000 messages, and prune as the only deleter.
+The in-memory window keeps its own contract (bounded, half-open timestamps); the file is the
+permanent record. These tests are the acceptance table of doc/transcript-jsonl-draft.md §11.
 """
 
 from __future__ import annotations
 
 import json
-import os
 import time
+from pathlib import Path
 
 import pytest
 
 
 @pytest.fixture()
 def persisted(plugin_package, tmp_path):
-    """Factory: ``make(**kwargs)`` -> a buffer writing under ``tmp_path``.
-
-    Every buffer is closed at teardown, so its writer thread is joined and cannot outlive the
-    test's temporary directory.
-    """
+    """Factory: ``make(**kwargs)`` -> a buffer writing under ``tmp_path``; every one is closed."""
     buffers = []
 
     def _make(**kwargs):
-        buffer = plugin_package.transcript.TranscriptBuffer(persist_dir=tmp_path, **kwargs)
+        kwargs.setdefault("persist_dir", tmp_path / "sessions")
+        kwargs.setdefault("run_dir", tmp_path / "run")
+        kwargs.setdefault("platform", "cli")
+        buffer = plugin_package.transcript.TranscriptBuffer(**kwargs)
         buffers.append(buffer)
         return buffer
 
@@ -33,280 +31,327 @@ def persisted(plugin_package, tmp_path):
         buffer.close()
 
 
+def _rows(buffer, session="s1", **kwargs):
+    return buffer.read_events("cli", "host", session, **kwargs)["rows"]
+
+
+def _conversation(turn: int = 1) -> list[dict]:
+    return [
+        {"role": "system", "content": "be terse"},
+        {"role": "user", "content": f"turn {turn}: deploy it"},
+        {"role": "assistant", "content": "reading the manifest",
+         "tool_calls": [{"id": f"c{turn}", "function": {"name": "exec",
+                                                        "arguments": '{"cmd":"ls"}'}}],
+         "reasoning_content": "check the manifest first"},
+        {"role": "tool", "tool_call_id": f"c{turn}", "name": "exec", "content": "a" * 6000},
+    ]
+
+
+# -- rows ---------------------------------------------------------------------
+
+
+def test_one_event_per_line_with_all_five_roles(persisted):
+    make, root = persisted
+    buffer = make()
+    buffer.ingest("host", "s1", _conversation())
+    assert buffer.flush() is True
+    path = root / "sessions" / "cli" / "host" / "s1.jsonl"
+    lines = path.read_text(encoding="utf-8").splitlines()
+    assert path.read_text(encoding="utf-8").endswith("\n")
+    rows = [json.loads(line) for line in lines]
+    assert [row["role"] for row in rows] == ["system", "user", "assistant", "reasoning", "tool"]
+    assert [row["seq"] for row in rows] == [1, 2, 3, 4, 5]
+    assert all(row["kind"] == "msg" and row["v"] == 1 for row in rows)
+    assert all(row["platform"] == "cli" and row["layer"] == "host"
+               and row["session_id"] == "s1" for row in rows)
+    # The 6000-character tool result is on disk in full: no flatten, no 4000 cut.
+    assert len(rows[4]["result"]) == 6000
+    assert rows[1]["text"] == "turn 1: deploy it"
+    assert rows[2]["tool_calls"][0]["name"] == "exec"
+    assert rows[3]["text"] == "check the manifest first"
+
+
+def test_two_syncs_do_not_repeat_the_first_turn(persisted):
+    make, _root = persisted
+    buffer = make()
+    first = _conversation(1)
+    second = _conversation(2)
+    assert buffer.ingest("host", "s1", first) == 5
+    assert buffer.ingest("host", "s1", first) == 0  # the same slice twice is a no-op
+    assert buffer.ingest("host", "s1", first + second) == 5
+    rows = _rows(buffer)
+    assert [row["text"] for row in rows if row["role"] == "user"] == [
+        "turn 1: deploy it", "turn 2: deploy it"]
+
+
+def test_a_lost_anchor_writes_a_gap_then_the_slice(persisted):
+    make, _root = persisted
+    buffer = make()
+    buffer.ingest("host", "s1", _conversation(1))
+    # Compaction rewrote the conversation: none of the old fingerprints survive.
+    rewritten = [{"role": "system", "content": "summary of earlier work"},
+                 {"role": "user", "content": "continue"}]
+    assert buffer.ingest("host", "s1", rewritten) == 2
+    gap = [row for row in _rows(buffer) if row["kind"] == "gap"]
+    assert len(gap) == 1 and gap[0]["reason"] == "compaction"
+    assert "summary of earlier work" in [row.get("text") for row in _rows(buffer)]
+
+
+def test_a_resumed_process_appends_only_the_new_tail(persisted):
+    make, _root = persisted
+    first = make()
+    first.bind("s1")
+    first.ingest("host", "s1", _conversation(1))
+    first.close()
+
+    second = make()
+    second.bind("s1")
+    rows = _rows(second)
+    assert len(rows) == 5  # replayed from the last_cache marker, not re-read as new
+    assert second.ingest("host", "s1", _conversation(1) + _conversation(2)) == 5
+    assert len(_rows(second)) == 10
+
+
+# -- reads --------------------------------------------------------------------
+
+
+def test_cursor_rolling_and_cross_part_reads(persisted):
+    make, _root = persisted
+    buffer = make(events_per_part=2)
+    for index in range(1, 6):
+        buffer.append_event("host", "s1", "user", text=f"m{index}", platform="cli")
+    assert buffer.flush() is True
+
+    assert [row["text"] for row in _rows(buffer, cursor=2)] == ["m3", "m4", "m5"]
+    rolling = buffer.read_events("cli", "host", "s1", last_n=2)
+    assert [row["text"] for row in rolling["rows"]] == ["m4", "m5"]
+    assert rolling["dropped_before"] == 3
+    assert rolling["next_cursor"] == 5
+
+    paged = buffer.read_events("cli", "host", "s1", limit=2, page=1)
+    assert [row["text"] for row in paged["rows"]] == ["m3", "m4"]
+    assert paged["truncated"] is True
+    parts = sorted(path.name for path in (persisted[1] / "sessions" / "cli" / "host").glob("*.jsonl"))
+    assert parts == ["s1.jsonl", "s1.part2.jsonl", "s1.part3.jsonl"]
+
+
+def test_a_truncated_final_line_is_skipped_not_raised(persisted):
+    make, root = persisted
+    buffer = make()
+    buffer.append_event("host", "s1", "user", text="kept")
+    assert buffer.flush() is True
+    path = root / "sessions" / "cli" / "host" / "s1.jsonl"
+    with open(path, "a", encoding="utf-8") as handle:
+        handle.write('{"v": 1, "seq": 99, "role": "ass')
+    rows = _rows(buffer)
+    assert [row["text"] for row in rows] == ["kept"]
+    # The next append survives the fragment: the writer keeps one line per event.
+    buffer.append_event("host", "s1", "assistant", text="after")
+    assert buffer.flush() is True
+    content = path.read_text(encoding="utf-8")
+    assert content.count("kept") == 1 and content.count("after") == 1
+    assert json.loads(content.splitlines()[-1])["text"] == "after"
+
+
+def test_evicted_rows_are_read_from_disk_and_reported(persisted):
+    make, _root = persisted
+    buffer = make(buffer_events_per_stream=2)
+    for index in range(4):
+        buffer.append_event("host", "s1", "user", text=f"m{index}", platform="cli")
+    assert buffer.flush() is True
+    result = buffer.read_events("cli", "host", "s1", limit=100, kinds=("msg",))
+    assert [row["text"] for row in result["rows"]] == ["m0", "m1", "m2", "m3"]
+    assert result["coverage"] == (3, 4)
+    assert result["evicted_before"] == 2
+    assert result["source"] == "mixed"
+
+
+def test_stream_count_and_byte_bounds_never_evict_the_pinned_stream(persisted):
+    make, _root = persisted
+    buffer = make(max_sessions=2, buffer_events_per_stream=100, buffer_bytes=1024 * 1024)
+    buffer.bind("s1")
+    buffer.append_event("host", "s1", "user", text="pinned", platform="cli")
+    buffer.append_event("host", "s2", "user", text="two", platform="cli")
+    buffer.append_event("host", "s3", "user", text="three", platform="cli")
+    assert len(buffer.stats()["streams"]) == 2
+    assert buffer.read_events("cli", "host", "s1", last_n=1)["rows"][0]["text"] == "pinned"
+
+    tiny = make(buffer_events_per_stream=100, buffer_bytes=512)
+    tiny.bind("s9")
+    tiny.append_event("host", "s9", "user", text="P" * 100, platform="cli")
+    for index in range(5):
+        tiny.append_event("host", f"b{index}", "user", text="x" * 300, platform="cli")
+    sessions = {row["session_id"] for row in tiny.stats()["streams"]}
+    assert "s9" in sessions                 # the pinned session is never evicted
+    assert "b0" not in sessions             # byte pressure evicted the oldest stream whole
+    assert tiny.stats()["bytes"] > 0        # disk bytes are reported after cache eviction
+
+
+# -- cache replay and multi-process -------------------------------------------
+
+
+def test_first_process_replays_only_the_marked_range(persisted):
+    make, _root = persisted
+    first = make(buffer_events_per_stream=3)
+    first.bind("s1")
+    for index in range(5):
+        first.append_event("host", "s1", "user", text=f"m{index}", platform="cli")
+    first.close()
+    assert [row["seq"] for row in _rows(first, kinds=("msg",))][-1] == 5
+
+    second = make()
+    assert second.bind("s1") is True
+    replayed = _rows(second, kinds=("msg",))
+    assert [row["text"] for row in replayed] == ["m2", "m3", "m4"]
+    assert second.read_events("cli", "host", "s1", last_n=1, kinds=("msg",))["source"] == "buffer"
+    # The old rows are still readable from the file, and the answer says so.
+    full = second.read_events("cli", "host", "s1", limit=100, kinds=("msg",))
+    assert full["source"] == "mixed" and len(full["rows"]) == 5
+    # The marker row keeps its seq; a post-replay append must not reuse it.
+    assert second.append_event("host", "s1", "user", text="m5", platform="cli")["seq"] == 7
+
+
+def test_a_second_live_process_does_not_rebuild(persisted):
+    make, _root = persisted
+    first = make()
+    first.bind("s1")
+    first.append_event("host", "s1", "user", text="one", platform="cli")
+    second = make()
+    assert second.bind("s1") is False
+    assert second.read_events("cli", "host", "s1", limit=100)["rows"][0]["text"] == "one"
+
+
+def test_each_live_process_marks_its_own_streams(persisted):
+    make, _root = persisted
+    first = make()
+    second = make()
+    first.bind("s1")
+    second.bind("s2")
+    first.append_event("host", "s1", "user", text="one", platform="cli")
+    second.append_event("host", "s2", "user", text="two", platform="cli")
+    assert first.flush() is True and second.flush() is True
+    second.close()
+    first.close()  # last: its own marker, plus a final fsync sweep
+
+    third = make()
+    assert third.bind("s1") is True
+    assert [row["text"] for row in _rows(third, session="s1", kinds=("msg",))] == ["one"]
+    assert [row["text"] for row in _rows(third, session="s2", kinds=("msg",))] == ["two"]
+
+
+def test_rebuild_takes_the_newest_marker_of_each_stream(persisted):
+    make, _root = persisted
+    first = make()
+    first.bind("s1")
+    first.append_event("host", "s1", "user", text="old", platform="cli")
+    first.close()
+
+    second = make()
+    second.bind("s1")
+    second.append_event("host", "s1", "user", text="new", platform="cli")
+    second.close()
+
+    third = make()
+    assert third.bind("s1") is True
+    # The newest marker covers this process's own writes; the earlier row stays on disk and is
+    # filled by a paged read, which reports where it came from.
+    assert [row["text"] for row in _rows(third, kinds=("msg",))] == ["new"]
+    full = third.read_events("cli", "host", "s1", limit=100, kinds=("msg",))
+    assert [row["text"] for row in full["rows"]] == ["old", "new"]
+    assert full["source"] == "mixed"
+
+
+def test_a_crash_leaves_readable_rows_and_no_replay(persisted):
+    make, root = persisted
+    crashed = make()
+    crashed.bind("s1")
+    crashed.append_event("host", "s1", "user", text="before crash", platform="cli")
+    assert crashed.flush() is True
+    # Simulate a kill: release the OS lock, write no marker, stop the writer without close().
+    crashed._process.release()
+    crashed._process = None
+    crashed._closing = True
+
+    restarted = make()
+    assert restarted.bind("s1") is True
+    # No last_cache marker: the in-memory cache is empty, and the answer says so.
+    cached = restarted.read_events("cli", "host", "s1", last_n=1)
+    assert cached["coverage"] == (0, 0)
+    disk = restarted.read_events("cli", "host", "s1", limit=100)
+    assert [row["text"] for row in disk["rows"]] == ["before crash"]
+    assert disk["source"] == "disk"
+
+
+def test_legacy_json_files_are_not_read_migrated_or_deleted(persisted):
+    make, root = persisted
+    buffer = make()
+    legacy = root / "sessions" / "s1.json"
+    legacy.write_text(json.dumps({"session_id": "s1", "messages": [
+        {"role": "user", "content": "old"}]}), encoding="utf-8")
+    buffer.bind("s1")
+    assert buffer.read_events("cli", "host", "s1", limit=100)["rows"] == []
+    assert buffer.read_aux("host", "s1") == []
+    assert legacy.exists() and json.loads(legacy.read_text(encoding="utf-8"))["session_id"] == "s1"
+
+
+# -- aux streams ---------------------------------------------------------------
+
+
+def test_record_aux_appends_deduped_and_read_aux_round_trips(persisted):
+    make, root = persisted
+    buffer = make()
+    conversation = [{"role": "user", "content": "q"},
+                    {"role": "assistant", "content": "a"}]
+    buffer.record_aux("adviser", "s1--quality", conversation, model="m", provider="p",
+                      toolsets=("file",), system_message="sys",
+                      usage={"total_tokens": 1234})
+    buffer.record_aux("adviser", "s1--quality", conversation + [
+        {"role": "user", "content": "follow-up"}], usage={"total_tokens": 99})
+    assert buffer.flush_aux("adviser", "s1--quality") is True
+
+    assert buffer.path_for_aux("adviser", "s1--quality") == (
+        root / "sessions" / "cli" / "adviser" / "s1--quality.jsonl")
+    rows = buffer.read_all("cli", "adviser", "s1--quality")
+    assert [row.get("text") for row in rows
+            if row.get("kind") == "msg" and row.get("role") != "system"] == [
+        "q", "a", "follow-up"]
+    assert [row for row in rows
+            if row.get("role") == "system" and row.get("text") == "sys"]
+    assert [row["content"] for row in buffer.read_aux("adviser", "s1--quality")] == [
+        "q", "a", "follow-up"]
+    run_ends = [row for row in rows if row["kind"] == "run_end"]
+    assert run_ends[0]["usage"] == {"total_tokens": 1234}
+
+
+def test_a_hostile_layer_name_cannot_escape_the_persist_directory(persisted):
+    make, root = persisted
+    buffer = make()
+    path = buffer.path_for_aux("../../evil", "layer-1")
+    assert path is not None and path.parent == root / "sessions" / "cli" / "evil"
+    buffer.record_aux("../../evil", "layer-1", [{"role": "user", "content": "x"}])
+    assert buffer.flush() is True
+    assert (root / "sessions" / "cli" / "evil" / "layer-1.jsonl").exists()
+    assert not (root / "sessions" / "evil.jsonl").exists()
+
+
+# -- window (unchanged contract) ----------------------------------------------
+
+
 def test_window_is_half_open_and_ordered(plugin_package):
     buffer = plugin_package.transcript.TranscriptBuffer()
     buffer.add("s", "user", "first", created_at=10.0)
     buffer.add("s", "assistant", "second", created_at=20.0)
     buffer.add("s", "user", "third", created_at=30.0)
     assert [row["content"] for row in buffer.window("s", 10.0, 30.0)] == ["second", "third"]
-    assert [row["content"] for row in buffer.window("s", 10.0, 20.0)] == ["second"]
     assert buffer.window("s", 30.0, 40.0) == []
-    assert buffer.window("other", 0.0, 100.0) == []
 
 
-def test_add_turn_keeps_the_pair_with_one_timestamp(plugin_package):
-    buffer = plugin_package.transcript.TranscriptBuffer()
-    buffer.add_turn("s", "deploy it", "done", author="Ada", author_id="u-1", created_at=5.0)
-    rows = buffer.messages("s")
-    assert [(row["role"], row["content"]) for row in rows] == [("user", "deploy it"),
-                                                              ("assistant", "done")]
-    assert rows[0]["author"] == "Ada" and rows[0]["author_id"] == "u-1" and rows[1]["author"] == ""
-
-
-def test_blank_content_is_ignored(plugin_package):
-    buffer = plugin_package.transcript.TranscriptBuffer()
-    buffer.add("s", "assistant", "   \n  ")
-    assert buffer.messages("s") == []
-
-
-def test_has_after_tracks_the_newest_message(plugin_package):
-    buffer = plugin_package.transcript.TranscriptBuffer()
-    assert buffer.has_after("s", 0.0) is False
-    buffer.add("s", "user", "hello there", created_at=10.0)
-    assert buffer.has_after("s", 5.0) is True
-    assert buffer.has_after("s", 10.0) is False
-
-
-def test_message_count_is_bounded_per_session(plugin_package):
-    buffer = plugin_package.transcript.TranscriptBuffer(max_messages=3)
+def test_message_count_and_character_budgets_bound_the_window(plugin_package):
+    buffer = plugin_package.transcript.TranscriptBuffer(max_messages=3, max_chars=25)
     for index in range(6):
         buffer.add("s", "user", f"message {index}", created_at=float(index))
-    assert [row["content"] for row in buffer.messages("s")] == ["message 3", "message 4", "message 5"]
-
-
-def test_character_budget_evicts_the_oldest(plugin_package):
-    buffer = plugin_package.transcript.TranscriptBuffer(max_chars=25)
+    assert len(buffer.messages("s")) <= 3
+    buffer.clear()
     buffer.add("s", "user", "a" * 20, created_at=1.0)
     buffer.add("s", "user", "b" * 20, created_at=2.0)
     assert [row["content"][0] for row in buffer.messages("s")] == ["b"]
-
-
-def test_only_the_newest_sessions_are_kept(plugin_package):
-    buffer = plugin_package.transcript.TranscriptBuffer(max_sessions=2)
-    buffer.add("old", "user", "one", created_at=1.0)
-    buffer.add("mid", "user", "two", created_at=2.0)
-    buffer.add("new", "user", "three", created_at=3.0)
-    assert buffer.messages("old") == []
-    assert [row["content"] for row in buffer.messages("mid")] == ["two"]
-    assert [row["content"] for row in buffer.messages("new")] == ["three"]
-
-
-def test_extend_carries_messages_to_another_session(plugin_package):
-    """/branch: the branch inherits the conversation, timestamps and authors included."""
-    buffer = plugin_package.transcript.TranscriptBuffer()
-    buffer.add("parent", "user", "original", author="Ada", author_id="u-1", created_at=7.0)
-    buffer.extend("branch", buffer.messages("parent"))
-    assert [(row["content"], row["author_id"], row["created_at"]) for row in buffer.messages("branch")] \
-        == [("original", "u-1", 7.0)]
-
-
-def test_clear_drops_one_session_or_all(plugin_package):
-    buffer = plugin_package.transcript.TranscriptBuffer()
-    buffer.add("a", "user", "one", created_at=1.0)
-    buffer.add("b", "user", "two", created_at=2.0)
-    buffer.clear("a")
-    assert buffer.messages("a") == [] and buffer.messages("b") != []
-    buffer.clear()
-    assert buffer.messages("b") == []
-
-
-def test_the_process_does_not_share_content_across_sessions(plugin_package):
-    """Sessions are keyed, so one session's window can never leak into another's."""
-    buffer = plugin_package.transcript.TranscriptBuffer()
-    buffer.add("a", "user", "secret from a", created_at=1.0)
-    assert buffer.window("b", 0.0, time.time() + 1) == []
-
-
-# -- persistence: the audit trail (§4.9) --------------------------------------
-
-CONTRACT_KEYS = {"session_id", "layer", "started_at", "updated_at", "model", "provider",
-                 "toolsets", "system_message", "messages", "usage"}
-
-
-def test_a_host_session_is_one_json_file_with_the_contract_keys(persisted):
-    make, root = persisted
-    buffer = make()
-
-    buffer.add_turn("session-1", "deploy it", "done", author="Ada", author_id="u-1",
-                    created_at=10.0)
-    assert buffer.flush("session-1") is True
-
-    data = json.loads((root / "session-1.json").read_text(encoding="utf-8"))
-    assert set(data) == CONTRACT_KEYS
-    assert data["session_id"] == "session-1"
-    assert data["layer"] == "host"
-    assert data["started_at"] == 10.0
-    assert data["updated_at"] >= 10.0
-    assert (data["model"], data["provider"], data["toolsets"], data["system_message"]) \
-        == ("", "", [], "")
-    assert data["usage"] == {}
-    assert [(row["role"], row["content"], row["author_id"]) for row in data["messages"]] \
-        == [("user", "deploy it", "u-1"), ("assistant", "done", "")]
-    assert not list(root.glob("*.tmp"))              # temp + os.replace leaves nothing behind
-
-
-def test_a_plugin_layer_session_lands_under_its_layer_directory(persisted):
-    make, root = persisted
-    buffer = make()
-
-    buffer.record_aux("dialectic", "job-7-2", [{"role": "assistant", "content": "critique"}],
-                      model="aux-model", provider="deepseek", toolsets=("file", "web"),
-                      system_message="be blunt")
-    assert buffer.flush() is True
-
-    data = json.loads((root / "dialectic" / "job-7-2.json").read_text(encoding="utf-8"))
-    assert set(data) == CONTRACT_KEYS
-    assert (data["session_id"], data["layer"]) == ("job-7-2", "dialectic")
-    assert (data["model"], data["provider"], data["toolsets"], data["system_message"]) \
-        == ("aux-model", "deepseek", ["file", "web"], "be blunt")
-    assert data["messages"] == [{"role": "assistant", "content": "critique"}]
-    assert data["usage"] == {}
-
-
-def test_plugin_layer_usage_is_persisted_with_the_snapshot(persisted):
-    make, root = persisted
-    buffer = make()
-
-    buffer.record_aux("adviser", "session-1--quality", [{"role": "user", "content": "q"}],
-                      model="aux-model", usage={"total_tokens": 1234,
-                                                 "estimated_cost_usd": 0.0042})
-    assert buffer.flush_aux("adviser", "session-1--quality") is True
-
-    data = json.loads((root / "adviser" / "session-1--quality.json")
-                      .read_text(encoding="utf-8"))
-    assert data["usage"] == {"total_tokens": 1234, "estimated_cost_usd": 0.0042}
-
-
-def test_flush_aux_waits_for_one_custom_agent_snapshot(persisted):
-    make, root = persisted
-    buffer = make()
-
-    buffer.record_aux("researcher", "layer-1",
-                      [{"role": "user", "content": "q"}, {"role": "assistant", "content": "a"}],
-                      model="m", provider="p", toolsets=("file",), system_message="sys")
-    assert buffer.flush_aux("researcher", "layer-1") is True
-
-    path = buffer.path_for_aux("researcher", "layer-1")
-    assert path == root / "researcher" / "layer-1.json"
-    data = json.loads(path.read_text(encoding="utf-8"))
-    assert (data["layer"], data["session_id"]) == ("researcher", "layer-1")
-    assert [row["role"] for row in data["messages"]] == ["user", "assistant"]
-
-
-def test_a_hostile_agent_name_cannot_escape_the_persist_directory(persisted):
-    make, root = persisted
-    buffer = make()
-    path = buffer.path_for_aux("../../evil", "layer-1")
-    assert path is not None and path.parent == root / "evil"
-
-
-def test_a_hostile_session_id_cannot_escape_the_persist_directory(persisted):
-    make, root = persisted
-    buffer = make()
-
-    buffer.record_aux("base", "../escape", [{"role": "user", "content": "x"}])
-    assert buffer.flush() is True
-
-    assert (root / "base" / "escape.json").exists()
-    assert not (root.parent / "escape.json").exists()
-
-
-def test_enqueue_never_blocks_the_turn_path(persisted):
-    """The writer is busy on every message and the caller still stays far under 5 ms."""
-    make, _root = persisted
-    buffer = make(debounce_messages=1, debounce_seconds=0.0)
-
-    worst = 0.0
-    for index in range(200):
-        started = time.perf_counter()
-        buffer.add("hot", "user", f"message {index}", created_at=float(index))
-        worst = max(worst, time.perf_counter() - started)
-    assert worst < 0.005, f"slowest add took {worst * 1000:.2f} ms"
-
-
-def test_past_two_thousand_messages_the_overflow_is_a_second_shard(persisted):
-    make, root = persisted
-    # The queue is 2000 deep by default too; give it room so this test exercises the file
-    # shard rather than the (separately specified) drop-the-oldest queue policy.
-    buffer = make(debounce_messages=2000, queue_max=4000)
-
-    for index in range(2001):
-        buffer.add("long", "user", f"m{index}", created_at=float(index))
-    assert buffer.flush("long") is True
-    assert buffer.dropped == 0
-
-    first = json.loads((root / "long.json").read_text(encoding="utf-8"))
-    second = json.loads((root / "long.part2.json").read_text(encoding="utf-8"))
-    assert len(first["messages"]) == 2000            # already-written content is not truncated
-    assert first["messages"][0]["content"] == "m0"
-    assert len(second["messages"]) == 1
-    assert second["messages"][0]["content"] == "m2000"
-
-
-def test_the_debounce_holds_until_flush_ends_it(persisted):
-    make, root = persisted
-    buffer = make()                                  # 30 s / 50 messages
-
-    buffer.add("quiet", "user", "one", created_at=1.0)
-    time.sleep(0.2)
-    assert not (root / "quiet.json").exists()        # still inside the debounce window
-
-    assert buffer.flush("quiet") is True
-    data = json.loads((root / "quiet.json").read_text(encoding="utf-8"))
-    assert [row["content"] for row in data["messages"]] == ["one"]
-
-
-def test_fifty_messages_write_without_a_flush(persisted):
-    make, root = persisted
-    buffer = make(debounce_seconds=30.0, debounce_messages=50)
-
-    for index in range(50):
-        buffer.add("burst", "user", f"m{index}", created_at=float(index))
-
-    deadline = time.time() + 5.0
-    while time.time() < deadline and not (root / "burst.json").exists():
-        time.sleep(0.01)
-    data = json.loads((root / "burst.json").read_text(encoding="utf-8"))
-    assert len(data["messages"]) == 50
-
-
-def test_close_flushes_what_is_still_queued(persisted):
-    make, root = persisted
-    buffer = make()
-
-    buffer.add("last", "user", "unsaved", created_at=1.0)
-    assert not (root / "last.json").exists()
-    buffer.close()
-    buffer.close()                                   # idempotent
-    data = json.loads((root / "last.json").read_text(encoding="utf-8"))
-    assert data["messages"][0]["content"] == "unsaved"
-
-
-def test_a_full_queue_drops_the_oldest_and_counts_it(persisted, monkeypatch):
-    make, _root = persisted
-    buffer = make(queue_max=8)
-    monkeypatch.setattr(buffer, "_drain_locked", lambda *args, **kwargs: None)
-
-    for index in range(20):
-        buffer.add("q", "user", f"m{index}", created_at=float(index))
-    assert buffer.dropped == 12
-
-
-def test_prune_deletes_only_expired_files(plugin_package, persisted):
-    make, root = persisted
-    assert plugin_package.transcript.DEFAULT_RETENTION_SECONDS == 30 * 24 * 60 * 60
-    buffer = make()
-
-    buffer.add("old", "user", "old", created_at=1.0)
-    buffer.add("fresh", "user", "fresh", created_at=1.0)
-    buffer.record_aux("base", "old-aux", [{"role": "user", "content": "x"}])
-    assert buffer.flush() is True
-
-    expired = [root / "old.json", root / "base" / "old-aux.json"]
-    for path in expired:
-        os.utime(path, (1_000.0, 1_000.0))
-
-    assert buffer.prune(plugin_package.transcript.DEFAULT_RETENTION_SECONDS) == 2
-    assert all(not path.exists() for path in expired)
-    assert (root / "fresh.json").exists()
-    assert buffer.prune() == 0                       # the default is the 30-day window

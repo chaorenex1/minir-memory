@@ -1,4 +1,4 @@
-"""adviser_session_search — five query shapes over a stand-in host ``state.db``."""
+"""minir_hermes_session_search — five query shapes over a stand-in host ``state.db``."""
 
 from __future__ import annotations
 
@@ -442,3 +442,63 @@ def test_handler_resolves_hermes_home_kwarg(search, tmp_path):
 
     assert payload["success"] is True
     assert payload["data"]["sessions"] == 6
+
+
+# -- platform default and caller scope ----------------------------------------
+
+
+def _scoped(search, path, *, platform="", caller="host", session_id="", **args):
+    return search.query(args, state_db=str(path), platform=platform, caller=caller,
+                        session_id=session_id)
+
+
+def test_the_tool_is_renamed_into_the_minir_toolset(search):
+    assert search.TOOL_NAME == "minir_hermes_session_search"
+    assert search.TOOLSET == "minir"
+
+
+def test_a_host_caller_is_filtered_to_its_platform_sources(search, db):
+    data = _scoped(search, db, platform="cli", mode="search", query="kubernetes")
+    assert data["total"] == 1
+    assert data["matches"][0]["session_id"] == "s1"
+    assert data["filter"] == {"platform": "cli", "sources": ["cli"], "session_id": None,
+                              "caller": "host"}
+
+
+def test_platform_star_disables_the_default_filter(search, db):
+    data = _scoped(search, db, platform="cli", mode="search", query="kubernetes")
+    assert data["filter"]["sources"] == ["cli"]
+    everywhere = search.query({"mode": "search", "query": "kubernetes", "platform": "*"},
+                              state_db=str(db), platform="cli")
+    assert everywhere["total"] == 2
+    assert {row["session_id"] for row in everywhere["matches"]} == {"s1", "s2"}
+    assert everywhere["filter"]["sources"] is None
+
+
+def test_an_empty_filtered_result_says_the_store_has_rows(search, db):
+    data = _scoped(search, db, platform="telegram", mode="sessions")
+    assert data["count"] == 0
+    assert "platform=" in data["hint"]
+    assert data["filter"]["sources"] == ["telegram"]
+
+
+def test_an_agent_caller_is_scoped_to_the_current_host_session(search, db):
+    data = _scoped(search, db, platform="cli", caller="agent", session_id="s2",
+                   mode="search", query="kubernetes")
+    assert data["total"] == 1
+    assert data["matches"][0]["session_id"] == "s2"
+    assert data["filter"] == {"platform": "*", "sources": None, "session_id": "s2",
+                              "caller": "agent"}
+
+    sessions = _scoped(search, db, platform="cli", caller="agent", session_id="s2",
+                       mode="sessions")
+    assert [row["id"] for row in sessions["sessions"]] == ["s2"]
+
+
+def test_the_handler_injects_the_caller_class(search, db):
+    payload = json.loads(search.handle(
+        {"mode": "sessions", "platform": "*"}, state_db=str(db), platform="cli",
+        caller="agent", session_id="s2"))
+    assert payload["success"] is True
+    assert payload["data"]["filter"]["caller"] == "agent"
+    assert [row["id"] for row in payload["data"]["sessions"]] == ["s2"]

@@ -74,12 +74,14 @@ def test_an_aux_run_writes_its_own_transcript(plugin_package, store, transcript,
     transcript.flush()
     deadline = time.time() + 2.0
     base = tmp_path / "sessions"
-    while time.time() < deadline and not any(base.rglob("*.json")):
+    while time.time() < deadline and not any(base.rglob("*.jsonl")):
         time.sleep(0.02)
-    files = list(base.rglob("*.json"))
+    files = list(base.rglob("*.jsonl"))
     assert files, "the aux pass wrote no transcript"
-    payload = json.loads(files[0].read_text(encoding="utf-8"))
-    assert payload["layer"] == "base" and payload["messages"][0]["content"] == "hi"
+    rows = [json.loads(line) for line in files[0].read_text(encoding="utf-8").splitlines()]
+    messages = [row for row in rows
+                if row["kind"] == "msg" and row["role"] != "system"]
+    assert rows[0]["layer"] == "base" and messages[0]["text"] == "hi"
 
 
 def test_a_primary_turn_persists_the_host_transcript(plugin_package, make_provider,
@@ -94,11 +96,35 @@ def test_a_primary_turn_persists_the_host_transcript(plugin_package, make_provid
     provider.sync_turn("deploy on Windows", "noted")
     provider._transcript.flush()
     sessions = pathlib.Path(provider._hermes_home) / "minir-memory" / "sessions"
-    files = list(sessions.glob("*.json"))
+    files = list(sessions.glob("cli/host/*.jsonl"))
     assert files, "the host session was not persisted"
-    payload = json.loads(files[0].read_text(encoding="utf-8"))
-    assert payload["layer"] == "host"
-    assert any("deploy on Windows" in json.dumps(message) for message in payload["messages"])
+    rows = [json.loads(line) for line in files[0].read_text(encoding="utf-8").splitlines()]
+    assert rows[0]["layer"] == "host"
+    assert any("deploy on Windows" in json.dumps(row) for row in rows)
+
+
+def test_a_primary_turn_and_the_plugin_block_cover_the_five_roles(plugin_package, make_provider,
+                                                                  monkeypatch):
+    monkeypatch.setenv("MINIR_REASONING_ENABLED", "true")
+    monkeypatch.setattr(plugin_package.worker, "call_model", lambda *args, **kwargs: "")
+    provider = make_provider({})
+    provider._worker.stop()
+    provider._worker._enabled = False
+    provider.sync_turn("deploy the tag", "done", messages=[
+        {"role": "user", "content": "deploy the tag"},
+        {"role": "assistant", "content": "checking",
+         "tool_calls": [{"id": "c1", "function": {"name": "exec", "arguments": "{}"}}],
+         "reasoning_content": "read the manifest first"},
+        {"role": "tool", "tool_call_id": "c1", "name": "exec", "content": "R" * 6000},
+    ])
+    provider._transcript.flush()
+    rows = provider._transcript.read_events("cli", "host", "session-test", limit=100,
+                                            kinds=("msg", "gap"))["rows"]
+    roles = {row["role"] for row in rows}
+    assert {"system", "user", "assistant", "tool", "reasoning"} <= roles
+    assert [row["seq"] for row in rows] == sorted(row["seq"] for row in rows)
+    tool_row = next(row for row in rows if row["role"] == "tool")
+    assert len(tool_row["result"]) == 6000
 
 
 def test_the_card_scheduler_anchors_at_install(make_provider, monkeypatch):

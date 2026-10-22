@@ -37,7 +37,7 @@ NOTICE_TEXT = (
     f"{NOTICE_MARKER}] Earlier turns in this session were compressed into the assistant summary "
     "below. Treat that summary as a derived record, not a live reply: it may be incomplete or "
     "stale, and the current conversation wins on conflict. Use minir_search or "
-    "adviser_session_search to recover exact details.")
+    "minir_hermes_session_search to recover exact details.")
 
 _MAX_FOLD_MESSAGES = 24
 _MAX_SUMMARY_CHARS = 8_000

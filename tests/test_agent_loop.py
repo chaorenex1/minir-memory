@@ -312,6 +312,30 @@ def test_a_run_without_host_messages_has_an_empty_transcript(loop, host):
     assert loop.run("q").messages == ()
 
 
+def test_a_top_level_reasoning_content_lands_on_the_assistant_message(loop, host):
+    rows = ({"role": "user", "content": "q"}, {"role": "assistant", "content": "a"})
+    converted = loop._with_reasoning(rows, "  because  ")
+    assert converted[1]["reasoning_content"] == "because"
+    assert converted[0] == rows[0]
+    only_reasoning = loop._with_reasoning((), "because")
+    assert only_reasoning == ({"role": "reasoning", "content": "because"},)
+    assert loop._with_reasoning(rows, "") == rows
+
+
+def test_the_run_binds_the_callers_transcript_layer(loop, host, monkeypatch):
+    seen: list[str] = []
+    original = FakeAgent.run_conversation
+
+    def record(self, prompt, system_message=None, **kwargs):
+        seen.append(loop.agent_history.current_layer())
+        return original(self, prompt, system_message=system_message, **kwargs)
+
+    monkeypatch.setattr(FakeAgent, "run_conversation", record)
+    loop.run("q", layer="base")
+    assert seen == ["base"]
+    assert loop.agent_history.current_layer() == ""  # reset after the run
+
+
 # -- lifecycle ----------------------------------------------------------------
 
 def test_run_closes_the_agent_even_when_the_model_fails(loop, host):

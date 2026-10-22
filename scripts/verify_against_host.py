@@ -7,7 +7,7 @@ What it proves (against the host install running on this machine, not a mock):
 2. The loader can load it by name      — ``plugins.memory.load_memory_provider("minir")``
 3. It satisfies the real ABC           — ``isinstance(provider, agent.memory_provider.MemoryProvider)``
 4. A note round-trips through the store — ``minir_remember`` -> ``prefetch()`` — and a
-   ``sync_turn()`` conversation reaches no SQLite table (the JSON audit trail under
+   ``sync_turn()`` conversation reaches no SQLite table (the JSONL event store under
    ``minir-memory/sessions`` is separate and never recallable)
 4b. The context engine loads by name    — ``plugins.context_engine.load_context_engine()``, folds
    a window, and restores the folded text from the host's own ``state.db`` (writing nothing)
@@ -68,7 +68,8 @@ try:
         "memory.minir.session_mode was not read from config.yaml"
 
     # A note round-trips through the store and comes back through prefetch. The conversation
-    # itself must NOT: this provider keeps turns in memory for the length of the process only.
+    # itself must NOT: it lives in the JSONL event store under minir-memory/sessions, never in
+    # a SQLite table, and recall never reads it.
     told = "The verification probe stores this distinctive sentence"
     provider.sync_turn(told, "acknowledged")
     provider.handle_tool_call("minir_remember",
@@ -181,10 +182,16 @@ try:
 
     aux_keys = sorted(task["key"] for task in get_plugin_auxiliary_tasks())
     assert "adviser" in aux_keys, "the adviser auxiliary route was not registered: %%r" %% aux_keys
-    adviser_entry = tool_registry.get_entry("adviser_consult")
-    assert adviser_entry is not None, "adviser_consult was not registered in the tool registry"
-    assert adviser_entry.toolset == "adviser", "unexpected toolset: %%r" %% adviser_entry.toolset
-    assert adviser_entry.is_async is True, "adviser_consult must be registered as an async handler"
+    session_entry = tool_registry.get_entry("minir_hermes_session_search")
+    assert session_entry is not None, \
+        "minir_hermes_session_search was not registered in the tool registry"
+    assert session_entry.toolset == "minir", "unexpected toolset: %%r" %% session_entry.toolset
+    assert session_entry.is_async is False, "the session search is one bounded SQLite read"
+    agent_entry = tool_registry.get_entry("minir_aiagent_search")
+    assert agent_entry is not None, "minir_aiagent_search was not registered in the tool registry"
+    assert agent_entry.toolset == "minir", "unexpected toolset: %%r" %% agent_entry.toolset
+    assert tool_registry.get_entry("adviser_consult") is None, \
+        "the deleted adviser_consult tool is still registered"
 
     # The plugin's own toolset: the same four schemas the memory provider exposes, registered
     # under a name an agent can enable explicitly (this is what the plugin's agents use).
@@ -204,7 +211,8 @@ try:
         "jobs": stats["jobs"],
         "dialectic_turns": layers["dialectic"]["turns"],
         "engine": {"loaded": engine.name, "folded_messages": len(history) - len(folded)},
-        "adviser": {"aux_tasks": aux_keys, "tool": "adviser_consult", "toolset": adviser_entry.toolset},
+        "adviser": {"aux_tasks": aux_keys, "session_search": session_entry.toolset,
+                    "agent_search": agent_entry.toolset},
         "queue": [{"layer": job["layer"], "session": job["session_id"], "turns": job["turns"],
                    "window": [round(job["from_ts"], 3), round(job["to_ts"], 3)], "status": job["status"]}
                   for job in provider._store.pending_jobs()],
@@ -308,9 +316,9 @@ def main() -> int:
             return 1
         print("result      : " + result.stdout.strip().splitlines()[-1])
         print("PASS: discovery, provider loading, ABC conformance, a note round-trip, the "
-              "no-transcript guarantee, a config.yaml-driven layer cadence, the counting loop's "
-              "job queue, live plugin-hook delivery, and the context engine's load + audited "
-              "summary fold all verified")
+              "transcript-in-JSONL-only guarantee, a config.yaml-driven layer cadence, the "
+              "counting loop's job queue, live plugin-hook delivery, and the context engine's "
+              "load + audited summary fold all verified")
         return 0
     finally:
         if args.keep:

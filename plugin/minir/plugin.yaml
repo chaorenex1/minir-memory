@@ -1,6 +1,6 @@
 name: minir
-version: 0.14.0
-description: "Minir — local-first memory plugin: independent base/review layers, four-section user/AI cards with a rolling window summary, a three-day review of four durable card files, knowledge pages with path-hint retrieval, an idle-session summary and knowledge extraction, per-turn token accounting, the minir toolset, FTS5 recall, and a JSON transcript audit trail."
+version: 0.15.0
+description: "Minir — local-first memory plugin: independent base/review layers, four-section user/AI cards with a rolling window summary, a three-day review of four durable card files, knowledge pages with path-hint retrieval, an idle-session summary and knowledge extraction, per-turn token accounting, the minir toolset, FTS5 recall, and a permanent JSONL transcript event store."
 author: chaorenex1
 license: MIT
 tags:
@@ -28,8 +28,8 @@ provides_middleware:
 # get_tool_schemas) requires declaring it here, or `hermes plugins validate` fails the
 # manifest with "undeclared tools registered".
 provides_tools:
-  - adviser_consult
-  - adviser_session_search
+  - minir_hermes_session_search
+  - minir_aiagent_search
   - minir_search
   - minir_remember
   - minir_forget

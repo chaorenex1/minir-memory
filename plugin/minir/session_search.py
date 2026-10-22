@@ -1,7 +1,7 @@
 """Read-only session search over the host's durable conversation store.
 
 The host keeps every turn verbatim in ``$HERMES_HOME/state.db`` (``messages.timestamp`` is REAL
-epoch seconds). This module exposes that store to the adviser toolset as one JSON tool with five
+epoch seconds). This module exposes that store to the ``minir`` toolset as one JSON tool with five
 query shapes, chosen explicitly (``mode``) or inferred from the arguments:
 
 * ``search``   — FTS5 (``messages_fts`` / ``messages_fts_trigram``) or a ``LIKE`` fallback over
@@ -45,8 +45,30 @@ from .history import MINIR_SYNTHETIC_PREFIXES, SYNTHETIC_PREFIXES
 
 logger = logging.getLogger(__name__)
 
-TOOL_NAME = "adviser_session_search"
-TOOLSET = "adviser"
+TOOL_NAME = "minir_hermes_session_search"
+TOOLSET = "minir"
+
+#: ``initialize(platform=...)`` values are not the same enum as ``sessions.source``. This map is
+#: the default filter for a host caller; a source outside it is reachable with an explicit
+#: ``source`` argument or ``platform="*"``. The result always echoes the filter it applied.
+_PLATFORM_SOURCES: dict[str, tuple[str, ...]] = {
+    "cli": ("cli",),
+    "tui": ("tui",),
+    "desktop": ("desktop",),
+    "local": ("local", "api_server"),
+    "api_server": ("api_server", "local"),
+    "plugin-agent": ("plugin-agent", "subagent"),
+    "subagent": ("subagent", "plugin-agent"),
+    "cron": ("cron",),
+    "oneshot": ("oneshot",),
+    "telegram": ("telegram",),
+    "feishu": ("feishu",),
+    "kanban": ("kanban",),
+    "tool": ("tool",),
+    "qqbot": ("qqbot",),
+    "weixin": ("weixin",),
+    "acp": ("acp",),
+}
 
 _MODE_DEFAULT = "auto"
 _MODES = ("search", "sessions", "messages", "around", "stats")
@@ -78,6 +100,14 @@ _RELATIVE_RE = re.compile(r"^(\d+)\s*(m|h|d|w)$", re.IGNORECASE)
 _RELATIVE_SECONDS = {"m": 60, "h": 3600, "d": 86400, "w": 604800}
 
 _LIKE_ESCAPE = "\\"
+
+
+def platform_sources(platform: str) -> list[str]:
+    """Which ``sessions.source`` values a caller platform sees by default."""
+    name = str(platform or "").strip()
+    if not name:
+        return []
+    return list(_PLATFORM_SOURCES.get(name, (name,)))
 
 
 class QueryError(Exception):
@@ -985,6 +1015,13 @@ SCHEMA = {
                 "description": ("Comma-separated session sources (cli, gateway, cron, ...). "
                                 "Hidden sources (kanban, subagent, tool) are excluded by default."),
             },
+            "platform": {
+                "type": "string",
+                "description": ("Defaults to the caller's platform and filters sessions.source "
+                                "through the platform map. '*' disables the default filter; an "
+                                "explicit value selects another platform's sources. Ignored for "
+                                "an agent caller (always the current host session)."),
+            },
             "profile": {
                 "type": "string",
                 "description": ("Read another Hermes profile's state.db instead of the active one "
@@ -1056,11 +1093,38 @@ SCHEMA = {
 }
 
 
-def query(args: dict[str, Any], *, hermes_home_path: Any = "", state_db: Any = "") -> dict[str, Any]:
-    """Run one query shape and return the tool's ``data`` object (raises :class:`QueryError`)."""
+def query(args: dict[str, Any], *, hermes_home_path: Any = "", state_db: Any = "",
+          platform: str = "", caller: str = "host", session_id: str = "") -> dict[str, Any]:
+    """Run one query shape and return the tool's ``data`` object (raises :class:`QueryError`).
+
+    Two caller classes decide the default scope. A host caller is filtered to its own platform's
+    session sources unless it passes ``source`` or ``platform="*"``. An agent caller (a plugin
+    layer run) is scoped to the current host session unconditionally: the ``platform`` argument
+    is ignored rather than rejected, so a model cannot widen the gate by retrying with another
+    value. The applied filter is echoed in the envelope, and an empty filtered result says
+    whether the database has rows at all.
+    """
     if not isinstance(args, dict):
         raise QueryError("invalid_args", "arguments must be an object")
+    args = dict(args)
     mode = _mode(args)
+    platform_label = str(platform or "").strip() or "cli"
+    agent_caller = str(caller or "host").strip() == "agent"
+    host_session = str(session_id or "").strip()
+    requested = str(args.get("platform") or "").strip()
+    applied_sources: Optional[list[str]] = None
+    if agent_caller:
+        args.pop("platform", None)
+        args.pop("source", None)
+        if host_session and mode == "search":
+            args["session_id"] = host_session
+        elif host_session and mode == "sessions":
+            args["query"] = host_session
+    elif requested != "*" and (requested or str(platform or "").strip()):
+        label = requested or platform_label
+        applied_sources = platform_sources(label)
+        if applied_sources and not args.get("source"):
+            args["source"] = ",".join(applied_sources)
     if state_db:
         path = Path(str(state_db))
     else:
@@ -1075,14 +1139,35 @@ def query(args: dict[str, Any], *, hermes_home_path: Any = "", state_db: Any = "
                              "(session_id/role/content/timestamp/id)")
         scols = _columns(connection, "sessions")
         if mode == "search":
-            return _search(connection, args, mcols, scols, path)
-        if mode == "sessions":
-            return _sessions(connection, args, scols, path)
-        if mode == "messages":
-            return _messages(connection, args, mcols, scols, path)
-        if mode == "around":
-            return _around(connection, args, mcols, scols, path)
-        return _stats(connection, path)
+            data = _search(connection, args, mcols, scols, path)
+        elif mode == "sessions":
+            data = _sessions(connection, args, scols, path)
+        elif mode == "messages":
+            data = _messages(connection, args, mcols, scols, path)
+        elif mode == "around":
+            data = _around(connection, args, mcols, scols, path)
+        else:
+            data = _stats(connection, path)
+        if agent_caller and host_session and mode == "sessions":
+            entries = [entry for entry in data.get("sessions") or ()
+                       if str(entry.get("id") or "") == host_session]
+            data["sessions"] = entries
+            data["count"] = len(entries)
+            data["total"] = len(entries)
+            data["has_more"] = False
+        data["filter"] = {
+            "platform": "*" if agent_caller or requested == "*" else (requested or platform_label),
+            "sources": applied_sources,
+            "session_id": host_session or str(args.get("session_id") or "") or None,
+            "caller": "agent" if agent_caller else "host",
+        }
+        if not data.get("count") and applied_sources and "sessions" in _tables(connection):
+            if connection.execute("SELECT 1 FROM sessions LIMIT 1").fetchone() is not None:
+                data["hint"] = (
+                    "No rows for this platform's sources (" + ", ".join(applied_sources)
+                    + "). The store has rows: pass platform=\"*\" (or an explicit source) to "
+                    "search every surface.")
+        return data
     except sqlite3.Error as exc:
         logger.debug("session_search: state.db read failed", exc_info=True)
         raise QueryError("state_db_error", f"state.db read failed: {exc}") from exc
@@ -1103,10 +1188,13 @@ def handle(args: dict[str, Any], **kwargs: Any) -> str:
     """Sync tool handler — always returns a JSON string, never raises into the tool loop."""
     try:
         data = query(args or {}, hermes_home_path=kwargs.get("hermes_home") or "",
-                     state_db=kwargs.get("state_db") or "")
+                     state_db=kwargs.get("state_db") or "",
+                     platform=str(kwargs.get("platform") or ""),
+                     caller=str(kwargs.get("caller") or "host"),
+                     session_id=str(kwargs.get("session_id") or ""))
     except QueryError as exc:
         return _error(exc.kind, exc.message)
     except Exception as exc:  # BLE001 -- reported as JSON, never raised into the loop
-        logger.exception("adviser_session_search failed")
+        logger.exception("minir_hermes_session_search failed")
         return _error("session_search_failed", str(exc)[:500])
     return _payload(data)

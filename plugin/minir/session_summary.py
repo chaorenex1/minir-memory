@@ -4,7 +4,7 @@ One session ends, the operator may or may not come back, and a day later the ses
 as finished. This module is the summary half of that finalisation. It runs on the same
 ``auxiliary.adviser`` agent route as the layer passes, with this plugin's toolset attached
 (``minir`` + ``adviser``), so the summarizer can read the session with
-``adviser_session_search`` and the store with ``minir_search``.
+``minir_hermes_session_search`` and the store with ``minir_search``.
 
 The **session hand-off** — the audited Task Handoff produced by :mod:`handoff` — is the first
 input of the user message. The agent reads it, checks it against the session when a claim needs
@@ -74,7 +74,7 @@ def build_prompt(*, session_id: str, handoff: str, markers: Any, usage: Any,
         "TOKEN USAGE (derived data):\n"
         + data_block("token_usage",
                      json.dumps(usage if usage is not None else {}, ensure_ascii=False)[:2_000]),
-        "Read the session with adviser_session_search (session_id, before as above, "
+        "Read the session with minir_hermes_session_search (session_id, before as above, "
         "include_inactive=true, include_compacted=true) when the hand-off or markers leave a "
         "claim unproven. Then write the final summary.",
     ]
@@ -96,7 +96,8 @@ def summarize_agent(*, session_id: str, handoff: str, markers: Any = None, usage
             provider=str(cfg.get("provider") or ""),
             api_mode=str(cfg.get("api_mode") or ""),
             toolsets=tools.agent_toolsets(cfg.get("toolsets")),
-            system_message=system_prompt())
+            system_message=system_prompt(),
+            layer="session_summary", history_session=session_id)
         return str(result.answer or "")
 
     try:

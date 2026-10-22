@@ -1,15 +1,12 @@
-"""Adviser surface — config block, message framing, handlers, registration.
+"""Adviser surface: the auxiliary route and the read-only host session search.
 
-The loop itself is covered by ``test_agent_loop.py``; here ``agent_loop`` is replaced so these
-tests are about what the adviser adds: which knobs it reads from ``auxiliary.adviser``, how it
-frames the message, the JSON contract of the two handlers, and the route/tool registration.
+The model-visible consult tool was deleted with its schema, handler, registration and prompt
+section; the worker's internal ``_adviser_consult`` path is covered by ``test_worker.py``. These
+tests cover what remains: the route's config resolution and the tool registration split.
 """
 
 from __future__ import annotations
 
-import asyncio
-import inspect
-import json
 import sys
 import types
 from pathlib import Path
@@ -17,21 +14,14 @@ from pathlib import Path
 import pytest
 
 ADVISER = "adviser"
-RUN = {"answer": "do the simple thing", "api_calls": 3, "model": "m",
-       "provider": "p", "toolsets": ["file"]}
 
 
 @pytest.fixture()
 def host(monkeypatch):
-    """Config stand-in plus fake run functions recording what the adviser passed them."""
     state = {
         "config": {"model": {"provider": "deepseek", "default": "deepseek-v4-flash"},
                    "auxiliary": {ADVISER: {}}},
-        "sync_calls": [],
-        "async_calls": [],
-        "fail_with": None,
     }
-
     package = types.ModuleType("hermes_cli")
     package.__path__ = []
     config_module = types.ModuleType("hermes_cli.config")
@@ -42,28 +32,8 @@ def host(monkeypatch):
 
 
 @pytest.fixture()
-def adviser(plugin_package, monkeypatch, host):
-    module = plugin_package.adviser
-
-    class FakeRun:
-        def as_dict(self):
-            return dict(RUN)
-
-    def run(message, **kwargs):
-        host["sync_calls"].append({"message": message, **kwargs})
-        if host["fail_with"] is not None:
-            raise host["fail_with"]
-        return FakeRun()
-
-    async def run_async(message, **kwargs):
-        host["async_calls"].append({"message": message, **kwargs})
-        if host["fail_with"] is not None:
-            raise host["fail_with"]
-        return FakeRun()
-
-    monkeypatch.setattr(module.agent_loop, "run", run, raising=True)
-    monkeypatch.setattr(module.agent_loop, "run_async", run_async, raising=True)
-    return module
+def adviser(plugin_package, host):
+    return plugin_package.adviser
 
 
 class FakeCtx:
@@ -92,6 +62,7 @@ class FakeCtx:
 
 # -- config -------------------------------------------------------------------
 
+
 def test_config_reads_the_adviser_block(adviser, host):
     host["config"]["auxiliary"][ADVISER] = {"provider": "openrouter", "model": "some/other",
                                             "toolsets": ["file"]}
@@ -112,175 +83,35 @@ def test_missing_config_keeps_the_plugin_defaults(adviser, monkeypatch):
     assert adviser.load_config() == {"toolsets": []}
 
 
-# -- message framing + run ----------------------------------------------------
-
-def test_run_frames_the_message_and_forwards_the_route(adviser, host):
-    host["config"]["auxiliary"][ADVISER] = {"provider": "openrouter", "model": "some/other",
-                                            "toolsets": ["file"]}
-
-    data = adviser.run("Ship it?", context="tests pass")
-
-    assert data == RUN
-    (call,) = host["sync_calls"]
-    expected = {"message": "Ship it?", "context": "tests pass", "model": "some/other",
-                "provider": "openrouter", "api_mode": "",
-                "toolsets": ["file", "minir", "adviser", "skills"],
-                "system_message": adviser._ADVISER_BRIEF}
-    # The consult may read the project root (the repo containing the cwd) and nothing else.
-    assert call.pop("project_dir") == adviser.project_dir()
-    assert call == expected
+# -- deleted consult surface ---------------------------------------------------
 
 
-def test_tool_toolsets_beat_the_configured_ones(adviser, host):
-    """An explicit override replaces the configured list; the plugin toolset is always added."""
-    host["config"]["auxiliary"][ADVISER] = {"toolsets": ["web"]}
-
-    adviser.run("q", toolsets=["file"])
-
-    assert host["sync_calls"][0]["toolsets"] == ["file", "minir", "adviser", "skills"]
+def test_the_consult_tool_is_gone(adviser):
+    """A half-deleted tool (schema without handler, or a name in the toolset) fails loudly."""
+    for symbol in ("TOOL_NAME", "SCHEMA", "handle", "handle_async", "run", "run_async"):
+        assert not hasattr(adviser, symbol), symbol
 
 
-def test_empty_config_passes_empty_route_overrides(adviser, host):
-    """Empty overrides mean "let agent_loop resolve it", not "pin an empty provider"."""
-    adviser.run("q")
-
-    call = host["sync_calls"][0]
-    assert (call["model"], call["provider"], call["api_mode"]) == ("", "", "")
-
-
-def test_the_api_mode_pin_reaches_the_loop(adviser, host):
-    host["config"]["auxiliary"][ADVISER] = {"provider": "custom:siliconflow",
-                                            "model": "Qwen/Qwen3.5-4B",
-                                            "api_mode": "chat_completions"}
-
-    adviser.run("q")
-
-    assert host["sync_calls"][0]["api_mode"] == "chat_completions"
-
-
-def test_run_async_awaits_the_async_loop(adviser, host):
-    data = asyncio.run(adviser.run_async("Ship it?", context="tests pass"))
-
-    assert data == RUN
-    assert host["sync_calls"] == []
-    (call,) = host["async_calls"]
-    assert call["message"] == "Ship it?"
-    assert call["context"] == "tests pass"
-    assert call["system_message"] == adviser._ADVISER_BRIEF
-
-
-# -- tool handler -------------------------------------------------------------
-
-def test_handler_requires_a_question(adviser, host):
-    payload = json.loads(adviser.handle({}))
-
-    assert payload["success"] is False
-    assert payload["error"]["type"] == "invalid_args"
-    assert host["sync_calls"] == []
-
-
-def test_async_handler_requires_a_question(adviser, host):
-    payload = json.loads(asyncio.run(adviser.handle_async({})))
-
-    assert payload["success"] is False
-    assert payload["error"]["type"] == "invalid_args"
-    assert host["async_calls"] == []
-
-
-def test_handler_reports_success(adviser, host):
-    payload = json.loads(adviser.handle({"question": "q", "context": "c"}))
-
-    assert payload == {"success": True, "data": RUN}
-
-
-def test_async_handler_reports_success(adviser, host):
-    payload = json.loads(asyncio.run(adviser.handle_async({"question": "q", "context": "c"})))
-
-    assert payload == {"success": True, "data": RUN}
-
-
-def test_handler_uses_the_bound_provider_main_adviser(adviser):
-    class Mode:
-        def consult(self, question, context="", toolsets=None):
-            return {"answer": "main adviser", "api_calls": 1, "model": "m",
-                    "provider": "p", "toolsets": []}
-
-    provider = types.SimpleNamespace(_adviser_mode=Mode())
-    payload = json.loads(adviser.handle({"question": "q"}, provider=provider))
-    assert payload == {"success": True, "data": {
-        "answer": "main adviser", "api_calls": 1, "model": "m",
-        "provider": "p", "toolsets": []}}
-
-
-def test_handler_turns_a_failure_into_json(adviser, host):
-    host["fail_with"] = RuntimeError("no credentials")
-
-    payload = json.loads(adviser.handle({"question": "q"}))
-
-    assert payload["success"] is False
-    assert payload["error"]["type"] == "adviser_failed"
-    assert "no credentials" in payload["error"]["message"]
-
-
-def test_async_handler_turns_a_failure_into_json(adviser, host):
-    host["fail_with"] = RuntimeError("no credentials")
-
-    payload = json.loads(asyncio.run(adviser.handle_async({"question": "q"})))
-
-    assert payload["success"] is False
-    assert payload["error"]["type"] == "adviser_failed"
-    assert "no credentials" in payload["error"]["message"]
-
-
-def test_handlers_report_an_empty_answer(adviser, monkeypatch):
-    class Blank:
-        def as_dict(self):
-            return {**RUN, "answer": ""}
-
-    monkeypatch.setattr(adviser.agent_loop, "run", lambda message, **kwargs: Blank())
-
-    payload = json.loads(adviser.handle({"question": "q"}))
-
-    assert payload["success"] is False
-    assert payload["error"]["type"] == "empty_answer"
-    assert payload["data"]["answer"] == ""
-
-
-def test_the_schema_offers_only_caller_owned_knobs(adviser):
-    """message/context/toolsets — model/provider are config, the budget is the loop's."""
-    properties = adviser.SCHEMA["parameters"]["properties"]
-
-    assert set(properties) == {"question", "context", "toolsets"}
-    assert adviser.SCHEMA["parameters"]["required"] == ["question"]
-
-
-# -- registration -------------------------------------------------------------
-
-def test_register_declares_the_route_and_both_tools(adviser):
+def test_register_declares_the_route_and_the_session_search(adviser):
     ctx = FakeCtx()
 
     adviser.register(ctx)
 
-    (kind, entry), (tool_kind, tool), (search_kind, search) = ctx.calls
+    (tool_kind, tool), (kind, entry) = ctx.calls
     assert (kind, entry["key"]) == ("auxiliary_task", "adviser")
     assert entry["display_name"] == "Adviser"
     assert entry["defaults"] == {"toolsets": []}
-    assert (tool_kind, tool["name"], tool["toolset"]) == ("tool", "adviser_consult", "adviser")
-    assert tool["schema"]["name"] == "adviser_consult"
-    # The registered handler must be the coroutine function, and the flag must agree with it:
-    # the host bridges async handlers (tools.registry.dispatch -> _run_async).
-    assert inspect.iscoroutinefunction(tool["handler"])
-    assert tool["is_async"] is True
-    assert (search_kind, search["name"], search["toolset"]) == (
-        "tool", "adviser_session_search", "adviser")
-    assert search["schema"]["name"] == "adviser_session_search"
-    assert search["handler"] is adviser.session_search.handle
-    assert search["is_async"] is False
-    assert search["schema"]["parameters"]["properties"]["mode"]["enum"] == [
+    assert (tool_kind, tool["name"], tool["toolset"]) == (
+        "tool", "minir_hermes_session_search", "minir")
+    assert tool["schema"]["name"] == "minir_hermes_session_search"
+    assert tool["is_async"] is False
+    assert tool["schema"]["parameters"]["properties"]["mode"]["enum"] == [
         "search", "sessions", "messages", "around", "stats"]
+    # The handler injects the caller class and platform; it is not the bare module function.
+    assert callable(tool["handler"])
 
 
-def test_manifest_declares_every_registered_adviser_tool(adviser):
+def test_manifest_declares_every_registered_adviser_tool(adviser, plugin_package):
     """``hermes plugins validate`` fails the manifest for an undeclared registered tool."""
     ctx = FakeCtx()
     adviser.register(ctx)
@@ -300,8 +131,11 @@ def test_manifest_declares_every_registered_adviser_tool(adviser):
             elif line.strip() and not line.startswith(" "):
                 break
 
-    assert registered == {"adviser_consult", "adviser_session_search"}
+    assert registered == {"minir_hermes_session_search"}
     assert registered <= set(declared)
+    assert set(plugin_package.plugin_tools.TOOL_NAMES) <= set(declared)
+    assert "adviser_consult" not in declared
+    assert "adviser_session_search" not in declared
 
 
 def test_provider_registration_survives_a_refused_auxiliary_key(plugin_package):
@@ -315,7 +149,8 @@ def test_provider_registration_survives_a_refused_auxiliary_key(plugin_package):
                          "pre_llm_call", "post_llm_call", "post_tool_call", "pre_tool_call",
                          "pre_verify", "on_interim_message", "on_stream_delta",
                          "post_api_request", "api_request_error"]
-    # The refused auxiliary key costs the adviser tools only; the plugin's own minir toolset
-    # is registered before that call and must survive it.
+    # The refused auxiliary key costs the adviser route only; the plugin's own minir toolset and
+    # the read-only session search are registered before that call and must survive it.
     assert [call[1]["name"] for call in ctx.calls if call[0] == "tool"] == [
-        "minir_search", "minir_remember", "minir_forget", "minir_stats", "minir_agents"]
+        "minir_search", "minir_remember", "minir_forget", "minir_stats", "minir_agents",
+        "minir_aiagent_search", "minir_hermes_session_search"]

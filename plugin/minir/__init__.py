@@ -2,14 +2,17 @@
 
 A complete, dependency-free reference implementation of the ``MemoryProvider``
 contract (``agent/memory_provider.py``): explicit notes go into a per-profile SQLite
-database, recall is a keyword search over them, and four tools let the model search,
-remember, forget, and inspect it.
+database, recall is a keyword search over them, and five tools let the model search,
+remember, forget, inspect it, and run a named custom agent.
 
-**No transcripts are stored.** The layers read the host's own ``state.db`` (plus an in-memory
-buffer for uncommitted turns); what reaches this provider's disk is what the base / dialectic
-layers *derived* (``layer_state`` and the FTS-indexed ``conclusions``) plus deliberate notes.
-Because the host store is the source of truth, a job queued before a restart can still be
-completed; inherited jobs are expired only when the profile has no ``state.db``.
+**The conversation is an append-only event store, not a database table.** The layers read the host's
+own ``state.db`` (plus an in-memory buffer for uncommitted turns) and persist what they *derived*
+(``layer_state`` and the FTS-indexed ``conclusions``) plus deliberate notes. The completed turns and
+every layer run are also appended as JSONL events under
+``$HERMES_HOME/minir-memory/sessions/<platform>/<layer>/``: one event per line, never rewritten or
+deleted, and readable through ``TranscriptBuffer.read_events``. The host store remains the source of
+truth, so a job queued before a restart can still be completed; inherited jobs are expired only
+when the profile has no ``state.db``.
 
 Fork this as a starting point:
 
@@ -54,6 +57,7 @@ from agent.memory_provider import (
 from tools.registry import tool_error
 
 from . import adviser
+from . import agent_history
 from . import card_review
 from . import extraction
 from . import file_guard
@@ -65,7 +69,6 @@ from . import scheduler
 from . import session_summary
 from . import tools as plugin_tools
 from .adviser_mode import AdviserMode
-from .adviser_prompts import MAIN_CONSULT_SECTION
 from .prompting import (
     advice_handling_section,
     advice_language_line,
@@ -77,7 +80,7 @@ from .prompting import (
 )
 from .layers import CATEGORIES as NOTE_CATEGORIES
 from .store import VALUE_MARKER_TYPES, MinirStore, format_when
-from .transcript import TranscriptBuffer
+from .transcript import HOST_LAYER, TranscriptBuffer, fingerprint
 from .turn_counter import (
     BASE_LAYER,
     DEFAULT_BASE_INTERVAL,
@@ -166,6 +169,24 @@ def _excerpt(text: str) -> str:
     """Flatten and bound text for tool responses (see ``_MAX_TOOL_EXCERPT``)."""
     flat = " ".join((text or "").split())
     return flat if len(flat) <= _MAX_TOOL_EXCERPT else flat[:_MAX_TOOL_EXCERPT] + "…"
+
+
+def _redact_text(text: str) -> tuple[str, bool]:
+    """Scrub un-redacted channels (system prompt, reasoning) and say whether a redactor ran.
+
+    Host ``messages`` are already put through ``_redact_for_provider``; ``pre_llm_call`` and
+    ``on_stream_delta`` are not. Without a host redactor the text is recorded as-is with
+    ``redacted: false`` — the file is permanent, so the flag is the honest part.
+    """
+    try:
+        from agent.monitoring.redaction import redact_for_export
+    except ImportError:
+        return text, False
+    try:
+        return redact_for_export(text) or "", True
+    except Exception:
+        logger.debug("minir: host redactor failed", exc_info=True)
+        return "[redaction unavailable]", True
 
 
 def _env_int(name: str, default: int) -> int:
@@ -263,6 +284,17 @@ class MinirMemoryProvider(MemoryProvider):
 
         self._store: Optional[MinirStore] = None
         self._session_id = ""
+        self._platform = "cli"
+        # Cache budget: streams, events per stream, total bytes. ``_records`` used to grow with
+        # the session count; the cache is a read source now, so all three are hard bounds.
+        self._buffer_streams = _as_positive_int(
+            os.environ.get("MINIR_BUFFER_STREAMS") or self._config.get("buffer_streams"), 20)
+        self._buffer_events = _as_positive_int(
+            os.environ.get("MINIR_BUFFER_EVENTS")
+            or self._config.get("buffer_events_per_stream"), 4000)
+        self._buffer_bytes = _as_positive_int(
+            os.environ.get("MINIR_BUFFER_BYTES") or self._config.get("buffer_bytes"),
+            256 * 1024 * 1024)
         self._agent_context = "primary"
         self._user_id = ""
         self._agent_identity = ""
@@ -277,8 +309,14 @@ class MinirMemoryProvider(MemoryProvider):
         self._knowledge: Optional[knowledge.KnowledgePipeline] = None
         self._recent_knowledge: list[list[str]] = []
         self._transcript = TranscriptBuffer(
+            platform=self._platform,
+            max_sessions=self._buffer_streams,
+            buffer_events_per_stream=self._buffer_events,
+            buffer_bytes=self._buffer_bytes,
             persist_dir=(os.path.join(self._hermes_home, "minir-memory", "sessions")
                          if str(self._hermes_home or "").strip() else None))
+        #: Reasoning deltas for the live turn, aggregated into one row at ``sync_turn``.
+        self._reasoning_deltas: dict[str, list[str]] = {}
         self._authors: dict[str, dict[str, Any]] = {}   # session -> last author seen on a turn
         self._lock = threading.Lock()              # guards the recall cache below
         self._cached: Optional[tuple[str, str, int]] = None  # (session_id, block, count)
@@ -286,7 +324,6 @@ class MinirMemoryProvider(MemoryProvider):
         self._prefetch_thread: Optional[threading.Thread] = None
         self._metrics: dict[str, dict[str, Any]] = {}
         self._metrics_seen = 0
-        self._adviser_consult_registered = False  # set by register() on the real host
         # Per-turn side channel: event ring + reviewer worker + llm_request delivery. Constructed
         # before initialize (the host may register hooks first); every path guards on the store.
         self._adviser_mode = AdviserMode(self)
@@ -314,6 +351,9 @@ class MinirMemoryProvider(MemoryProvider):
         global _ACTIVE_PROVIDER
         _ACTIVE_PROVIDER = self
         self._session_id = session_id or ""
+        # The partition key every stream (and every agent run) is written under. The host
+        # passes this on initialize; a bare caller gets ``cli``.
+        self._platform = str(kwargs.get("platform") or self._platform or "cli")
         self._adviser_mode.session_started(self._session_id)
         self._agent_context = str(kwargs.get("agent_context") or "primary")
         # Identity the host hands us: drives which subject each layer's artifact belongs to.
@@ -322,10 +362,18 @@ class MinirMemoryProvider(MemoryProvider):
         self._profile = (host_history.profile_name(self._state_db, self._session_id)
                          or str(kwargs.get("profile") or kwargs.get("profile_name") or "default"))
         self._identity, self._preference = host_history.load_identity(self._hermes_home, self._profile)
-        # The audit trail and the knowledge pipeline are profile-scoped: both need the home the
-        # host just handed us, which the constructor (called before initialize) did not know.
+        # The event store is profile-scoped: it needs the home the host just handed us, which
+        # the constructor (called before initialize) did not know. ``bind`` pins this session
+        # and, when this is the first process after a clean shutdown, replays the last cache
+        # range of each stream.
         self._transcript = TranscriptBuffer(
-            persist_dir=str(Path(self._hermes_home) / _STORE_DIRNAME / "sessions"))
+            platform=self._platform,
+            max_sessions=self._buffer_streams,
+            buffer_events_per_stream=self._buffer_events,
+            buffer_bytes=self._buffer_bytes,
+            persist_dir=str(Path(self._hermes_home) / _STORE_DIRNAME / "sessions"),
+            run_dir=str(Path(self._hermes_home) / _STORE_DIRNAME / "run"))
+        self._transcript.bind(self._session_id, platform=self._platform)
         self._knowledge = knowledge.KnowledgePipeline(
             self._hermes_home,
             language=str(self._config.get("content_language") or "en"),
@@ -337,7 +385,7 @@ class MinirMemoryProvider(MemoryProvider):
             identity=self._identity, preference=self._preference,
             depth=self._dialectic_depth,
             content_language=str(self._config.get("content_language") or "en"),
-            hermes_home=self._hermes_home,
+            hermes_home=self._hermes_home, platform=self._platform,
             on_value_markers=(self._knowledge.enqueue_from_refresh
                       if self._knowledge is not None else None))
         self._card_scheduler = card_review.CardReviewScheduler(
@@ -384,6 +432,7 @@ class MinirMemoryProvider(MemoryProvider):
         # session would never enqueue its initial dialectic pass. Do it here too; has_open_job
         # makes the hook's later attempt a no-op.
         self.cold_start(self._session_id)
+        self._record_system_prompt()
         # No other drain here on purpose: a drain started now would race the first turn and
         # could claim a job that was queued before the turn's messages existed, burning the
         # window as empty. Jobs are drained where content exists — sync_turn, a boundary, shutdown.
@@ -428,6 +477,18 @@ class MinirMemoryProvider(MemoryProvider):
             {"key": "content_language",
              "description": "Language for card and knowledge prose (field names stay English)",
              "type": "text", "default": "en", "env_var": "MINIR_CONTENT_LANGUAGE"},
+            {"key": "buffer_streams",
+             "description": "Transcript streams kept in memory (the current session is pinned)",
+             "type": "integer", "default": "20", "minimum": 1,
+             "env_var": "MINIR_BUFFER_STREAMS"},
+            {"key": "buffer_events_per_stream",
+             "description": "Events kept per transcript stream in memory (the file keeps all)",
+             "type": "integer", "default": "4000", "minimum": 1,
+             "env_var": "MINIR_BUFFER_EVENTS"},
+            {"key": "buffer_bytes",
+             "description": "Total transcript cache budget in bytes (oldest streams evict first)",
+             "type": "integer", "default": "268435456", "minimum": 1024,
+             "env_var": "MINIR_BUFFER_BYTES"},
             {"key": "card_token_budget",
              "description": "Hard per-file budget for the four global card files",
              "type": "integer", "default": "2000", "minimum": 200,
@@ -527,14 +588,13 @@ class MinirMemoryProvider(MemoryProvider):
         return craft_rules_section()
 
     def _adviser_prompt_block(self) -> str:
-        """Dynamic adviser contract, gated on the configured/registered surfaces."""
+        """Dynamic adviser contract, gated on the configured surface."""
         try:
             enabled = self._adviser_mode.enabled(self._session_id)
             adviser_only = enabled and self._adviser_mode.mode(self._session_id) == "adviser_only"
-            consult = bool(self._adviser_consult_registered)
         except Exception:
             return ""
-        if not (enabled or consult):
+        if not enabled:
             return ""
         parts = [
             "# Advisers",
@@ -558,8 +618,6 @@ class MinirMemoryProvider(MemoryProvider):
             brief = self._adviser_mode.mode_brief(self._session_id)
             if brief:
                 parts.append(brief)
-        if consult:
-            parts.append(MAIN_CONSULT_SECTION)
         return "\n\n".join(parts)
 
     def queue_prefetch(self, query: str, *, session_id: str = "") -> None:
@@ -675,13 +733,16 @@ class MinirMemoryProvider(MemoryProvider):
         session_id: str = "", messages: Optional[list[dict[str, Any]]] = None,
         turn_author: Optional[dict[str, Any]] = None,
     ) -> None:
-        """Hand the completed turn to the layer worker (host calls this on a background worker).
+        """Record the completed turn and hand it to the layer worker.
 
-        Nothing is written to disk: the turn goes into the in-memory transcript, and only what
-        the layers *derive* from it is persisted. ``turn_author`` (``{"id", "name", "is_bot"}``)
-        is retained as evidence metadata for the user side; the base layer always models this
-        profile's single user, not a per-author artifact. The tick's cached author is the
-        fallback for a host that does not pass it here.
+        The host's ``messages`` is the run's whole conversation, so the event store appends only
+        the tail after its ``fp`` anchor (``transcript.ingest``); a compaction that removed the
+        anchor writes a ``gap`` row instead of replaying silently. The in-memory window still
+        takes the user/assistant pair, because the worker reads timestamp windows.
+
+        ``turn_author`` (``{"id", "name", "is_bot"}``) is retained as evidence metadata for the
+        user side; the base layer always models this profile's single user, not a per-author
+        artifact.
         """
         if self._store is None or self._agent_context not in ("", "primary"):
             return  # host contract: non-primary contexts (subagent/cron/flush) do not write memory
@@ -694,6 +755,17 @@ class MinirMemoryProvider(MemoryProvider):
         author, author_id = self._turn_author(turn_author, session)
         self._cancel_session_extraction(session)
         try:
+            if messages:
+                self._transcript.ingest(HOST_LAYER, session, messages, platform=self._platform)
+            else:
+                # A host that passes no slice still gets the pair on disk; no fingerprint is
+                # needed because there is nothing to dedupe against.
+                self._transcript.append_event(HOST_LAYER, session, "user", text=user_content,
+                                              platform=self._platform)
+                self._transcript.append_event(HOST_LAYER, session, "assistant",
+                                              text=assistant_content or "",
+                                              platform=self._platform)
+            self._flush_reasoning(session)
             self._transcript.add_turn(session, user_content, assistant_content,
                                       author=author, author_id=author_id)
             # The turn's content exists now, so this is the earliest useful moment to drain the
@@ -701,6 +773,42 @@ class MinirMemoryProvider(MemoryProvider):
             self._kick_worker()
         except Exception as exc:  # a memory failure must never break the host's turn worker
             logger.warning("Minir sync_turn failed: %s", exc)
+
+    def _flush_reasoning(self, session: str) -> None:
+        """Append the turn's aggregated reasoning row, redacted; nothing when never opted in."""
+        parts = self._reasoning_deltas.pop(str(session or ""), None)
+        if not parts:
+            return
+        text, redacted = _redact_text("".join(parts))
+        self._transcript.append_reasoning(HOST_LAYER, session, text, platform=self._platform,
+                                          redacted=redacted)
+
+    def _record_system_prompt(self) -> None:
+        """Record the system text this provider contributes to the host prompt.
+
+        The host keeps no system rows in ``state.db`` and passes no system message in its
+        ``messages`` slice, so the ``system`` role has no host source. The honest row is the block
+        this plugin injects; ``source="plugin_system"`` says so, and the ``hash`` keeps one copy
+        per distinct prompt. A host slice that does carry a ``system`` row is recorded by
+        ``ingest`` as well.
+        """
+        if self._store is None or not self._session_id:
+            return
+        try:
+            text = (self.system_prompt_block() or "").strip()
+            if not text:
+                return
+            digest = fingerprint("system", text)[3:]
+            rows = self._transcript.read_events(
+                self._platform, HOST_LAYER, self._session_id, roles=("system",), limit=20)["rows"]
+            if any(str(row.get("hash") or "") == digest for row in rows):
+                return
+            self._transcript.append_event(
+                HOST_LAYER, self._session_id, "system", text=text, platform=self._platform,
+                redacted=True, chars=len(text), hash=digest, source="plugin_system",
+                fp=fingerprint("system", text))
+        except Exception:
+            logger.debug("Minir system prompt recording failed", exc_info=True)
 
     def _turn_author(self, turn_author: Optional[dict[str, Any]], session: str) -> tuple[str, str]:
         """``(name, id)`` of the user side of this turn: the host's argument, else the last tick."""
@@ -1055,7 +1163,8 @@ class MinirMemoryProvider(MemoryProvider):
                 status="active", to_ts=window_end or None)
         pages = extraction.extract_pages(
             session_id=session, summary=summary_text, handoff=handoff_text,
-            markers=snapshot, usage=usage, hermes_home=self._hermes_home)
+            markers=snapshot, usage=usage, hermes_home=self._hermes_home,
+            transcript=self._transcript, platform=self._platform, window_end=window_end)
         written = 0
         for page in pages:
             page["source_session"] = session
@@ -1312,6 +1421,7 @@ class MinirMemoryProvider(MemoryProvider):
                                              if self._adviser_mode else {}),
                                },
                                "artifacts": self._store.all_layer_states(),
+                               "transcript": self._transcript.stats(),
                                "buffered_messages": len(self._transcript.messages(self._session_id)),
                                "prefetch_limit": self._prefetch_limit,
                                "dialectic_depth": self._dialectic_depth,
@@ -1333,8 +1443,8 @@ class MinirMemoryProvider(MemoryProvider):
             self._store, self._hermes_home, self._profile,
             complete=self._worker.review_cards, since=since,
             plugin_yaml=self._worker._plugin_yaml,
-            language=str(self._config.get("content_language") or "en"))
-        self._transcript.prune()  # the review is the retention clock: 30 days
+            language=str(self._config.get("content_language") or "en"),
+            transcript=self._transcript, platform=self._platform)
         return revisions
 
     # -- cold start -----------------------------------------------------------
@@ -1515,13 +1625,12 @@ def register(ctx) -> None:
     # auxiliary-task API; the adviser surface belongs to the memory-plugin collector only.
     if not hasattr(ctx, "register_auxiliary_task"):
         return
-    # Second surface of the same directory: the auxiliary ``adviser`` route + its in-process
-    # agent loop (``adviser_consult``). Optional by design — a host without the auxiliary-task
+    # Second surface of the same directory: the auxiliary ``adviser`` route and the read-only
+    # host session search. Optional by design — a host without the auxiliary-task
     # API (or a config that refuses the key) must still get the memory provider, so a failure
     # here is logged and swallowed rather than raising out of ``register()``.
     try:
         adviser.register(ctx, provider)
-        provider._adviser_consult_registered = True
     except Exception as exc:
         logger.warning("Minir adviser registration failed: %s", exc)
 
@@ -1599,6 +1708,9 @@ def _on_session_finalize(session_id: str = "", provider: Optional[MinirMemoryPro
         if resolved is not None:
             resolved._adviser_mode.session_end(session_id)
             resolved.flush_metrics()
+            # Bounded flush: the host is tearing this session down, so the queued rows must
+            # reach the file, but a slow disk must not hold the process.
+            resolved._transcript.flush(session_id, timeout=5.0)
         logger.info("Minir on_session_finalize: session=%s", session_id or "-")
     except Exception as exc:
         logger.warning("Minir on_session_finalize failed: %s", exc)
@@ -1711,17 +1823,23 @@ def _on_interim_message(session_id: str = "", turn_id: str = "", text: Any = Non
 def _on_stream_delta(session_id: str = "", turn_id: str = "", delta: Any = None,
                      kind: str = "text", provider: Optional[MinirMemoryProvider] = None,
                      **kwargs) -> None:
-    """Keep a bounded reasoning excerpt when the adviser is explicitly opted in.
+    """Keep a bounded reasoning excerpt and, at turn end, one reasoning event row.
 
-    The host only delivers reasoning deltas when ``plugins.stream_reasoning_deltas`` is on and
-    the plugin's own ``include_reasoning`` is on; either switch off makes this a no-op. The
-    excerpt is never persisted: it lives in the review prompt only.
+    The host only delivers reasoning deltas when ``plugins.stream_reasoning_deltas`` is on, and
+    the plugin's own ``include_reasoning`` gates the review prompt. The transcript row is the
+    permanent record; the excerpt is only ever a prompt input.
     """
     if str(kind or "") != "reasoning":
         return
     resolved = _resolve_provider(provider)
     if resolved is not None:
         resolved._adviser_mode.on_stream_delta(session_id, str(delta or ""))
+        key = str(session_id or "")
+        parts = resolved._reasoning_deltas.setdefault(key, [])
+        parts.append(str(delta or ""))
+        total = sum(len(part) for part in parts)
+        while parts and total > 200_000:  # keep the tail, never the whole thought
+            total -= len(parts.pop(0))
 
 
 def _on_post_api_request(session_id: str = "", turn_id: str = "", api_request_id: str = "",
