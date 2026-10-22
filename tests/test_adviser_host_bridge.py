@@ -216,6 +216,26 @@ def test_terminal_blocker_queues_a_post_turn_once(plugin_package, make_provider,
     assert len(calls["post"]) == 1
 
 
+def test_terminal_concern_queues_a_post_turn_by_default(
+        plugin_package, make_provider, monkeypatch):
+    provider = _provider(make_provider)
+    mode = provider._adviser_mode
+    monkeypatch.setattr(plugin_package.agent_loop, "run", _fake_run(_advice("soften the claim")))
+    calls = _patch_bridge(plugin_package, monkeypatch)
+    assert mode._cfg()["trigger_severity"] == "concern"
+
+    mode.on_post_tool_call(
+        session_id=SESSION, turn_id="t1", tool_name="read_file", status="ok",
+        args={"path": "a.py"}, result="ok")
+    # The final answer already ran: only the post-turn channel is left.
+    mode._terminal[SESSION] = "t1"
+
+    assert mode.review_once(SESSION, "test") is True
+    assert len(calls["post"]) == 1
+    assert "soften the claim" in calls["post"][0][1]
+    assert calls["steer"] == [] and calls["continue"] == []
+
+
 def test_host_continuation_is_queued_and_reconciled_when_it_never_fires(
         plugin_package, make_provider, monkeypatch):
     provider = _provider(make_provider, host_continue=True)
@@ -283,7 +303,8 @@ def test_a_refused_host_delivery_releases_the_reservation(
 
 def test_advice_after_the_final_answer_is_not_queued_as_a_continuation(
         plugin_package, make_provider, monkeypatch):
-    provider = _provider(make_provider, host_continue=True)
+    # The post-turn trigger is off here so the ledger fallback for a terminal miss stays visible.
+    provider = _provider(make_provider, host_continue=True, trigger_turn=False)
     monkeypatch.setattr(plugin_package.agent_loop, "run", _fake_run(_advice("late finding")))
     calls = _patch_bridge(
         plugin_package, monkeypatch, continuation={"ok": True, "token": "tok-late"})
@@ -362,7 +383,7 @@ def test_post_llm_call_captures_the_preserve_writer(plugin_package, make_provide
 
 def test_terminal_concern_is_preserved_as_an_end_of_turn_card(
         plugin_package, make_provider, monkeypatch):
-    provider = _provider(make_provider)
+    provider = _provider(make_provider, trigger_turn=False)
     monkeypatch.setattr(plugin_package.agent_loop, "run", _fake_run(_advice("left a gap")))
     # The review runs after the host unbound the turn; preserve must still work.
     calls = _patch_bridge(plugin_package, monkeypatch, live=False)
@@ -386,7 +407,7 @@ def test_terminal_concern_is_preserved_as_an_end_of_turn_card(
 
 
 def test_a_stale_preserve_writer_is_not_used(plugin_package, make_provider, monkeypatch):
-    provider = _provider(make_provider)
+    provider = _provider(make_provider, trigger_turn=False)
     monkeypatch.setattr(plugin_package.agent_loop, "run", _fake_run(_advice("late card")))
     calls = _patch_bridge(plugin_package, monkeypatch, live=False)
     mode = provider._adviser_mode
@@ -406,7 +427,7 @@ def test_a_stale_preserve_writer_is_not_used(plugin_package, make_provider, monk
 
 
 def test_a_refused_preserve_keeps_the_rows_pending(plugin_package, make_provider, monkeypatch):
-    provider = _provider(make_provider)
+    provider = _provider(make_provider, trigger_turn=False)
     monkeypatch.setattr(plugin_package.agent_loop, "run", _fake_run(_advice("keep me")))
     calls = _patch_bridge(plugin_package, monkeypatch, preserve={"ok": False}, live=False)
     mode = provider._adviser_mode

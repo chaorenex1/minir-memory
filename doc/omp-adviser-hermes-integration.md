@@ -452,7 +452,7 @@ Desktop 的 transcript 水合把 `display_kind="adviser"` 当作 machine notice 
 |---|---|---|
 | 中途 steer | 只能改下一次请求副本 | `agent.steer(kind="adviser")`，下一安全边界生效；blocker 可用 `agent.interrupt` 立即停止等待当前工具批次（协作式：不轮询的工具被放弃） |
 | blocker 阻断工具 | `pre_tool_call` block | 保留；blocker 先 interrupt，再以 steer 行给出理由 |
-| 终局后续跑 | 仅 `pre_verify`（改过文件） | 任意文本收尾可 continuation；terminal blocker 可 `queue_post_turn` 让 surface 自动开新回合（每 session 1 次） |
+| 终局后续跑 | 仅 `pre_verify`（改过文件） | 任意文本收尾可 continuation；terminal advice ≥ `trigger_severity`（默认 concern）可 `queue_post_turn` 让 surface 自动开新回合（每 session 1 次） |
 | preserve 卡片 | 只有 ledger / gateway 消息 | 四个宿主 surface 都按 `display_kind="adviser"` 渲染 adviser 块：Desktop 水合成 advisory card（severity 着色、label、Markdown 正文）；TUI 画 `◆ adviser` 卡（live `message.adviser` 事件 + 水合行，按 `plugin_message_id` 去重），Web chat 走 TUI 的 PTY 自动继承；classic CLI 打印带 label 的块（流式回复框结束时释放，resume recap 单列）；Web session inspector 用 adviser 样式显示 label 与正文 |
 | plan mode | 拿不到 | 宿主 `set_flag` 可发布 `plan_mode`；另外 adviser 从 `plan_mode` 工具的 `on/off/submit/status` 结果镜像状态（插件装了就生效）。为真时只展示，不 steer/interrupt/trigger |
 | reasoning 流 | 拿不到 | 插件侧已可订阅 `on_stream_delta(kind="reasoning")`，但需宿主 `plugins.stream_reasoning_deltas: true` 且插件 `include_reasoning: true`；prompt 取全量（`max_reasoning_chars` 可设上限），全量落盘 `sessions/reasoning/<session>.log`（无字符上限） |
@@ -471,8 +471,8 @@ Desktop 的 transcript 水合把 `display_kind="adviser"` 当作 machine notice 
   host_interrupt: true    # blocker 停止当前工具批次（协作式）
   interrupt_severity: blocker
   host_continue: true     # severity ≥ continue_severity 时请求续跑
-  trigger_turn: true      # terminal blocker 可让 surface 开新回合
-  trigger_severity: blocker
+  trigger_turn: true      # terminal advice ≥ trigger_severity 可让 surface 开新回合
+  trigger_severity: concern
   max_post_turn_triggers: 1   # 每 session，防自激
   preserve: true            # 终局无动作的建议落成回合末尾卡片（0010）
   shutdown_wait_ms: 5000    # 退出前给 in-flight review 的预算；strict 取 strict_max_ms

@@ -124,7 +124,7 @@ _DEFAULTS: dict[str, Any] = {
     # A terminal answer at/above trigger_severity may start one fresh surface turn, bounded per
     # session so an adviser-triggered turn cannot trigger itself forever.
     "trigger_turn": True,
-    "trigger_severity": "blocker",
+    "trigger_severity": "concern",
     "max_post_turn_triggers": 1,
     # -- rostered reviewer lifecycle ------------------------------------------
     # A failed member pauses alone; the rest of the roster keeps reviewing.
