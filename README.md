@@ -6,7 +6,8 @@ and grow into a real provider.
 
 It keeps explicit value markers and every derived conclusion in a per-profile SQLite database,
 recalls them through an FTS5 trigram index (CJK-safe, with a token-scan fallback), and exposes
-five tools (`minir_search`, `minir_remember`, `minir_forget`, `minir_stats`, `minir_agents`). On top of that it runs
+six tools (`minir_search`, `minir_remember`, `minir_forget`, `minir_todo`, `minir_stats`,
+`minir_agents`). On top of that it runs
 two **independent** reasoning layers: the base layer builds the user/AI cards every 24 turns, the
 dialectic reviews them every 8 turns against its own evidence window, and corrects the newest base
 artifact (a pre-overwrite snapshot and an FTS index are kept). The review publishes a short
@@ -65,7 +66,8 @@ review_mode); config `roster` entries override it field by field.
 
 **SQLite holds no transcripts.** The worker reads `(from_ts, to_ts]` messages from
 `$HERMES_HOME/state.db` read-only (plus the in-process buffer for turns not yet committed) and
-persists only what the layers *derived* from them plus notes you asked to keep. What the provider
+persists only what the layers *derived* from them plus the conclusions you asked it to keep.
+What the provider
 does keep is a separate **transcript event store** of JSONL files under
 `$HERMES_HOME/minir-memory/sessions/` (host turns and layer runs, append-only and permanent, with
 no recall from it). Derived content may quote or reference the messages it reasoned over — it is a
@@ -88,7 +90,7 @@ pyproject.toml         package metadata, pytest config, pip entry point
 plugin/minir/          the deployable plugin directory (copy this to plugins/minir)
   plugin.yaml          manifest (name/version/description + metadata)
   __init__.py          register(ctx) + MinirMemoryProvider + the engine export
-  store.py             SQLite storage: notes, conclusions + FTS5, base revisions, jobs, metrics
+  store.py             SQLite storage: conclusions + FTS5, dialectic refreshes, jobs, metrics
   history.py           read-only host history, profile resolution, identity files
   transcript.py        bounded turn window + the permanent JSONL event store (sessions/)
   transcript_process.py per-process locks, first/last-process verdicts, cache replay
@@ -204,17 +206,18 @@ be granted them explicitly (see "The `minir` toolset" below).
 
 | Tool | Parameters | Behaviour |
 | --- | --- | --- |
-| `minir_search` | `query` (required), `limit`, `scope`, `session_id` | Ranked FTS5 recall. Default `scope="session"`: the current session plus durable cards and notes. `scope="all"` searches every session; `session_id` targets one explicitly. `limit` defaults to `prefetch_limit` and is capped at 20. Each result carries `kind`, `when`, `source`, `session_id`, `text` (600-char excerpt) and, for a typed marker, `marker_type`. Only a typed marker exposes a forgettable `note_id`/`id`. |
-| `minir_remember` | `type` (required), `content` (required) | Records an explicit value-output marker of that type (`entities`, `trajectories`, `experiences`, `tools`, `projects`), bound to the current session and mirrored into `conclusions` so FTS finds it. Returns `{stored, note_id, type, session_id}`. |
-| `minir_forget` | `type` (required), `note_id` (required) | Deletes the marker only when its stored type matches. Returns `{deleted, note_id, type}`; a wrong type or unknown id yields `deleted: false`. Conclusions have no `note_id` and cannot be deleted. |
-| `minir_stats` | none | Store counts (including `markers` per type), layer counters, the scheduler ledger, published artifacts, buffered messages, in-memory tool metrics, the session's token usage and its newest turn rows, and the database path. |
+| `minir_search` | `query` (required), `limit`, `scope`, `type`, `session_id` | Ranked FTS5 recall. Default `scope="session"`: the current session plus durable cards and markers. `scope="all"` searches every session; `session_id` targets one explicitly. `limit` defaults to `prefetch_limit` and is capped at 20; `type` keeps only that conclusion kind. Each result carries `conclusions_id`, `kind`, `key`, `text` (600-char excerpt), `when`, `author`, `subject`, `session_id`, `score` and `rank`. |
+| `minir_remember` | `type` (required), `content` (required) | Stores one conclusion of that kind (`note`, `entities`, `trajectories`, `experiences`, `tools`, `projects`, `todo`) in the single memory table, bound to the current session and indexed for FTS. Returns `{stored, conclusions_id, type, session_id}`. |
+| `minir_forget` | `type` (required), `conclusions_id` (required) | Deletes that row only when its stored kind matches. Returns `{deleted, conclusions_id, type}`; a wrong kind or unknown id yields `deleted: false`. |
+| `minir_todo` | `todos` (required) | Replaces this session's todo list, at most two levels deep (`parent` names a top-level id) and 256 items. It is stored as one row (`kind="todo"`), rendered as a markdown table into the final answer, and summarised as `open/total` in the next turn's recall. An empty list deletes the row. |
+| `minir_stats` | none | Store counts (with `conclusions_by_kind` for this session), layer counters, the scheduler ledger, published artifacts, buffered messages, in-memory tool metrics, the session's token usage and its newest turn rows, and the database path. |
 | `minir_agents` | `agent_name` (required), `user_prompts` (required), `system_prompts`, `context_files`, `project_dir`, `tool_sets`, `skip_memory`, `skip_context_files`, `skip_background_review`, `load_soul_identity` | Runs a named in-process agent; omitting `tool_sets` grants every host tool. The full run is flushed to `sessions/<agent_name>/<layer_session_id>.json`. |
 
 Explicit markers are separate from the base layer's automatic value markers: the worker keeps
 merging its own five-key inventory per refresh, while a remembered marker is a session-bound,
-type-tagged row that search can recall and `minir_forget` can remove. Notes mirrored from the
-host's built-in memory tools (`on_memory_write`) stay durable and untyped; they are recallable in
-both public scopes.
+kind-tagged conclusions row that search can recall and `minir_forget` can remove. Writes mirrored
+from the host's built-in memory tools (`on_memory_write`) land under `kind="note"`; they are
+recallable in both public scopes.
 
 Two further tools exist only in the agent-facing `minir` registry toolset (not in the provider's
 main-agent surface):
@@ -273,7 +276,7 @@ event). Four things happen there beyond the layer drain:
    the session total in `session_usage` beside the host's own `sessions.input_tokens` /
    `output_tokens` aggregate. `minir_stats` reports both, so a turn's final consumption is
    auditable even after the process is gone.
-2. **A marker snapshot.** The session's explicit typed notes plus its newest base-layer
+2. **A marker snapshot.** The session's explicit typed markers plus its newest base-layer
    value markers are captured into `session_extractions` with `due_at = now + 24h`. A
    session with no markers arms nothing; the timer is for durable sessions.
 3. **A cancellable timer.** Any user turn in that session (`on_turn_start`, `sync_turn`) deletes
@@ -322,8 +325,9 @@ publishes into `layer_state`/`conclusions`. Each base refresh also appends one s
 `base_refreshes` (session, time window, actual turn range, the six outputs, `is_latest`); one base
 window has one job.
 `prefetch()` injects only the newest base revision note (`## Base Revision`, bounded to 1200 chars)
-ahead of recall. Recall covers explicit notes and value markers only — the current session's
-notes plus durable notes; every derived artifact (the four base sections, the revision note, chunks
+ahead of recall. Recall covers explicit memory only — the current session's markers plus durable
+markers, and the session's todo list; every derived artifact (the six base conclusions, the review
+note, chunks
 and summaries) stays explicit-recall through `minir_search`. Another session's rows are reachable
 only through `minir_search(scope="all")`, never by automatic injection. Advice has one producer
 (the live reviewer); the dialectic layer writes no advice at all.
@@ -392,8 +396,10 @@ The base row keeps `user_representation` for `user_self_representation`, `user_p
 `user_preferences`, the same-named `ai_self_representation` and `ai_identity_card` for `ai_identity`,
 `window_summary` for the summary section, and `value_markers` for
 `{"value_markers": [...]}`. The same data is
-rendered into the four-section artifact and split into searchable conclusions (`base.user_card`,
-`base.ai_card`, `base.window_summary`, `base.value_markers`). `is_latest=1` marks the row with the
+rendered into the four-section artifact, and every column is published once per session as its own
+conclusion (`base.user_representation`, `base.user_peer_card`, `base.ai_self_representation`,
+`base.ai_identity_card`, `base.window_summary`, `base.value_markers`) through
+`publish_base_conclusions`, guarded by `base_refreshes.conclusions_published_at`. `is_latest=1` marks the row with the
 greatest `window_to_ts` per `(session_id, subject)` — window order, not write order, so a slow
 older window that finishes late is history, never "latest". `window_from_turn`/`window_to_turn`
 record the session turns the window actually covered (one user message is one turn), extending
@@ -436,17 +442,18 @@ dialectic writes no advices: advice has a single producer, the live reviewer.
 When `base_changed.fields` is non-empty, the corrected parts overwrite the base row **in one
 transaction**:
 
-1. the current six columns + advices are snapshotted into `base_revisions` (with the affected
+1. the current six columns are snapshotted into `dialectic_refreshes` (with the affected
    `base_refresh_id`, window/turn ranges, `changed_fields`, `source_job_id`, `is_latest`);
 2. the changed columns of `base_refreshes` are updated in place (window order and `is_latest` are
    unchanged);
 3. the base `layer_state` artifact is rewritten from the corrected parts, and its `conclusions`
    sections are updated.
 
-`base_revisions_fts` is an external-content trigram index over the six snapshot columns plus
-`advices` (seven columns), so a previous model state is still recallable with
-`search_base_revisions()`. The dialectic writes no advices, so that column stays `[]`; the
-`advisories` ledger belongs to the live reviewer alone. A base correction never changes which
+`dialectic_refreshes_fts` is an external-content trigram index over the six snapshot columns, so a
+previous model state is still recallable with `search_base_revisions()`. (The table was
+`base_revisions` and carried a dead `advices` column; both name and column are gone, and the
+Python method names keep their old spelling.) The `advisories` ledger belongs to the live
+reviewer alone. A base correction never changes which
 window is `is_latest`; an operator-authored identity still wins over any inference.
 
 The model may be told who the assistant is from
@@ -801,7 +808,7 @@ write authority:
 | Trigger | base refresh / compression boundary | tool cadence, tool error, mutation, final answer |
 | Input | base artifact + window history | user goal, intent, tool results, final answer, long-term context |
 | Output | six corrected cards + `## Base Revision` note | `silent` or 1–3 advices |
-| Writes | `base_refreshes`, `base_revisions`, `layer_state` | `advisories` only |
+| Writes | `base_refreshes`, `dialectic_refreshes`, `layer_state` | `advisories` only |
 | Delivery | none: memory correction, no advice | `llm_request`, boundary aside, gate, gateway |
 | Lifetime | durable audit | current turn, expires |
 
@@ -977,9 +984,10 @@ interval instead of immediately repeating the same window.
 ### Summary storage and FTS
 
 The summary is written to `conclusions` as `session_summary`, session-scoped and keyed by
-`session_summary:<session>:<run_id>`. It starts `pending`; `on_turn_complete` promotes exactly the
-run named by the `[minir summary #<run_id>]` marker when the host commits the returned list, so a
-discarded compression never becomes recallable. The full summary text is stored (the assistant
+`session_summary:<index>`, where `index` is this session's next compression count
+(`next_session_summary_index`). It is `active` from the start: there is no pending phase and no
+promotion step, and the `[minir summary #<run_id>]` marker is only for folding the carrier message
+(the run id rides `evidence`). The full summary text is stored (the assistant
 message is not a 900-character excerpt) and `conclusions_fts` already indexes it with the trigram
 tokenizer; `minir_search` can recall it inside its own session. There is no separate FTS table to
 build. A subsequent compression replaces the previous summary message rather than accumulating a
@@ -1093,14 +1101,14 @@ hand-edited config.yaml are equivalent. Most keys also have an env override —
 env var wins** when both are set. Layer intervals, depth, `reasoning_enabled` and the transcript
 cache budget are read when a session opens.
 
-Every published conclusion is searchable: `notes`, the four base sections, the dialectic review,
-local compression chunks, and the final `session_summary` of each compression. The index uses
+Every published conclusion is searchable: the six base conclusions, the tool markers, the
+dialectic review, local compression chunks, and the final `session_summary` of each compression. The index uses
 FTS5 `trigram` so Chinese queries work; if the SQLite build lacks FTS5, `minir_search` falls back
-to a token scan. Base revisions are a separate audit surface (`search_base_revisions`, trigram
-over the six pre-overwrite fields plus advices); pending advices live in `advisories` and are
+to a token scan. Dialectic refreshes are a separate audit surface (`search_base_revisions`,
+trigram over the six pre-overwrite fields); pending advices live in `advisories` and are
 delivered through `pre_llm_call`, not injected as durable recall. Session summaries, reviews,
-chunks and session-bound value markers only match their own `session_id`; user peer
-cards, AI identity and durable notes recall across sessions. `minir_search` defaults to the
+chunks and session-bound value markers only match their own `session_id`; the four durable base
+conclusions and durable markers recall across sessions. `minir_search` defaults to the
 current session's view and only crosses sessions when `scope="all"` is passed.
 
 Restart Hermes (an already-running Gateway/TUI keeps the previous code in memory).
@@ -1183,7 +1191,7 @@ package is `plugin/minir`, so it is never collected as a test module.
   buckets, and the worker claims one job at a time with a single `UPDATE`.
 * **`hermes_home` is profile-scoped** — always use the `initialize()` kwarg, never
   hardcode `~/.hermes`, or multiplexed profiles cross-contaminate.
-* **No transcripts on disk** — the schema holds notes, job bookkeeping and layer artifacts and
+* **No transcripts on disk** — the schema holds conclusions, job bookkeeping and layer artifacts and
   nothing else; `tests/test_provider.py` asserts that a distinctive sentence handed to
   `sync_turn` is present in no row of any table, and the host verification probe repeats the
   check through the real loader.
@@ -1201,7 +1209,7 @@ package is `plugin/minir`, so it is never collected as a test module.
   `MINIR_SESSION_MODE`) and the env var wins over config.yaml. Override
   `save_config(values, hermes_home)` only if your values need a native format the host cannot
   write.
-* **Everything injected is bounded** — stored notes and artifacts are truncated on write
+* **Everything injected is bounded** — stored conclusions and artifacts are truncated on write
   (4000 chars), the recall block is capped at 2000, and the layer block at 1200, so nothing
   unbounded reaches the prompt.
 * **Counting is off the bounded-hook path** — the counters run on `on_turn_start` /

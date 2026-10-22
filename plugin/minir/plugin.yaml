@@ -1,5 +1,5 @@
 name: minir
-version: 0.15.0
+version: 0.16.0
 description: "Minir — local-first memory plugin: independent base/review layers, four-section user/AI cards with a rolling window summary, a three-day review of four durable card files, knowledge pages with path-hint retrieval, an idle-session summary and knowledge extraction, per-turn token accounting, the minir toolset, FTS5 recall, and a permanent JSONL transcript event store."
 author: chaorenex1
 license: MIT
@@ -18,6 +18,7 @@ provides_hooks:
   - post_tool_call
   - pre_tool_call
   - pre_verify
+  - transform_llm_output
   - on_interim_message
   - on_stream_delta
   - post_api_request
@@ -33,5 +34,6 @@ provides_tools:
   - minir_search
   - minir_remember
   - minir_forget
+  - minir_todo
   - minir_stats
   - minir_agents

@@ -68,7 +68,7 @@ from . import layers
 from . import rules as layer_rules
 from . import window_summary as summary_template
 from .prompting import data_block
-from .store import MinirStore, format_when
+from .store import MinirStore
 from .transcript import HOST_LAYER, TranscriptBuffer
 from . import transcript_prompt
 from .turn_counter import BASE_LAYER, DIALECTIC_LAYER
@@ -591,6 +591,18 @@ def _read_plugin_yaml() -> str:
         return ""
 
 
+def chunk_window_start(chunk: dict[str, Any]) -> float:
+    """The window start a chunk summary key encodes (``chunk:<sid>:<from_ts>``).
+
+    Conclusions have no window columns; the key is what identifies the window, so a reader that
+    must order or filter chunks by time parses it instead of a column.
+    """
+    try:
+        return float(str(chunk.get("key") or "").rsplit(":", 1)[-1])
+    except ValueError:
+        return 0.0
+
+
 def _chunk_prompt(chunks: list[dict[str, Any]], max_chars: int = 4_000) -> str:
     """Format the canonical chain for the dialectic prompt, newest chunks first under budget."""
     kept: list[str] = []
@@ -599,11 +611,7 @@ def _chunk_prompt(chunks: list[dict[str, Any]], max_chars: int = 4_000) -> str:
         body = str(chunk.get("content") or "").strip()
         if not body:
             continue
-        window = ""
-        if chunk.get("from_ts") is not None and chunk.get("to_ts") is not None:
-            window = (f" · {format_when(float(chunk['from_ts']))}"
-                      f"–{format_when(float(chunk['to_ts']))}")
-        block = f"### Chunk {index}{window}\n{body}"
+        block = f"### Chunk {index}\n{body}"
         if size + len(block) + 1 > max_chars and kept:
             kept.append("### […older chunks omitted]")
             break
@@ -1202,10 +1210,9 @@ class LayerWorker:
                 rows, self._store.latest_chunk_turn_before(session, from_ts), int(turns or 0))
         if chunk_text.strip() and session:
             self._store.add_chunk_summary(
-                session, from_ts, to_ts, chunk_text,
+                session, from_ts, chunk_text,
                 evidence=json.dumps([row.get("message_uid") for row in rows
-                                     if row.get("message_uid")]),
-                from_turn=from_turn, to_turn=to_turn)
+                                     if row.get("message_uid")]))
         record = {"subject": subject,
                   "window_from_ts": float(from_ts), "window_to_ts": float(to_ts),
                   "window_from_turn": from_turn, "window_to_turn": to_turn, **parts}
@@ -1297,7 +1304,7 @@ class LayerWorker:
                         "content": previous_content(DIALECTIC_LAYER, previous, session)}
         chunks = _chunk_prompt([
             chunk for chunk in self._store.chunk_summaries(session)
-            if float(chunk.get("to_ts") or 0.0) <= float(to_ts) + 1e-6
+            if chunk_window_start(chunk) <= float(to_ts) + 1e-6
         ])
         # The review reads the session's live base artifact, not a row pinned to its own window:
         # with independent cadences the base window and the review window rarely start on the
@@ -1353,9 +1360,7 @@ class LayerWorker:
         if "window_summary" in changed_parts:
             body = summary_template.validate(corrected["window_summary"]).split("\n", 1)[1].strip()
             chunk_version = self._store.add_chunk_summary(
-                session, float(base_row["window_from_ts"]), float(base_row["window_to_ts"]),
-                body, from_turn=base_row.get("window_from_turn"),
-                to_turn=base_row.get("window_to_turn"))
+                session, float(base_row["window_from_ts"]), body)
             if not chunk_version:
                 changes.pop("window_summary", None)
                 changed_parts.remove("window_summary")

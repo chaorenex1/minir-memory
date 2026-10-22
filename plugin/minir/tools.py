@@ -1,4 +1,4 @@
-"""The plugin's own toolset — the five store tools plus the two agent-facing searches.
+"""The plugin's own toolset — the six store tools plus the two agent-facing searches.
 
 The memory-provider surface already hands five schemas to the main agent through
 ``MemoryProvider.get_tool_schemas``. That path only reaches an agent that has the host's
@@ -31,8 +31,7 @@ from typing import Any, Callable, Optional
 
 from tools.registry import tool_error
 
-from .layers import CATEGORIES
-from .store import VALUE_MARKER_TYPES
+from .store import CONCLUSION_KINDS
 from . import agent_history
 
 logger = logging.getLogger(__name__)
@@ -44,12 +43,12 @@ SKILL_TOOLSET= "skills"
 #: agent it runs, and ``file_guard`` scopes the calls while that agent runs.
 FILE_TOOLSET = "file"
 TOOL_NAMES: tuple[str, ...] = (
-    "minir_search", "minir_remember", "minir_forget", "minir_stats", "minir_agents",
+    "minir_search", "minir_remember", "minir_forget", "minir_todo", "minir_stats", "minir_agents",
     "minir_aiagent_search")
 
 _EMOJI: dict[str, str] = {
-    "minir_search": "🔎", "minir_remember": "📌", "minir_forget": "🗑️", "minir_stats": "📊",
-    "minir_agents": "🧩",
+    "minir_search": "🔎", "minir_remember": "📌", "minir_forget": "🗑️", "minir_todo": "✅",
+    "minir_stats": "📊", "minir_agents": "🧩",
 }
 
 
@@ -69,34 +68,49 @@ _TOOL_SEARCH = _tool_schema(
     "Search Minir's long-term memory for stored value markers and derived conclusions — "
     "user/AI cards, adviser reviews, session summaries and notes. Minir keeps no "
     "transcripts; this searches the conclusions derived from them. The default scope is the "
-    "current session plus durable cards and notes; set scope='all' to search across sessions.",
+    "current session plus durable cards and markers; set scope='all' to search across sessions.",
     {"query": _prop("What to search for."),
      "limit": _prop("Maximum results to return (default: the provider's prefetch limit).",
                     "integer"),
      "scope": _prop("Recall scope: 'session' (default) or 'all' for cross-session search.",
                     "string", enum=["session", "all"]),
+     "type": _prop("Only return conclusions of this kind; omitted searches every kind.",
+                   "string", enum=list(CONCLUSION_KINDS)),
      "session_id": _prop("Optional session to search instead of the current one "
                          "(ignored when scope='all').")},
     ("query",))
 _TOOL_REMEMBER = _tool_schema(
     "minir_remember",
-    "Record a new value-output marker: one semantic category, one organisational type, the "
-    "statement itself.",
-    {"type": _prop("Value-marker organisational type.", "string",
-                   enum=list(VALUE_MARKER_TYPES)),
-     "category": _prop("Semantic category.", "string", enum=list(CATEGORIES)),
+    "Record a new conclusion: one kind plus the statement itself. The stored row is searchable "
+    "by minir_search and can be deleted by minir_forget with its conclusions_id.",
+    {"type": _prop("Conclusion kind.", "string", enum=list(CONCLUSION_KINDS)),
      "content": _prop("The value-output marker to remember.")},
-    ("type", "category", "content"))
+    ("type", "content"))
 _TOOL_FORGET = _tool_schema(
     "minir_forget",
-    "Delete an old value-output marker by its note_id and type. Use only the note_id returned "
-    "for a typed marker result (kind='note' with marker_type) or by minir_remember; untyped "
-    "notes and conclusions have no note_id and cannot be forgotten. The type must match the "
-    "marker or nothing is deleted.",
-    {"type": _prop("Value-marker type the marker was stored with.", "string",
-                   enum=list(VALUE_MARKER_TYPES)),
-     "note_id": _prop("Id of the marker to delete.", "integer")},
-    ("type", "note_id"))
+    "Delete one stored conclusion by its conclusions_id and kind. Use only an id returned by "
+    "minir_remember or minir_search; the kind must match the stored row or nothing is deleted.",
+    {"type": _prop("Conclusion kind the row was stored with.", "string",
+                   enum=list(CONCLUSION_KINDS)),
+     "conclusions_id": _prop("Id of the conclusion to delete.", "integer")},
+    ("type", "conclusions_id"))
+_TOOL_TODO = _tool_schema(
+    "minir_todo",
+    "Replace this session's todo list. At most two levels: a top-level item, and a child item "
+    "naming its parent's id. The whole list is stored as one row and rendered into the final "
+    "answer as a markdown table; the next turn's recall shows the open/total counts. An empty "
+    "list deletes the row.",
+    {"todos": _prop("The complete list; sending [] clears it.", "array",
+                    items={"type": "object",
+                           "properties": {
+                               "id": _prop("Stable id, unique in this list (<=64 chars)."),
+                               "content": _prop("What the item is (<=2000 chars)."),
+                               "status": _prop("Item state.", "string",
+                                               enum=["pending", "in_progress", "completed",
+                                                     "cancelled"]),
+                               "parent": _prop("Id of the top-level item this belongs to.")},
+                           "required": ["id", "content"]})},
+    ("todos",))
 _TOOL_STATS = _tool_schema(
     "minir_stats",
     "Report Minir store statistics — note/marker/session/job counts, the base + dialectic layer "
@@ -127,7 +141,7 @@ _TOOL_AGENTS = _tool_schema(
     ("agent_name", "user_prompts"))
 
 SCHEMAS: tuple[dict[str, Any], ...] = (
-    _TOOL_SEARCH, _TOOL_REMEMBER, _TOOL_FORGET, _TOOL_STATS, _TOOL_AGENTS)
+    _TOOL_SEARCH, _TOOL_REMEMBER, _TOOL_FORGET, _TOOL_TODO, _TOOL_STATS, _TOOL_AGENTS)
 
 
 def agent_toolsets(base: Any = None) -> list[str]:
@@ -150,7 +164,7 @@ def agent_toolsets(base: Any = None) -> list[str]:
 
 def register(ctx: Any, provider: Any = None,
              resolve: Optional[Callable[[], Any]] = None) -> list[str]:
-    """Register the five store tools plus the agent transcript search; returns the names added.
+    """Register the store tools plus the agent transcript search; returns the names added.
 
     ``resolve`` is the live-provider lookup (the host can construct this plugin twice). It is
     called per tool call, not at registration, so a provider initialized after this call is still

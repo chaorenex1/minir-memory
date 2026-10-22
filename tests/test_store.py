@@ -1,7 +1,7 @@
 """Store behavior — SQLite persistence, FTS recall, scoping, bounds, and migration.
 
-No transcripts: the store holds notes, job bookkeeping, derived layer artifacts, the indexed
-conclusions built from them, and aggregated tool metrics.
+No transcripts: ``conclusions`` is the only memory table. The store holds its rows, job
+bookkeeping, the base refresh windows, and aggregated tool metrics.
 """
 
 from __future__ import annotations
@@ -30,59 +30,83 @@ def test_creates_parent_directories(plugin_package, tmp_path):
 def test_schema_holds_no_transcript(store):
     tables = {row[0] for row in store._conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'")}
     assert "turns" not in tables
-    assert {"notes", "jobs", "layer_state", "base_refreshes", "conclusions", "metrics"} <= tables
+    assert "notes" not in tables, "conclusions is the only memory table"
+    assert {"jobs", "layer_state", "base_refreshes", "conclusions", "metrics"} <= tables
     assert "conclusions_fts" in tables
+    columns = {row[1] for row in store._conn.execute("PRAGMA table_info(conclusions)")}
+    assert columns == {"id", "kind", "key", "session_id", "subject", "content", "evidence",
+                       "version", "status", "created_at", "updated_at"}
 
 
-def test_remember_and_search_roundtrip(store):
-    note_id = store.remember("User deploys Hermes on Windows with Docker Desktop", source="tool")
+def test_conclusions_fts_still_queries_after_the_shrink(store):
+    store.save_conclusion("entities", "User deploys Hermes on Windows with Docker Desktop")
+    assert store.search("Docker Hermes"), "the FTS index still reaches a stored row"
+
+
+def test_save_conclusion_returns_the_row_and_search_hides_note_fields(store):
+    row_id = store.save_conclusion(
+        "entities", "User deploys Hermes on Windows with Docker Desktop", subject="tool")
+    assert row_id > 0
     results = store.search("Docker Hermes")
     assert results, "content with both terms must be found"
     top = results[0]
-    assert top["kind"] == "note" and top["id"] == note_id and top["score"] >= 2
+    assert top["kind"] == "entities" and top["conclusions_id"] == row_id and top["score"] >= 2
+    assert set(top) == {"conclusions_id", "kind", "key", "text", "when", "author", "subject",
+                        "session_id", "score", "rank"}
+
+
+def test_save_conclusion_keeps_content_verbatim(store):
+    payload = '{"value_markers": ["工具", "pytest"]}'
+    plain = "plain text with spaces\nand a second line"
+    store.save_conclusion("tools", payload, key="marker:1")
+    store.save_conclusion("note", plain, key="next:1")
+    assert store.get_conclusion("tools", "marker:1")["content"] == payload
+    assert store.search("pytest")[0]["text"] == payload
+    assert store.get_conclusion("note", "next:1")["content"] == plain
 
 
 def test_search_ranks_more_matches_first(store):
-    store.remember("kubernetes cluster upgrade")
-    store.remember("kubernetes notes")
+    store.save_conclusion("note", "kubernetes cluster upgrade")
+    store.save_conclusion("note", "kubernetes notes")
     results = store.search("kubernetes cluster")
     assert results[0]["score"] >= results[-1]["score"]
     assert "cluster" in results[0]["text"]
 
 
 def test_search_rejects_noise_queries(store):
-    store.remember("a b c")
+    store.save_conclusion("note", "a b c")
     assert store.search("") == []
     assert store.search("a b") == []  # tokens shorter than 2 chars are ignored
 
 
 def test_search_limit_is_bounded(store):
     for index in range(25):
-        store.remember(f"alpha beta gamma item {index}")
+        store.save_conclusion("note", f"alpha beta gamma item {index}")
     assert len(store.search("alpha beta gamma", limit=100)) <= 20
 
 
-def test_remember_and_forget(store):
-    note_id = store.remember("rotate credentials quarterly")
-    assert store.forget(note_id) is True
-    assert store.forget(note_id) is False
-    assert store.search("rotate credentials") == []
+def test_forget_conclusion_requires_the_stored_kind(store):
+    row_id = store.save_conclusion("note", "rotate credentials quarterly", session_id="s1")
+    assert store.forget_conclusion("tools", row_id) is False, "a wrong kind deletes nothing"
+    assert store.search("rotate credentials", session_id="s1"), "the row is still there"
+    assert store.forget_conclusion("note", row_id) is True
+    assert store.search("rotate credentials", session_id="s1") == []
 
 
 def test_session_scope_hides_other_sessions_until_scope_all(store):
-    mine = store.remember("alpha marker", marker_type="tools", session_id="s1")
-    other = store.remember("alpha marker", marker_type="tools", session_id="s2")
-    durable = store.remember("alpha marker durable")
+    mine = store.save_conclusion("tools", "alpha marker", session_id="s1")
+    other = store.save_conclusion("tools", "alpha marker", session_id="s2")
+    durable = store.save_conclusion("note", "alpha marker durable")
 
     rows = store.search("alpha marker", session_id="s1")
-    ids = {row["note_id"] for row in rows}
+    ids = {row["conclusions_id"] for row in rows}
     assert mine in ids and durable in ids and other not in ids
-    assert next(row for row in rows if row["note_id"] == mine)["marker_type"] == "tools"
+    assert next(row for row in rows if row["conclusions_id"] == mine)["kind"] == "tools"
 
     rows = store.search("alpha marker", session_id="s1", scope="all")
-    ids = {row["note_id"] for row in rows}
+    ids = {row["conclusions_id"] for row in rows}
     assert {mine, other, durable} <= ids
-    assert next(row for row in rows if row["note_id"] == other)["session_id"] == "s2"
+    assert next(row for row in rows if row["conclusions_id"] == other)["session_id"] == "s2"
 
 
 def test_session_scope_keeps_other_reviews_out_until_scope_all(store):
@@ -94,40 +118,57 @@ def test_session_scope_keeps_other_reviews_out_until_scope_all(store):
 
 
 def test_search_kind_filter_applies_before_the_limit(store):
-    note_id = store.remember("zebraword note", marker_type="tools", session_id="s1")
+    marker = store.save_conclusion("tools", "zebraword note", session_id="s1")
     for index in range(25):
-        store.put_conclusion("base.user_representation", f"goal:{index}",
-                             f"zebraword derived {index}", session_id="s1")
-    rows = store.search("zebraword", limit=1, session_id="s1", kinds=frozenset({"note"}))
-    assert [row["note_id"] for row in rows] == [note_id]
+        store.save_conclusion("base.user_representation", f"zebraword derived {index}",
+                              key=f"goal:{index}", session_id="s1")
+    rows = store.search("zebraword", limit=1, session_id="s1", kinds=frozenset({"tools"}))
+    assert [row["conclusions_id"] for row in rows] == [marker]
+    assert all(row["kind"] == "tools"
+               for row in store.search("zebraword", session_id="s1",
+                                       kinds=frozenset({"tools"})))
+    # Without the filter the 25 derived rows crowd the marker out of a short page: that is why
+    # the filter runs in SQL before the limit instead of after it.
+    assert all(row["kind"] != "tools"
+               for row in store.search("zebraword", limit=1, session_id="s1"))
 
 
-def test_forget_marker_requires_the_stored_type(store):
-    note_id = store.remember("typed marker", marker_type="tools", session_id="s1")
-    assert store.forget(note_id, marker_type="projects") is False
-    assert store.search("typed marker", session_id="s1")
-    assert store.forget(note_id, marker_type="tools") is True
-    assert store.search("typed marker", session_id="s1") == []
-
-
-def test_forget_by_content(store):
-    store.remember("mirrored entry")
-    store.remember("unrelated")
-    assert store.forget_by_content("mirrored entry") == 1
-    assert store.stats()["notes"] == 1
+def test_newest_conclusion_by_content_is_the_mirror_undo(store):
+    first = store.save_conclusion("note", "mirrored entry", session_id="s1")
+    second = store.save_conclusion("note", "mirrored entry", session_id="s1")
+    store.save_conclusion("note", "mirrored entry", session_id="s2")
+    assert store.newest_conclusion_by_content("note", "mirrored entry",
+                                              session_id="s1")["id"] == second != first
 
 
 def test_stats_counts(store):
-    store.remember("a note")
+    store.save_conclusion("note", "a note", session_id="s1")
     store.record_job("base", "s1", 0.0, 1.0)
     store.record_job("dialectic", "s2", 0.0, 1.0)
     stats = store.stats()
-    assert (stats["notes"], stats["sessions"], stats["jobs"], stats["pending_jobs"]) == (1, 2, 2, 2)
+    assert "notes" not in stats and "markers" not in stats
+    assert (stats["sessions"], stats["jobs"], stats["pending_jobs"]) == (2, 2, 2)
     assert stats["db_bytes"] > 0 and stats["db_path"].endswith("memory.db")
 
 
+def test_conclusions_by_kind_only_counts_one_session(store):
+    store.save_conclusion("note", "a note", session_id="s1")
+    store.save_conclusion("tools", "a tool marker", session_id="s1")
+    store.save_conclusion("tools", "another tool marker", session_id="s1")
+    store.save_conclusion("tools", "durable tool marker")
+    assert store.conclusions_by_kind("s1") == {"note": 1, "tools": 2}
+    assert store.conclusions_by_kind("s2") == {}
+
+
+def test_next_session_summary_index_counts_one_session(store):
+    assert store.next_session_summary_index("s1") == 1
+    store.save_conclusion("session_summary", "one", key="session_summary:1", session_id="s1")
+    assert store.next_session_summary_index("s1") == 2
+    assert store.next_session_summary_index("s2") == 1, "another session starts at one"
+
+
 def test_stored_content_is_truncated(store):
-    store.remember("x" * 15_000)
+    store.save_conclusion("note", "x" * 15_000)
     assert len(store.search("x" * 10)[0]["text"]) <= 12_000
 
 
@@ -271,39 +312,27 @@ def test_the_worker_job_path_does_not_raise_after_close(store):
 
 
 def test_conclusions_are_indexed_and_session_scoped(store):
-    """Durable cards recall across sessions; a window summary or review never leaks."""
-    base = ("## User Card\n### Self Representation\n- occupation: finish the plugin\n"
-            "### Preferences\n- communication: prefers terse answers\n\n"
-            "## AI Card\n### Self Representation\n- current_goal: direct\n"
-            "### Identity\n- name: minir\n\n"
-            "## Window Summary\n### Objective\ndeploy the Windows build\n\n"
-            "## Value Markers\n- [KNOWLEDGE:fact/tools] pytest")
-    store.put_layer_state("base", "user:ada", base, session_id="s1", ai_subject="agent:default:minir")
-    dialectic = "## Base Revision\n- user_preferences: skipped the smoke test"
-    store.put_layer_state("dialectic", "agent:default:minir", dialectic, session_id="s1")
+    """Durable cards recall across sessions; a window row or review never leaks."""
+    durable = store.save_conclusion("base.user_peer_card", "prefers terse answers",
+                                    key="user:ada", subject="user:ada")
+    summary = store.save_conclusion("base.window_summary", "deploy the Windows build",
+                                    key="session:s1:user:ada", session_id="s1",
+                                    subject="user:ada")
+    store.put_layer_state("dialectic", "agent:default:minir",
+                          "## Base Revision\n- user_preferences: skipped the smoke test",
+                          session_id="s1")
 
-    goal = store.search("finish the plugin", session_id="s1")
-    assert goal and goal[0]["kind"] == "base.user_card"
-    durable = store.search("finish the plugin", session_id="s2")
-    assert durable and durable[0]["kind"] == "base.user_card", \
-        "the user card is durable across sessions"
-
-    summary = store.search("Windows build", session_id="s1")
-    assert summary and summary[0]["kind"] == "base.window_summary"
+    assert store.search("terse", session_id="s1")[0]["conclusions_id"] == durable
+    assert store.search("terse", session_id="s2")[0]["conclusions_id"] == durable, \
+        "the user peer card is durable across sessions"
+    assert store.search("Windows build", session_id="s1")[0]["conclusions_id"] == summary
     assert store.search("Windows build", session_id="s2") == [], \
-        "a window summary must not leak into another session"
-
-    review = store.search("skipped smoke", session_id="s1")
-    assert review and review[0]["kind"] == "dialectic.review"
+        "a window row must not leak into another session"
+    assert store.search("Windows build", session_id="") == [], \
+        "a session-bound row is not visible without a session"
+    assert store.search("skipped smoke", session_id="s1")[0]["kind"] == "dialectic.review"
     assert not any(row["kind"] == "dialectic.review"
                    for row in store.search("skipped smoke", session_id="s2"))
-
-    peer = store.search("terse answers", session_id="s2")
-    assert peer and peer[0]["kind"] == "base.user_card", \
-        "durable conclusions are cross-session"
-
-    assert store.search("Windows build", session_id="") == [], \
-        "a session-bound summary is not visible without a session"
 
 
 def test_compression_gate_pauses_until_cleared_or_expired(store):
@@ -315,20 +344,10 @@ def test_compression_gate_pauses_until_cleared_or_expired(store):
     assert store.compression_gate_active("s1") is False
 
 
-def test_promote_summary_run_only_touches_the_matching_marker(store):
-    store.put_conclusion("session_summary", "session_summary:s1:r1", "one",
-                         session_id="s1", subject="session", status="pending")
-    store.put_conclusion("session_summary", "session_summary:s1:r2", "two",
-                         session_id="s1", subject="session", status="pending")
-    assert store.promote_summary_run("s1", "r1") == 1
-    assert store.get_conclusion("session_summary", "session_summary:s1:r1")["status"] == "active"
-    assert store.get_conclusion("session_summary", "session_summary:s1:r2")["status"] == "pending"
-
-
-def test_remember_and_forget_update_the_index(store):
-    note_id = store.remember("fts indexed conclusion")
+def test_save_conclusion_is_indexed_and_forget_removes_the_hit(store):
+    row_id = store.save_conclusion("note", "fts indexed conclusion")
     assert store.search("indexed conclusion")
-    assert store.forget(note_id) is True
+    assert store.forget_conclusion("note", row_id) is True
     assert store.search("indexed conclusion") == []
 
 
@@ -433,7 +452,7 @@ def test_apply_base_revision_snapshots_then_updates_atomically(store):
     assert revision["base_refresh_id"] == refresh_id
     assert revision["user_peer_card"] == "old peer"
     assert json.loads(revision["changed_fields"]) == ["user_peer_card"]
-    assert revision["advices"] == "[]"
+    assert "advices" not in revision, "the legacy column is gone"
     state = store.layer_state("base", "user:ada")
     assert state["version"] == 1 and "new peer" in state["content"]
     hits = store.search_base_revisions("old peer", session_id="s1")
@@ -503,12 +522,63 @@ def test_legacy_base_refreshes_rename_the_window_summary_and_gain_value_markers_
         reopened.close()
 
 
+
+
+def test_legacy_two_table_database_migrates_to_conclusions_only(plugin_package, tmp_path):
+    """An old database loses ``notes`` and renames ``base_revisions`` in one open."""
+    path = tmp_path / "legacy" / "memory.db"
+    path.parent.mkdir(parents=True)
+    legacy = sqlite3.connect(str(path))
+    try:
+        legacy.executescript(
+            "CREATE TABLE notes (id INTEGER PRIMARY KEY AUTOINCREMENT,"
+            " source TEXT NOT NULL DEFAULT 'tool', content TEXT NOT NULL,"
+            " created_at REAL NOT NULL, session_id TEXT NOT NULL DEFAULT '',"
+            " marker_type TEXT NOT NULL DEFAULT '', category TEXT NOT NULL DEFAULT '');"
+            "INSERT INTO notes (source, content, created_at, session_id, marker_type, category)"
+            " VALUES ('tool', 'old marker', 1.0, 's1', 'tools', 'KNOWLEDGE');"
+            "CREATE TABLE base_revisions (id INTEGER PRIMARY KEY AUTOINCREMENT,"
+            " session_id TEXT NOT NULL DEFAULT '', subject TEXT NOT NULL DEFAULT '',"
+            " base_refresh_id INTEGER NOT NULL DEFAULT 0, window_from_ts REAL NOT NULL,"
+            " window_to_ts REAL NOT NULL, window_from_turn INTEGER, window_to_turn INTEGER,"
+            " user_representation TEXT NOT NULL DEFAULT '',"
+            " user_peer_card TEXT NOT NULL DEFAULT '',"
+            " ai_self_representation TEXT NOT NULL DEFAULT '',"
+            " ai_identity_card TEXT NOT NULL DEFAULT '',"
+            " window_summary TEXT NOT NULL DEFAULT '',"
+            " value_markers TEXT NOT NULL DEFAULT '',"
+            " advices TEXT NOT NULL DEFAULT '[]', changed_fields TEXT NOT NULL DEFAULT '[]',"
+            " source_job_id INTEGER NOT NULL DEFAULT 0,"
+            " is_latest INTEGER NOT NULL DEFAULT 1, created_at REAL NOT NULL);"
+            "INSERT INTO base_revisions (session_id, subject, window_from_ts, window_to_ts,"
+            " window_from_turn, window_to_turn, user_peer_card, advices, changed_fields,"
+            " created_at) VALUES ('s1', 'user:ada', 0, 10, 1, 2, 'old peer', '[]',"
+            " '[\"user_peer_card\"]', 1.0);")
+        legacy.commit()
+    finally:
+        legacy.close()
+
+    reopened = plugin_package.store.MinirStore(path)
+    try:
+        tables = {row[0] for row in reopened._conn.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table'")}
+        assert "notes" not in tables and "base_revisions" not in tables
+        columns = {row[1] for row in reopened._conn.execute(
+            "PRAGMA table_info(dialectic_refreshes)")}
+        assert "advices" not in columns and "window_from_ts" in columns
+        rows = reopened.base_revisions("s1", "user:ada")
+        assert len(rows) == 1 and rows[0]["user_peer_card"] == "old peer"
+        assert (rows[0]["window_from_ts"], rows[0]["window_to_turn"]) == (0.0, 2)
+        assert reopened.search_base_revisions("old peer", session_id="s1")
+    finally:
+        reopened.close()
+
 def test_legacy_session_chunk_summary_kind_is_renamed(plugin_package, tmp_path):
     path = tmp_path / "mem" / "memory.db"
     first = plugin_package.store.MinirStore(path)
     try:
-        first.put_conclusion("session_chunk_summary", "chunk:s1:0:10", "window body",
-                             session_id="s1", subject="session")
+        first.save_conclusion("session_chunk_summary", "window body", key="chunk:s1:0:10",
+                              session_id="s1", subject="session")
     finally:
         first.close()
     reopened = plugin_package.store.MinirStore(path)
@@ -583,3 +653,43 @@ def test_release_advisories_only_returns_injected_rows(store):
     store.stage_advisories(ids, "req-1")
     assert store.release_advisories(ids) == 0
     assert store.reset_staged(ids) == 1
+
+
+def test_publish_base_conclusions_writes_the_six_fields_once(store):
+    """One conclusion per calibrated column; user/agent rows durable, window rows session-bound."""
+    store.add_base_refresh(
+        "s1", "user:ada", window_from_ts=0.0, window_to_ts=10.0,
+        window_from_turn=1, window_to_turn=2,
+        user_representation="- [goal] ship", user_peer_card="- terse",
+        ai_self_representation="- [done] x", ai_identity_card="- direct",
+        window_summary="- window", value_markers='{"value_markers": []}')
+    assert store.publish_base_conclusions(
+        "s1", user_subject="user:ada", ai_subject="agent:default:minir") == 6
+
+    rows = {row["kind"]: dict(row) for row in store._conn.execute(
+        "SELECT kind, session_id, content FROM conclusions WHERE kind LIKE 'base.%'")}
+    assert set(rows) == {"base.user_representation", "base.user_peer_card",
+                         "base.ai_self_representation", "base.ai_identity_card",
+                         "base.window_summary", "base.value_markers"}
+    for kind in ("base.user_representation", "base.user_peer_card",
+                 "base.ai_self_representation", "base.ai_identity_card"):
+        assert rows[kind]["session_id"] == "", f"{kind} must stay durable"
+    assert rows["base.window_summary"]["session_id"] == "s1"
+    assert rows["base.value_markers"]["session_id"] == "s1"
+    assert rows["base.value_markers"]["content"] == '{"value_markers": []}', \
+        "the column value is stored verbatim"
+
+    # A second caller (another hook, another provider instance) publishes nothing, and a later
+    # refresh window of the same session does not reopen it either.
+    assert store.publish_base_conclusions(
+        "s1", user_subject="user:ada", ai_subject="agent:default:minir") == 0
+    store.add_base_refresh(
+        "s1", "user:ada", window_from_ts=10.0, window_to_ts=20.0,
+        window_from_turn=3, window_to_turn=4,
+        user_representation="- [goal] ship more", user_peer_card="- terse",
+        ai_self_representation="- [done] y", ai_identity_card="- direct",
+        window_summary="- window 2", value_markers='{"value_markers": []}')
+    assert store.publish_base_conclusions(
+        "s1", user_subject="user:ada", ai_subject="agent:default:minir") == 0
+    assert store.get_conclusion(
+        "base.user_representation", "user:ada")["content"] == "- [goal] ship"

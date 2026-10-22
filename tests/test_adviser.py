@@ -147,10 +147,10 @@ def test_provider_registration_survives_a_refused_auxiliary_key(plugin_package):
     assert len(ctx.memory_providers) == 1
     assert ctx.hooks == ["on_session_start", "on_session_reset", "on_session_finalize",
                          "pre_llm_call", "post_llm_call", "post_tool_call", "pre_tool_call",
-                         "pre_verify", "on_interim_message", "on_stream_delta",
-                         "post_api_request", "api_request_error"]
+                         "pre_verify", "transform_llm_output", "on_interim_message",
+                         "on_stream_delta", "post_api_request", "api_request_error"]
     # The refused auxiliary key costs the adviser route only; the plugin's own minir toolset and
     # the read-only session search are registered before that call and must survive it.
     assert [call[1]["name"] for call in ctx.calls if call[0] == "tool"] == [
-        "minir_search", "minir_remember", "minir_forget", "minir_stats", "minir_agents",
-        "minir_aiagent_search", "minir_hermes_session_search"]
+        "minir_search", "minir_remember", "minir_forget", "minir_todo", "minir_stats",
+        "minir_agents", "minir_aiagent_search", "minir_hermes_session_search"]

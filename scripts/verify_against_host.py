@@ -85,12 +85,13 @@ try:
         for table in tables:
             if table.startswith(("sqlite_", "conclusions_fts")):
                 continue  # FTS shadow tables index conclusions; they are checked via the base table
-            if table == "notes":
-                continue  # the explicit note is this table's job
             if table == "conclusions":
-                # Notes are mirrored into conclusions for unified FTS recall; derived rows are not.
+                # An explicit minir_remember marker is this table's job, whatever its kind:
+                # conclusions is the only memory table. Derived rows must never carry it.
+                marks = ",".join("?" * len(module.CONCLUSION_KINDS))
                 rows = str(connection.execute(
-                    "SELECT * FROM conclusions WHERE kind != 'note'").fetchall())
+                    "SELECT * FROM conclusions WHERE kind NOT IN (%%s)" %% marks,
+                    module.CONCLUSION_KINDS).fetchall())
             else:
                 rows = str(connection.execute("SELECT * FROM %%s" %% table).fetchall())
             assert "acknowledged" not in rows, "conversation content reached %%s" %% table

@@ -657,12 +657,13 @@ class _FakeAuxiliary:
 
 
 def _seed_base_refresh(store, *, window_from_ts: float = 0.0, window_to_ts: float = 20.0,
-                       peer=None, user=None, summary=None, identity=None):
+                       peer=None, user=None, summary=None, identity=None,
+                       window_from_turn=None, window_to_turn=None):
     """A base refresh row for the window a dialectic job will review."""
     return store.add_base_refresh(
         SESSION, "user:default",
         window_from_ts=window_from_ts, window_to_ts=window_to_ts,
-        window_from_turn=None, window_to_turn=None,
+        window_from_turn=window_from_turn, window_to_turn=window_to_turn,
         user_representation=json.dumps(user if user is not None else _user_self()),
         user_peer_card=json.dumps(peer if peer is not None else _user_prefs()),
         ai_self_representation=json.dumps(_ai_self()),
@@ -812,21 +813,26 @@ def test_base_refresh_appends_a_chunk_and_projects_only_the_newest(store, transc
     assert artifact.count("### Objective") == 1
 
 
-def test_each_chunk_records_the_turn_range_it_actually_covers(store, transcript, worker):
+def test_each_window_records_the_turn_range_it_actually_covers(store, transcript, worker):
+    """The window lives on ``base_refreshes``; the chunk row identifies it by its key."""
     # Three host turns were counted, but this window only stored the last one's message.
     transcript.add(SESSION, "user", "first window", created_at=10.0)
     _dispatch(store, transcript, SESSION, BASE, 0.0, 20.0, turns=3)
     assert worker.run_once() == 1
+    row = store.latest_base_refresh(SESSION, "user:default")
+    assert (row["window_from_turn"], row["window_to_turn"]) == (3, 3)
+    assert store.chunk_turn_range(SESSION, float(row["window_from_ts"])) == (3, 3)
     chunk = store.chunk_summaries(SESSION)[0]
-    assert (chunk["from_turn"], chunk["to_turn"]) == (3, 3)
+    assert chunk["key"] == f"chunk:{SESSION}:0.000000"
+    assert "from_turn" not in chunk and "from_ts" not in chunk
 
     transcript.add(SESSION, "user", "second window", created_at=30.0)
     transcript.add(SESSION, "user", "third window", created_at=31.0)
     _dispatch(store, transcript, SESSION, BASE, 20.0, 40.0, turns=5)
     assert worker.run_once() == 1
-    chunk = store.chunk_summaries(SESSION)[-1]
-    assert (chunk["from_turn"], chunk["to_turn"]) == (4, 5)
-    assert "turns 4-5" in store.latest_chunk_summary(SESSION)
+    row = store.latest_base_refresh(SESSION, "user:default")
+    assert (row["window_from_turn"], row["window_to_turn"]) == (4, 5)
+    assert store.chunk_turn_range(SESSION, float(row["window_from_ts"])) == (4, 5)
 
 
 def test_final_summary_supersedes_the_chunk_chain(store, transcript, worker):
@@ -835,8 +841,8 @@ def test_final_summary_supersedes_the_chunk_chain(store, transcript, worker):
     worker.run_once()
     assert len(store.chunk_summaries(SESSION)) == 1
 
-    store.put_conclusion("session_summary", "summary:" + SESSION, "## Goal\n- done",
-                         session_id=SESSION, subject="session", status="active")
+    store.save_conclusion("session_summary", "## Goal\n- done", key="summary:" + SESSION,
+                          session_id=SESSION, subject="session", status="active")
     assert store.supersede_chunk_summaries(SESSION) == 1
     assert store.chunk_summaries(SESSION) == []
     assert store.latest_chunk_summary(SESSION) == "", \
@@ -849,8 +855,8 @@ def test_final_summary_supersedes_the_chunk_chain(store, transcript, worker):
 
 
 def test_dialectic_prompt_consumes_the_chunk_chain(store, transcript, worker):
-    store.add_chunk_summary(SESSION, 1.0, 2.0, "chunk one: tests pass")
-    store.add_chunk_summary(SESSION, 2.0, 3.0, "chunk two: tests fail")
+    store.add_chunk_summary(SESSION, 1.0, "chunk one: tests pass")
+    store.add_chunk_summary(SESSION, 2.0, "chunk two: tests fail")
     _seed_base_refresh(store)
     transcript.add(SESSION, "user", "reconcile this", created_at=10.0)
     _dispatch(store, transcript, SESSION, DIALECTIC, 0.0, 20.0)
@@ -873,7 +879,7 @@ def test_base_prompt_feeds_the_previous_summary_as_markdown(store, transcript, w
 def test_a_dialectic_job_without_a_base_row_spends_no_model_call(
         plugin_package, store, transcript):
     """The chunk chain alone cannot correct anything: there is no base refresh to target."""
-    store.add_chunk_summary(SESSION, 1.0, 2.0, "chunk-only evidence")
+    store.add_chunk_summary(SESSION, 1.0, "chunk-only evidence")
     calls: list[str] = []
 
     def complete(task, system, prompt, **kwargs):
@@ -1093,14 +1099,15 @@ def test_one_shot_fallback_prompt_does_not_mention_unavailable_tools(store, tran
         assert "JSON object" in call["system"]
 
 
-def test_retry_reuses_the_chunk_turn_range(store, transcript, worker):
+def test_retry_reuses_the_window_turn_range(store, transcript, worker):
     transcript.add(SESSION, "user", "retry this window", created_at=10.0)
-    store.add_chunk_summary(SESSION, 0.0, 20.0, "- previous attempt", from_turn=1, to_turn=5)
+    # The window already published once with turns 1-5; the job is re-queued for a retry.
+    _seed_base_refresh(store, window_from_turn=1, window_to_turn=5)
     _dispatch(store, transcript, SESSION, BASE, 0.0, 20.0, turns=5)
     assert worker.run_once() == 1
     row = store.latest_base_refresh(SESSION, "user:default")
     assert (row["window_from_turn"], row["window_to_turn"]) == (1, 5), \
-        "a retry must reuse the chunk range, not treat its own chunk as the previous window"
+        "a retry must reuse the stored window range, not recompute it"
 
 
 def test_card_items_are_bounded(plugin_package):
@@ -1195,7 +1202,7 @@ def test_dialectic_revision_snapshots_the_old_base_and_applies_the_change(
     assert revision["base_refresh_id"] == latest["id"]
     assert json.loads(revision["user_peer_card"]) == direct
     assert json.loads(revision["changed_fields"]) == ["user_peer_card"]
-    assert revision["advices"] == "[]", "the dialectic no longer stores advice"
+    assert "advices" not in revision, "the dialectic no longer stores advice"
     assert "No emoji." in store.layer_state(BASE, "user:default")["content"]
     assert store.search_base_revisions("direct", session_id=SESSION)
     assert store.stats()["base_revisions"] == 1

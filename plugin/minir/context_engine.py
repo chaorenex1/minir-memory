@@ -178,16 +178,13 @@ class MinirContextEngine(ContextEngine):
 
     def on_turn_complete(self, messages: list[dict[str, Any]],
                          usage: Optional[dict[str, Any]] = None, **kwargs: Any) -> None:
-        """Promote the summary run whose marker is present in the committed message list."""
+        """Release the compression gate once the committed list carries a summary marker."""
         if not isinstance(messages, list) or not self._session_id:
             return
         store = self._memory_store()
         if store is None:
             return
-        run_ids = self.summary_run_ids(messages)
-        for run_id in run_ids:
-            store.promote_summary_run(self._session_id, run_id)
-        if run_ids:
+        if self.summary_run_ids(messages):
             store.clear_compression_gate(self._session_id)
 
     def update_from_response(self, usage: dict[str, Any]) -> None:
@@ -268,10 +265,13 @@ class MinirContextEngine(ContextEngine):
             run_id = uuid.uuid4().hex[:12]
             if store is not None and session:
                 store.expire_pending_handoffs(session, before=time.time() - 3_600)
-                key = f"session_summary:{session}:{run_id}"
-                store.put_conclusion(
-                    "session_summary", key, summary, session_id=session, subject="session",
-                    evidence=json.dumps([run_id]), status="pending")
+                # The index is this session's compression count, not the run id: the row is
+                # active from the start, so no later pass has to promote it.
+                store.save_conclusion(
+                    "session_summary", summary,
+                    key=f"session_summary:{store.next_session_summary_index(session)}",
+                    session_id=session, subject="session",
+                    evidence=json.dumps([run_id]), status="active")
             if not had_summary:
                 head = self._insert_notice(head)
             summary_message = {

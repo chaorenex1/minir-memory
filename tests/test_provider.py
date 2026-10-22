@@ -85,7 +85,7 @@ def test_initialize_creates_profile_scoped_store(provider, tmp_path):
 
 def test_notes_survive_a_new_instance(plugin_package, make_provider):
     first = make_provider({})
-    first.handle_tool_call("minir_remember", {"type": "tools", "category": "KNOWLEDGE", "content": "We standardized on SQLite for the store"})
+    first.handle_tool_call("minir_remember", {"type": "tools", "content": "We standardized on SQLite for the store"})
     first.shutdown()
 
     second = make_provider({})  # same tmp home -> same db file
@@ -219,13 +219,13 @@ def test_prefetch_limit_can_be_set_by_env(make_provider, monkeypatch):
     monkeypatch.setenv("MINIR_PREFETCH_LIMIT", "2")
     provider = make_provider({"prefetch_limit": 9})
     for index in range(5):
-        provider._store.remember(f"deployment checklist entry {index}")
+        provider._store.save_conclusion("note", f"deployment checklist entry {index}")
     payload = json.loads(provider.handle_tool_call("minir_search", {"query": "deployment checklist"}))
     assert len(payload["results"]) == 2
 
 
 def test_queue_prefetch_feeds_next_prefetch(provider):
-    provider.handle_tool_call("minir_remember", {"type": "tools", "category": "KNOWLEDGE", "content": "User deploys via Docker Desktop"})
+    provider.handle_tool_call("minir_remember", {"type": "tools", "content": "User deploys via Docker Desktop"})
     provider.queue_prefetch("Docker Desktop")
     thread = provider._prefetch_thread
     if thread is not None:
@@ -238,7 +238,7 @@ def test_queue_prefetch_feeds_next_prefetch(provider):
 
 def test_prefetch_falls_back_to_inline_search(provider):
     """No queued result (first turn): prefetch still recalls, bounded and inline."""
-    provider.handle_tool_call("minir_remember", {"type": "entities", "category": "KNOWLEDGE", "content": "staging cluster lives in eu-west"})
+    provider.handle_tool_call("minir_remember", {"type": "entities", "content": "staging cluster lives in eu-west"})
     block = provider.prefetch("staging cluster")
     assert "eu-west" in block
 
@@ -249,7 +249,7 @@ def test_prefetch_on_empty_store_is_blank(provider):
 
 
 def test_prefetch_never_returns_stale_recall(provider):
-    provider.handle_tool_call("minir_remember", {"type": "experiences", "category": "KNOWLEDGE", "content": "remembered once"})
+    provider.handle_tool_call("minir_remember", {"type": "experiences", "content": "remembered once"})
     assert provider.prefetch("remembered") != ""
     assert provider.prefetch("totally unrelated empty query") == ""
     assert provider.recall_status() is None
@@ -257,46 +257,49 @@ def test_prefetch_never_returns_stale_recall(provider):
 
 def test_tools_roundtrip(provider):
     stored = json.loads(provider.handle_tool_call(
-        "minir_remember", {"type": "experiences", "category": "KNOWLEDGE", "content": "prefers terse output"}))
+        "minir_remember", {"type": "experiences", "content": "prefers terse output"}))
     assert stored["stored"] is True and stored["type"] == "experiences"
     found = json.loads(provider.handle_tool_call("minir_search", {"query": "terse output"}))
     assert found["count"] >= 1 and found["scope"] == "session"
-    note = next(row for row in found["results"] if row["kind"] == "note")
-    note_id = note["id"]
-    assert note["marker_type"] == "experiences"
-    # A wrong type must not delete the marker.
+    marker = next(row for row in found["results"] if row["kind"] == "experiences")
+    conclusions_id = marker["conclusions_id"]
+    assert conclusions_id == stored["conclusions_id"]
+    # A wrong kind must not delete the row.
     assert json.loads(provider.handle_tool_call(
-        "minir_forget", {"type": "tools", "note_id": note_id}))["deleted"] is False
+        "minir_forget", {"type": "tools", "conclusions_id": conclusions_id}))["deleted"] is False
     assert json.loads(provider.handle_tool_call(
-        "minir_forget", {"type": "experiences", "note_id": note_id}))["deleted"] is True
+        "minir_forget", {"type": "experiences",
+                         "conclusions_id": conclusions_id}))["deleted"] is True
     assert json.loads(provider.handle_tool_call(
-        "minir_forget", {"type": "experiences", "note_id": str(note_id)}))["deleted"] is False
+        "minir_forget", {"type": "experiences",
+                         "conclusions_id": str(conclusions_id)}))["deleted"] is False
     stats = json.loads(provider.handle_tool_call("minir_stats", {}))
-    assert stats["notes"] == 0 and stats["markers"] == {} and "db_path" in stats
+    assert "notes" not in stats and "markers" not in stats and "db_path" in stats
+    assert stats["conclusions_by_kind"] == {}, "every row of this session is gone"
 
 
 def test_prefetch_kind_filter_survives_derived_crowding(provider):
     provider.handle_tool_call(
-        "minir_remember", {"type": "tools", "category": "KNOWLEDGE", "content": "zebraword note"})
+        "minir_remember", {"type": "tools", "content": "zebraword note"})
     for index in range(25):
-        provider._store.put_conclusion(
-            "base.user_card", f"goal:{index}",
-            f"zebraword zebraword zebraword derived {index}",
-            session_id=provider._session_id)
+        provider._store.save_conclusion(
+            "base.user_peer_card", f"zebraword zebraword zebraword derived {index}",
+            key=f"goal:{index}", subject="user:default")
     block = provider.prefetch("zebraword")
     assert "zebraword note" in block
     assert "zebraword zebraword" not in block
 
 
-def test_search_does_not_advertise_untyped_notes_as_forgettable(provider):
-    note_id = provider._store.remember("untyped durable note")
+def test_search_identifies_every_row_by_kind_and_conclusions_id(provider):
+    row_id = provider._store.save_conclusion("note", "untyped durable note")
     payload = json.loads(provider.handle_tool_call(
         "minir_search", {"query": "untyped durable note"}))
     note = next(row for row in payload["results"] if row["kind"] == "note")
-    assert "marker_type" not in note
+    assert note["conclusions_id"] == row_id
+    assert "marker_type" not in note and "category" not in note
     assert "note_id" not in note and "id" not in note
     assert json.loads(provider.handle_tool_call(
-        "minir_forget", {"type": "tools", "note_id": note_id}))["deleted"] is False
+        "minir_forget", {"type": "tools", "conclusions_id": row_id}))["deleted"] is False
 
 
 def test_tool_argument_validation(provider):
@@ -308,14 +311,17 @@ def test_tool_argument_validation(provider):
         "minir_remember", {"type": "nonsense", "content": "x"}))
     assert "error" in json.loads(provider.handle_tool_call(
         "minir_remember", {"content": "x"}))
-    assert "error" in json.loads(provider.handle_tool_call("minir_forget", {"note_id": "abc"}))
     assert "error" in json.loads(provider.handle_tool_call(
-        "minir_forget", {"type": "nonsense", "note_id": 1}))
+        "minir_forget", {"conclusions_id": "abc"}))
+    assert "error" in json.loads(provider.handle_tool_call(
+        "minir_forget", {"type": "nonsense", "conclusions_id": 1}))
+    assert "error" in json.loads(provider.handle_tool_call(
+        "minir_search", {"query": "x", "type": "nonsense"}))
 
 
 def test_search_scope_all_crosses_sessions(provider):
     provider.handle_tool_call(
-        "minir_remember", {"type": "projects", "category": "KNOWLEDGE", "content": "cross session fact"})
+        "minir_remember", {"type": "projects", "content": "cross session fact"})
     provider.on_session_switch("other-session")
     current = json.loads(provider.handle_tool_call(
         "minir_search", {"query": "cross session fact"}))
@@ -323,21 +329,23 @@ def test_search_scope_all_crosses_sessions(provider):
     across = json.loads(provider.handle_tool_call(
         "minir_search", {"query": "cross session fact", "scope": "all"}))
     assert across["scope"] == "all" and across["count"] == 1
-    assert across["results"][0]["marker_type"] == "projects"
+    assert across["results"][0]["kind"] == "projects"
 
 
 def test_on_memory_write_mirrors_and_removes(provider):
+    session = provider._session_id
     provider.on_memory_write("add", "user", "user profile entry")
-    assert provider._store.stats()["notes"] == 1
+    assert provider._store.conclusions_by_kind(session) == {"note": 1}
     provider.on_memory_write("replace", "memory", "user profile entry v2")
-    assert provider._store.stats()["notes"] == 2
+    assert provider._store.conclusions_by_kind(session) == {"note": 2}
     provider.on_memory_write("remove", "user", "user profile entry")
-    assert provider._store.stats()["notes"] == 1
+    assert provider._store.conclusions_by_kind(session) == {"note": 1}, \
+        "the remove branch deletes the newest mirror row by content"
 
 
 def test_on_session_switch_rebinds_and_reset_clears_cache(provider):
     provider.handle_tool_call(
-        "minir_remember", {"type": "experiences", "category": "KNOWLEDGE", "content": "switch test fact"})
+        "minir_remember", {"type": "experiences", "content": "switch test fact"})
     provider.queue_prefetch("switch test")
     provider.on_session_switch("session-2")
     assert provider._session_id == "session-2"
@@ -356,7 +364,7 @@ def test_shutdown_is_idempotent(plugin_package, make_provider):
 
 
 def test_search_results_are_excerpted(provider):
-    provider.handle_tool_call("minir_remember", {"type": "experiences", "category": "KNOWLEDGE", "content": "long " * 400})
+    provider.handle_tool_call("minir_remember", {"type": "experiences", "content": "long " * 400})
     payload = json.loads(provider.handle_tool_call("minir_search", {"query": "long"}))
     assert payload["results"]
     assert all(len(row["text"]) <= 601 for row in payload["results"])
@@ -365,7 +373,7 @@ def test_search_results_are_excerpted(provider):
 def test_recall_block_is_bounded(make_provider):
     provider = make_provider({"prefetch_limit": 20})
     for index in range(10):
-        provider._store.remember(f"bounded note {index} " + "y" * 400)
+        provider._store.save_conclusion("note", f"bounded note {index} " + "y" * 400)
     block = provider.prefetch("bounded")
     assert "more results truncated" in block
     assert len(block) < 2600
@@ -750,14 +758,20 @@ def test_register_wires_the_provider_and_its_hooks(plugin_package):
     assert isinstance(ctx.provider, plugin_package.MinirMemoryProvider)
     assert set(ctx.hooks) == {"on_session_start", "on_session_reset", "on_session_finalize",
                               "pre_llm_call", "post_llm_call", "post_tool_call",
-                              "pre_tool_call", "pre_verify", "on_interim_message",
-                              "on_stream_delta", "post_api_request", "api_request_error"}
+                              "pre_tool_call", "pre_verify", "transform_llm_output",
+                              "on_interim_message", "on_stream_delta", "post_api_request",
+                              "api_request_error"}
     # A non-None result would be injected into the user message (pre_llm_call) or sent to
-    # the chat (on_session_finalize), so every handler must return None.
-    for callback in ctx.hooks.values():
+    # the chat (on_session_finalize), so every handler must return None. The answer transform
+    # is the one hook whose return value replaces the answer, so it is checked separately.
+    for name, callback in ctx.hooks.items():
+        if name == "transform_llm_output":
+            continue
         assert callback(session_id="s", old_session_id="o", reason="new_session", turn_id="t",
                         model="m", platform="cli", tool_name="terminal", duration_ms=3,
                         provider=object()) is None
+    assert ctx.hooks["transform_llm_output"](
+        response_text="answer", session_id="s", provider=object()) is None
 
 
 def test_registered_middleware_accepts_the_host_provider_payload(plugin_package):
@@ -923,26 +937,20 @@ def test_layers_reason_from_host_history_and_publish_searchable_sections(
     assert "user_preferences" in str((review or {}).get("content") or "")
 
 
-def test_search_never_exposes_a_conclusion_as_a_forgettable_note(plugin_package, provider):
-    provider._store.put_layer_state(
-        "base", "user:default",
-        "## User Card\n### Self Representation\n- occupation: deploy\n"
-        "### Preferences\n- communication: terse\n\n"
-        "## AI Card\n### Self Representation\n- current_goal: direct\n"
-        "### Identity\n- name: minir\n\n"
-        "## Window Summary\n### Objective\ndeploy\n\n"
-        "## Value Markers\n- [KNOWLEDGE:fact/tools] pytest",
-        session_id=provider._session_id)
-    payload = json.loads(provider.handle_tool_call("minir_search", {"query": "deploy"}))
-    conclusion = next(row for row in payload["results"] if row["kind"].startswith("base."))
-    assert "id" not in conclusion and "note_id" not in conclusion
-    assert "conclusion_id" not in conclusion
+def test_search_exposes_one_id_field_for_base_and_tool_rows(plugin_package, provider):
+    provider._store.save_conclusion("base.user_representation", "deploy the release",
+                                    key="user:default", subject="user:default")
+    payload = json.loads(provider.handle_tool_call("minir_search", {"query": "deploy release"}))
+    base_row = next(row for row in payload["results"] if row["kind"].startswith("base."))
+    assert base_row["conclusions_id"] > 0
+    assert "id" not in base_row and "note_id" not in base_row
+    assert "conclusion_id" not in base_row
 
-    note_id = json.loads(provider.handle_tool_call(
-        "minir_remember", {"type": "experiences", "category": "KNOWLEDGE", "content": "a forgettable note"}))["note_id"]
+    row_id = json.loads(provider.handle_tool_call(
+        "minir_remember", {"type": "experiences", "content": "a forgettable note"}))["conclusions_id"]
     found = json.loads(provider.handle_tool_call("minir_search", {"query": "forgettable"}))
-    note = next(row for row in found["results"] if row["kind"] == "note")
-    assert note["note_id"] == note_id and note["id"] == note_id
+    marker = next(row for row in found["results"] if row["kind"] == "experiences")
+    assert marker["conclusions_id"] == row_id
 
 
 def test_boundary_queues_a_state_db_tail_after_the_buffer_was_lost(
@@ -985,11 +993,11 @@ def test_prefetch_does_not_inject_another_sessions_review_or_summary(provider):
 
 
 def test_prefetch_never_injects_durable_base_cards_from_fts(provider):
-    provider._store.put_conclusion("base.user_card", "user:default",
-                                   "durable peer card secret", subject="user:default")
-    provider._store.put_conclusion("base.ai_card", "agent:default:minir",
-                                   "durable identity card secret", subject="agent:default:minir")
-    provider._store.remember("durable peer card note")
+    provider._store.save_conclusion("base.user_peer_card", "durable peer card secret",
+                                    key="user:default", subject="user:default")
+    provider._store.save_conclusion("base.ai_identity_card", "durable identity card secret",
+                                    key="agent:default:minir", subject="agent:default:minir")
+    provider._store.save_conclusion("note", "durable peer card note")
 
     block = provider.prefetch("durable peer card secret")
     assert "durable peer card note" in block
@@ -1008,22 +1016,24 @@ def test_prefetch_never_injects_durable_base_cards_from_fts(provider):
     payload = json.loads(provider.handle_tool_call(
         "minir_search", {"query": "durable peer card secret"}))
     kinds = {row["kind"] for row in payload["results"]}
-    assert "base.user_card" in kinds and "base.ai_card" in kinds, \
+    assert {"base.user_peer_card", "base.ai_identity_card"} <= kinds, \
         "explicit minir_search still exposes the durable cards"
 
 
 def test_prefetch_does_not_inject_any_base_artifact(provider):
-    provider._store.put_layer_state(
-        "base", "user:default",
-        "## User Card\n### Self Representation\n- occupation: zebraword engineer\n"
-        "### Preferences\n- communication: zebraword durable preference\n\n"
-        "## AI Card\n### Self Representation\n- current_goal: zebraword ai stance\n"
-        "### Identity\n- name: minir\n\n"
-        "## Window Summary\n### Objective\nzebraword projection\n\n"
-        "## Value Markers\n- [KNOWLEDGE:fact/tools] zebraword tool",
-        session_id=provider._session_id)
+    session = provider._session_id
+    provider._store.save_conclusion("base.user_representation", "zebraword engineer",
+                                    key="user:default", subject="user:default")
+    provider._store.save_conclusion("base.user_peer_card", "zebraword durable preference",
+                                    key="user:default", subject="user:default")
+    provider._store.save_conclusion("base.ai_self_representation", "zebraword ai stance",
+                                    key="agent:default:minir", subject="agent:default:minir")
+    provider._store.save_conclusion("base.window_summary", "zebraword projection",
+                                    key=f"session:{session}:user:default", session_id=session)
+    provider._store.save_conclusion("base.value_markers", "- [tool] zebraword tool",
+                                    key=f"session:{session}:user:default", session_id=session)
     provider.handle_tool_call(
-        "minir_remember", {"type": "experiences", "category": "KNOWLEDGE", "content": "zebraword note"})
+        "minir_remember", {"type": "experiences", "content": "zebraword note"})
 
     block = provider.prefetch("zebraword")
     assert "zebraword note" in block
@@ -1035,8 +1045,9 @@ def test_prefetch_does_not_inject_any_base_artifact(provider):
 
     payload = json.loads(provider.handle_tool_call("minir_search", {"query": "zebraword"}))
     kinds = {row["kind"] for row in payload["results"]}
-    assert {"base.user_card", "base.ai_card", "base.value_markers"} <= kinds, \
-        "minir_search still exposes the base sections"
+    assert {"base.user_representation", "base.user_peer_card",
+            "base.ai_self_representation", "base.value_markers"} <= kinds, \
+        "minir_search still exposes the base conclusions"
 
 
 def test_system_prompt_block_gates_adviser_sections(plugin_package, make_provider):
@@ -1070,3 +1081,114 @@ def test_system_prompt_block_gates_adviser_sections(plugin_package, make_provide
     disabled_block = disabled.system_prompt_block()
     assert "# Advisers" not in disabled_block
     assert "## adviser_consult" not in disabled_block
+
+
+# -- conclusions only: type filter, todo surface, final-answer injection -------
+
+def test_search_type_returns_only_that_kind(provider):
+    provider.handle_tool_call("minir_remember", {"type": "tools", "content": "zebraword tool fact"})
+    provider.handle_tool_call("minir_remember", {"type": "projects",
+                                                 "content": "zebraword project fact"})
+    only = json.loads(provider.handle_tool_call(
+        "minir_search", {"query": "zebraword", "type": "tools"}))
+    assert [row["kind"] for row in only["results"]] == ["tools"]
+    everything = json.loads(provider.handle_tool_call("minir_search", {"query": "zebraword"}))
+    assert {row["kind"] for row in everything["results"]} == {"tools", "projects"}
+
+
+def test_inject_order_puts_known_types_first_then_first_queued(plugin_package, provider):
+    session = provider._session_id
+    provider.transform_llm_output_inject("entities", "- a marker")
+    provider.transform_llm_output_inject("todo", "| t |")
+    provider.transform_llm_output_inject("other", "- unknown")
+
+    answer = plugin_package._on_transform_llm_output(
+        response_text="the answer", session_id=session, provider=provider)
+
+    assert answer.startswith("the answer\n\n")
+    assert answer.index("| t |") < answer.index("- a marker") < answer.index("- unknown")
+    assert provider._injects == {}, "the queue is cleared by the trigger"
+
+
+def test_inject_trigger_clears_even_without_answer_text(plugin_package, provider):
+    session = provider._session_id
+    provider.transform_llm_output_inject("todo", "| t |")
+    assert plugin_package._on_transform_llm_output(
+        response_text="", session_id=session, provider=provider) is None
+    assert provider._injects == {}, "an empty answer still consumes the queue"
+    assert plugin_package._on_transform_llm_output(
+        response_text="later answer", session_id=session, provider=provider) is None
+
+
+def test_stateful_inject_keeps_only_the_last_block(plugin_package, provider):
+    session = provider._session_id
+    provider.transform_llm_output_inject("todo", "| old |")
+    provider.transform_llm_output_inject("todo", "| new |")
+    assert len(provider._injects[session]) == 1
+    answer = plugin_package._on_transform_llm_output(
+        response_text="the answer", session_id=session, provider=provider)
+    assert "| new |" in answer and "| old |" not in answer
+
+
+def test_inject_limits_refuse_instead_of_truncating(provider):
+    session = provider._session_id
+    for index in range(25):
+        provider.transform_llm_output_inject("entity", f"- {index}")
+    assert len(provider._injects[session]) == 20, "the per-session cap is 20 items"
+    provider.transform_llm_output_inject("entity", "- overflow")
+    assert len(provider._injects[session]) == 20
+    assert all(item["content"] != "- overflow" for item in provider._injects[session])
+
+
+def test_todo_validation_refuses_bad_lists_without_storing(provider):
+    session = provider._session_id
+    nested = json.loads(provider.handle_tool_call("minir_todo", {"todos": [
+        {"id": "a", "content": "one"},
+        {"id": "b", "content": "two", "parent": "a"},
+        {"id": "c", "content": "three", "parent": "b"}]}))
+    assert "error" in nested and "two levels" in nested["error"]
+    orphan = json.loads(provider.handle_tool_call("minir_todo", {"todos": [
+        {"id": "a", "content": "one", "parent": "ghost"}]}))
+    assert "error" in orphan and "not in this list" in orphan["error"]
+    duplicate = json.loads(provider.handle_tool_call("minir_todo", {"todos": [
+        {"id": "a", "content": "one"}, {"id": "a", "content": "two"}]}))
+    assert "error" in duplicate and "duplicate" in duplicate["error"]
+    assert provider._store.get_conclusion("todo", f"session:{session}:todo") is None
+
+
+def test_todo_keeps_one_row_per_session_and_clears_it(provider):
+    session = provider._session_id
+    provider.handle_tool_call("minir_todo", {"todos": [{"id": "t1", "content": "first"}]})
+    provider.handle_tool_call("minir_todo", {"todos": [
+        {"id": "t2", "content": "second", "status": "completed"}]})
+    row = provider._store.get_conclusion("todo", f"session:{session}:todo")
+    assert json.loads(row["content"])["todos"] == [
+        {"id": "t2", "content": "second", "status": "completed"}]
+    assert provider._store.conclusions_by_kind(session) == {"todo": 1}
+
+    cleared = json.loads(provider.handle_tool_call("minir_todo", {"todos": []}))
+    assert cleared["deleted"] is True
+    assert provider._store.get_conclusion("todo", f"session:{session}:todo") is None
+
+
+def test_todo_renders_in_prefetch_and_in_the_answer(plugin_package, provider):
+    session = provider._session_id
+    stored = json.loads(provider.handle_tool_call("minir_todo", {"todos": [
+        {"id": "t1", "content": "跑全量测试", "status": "in_progress"},
+        {"id": "t1a", "content": "先跑 unit", "status": "pending", "parent": "t1"},
+        {"id": "t2", "content": "写迁移说明", "status": "completed"}]}))
+    assert (stored["count"], stored["open"]) == (3, 2)
+
+    block = provider.prefetch("nothing matches this")
+    assert "[Todos] 2 open / 3 total" in block
+    assert "  [~] t1 跑全量测试  (in_progress)" in block
+    assert "    [ ] t1a 先跑 unit" in block
+    assert "  [x] t2 写迁移说明" in block
+
+    answer = plugin_package._on_transform_llm_output(
+        response_text="done", session_id=session, provider=provider)
+    assert answer.startswith("done\n\n| # | 任务 | 状态 | 父项 |")
+    assert "| 1 | 跑全量测试 | in_progress |  |" in answer
+    assert "| 1.1 | 先跑 unit | pending | t1 |" in answer
+    assert "| 2 | 写迁移说明 | completed |  |" in answer
+    assert answer.rstrip().endswith("Todo: 1/3 done, 1 in progress, 1 pending.")

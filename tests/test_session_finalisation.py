@@ -33,7 +33,7 @@ class _Ctx:
         self.tools[name] = (toolset, schema, handler)
 
 
-def test_the_minir_toolset_registers_all_four_tools(make_provider, plugin_package):
+def test_the_minir_toolset_registers_every_tool(make_provider, plugin_package):
     provider = make_provider()
     ctx = _Ctx()
 
@@ -41,13 +41,12 @@ def test_the_minir_toolset_registers_all_four_tools(make_provider, plugin_packag
 
     assert registered == list(plugin_package.plugin_tools.TOOL_NAMES)
     assert {toolset for toolset, _schema, _handler in ctx.tools.values()} == {"minir"}
-    assert ctx.tools["minir_remember"][1]["parameters"]["required"] == [
-        "type", "category", "content"]
+    assert ctx.tools["minir_remember"][1]["parameters"]["required"] == ["type", "content"]
     result = json.loads(ctx.tools["minir_remember"][2](
-        {"type": "tools", "category": "KNOWLEDGE", "content": "gopass backs secrets"}))
+        {"type": "tools", "content": "gopass backs secrets"}))
     assert result["stored"] is True
     stats = json.loads(ctx.tools["minir_stats"][2]({}))
-    assert stats["notes"] >= 1
+    assert stats["conclusions_by_kind"] == {"tools": 1}
     assert "session_usage" in stats and "turn_usage" in stats
 
 

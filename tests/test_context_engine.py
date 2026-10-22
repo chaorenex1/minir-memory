@@ -191,19 +191,24 @@ def test_compress_returns_head_notice_assistant_summary_and_tail(
     assert "recover:" not in summaries[0]["content"], "no folded uid list"
 
 
-def test_compress_writes_a_pending_summary_and_promotes_it_on_observation(
+def test_compress_writes_an_active_summary_indexed_per_session(
         plugin_package, tmp_path, state_db, monkeypatch):
     _compression_env(monkeypatch, plugin_package)
     engine = _engine(plugin_package, hermes_home=tmp_path, state_db=state_db)
     result = engine.compress(_conversation(12))
     store = engine._memory_store()
-    pending = store.newest_conclusion("session_summary", session_id=SESSION)
-    assert pending is None, "a pending summary is not recallable before its marker is observed"
+    first = store.get_conclusion("session_summary", "session_summary:1")
+    assert first is not None, "the summary is active from the start, with no pending phase"
+    assert first["status"] == "active" and first["session_id"] == SESSION
+    assert HANDOFF in first["content"]
 
+    # The marker still releases the compression gate; nothing promotes the row any more.
     engine.on_turn_complete(result)
-    active = store.newest_conclusion("session_summary", session_id=SESSION)
-    assert active is not None and active["status"] == "active"
-    assert HANDOFF in active["content"]
+    assert store.compression_gate_active(SESSION) is False
+
+    engine.compress(result)
+    second = store.get_conclusion("session_summary", "session_summary:2")
+    assert second is not None and second["status"] == "active"
 
 
 def test_the_notice_is_added_only_once(plugin_package, tmp_path, state_db, monkeypatch):
@@ -241,7 +246,7 @@ def test_summary_agent_failure_falls_back_to_the_prepared_chunk(
     monkeypatch.setattr(plugin_package.handoff, "summarize_agent", lambda *a, **k: "")
     engine = _engine(plugin_package, hermes_home=tmp_path, state_db=state_db)
     store = engine._memory_store()
-    store.add_chunk_summary(SESSION, 1.0, 2.0, "prepared chunk fact")
+    store.add_chunk_summary(SESSION, 1.0, "prepared chunk fact")
     result = engine.compress(_conversation(12))
     summary = next(m for m in result
                    if plugin_package.context_engine.SUMMARY_MARKER in m["content"])

@@ -1,5 +1,8 @@
 # minir_todo：会话内使用的两级待办工具（草稿 v4）
 
+> 已被 `doc/conclusions-only-draft.md` 取代：todo 改为 conclusions 单行（`kind="todo"`），
+> 不再用 JSONL 文件、多列表、`due_at`、`blocked`。本文件仅保留作历史记录。
+
 状态：草稿，供评审（v4）。代码基线：`plugin/minir/` 当前 main（`9269854`）。
 
 v4 的口径变化：`minir_todo` 是**会话内**工具，不是跨会话目标库。工具只在主会话里可用，默认视图只看本会话；落盘是为了会话续接与崩溃恢复，不是为了把待办搬到别的会话。若你只是指「不给后台 run 用」，删掉第 1 节里 `scope="all"` 那一段即可，其余不变。

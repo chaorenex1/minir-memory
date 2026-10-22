@@ -380,7 +380,7 @@ def build_prompt(store: Any, hermes_home: str, profile: str, since: float, *, sc
             break
         blocks.append(block)
         size += len(block)
-    markers = store.marker_notes(limit=50) if hasattr(store, "marker_notes") else []
+    markers = store.marker_conclusions(limit=50) if hasattr(store, "marker_conclusions") else []
     side_label = "AI" if side == "ai" else "user"
     parts = [
         "Target profile: " + _safe_profile(profile),
@@ -413,8 +413,8 @@ def build_prompt(store: Any, hermes_home: str, profile: str, since: float, *, sc
                          + "\n\n".join(reversed(snippets)))
     if markers:
         parts.append("Explicit markers:\n" + json.dumps(
-            [{"type": row.get("marker_type"), "category": row.get("category"),
-              "content": row.get("content")} for row in markers], ensure_ascii=False))
+            [{"type": row.get("kind"), "content": row.get("content")} for row in markers],
+            ensure_ascii=False))
     edited = _hand_edited(store, paths, parts_for_scope)
     if edited:
         parts.append("Hand-edited since the last review (operator text; keep unless the evidence "

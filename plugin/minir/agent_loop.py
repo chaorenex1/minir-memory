@@ -96,7 +96,7 @@ _USAGE_KEYS = (
 #: still should not spend its budget mutating scratch or believe it can fix what it finds. The
 #: memory write/spawn surfaces are stripped too: a reviewer reads and advises only.
 READ_ONLY_DROPPED_TOOLS = frozenset({
-    "write_file", "patch", "minir_remember", "minir_forget", "minir_agents",
+    "write_file", "patch", "minir_remember", "minir_forget", "minir_todo", "minir_agents",
     "skill_manage",
 })
 

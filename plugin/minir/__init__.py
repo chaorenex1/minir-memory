@@ -1,13 +1,14 @@
 """Minir memory plugin — a minimal Hermes memory-provider template.
 
 A complete, dependency-free reference implementation of the ``MemoryProvider``
-contract (``agent/memory_provider.py``): explicit notes go into a per-profile SQLite
-database, recall is a keyword search over them, and five tools let the model search,
-remember, forget, inspect it, and run a named custom agent.
+contract (``agent/memory_provider.py``): explicit memories are conclusions in a per-profile
+SQLite database, recall is a keyword search over them, and six tools let the model search,
+remember, forget, keep a todo list, inspect the store, and run a named custom agent.
 
 **The conversation is an append-only event store, not a database table.** The layers read the host's
 own ``state.db`` (plus an in-memory buffer for uncommitted turns) and persist what they *derived*
-(``layer_state`` and the FTS-indexed ``conclusions``) plus deliberate notes. The completed turns and
+(``layer_state`` and the FTS-indexed ``conclusions``) plus the conclusions you asked it to keep.
+The completed turns and
 every layer run are also appended as JSONL events under
 ``$HERMES_HOME/minir-memory/sessions/<platform>/<layer>/``: one event per line, never rewritten or
 deleted, and readable through ``TranscriptBuffer.read_events``. The host store remains the source of
@@ -78,8 +79,10 @@ from .prompting import (
     craft_rules_section,
     marker_glossary,
 )
-from .layers import CATEGORIES as NOTE_CATEGORIES
-from .store import VALUE_MARKER_TYPES, MinirStore, format_when
+from .store import CONCLUSION_KINDS, MinirStore, format_when
+# The same stored-text bound the store truncates at: a longer todo payload must be refused
+# rather than silently cut into invalid JSON.
+from .store import _MAX_CONTENT as _MAX_CONCLUSION_CHARS
 from .transcript import HOST_LAYER, TranscriptBuffer, fingerprint
 from .turn_counter import (
     BASE_LAYER,
@@ -113,10 +116,32 @@ _MAX_TOOL_EXCERPT = 600           # text excerpt returned by the minir_search to
 _MAX_AUTHOR_CACHE = 64            # per-session last-seen author, bounded like the turn counter
 _COMPRESSION_GATE_TTL = 300.0     # seconds a crashed compression may pause periodic scheduling
 _PRE_COMPRESS_TIMEOUT = 120.0     # synchronous base -> dialectic budget before compress()
-# Prefetch injects explicit memory only. Every derived artifact — the six base sections, the
-# dialectic review (injected separately by ``_layer_block``), chunk summaries and compression
-# summaries — stays explicit-recall through ``minir_search``.
-_PREFETCH_KINDS = frozenset({"note"})
+# Prefetch injects explicit memory only: the six tool kinds that describe durable knowledge.
+# ``todo`` is not one of them — the per-session list is injected by ``_todo_block``. Every
+# derived artifact — the calibrated base fields, the dialectic review (injected separately by
+# ``_layer_block``), chunk summaries and compression summaries — stays explicit-recall through
+# ``minir_search``.
+_PREFETCH_KINDS = frozenset({"note", "entities", "trajectories", "experiences", "tools",
+                             "projects"})
+
+# Final-answer injection. ``transform_llm_output_inject`` queues markdown for the answer the
+# model is finishing; the host hook pops the whole session queue, so one turn cannot inherit the
+# previous turn's block. Known types render in this declaration order, unknown types after them
+# in first-queued order, and a stateful type keeps only its newest item because a second table
+# in one answer is never useful.
+INJECT_ORDER: tuple[str, ...] = ("todo",)
+INJECT_STATEFUL = frozenset({"todo"})
+_MAX_INJECT_ITEMS = 20
+_MAX_INJECT_CHARS = 32 * 1024
+
+# The host's todo item shape (``tools/todo_tool.py``): two levels, four states.
+_TODO_STATUSES: tuple[str, ...] = ("pending", "in_progress", "completed", "cancelled")
+_TODO_OPEN_STATUSES = frozenset({"pending", "in_progress"})
+_TODO_PREFIX: dict[str, str] = {"pending": " ", "in_progress": "~", "completed": "x",
+                                "cancelled": "-"}
+_MAX_TODO_ITEMS = 256
+_MAX_TODO_ID = 64
+_MAX_TODO_CONTENT = 2000
 
 #: A session is not "finished" until it has been quiet this long. The operator can resume it
 #: inside the window; typing again cancels the pending extraction.
@@ -171,6 +196,22 @@ def _excerpt(text: str) -> str:
     return flat if len(flat) <= _MAX_TOOL_EXCERPT else flat[:_MAX_TOOL_EXCERPT] + "…"
 
 
+
+def _todo_line(item: dict[str, Any], *, indent: int) -> str:
+    """One prompt line: ``[x] id content`` with the state as a one-character prefix."""
+    status = str(item.get("status") or "pending")
+    suffix = f"  ({status})" if status == "in_progress" else ""
+    return (f"{' ' * indent}[{_TODO_PREFIX.get(status, ' ')}] "
+            f"{item.get('id')} {item.get('content')}{suffix}")
+
+
+def _todo_row(number: str, item: dict[str, Any]) -> str:
+    """One markdown table row; a pipe in the text is escaped so the table stays a table."""
+    content = " ".join(str(item.get("content") or "").split()).replace("|", chr(92) + "|")
+    return (f"| {number} | {content} | {item.get('status') or 'pending'} | "
+            f"{item.get('parent') or ''} |")
+
+
 def _redact_text(text: str) -> tuple[str, bool]:
     """Scrub un-redacted channels (system prompt, reasoning) and say whether a redactor ran.
 
@@ -219,7 +260,7 @@ def _as_positive_int(value: Any, default: int = 1) -> int:
 
 
 class MinirMemoryProvider(MemoryProvider):
-    """Local-first memory: notes + layer conclusions in SQLite, FTS recall, no transcripts."""
+    """Local-first memory: conclusions in SQLite, FTS recall, no transcripts."""
 
     def __init__(self, config: Optional[dict[str, Any]] = None):
         self._config = dict(config) if config is not None else _load_config()
@@ -318,8 +359,11 @@ class MinirMemoryProvider(MemoryProvider):
         #: Reasoning deltas for the live turn, aggregated into one row at ``sync_turn``.
         self._reasoning_deltas: dict[str, list[str]] = {}
         self._authors: dict[str, dict[str, Any]] = {}   # session -> last author seen on a turn
-        self._lock = threading.Lock()              # guards the recall cache below
+        self._lock = threading.Lock()              # guards the recall cache and inject queue
         self._cached: Optional[tuple[str, str, int]] = None  # (session_id, block, count)
+        #: session_id -> [{"type", "content", "seq"}]; popped whole when the answer is rendered.
+        self._injects: dict[str, list[dict[str, Any]]] = {}
+        self._inject_seq = 0
         self._last_recall: Optional[RecallStatus] = None
         self._prefetch_thread: Optional[threading.Thread] = None
         self._metrics: dict[str, dict[str, Any]] = {}
@@ -567,10 +611,13 @@ class MinirMemoryProvider(MemoryProvider):
             "- minir_search: look up prior decisions, preferences, projects and conclusions. It "
             "searches the current session by default; scope=\"all\" searches every session. "
             "Search before asking the user to repeat history.\n"
-            "- minir_remember: record one durable item with type (entities, trajectories, "
-            "experiences, tools or projects) and content. Store what should outlive this turn, "
-            "not transient state, and never store secrets or credentials.\n"
-            "- minir_forget: delete one typed marker by note_id and type.\n"
+            "- minir_remember: record one durable item under a kind (note, entities, "
+            "trajectories, experiences, tools, projects, todo) with its content. Store what "
+            "should outlive this turn, not transient state, and never store secrets or "
+            "credentials.\n"
+            "- minir_forget: delete one stored conclusion by conclusions_id and kind.\n"
+            "- minir_todo: replace this session's todo list; it is rendered into the final "
+            "answer and summarised in the next turn's recall.\n"
             "- minir_stats: inspect the store and the published layer artifacts.\n"
             "\nWORKFLOW\n"
             "1. Search before asking the user to repeat history.\n"
@@ -656,10 +703,11 @@ class MinirMemoryProvider(MemoryProvider):
         is rarely what a keyword query would have surfaced. No base-layer section is injected
         here; every base artifact stays recallable through ``minir_search``.
 
-        Recall covers explicit notes and value markers only: the current session's notes plus
-        durable notes. Every derived artifact (base sections, review, chunks, summaries) is
-        explicit-recall through ``minir_search``, and another session's rows are reachable only
-        by an explicit ``minir_search(scope="all")`` call — never by automatic injection.
+        Recall covers explicit memory only: the current session's markers plus durable ones,
+        and the session's todo list (``_todo_block``, no query needed). Every derived artifact
+        (base fields, review, chunks, summaries) is explicit-recall through ``minir_search``,
+        and another session's rows are reachable only by an explicit
+        ``minir_search(scope="all")`` call — never by automatic injection.
         """
         session = session_id or self._session_id
         block, count = "", 0
@@ -673,9 +721,11 @@ class MinirMemoryProvider(MemoryProvider):
             except Exception as exc:
                 logger.debug("Minir prefetch search failed: %s", exc)
         state, state_items = self._layer_block(session)
-        if state:
-            block = f"{state}\n\n{block}" if block else state
-            count += state_items
+        todo, todo_items = self._todo_block(session)
+        head = "\n\n".join(part for part in (state, todo) if part)
+        if head:
+            block = f"{head}\n\n{block}" if block else head
+            count += state_items + todo_items
         paths_block, path_items = self._knowledge_block(query)
         if paths_block:
             block = f"{paths_block}\n\n{block}" if block else paths_block
@@ -721,6 +771,183 @@ class MinirMemoryProvider(MemoryProvider):
         except Exception as exc:  # injection must never break a turn
             logger.debug("Minir layer state read failed: %s", exc)
             return "", 0
+
+    # -- todo list -------------------------------------------------------------
+
+    @staticmethod
+    def _todo_key(session: str) -> str:
+        """The one row per session that holds the whole list."""
+        return f"session:{session}:todo"
+
+    def _todo_items(self, session: str) -> list[dict[str, Any]]:
+        """The stored list for one session; ``[]`` when it has none or the row is unreadable."""
+        if self._store is None or not session:
+            return []
+        try:
+            row = self._store.get_conclusion("todo", self._todo_key(session))
+            if not row:
+                return []
+            payload = json.loads(str(row.get("content") or ""))
+        except (TypeError, ValueError):
+            return []
+        items = payload.get("todos") if isinstance(payload, dict) else None
+        if not isinstance(items, list):
+            return []
+        return [item for item in items if isinstance(item, dict)]
+
+    @staticmethod
+    def _todo_lines(items: list[dict[str, Any]]) -> list[str]:
+        """Two-level render for prompt injection: one prefix per state, children indented."""
+        open_count = sum(1 for item in items
+                         if str(item.get("status") or "pending") in _TODO_OPEN_STATUSES)
+        lines = [f"[Todos] {open_count} open / {len(items)} total"]
+        for item in items:
+            if item.get("parent"):
+                continue
+            lines.append(_todo_line(item, indent=2))
+            for child in items:
+                if child.get("parent") == item.get("id"):
+                    lines.append(_todo_line(child, indent=4))
+        return lines
+
+    def _todo_block(self, session: str) -> tuple[str, int]:
+        """The todo list as a prefetch block; never routed through query recall."""
+        items = self._todo_items(session)
+        if not items:
+            return "", 0
+        return "\n".join(self._todo_lines(items)), len(items)
+
+    @staticmethod
+    def _todo_table(items: list[dict[str, Any]]) -> str:
+        """Markdown table for the final answer plus the one-line status summary."""
+        rows = ["| # | 任务 | 状态 | 父项 |", "| --- | --- | --- | --- |"]
+        for index, item in enumerate((item for item in items if not item.get("parent")), start=1):
+            rows.append(_todo_row(str(index), item))
+            children = [child for child in items if child.get("parent") == item.get("id")]
+            for child_index, child in enumerate(children, start=1):
+                rows.append(_todo_row(f"{index}.{child_index}", child))
+        counts = {status: sum(1 for item in items
+                              if str(item.get("status") or "pending") == status)
+                  for status in _TODO_STATUSES}
+        summary = (f"Todo: {counts['completed']}/{len(items)} done, "
+                   f"{counts['in_progress']} in progress, {counts['pending']} pending.")
+        if counts["cancelled"]:
+            summary += f" {counts['cancelled']} cancelled."
+        return "\n".join(rows) + "\n\n" + summary
+
+    def _validate_todos(self, raw: list[Any]) -> tuple[list[dict[str, Any]], str]:
+        """Validate the host-shaped list; returns ``(items, error)`` with one of them empty."""
+        if len(raw) > _MAX_TODO_ITEMS:
+            return [], f"todo_too_large: at most {_MAX_TODO_ITEMS} items"
+        items: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        for entry in raw:
+            if not isinstance(entry, dict):
+                return [], "todos must be objects with id and content"
+            item_id = str(entry.get("id") or "").strip()
+            if not item_id or len(item_id) > _MAX_TODO_ID:
+                return [], f"todo id must be 1..{_MAX_TODO_ID} characters"
+            if item_id in seen:
+                return [], f"duplicate todo id: {item_id}"
+            seen.add(item_id)
+            content = str(entry.get("content") or "").strip()
+            if not content or len(content) > _MAX_TODO_CONTENT:
+                return [], (f"todo {item_id}: content must be 1..{_MAX_TODO_CONTENT} "
+                            "characters")
+            status = str(entry.get("status") or "pending").strip()
+            if status not in _TODO_STATUSES:
+                return [], (f"todo {item_id}: status must be one of: "
+                            f"{', '.join(_TODO_STATUSES)}")
+            item: dict[str, Any] = {"id": item_id, "content": content, "status": status}
+            parent = str(entry.get("parent") or "").strip()
+            if parent:
+                item["parent"] = parent
+            items.append(item)
+        by_id = {item["id"]: item for item in items}
+        for item in items:
+            parent = item.get("parent")
+            if not parent:
+                continue
+            target = by_id.get(parent)
+            if target is None:
+                return [], f"todo {item['id']}: parent {parent} is not in this list"
+            if parent == item["id"] or target.get("parent"):
+                return [], (f"todo {item['id']}: parent {parent} must be a top-level item "
+                            "(two levels only)")
+        return items, ""
+
+    def _handle_todo(self, args: dict[str, Any]) -> str:
+        """Replace the session's todo list and queue the table for this answer."""
+        session = self._session_id
+        if not session:
+            return tool_error("no session id: the todo list is per session")
+        raw = args.get("todos")
+        if not isinstance(raw, list):
+            return tool_error("todos must be a list")
+        items, error = self._validate_todos(raw)
+        if error:
+            return tool_error(error)
+        key = self._todo_key(session)
+        if not items:
+            row = self._store.get_conclusion("todo", key)
+            deleted = bool(row is not None
+                           and self._store.forget_conclusion("todo", int(row["id"])))
+            return json.dumps({"stored": False, "deleted": deleted, "count": 0, "open": 0,
+                               "session_id": session})
+        payload = json.dumps({"todos": items}, ensure_ascii=False)
+        if len(payload) > _MAX_CONCLUSION_CHARS:
+            return tool_error(f"todo_too_large: {len(payload)} chars "
+                              f"(limit {_MAX_CONCLUSION_CHARS})")
+        conclusions_id = self._store.save_conclusion(
+            "todo", payload, key=key, session_id=session, subject="tool")
+        # The answer being composed gets the table; the next turn's prefetch gets the counts.
+        self.transform_llm_output_inject("todo", self._todo_table(items))
+        open_count = sum(1 for item in items
+                         if str(item.get("status")) in _TODO_OPEN_STATUSES)
+        return json.dumps({"stored": True, "conclusions_id": conclusions_id,
+                           "count": len(items), "open": open_count, "session_id": session})
+
+    # -- final-answer injection ------------------------------------------------
+
+    def transform_llm_output_inject(self, inject_type: str, content_md: str,
+                                    *, session_id: str = "") -> None:
+        """Queue markdown to append to this session's final answer.
+
+        The host's ``transform_llm_output`` hook pops the whole queue when the answer is
+        rendered, so a block lands once and can never attach to a later turn. A stateful type
+        replaces its earlier item: two versions of the todo table in one answer would
+        contradict each other.
+        """
+        session = str(session_id or self._session_id or "").strip()
+        if not session:
+            logger.debug("Minir inject dropped: no session id for %s", inject_type)
+            return
+        text = (content_md or "").strip()
+        if not text:
+            return
+        kind = str(inject_type or "").strip() or "general"
+        with self._lock:
+            queue = self._injects.setdefault(session, [])
+            if kind in INJECT_STATEFUL:
+                queue[:] = [item for item in queue if item["type"] != kind]
+            queued = sum(len(item["content"]) for item in queue)
+            if len(queue) >= _MAX_INJECT_ITEMS or queued + len(text) > _MAX_INJECT_CHARS:
+                logger.warning("Minir inject refused for %s: %d items / %d chars queued",
+                               session, len(queue), queued)
+                return
+            self._inject_seq += 1
+            queue.append({"type": kind, "content": text, "seq": self._inject_seq})
+
+    def _take_injects(self, session: str) -> str:
+        """Render and clear this session's queue; ``""`` when nothing is queued."""
+        with self._lock:
+            queue = self._injects.pop(str(session or ""), [])
+        if not queue:
+            return ""
+        order = {name: index for index, name in enumerate(INJECT_ORDER)}
+        ordered = sorted(queue, key=lambda item: (order.get(item["type"], len(INJECT_ORDER)),
+                                                 int(item["seq"])))
+        return "\n\n".join(item["content"] for item in ordered)
 
     def recall_status(self) -> Optional[RecallStatus]:
         """What the last ``prefetch()`` injected — never a stale prior count."""
@@ -822,12 +1049,20 @@ class MinirMemoryProvider(MemoryProvider):
                     action, target, len(content or ""))
         if self._store is None or not (content or "").strip():
             return
+        session = self._session_id
         try:
             if action in {"add", "replace"}:
-                self._store.remember(content.strip(), source=f"memory_tool/{target}")
+                self._store.save_conclusion(
+                    "note", content.strip(), session_id=session,
+                    subject=f"memory_tool/{target}", version=1)
             elif action == "remove":
                 # ``metadata["previous_content"]`` may be absent; content itself is the entry.
-                self._store.forget_by_content(content.strip())
+                # The mirror writes ``note`` rows, so the undo targets the newest one in this
+                # session; there is no separate notes table to search.
+                row = self._store.newest_conclusion_by_content(
+                    "note", content.strip(), session_id=session)
+                if row is not None:
+                    self._store.forget_conclusion("note", int(row["id"]))
         except Exception as exc:
             logger.debug("Minir memory mirror failed: %s", exc)
 
@@ -919,6 +1154,9 @@ class MinirMemoryProvider(MemoryProvider):
             if self._worker is not None:
                 self._worker.drain_session(session_id, timeout=_PRE_COMPRESS_TIMEOUT)
                 self._kick_worker()  # let a timed-out drain finish in the background
+            # The window being compressed is now reasoned over: publish its calibrated fields
+            # before the counters reset. The summary this engine writes afterwards is separate.
+            self.publish_base_conclusions(session_id)
             TRACKER.reset_layers(session_id)
         except Exception as exc:
             self._store.clear_compression_gate(session_id)
@@ -940,12 +1178,43 @@ class MinirMemoryProvider(MemoryProvider):
             self._flush_boundary(session, close=True)
         except Exception as exc:
             logger.warning("Minir on_session_end flush failed: %s", exc)
+        self._drain_boundary(session)
         self._finish_session(session)
+
+    def _drain_boundary(self, session: str) -> None:
+        """Wait for the boundary drain before the session's one calibrated publish.
+
+        ``_flush_boundary`` records the jobs and kicks a background drain; publishing against a
+        refresh row that does not exist yet would write nothing and burn the session's single
+        shot. Bounded like the compression drain, and never fatal to finalisation.
+        """
+        if self._worker is None or not session:
+            return
+        try:
+            self._worker.drain_session(session, timeout=_PRE_COMPRESS_TIMEOUT)
+        except Exception as exc:
+            logger.warning("Minir boundary drain failed: %s", exc)
+
+    def publish_base_conclusions(self, session_id: str) -> int:
+        """Publish this session's calibrated base fields as conclusions (once per session)."""
+        if self._store is None or self._worker is None or not session_id:
+            return 0
+        try:
+            written = self._store.publish_base_conclusions(
+                session_id, user_subject=self._worker.user_subject(),
+                ai_subject=self._worker.dialectic_subject())
+        except Exception as exc:
+            logger.warning("Minir base conclusion publish failed: %s", exc)
+            return 0
+        if written:
+            logger.info("Minir published %d base conclusions for %s", written, session_id)
+        return written
 
     def _finish_session(self, session: str) -> None:
         """Boundary finalisation: per-turn usage, adviser state, then the idle timer."""
         if not session:
             return
+        self.publish_base_conclusions(session)
         try:
             totals = self._finalize_session_usage(session)
             logger.info("Minir session %s final usage: turns=%s api_calls=%s tokens=%s",
@@ -1020,11 +1289,10 @@ class MinirMemoryProvider(MemoryProvider):
             return snapshot
         try:
             notes = self._store.session_markers(session)
-            # Bound each note: a marker's text can be large, and the snapshot is evidence for
-            # one extraction run, not an archive of the note table.
+            # Bound each marker: its text can be large, and the snapshot is evidence for one
+            # extraction run, not an archive of the conclusions table.
             snapshot["notes"] = [
-                {"id": note.get("id"), "marker_type": note.get("marker_type"),
-                 "category": note.get("category"),
+                {"conclusions_id": note.get("conclusions_id"), "kind": note.get("kind"),
                  "content": str(note.get("content") or "")[:400],
                  "created_at": note.get("created_at")}
                 for note in notes[-50:]]
@@ -1155,12 +1423,12 @@ class MinirMemoryProvider(MemoryProvider):
             # The hand-off is a real audited record; using it beats losing the session summary.
             summary_text = handoff_text
         if summary_text:
-            self._store.put_conclusion(
-                "session_summary", f"session_summary:{session}:final", summary_text,
+            self._store.save_conclusion(
+                "session_summary", summary_text, key=f"session_summary:{session}:final",
                 session_id=session, subject="session",
                 evidence=json.dumps(["session_handoff"] if handoff_text else [],
                                     ensure_ascii=False),
-                status="active", to_ts=window_end or None)
+                status="active")
         pages = extraction.extract_pages(
             session_id=session, summary=summary_text, handoff=handoff_text,
             markers=snapshot, usage=usage, hermes_home=self._hermes_home,
@@ -1355,63 +1623,63 @@ class MinirMemoryProvider(MemoryProvider):
             scope = str(args.get("scope") or "session").strip().lower()
             if scope not in {"session", "all"}:
                 return tool_error("scope must be 'session' or 'all'")
+            kinds: Optional[frozenset[str]] = None
+            kind_filter = str(args.get("type") or "").strip()
+            if kind_filter:
+                if kind_filter not in CONCLUSION_KINDS:
+                    return tool_error(
+                        f"type must be one of: {', '.join(CONCLUSION_KINDS)}")
+                kinds = frozenset({kind_filter})
             rows = self._search(query, limit=args.get("limit"),
                                 session_id=str(args.get("session_id") or self._session_id),
-                                scope=scope)
-            results = []
-            for row in rows:
-                entry = {"kind": row["kind"], "when": format_when(row["when"]),
-                         "source": row["author"], "session_id": row.get("session_id", ""),
-                         "text": _excerpt(row["text"])}
-                if row.get("marker_type"):
-                    entry["marker_type"] = row["marker_type"]
-                # Only a typed marker has a forgettable id. Never expose a conclusion id under
-                # ``id``, and never advertise an untyped note (host mirror/legacy row) that
-                # ``minir_forget`` cannot delete: the type check would reject it.
-                if (row["kind"] == "note" and row.get("marker_type")
-                        and row.get("note_id") is not None):
-                    entry["note_id"] = row["note_id"]
-                    entry["id"] = row["note_id"]
-                results.append(entry)
+                                scope=scope, kinds=kinds)
+            results = [{
+                "conclusions_id": row["conclusions_id"],
+                "kind": row["kind"],
+                "key": row.get("key") or "",
+                "text": _excerpt(row["text"]),
+                "when": format_when(row["when"]),
+                "author": row["author"],
+                "subject": row.get("subject") or "",
+                "session_id": row.get("session_id") or "",
+                "score": row.get("score") or 0.0,
+                "rank": row.get("rank") or 0.0,
+            } for row in rows]
             return json.dumps({"count": len(rows), "scope": scope, "results": results})
         if tool_name == "minir_remember":
-            marker_type = str(args.get("type") or "").strip()
-            if not marker_type:
+            kind = str(args.get("type") or "").strip()
+            if not kind:
                 return tool_error("type is required")
-            if marker_type not in VALUE_MARKER_TYPES:
-                return tool_error(
-                    f"type must be one of: {', '.join(VALUE_MARKER_TYPES)}")
-            category = str(args.get("category") or "").strip().upper()
-            if not category:
-                return tool_error("category is required")
-            if category not in NOTE_CATEGORIES:
-                return tool_error(
-                    f"category must be one of: {', '.join(NOTE_CATEGORIES)}")
+            if kind not in CONCLUSION_KINDS:
+                return tool_error(f"type must be one of: {', '.join(CONCLUSION_KINDS)}")
             content = str(args.get("content") or "").strip()
             if not content:
                 return tool_error("content is required")
-            note_id = self._store.remember(
-                content, source="tool", marker_type=marker_type, category=category,
-                session_id=self._session_id)
-            return json.dumps({"stored": True, "note_id": note_id, "type": marker_type,
-                               "category": category, "session_id": self._session_id})
+            conclusions_id = self._store.save_conclusion(
+                kind, content, session_id=self._session_id, subject="tool")
+            return json.dumps({"stored": True, "conclusions_id": conclusions_id,
+                               "type": kind, "session_id": self._session_id})
         if tool_name == "minir_forget":
-            marker_type = str(args.get("type") or "").strip()
-            if not marker_type:
+            kind = str(args.get("type") or "").strip()
+            if not kind:
                 return tool_error("type is required")
-            if marker_type not in VALUE_MARKER_TYPES:
-                return tool_error(
-                    f"type must be one of: {', '.join(VALUE_MARKER_TYPES)}")
+            if kind not in CONCLUSION_KINDS:
+                return tool_error(f"type must be one of: {', '.join(CONCLUSION_KINDS)}")
             try:  # tolerate "5" from models that stringify integers
-                note_id = int(args.get("note_id"))
+                conclusions_id = int(args.get("conclusions_id"))
             except (TypeError, ValueError):
-                return tool_error("note_id must be an integer")
-            deleted = self._store.forget(note_id, marker_type=marker_type)
-            return json.dumps({"deleted": deleted, "note_id": note_id, "type": marker_type})
+                return tool_error("conclusions_id must be an integer")
+            deleted = self._store.forget_conclusion(kind, conclusions_id)
+            return json.dumps({"deleted": deleted, "conclusions_id": conclusions_id,
+                               "type": kind})
+        if tool_name == "minir_todo":
+            return self._handle_todo(args)
         if tool_name == "minir_stats":
             with self._lock:
                 metrics = {tool: dict(values) for tool, values in self._metrics.items()}
             return json.dumps({**self._store.stats(), "session_id": self._session_id,
+                               "conclusions_by_kind":
+                                   self._store.conclusions_by_kind(self._session_id),
                                "profile": self._profile,
                                "layers": TRACKER.snapshot(self._session_id),
                                "scheduler": self._scheduler.snapshot(),
@@ -1552,9 +1820,7 @@ class MinirMemoryProvider(MemoryProvider):
         lines = [f"## {_PROVIDER_LABEL} recall"]
         size = len(lines[0])
         for row in rows:
-            marker_type = str(row.get("marker_type") or "")
-            label = (f"{marker_type} marker ({row['author'] or 'tool'})" if marker_type
-                     else f"Note ({row['author'] or 'tool'})")
+            label = f"{row.get('kind') or 'note'} ({row['author'] or 'tool'})"
             label = f"{label} · {format_when(row['when'])}"
             text = " ".join(row["text"].split())
             line = f"- [{label}] {text}"
@@ -1607,6 +1873,9 @@ def register(ctx) -> None:
     ctx.register_hook("pre_tool_call", _hook(_on_pre_tool_call, provider))
     # Verify-on-stop gate: a live blocker may keep a code-editing turn going once.
     ctx.register_hook("pre_verify", _hook(_on_pre_verify, provider))
+    # Final-answer injection: the host hands the rendered answer here, the last point where a
+    # queued block (the todo table) can still join it.
+    ctx.register_hook("transform_llm_output", _hook(_on_transform_llm_output, provider))
     # Adviser mode observers: the event ring needs the assistant's intent (interim text and
     # successful API responses with tool calls), the tool outcome, and the final answer.
     ctx.register_hook("on_interim_message", _hook(_on_interim_message, provider))
@@ -1693,6 +1962,10 @@ def _on_session_reset(session_id: str = "", old_session_id: str = "",
         if old_session_id:
             TRACKER.stop(old_session_id)
         TRACKER.begin(session_id)
+        resolved = _resolve_provider(provider)
+        if resolved is not None and old_session_id:
+            # The session that ended is the old one; the new one has no calibration yet.
+            resolved.publish_base_conclusions(old_session_id)
         logger.info("Minir on_session_reset: %s -> %s (reason=%s)",
                     old_session_id or "-", session_id or "-", reason or "-")
     except Exception as exc:
@@ -1706,6 +1979,7 @@ def _on_session_finalize(session_id: str = "", provider: Optional[MinirMemoryPro
         TRACKER.stop(session_id)
         resolved = _resolve_provider(provider)
         if resolved is not None:
+            resolved.publish_base_conclusions(session_id)
             resolved._adviser_mode.session_end(session_id)
             resolved.flush_metrics()
             # Bounded flush: the host is tearing this session down, so the queued rows must
@@ -1714,6 +1988,28 @@ def _on_session_finalize(session_id: str = "", provider: Optional[MinirMemoryPro
         logger.info("Minir on_session_finalize: session=%s", session_id or "-")
     except Exception as exc:
         logger.warning("Minir on_session_finalize failed: %s", exc)
+
+
+def _on_transform_llm_output(response_text: str = "", session_id: str = "",
+                             provider: Optional[MinirMemoryProvider] = None,
+                             **kwargs) -> Optional[str]:
+    """Append the session's queued blocks to the final answer; ``None`` keeps the text as is.
+
+    The queue is popped before either check: the host calls this once per turn, and a block
+    queued for this answer must not survive into the next one even when the model produced no
+    text. Returning the block alone would delete the model's answer, so the text always leads.
+    """
+    resolved = _resolve_provider(provider)
+    if resolved is None or resolved._store is None:
+        return None
+    try:
+        block = resolved._take_injects(session_id or resolved._session_id)
+    except Exception as exc:  # an injection must never break the answer
+        logger.warning("Minir final-answer injection failed: %s", exc)
+        return None
+    if not block or not str(response_text or "").strip():
+        return None
+    return response_text.rstrip() + "\n\n" + block
 
 
 def _on_pre_llm_call(session_id: str = "", turn_id: str = "",

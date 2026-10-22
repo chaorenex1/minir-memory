@@ -33,8 +33,10 @@ class FakeAgent:
         self.tools = [{"function": {"name": "read_file"}},
                       {"function": {"name": "write_file"}},
                       {"function": {"name": "patch"}},
-                      {"function": {"name": "minir_remember"}}]
-        self.valid_tool_names = {"read_file", "write_file", "patch", "minir_remember"}
+                      {"function": {"name": "minir_remember"}},
+                      {"function": {"name": "minir_todo"}}]
+        self.valid_tool_names = {"read_file", "write_file", "patch", "minir_remember",
+                                 "minir_todo"}
         FakeAgent.instances.append(self)
 
     def run_conversation(self, prompt, system_message=None, **_kwargs):
@@ -393,6 +395,8 @@ def test_read_only_drops_mutating_tools_and_usage_is_captured(loop, host):
     (agent,) = FakeAgent.instances
     assert [tool["function"]["name"] for tool in agent.tools] == ["read_file"]
     assert agent.valid_tool_names == {"read_file"}
+    # The write surfaces a reviewer must not hold: the memory tools and the todo list too.
+    assert "minir_todo" in loop.READ_ONLY_DROPPED_TOOLS
     assert run.usage == {"total_tokens": 42, "estimated_cost_usd": 0.001}
 
 
