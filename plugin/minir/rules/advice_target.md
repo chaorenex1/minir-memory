@@ -36,17 +36,21 @@ Artifact targets:
   justify or drop. nit: optional.
 
 Consistency targets:
-- `user_preferences_check`: the session against `base.user_card` `### Preferences`, falling back
-  to the global `user-card/preference.md`. Kinds: `violated`, `temporary_override`, `stale_card`.
-  Not eligible for the repair round.
-- `ai_self_representation_check`: the session against `base.ai_self`. Kinds: `false_claim`,
-  `missing_work`, `scope_change`. The only target eligible for the repair round.
+- `user_preferences_check`: the session against `base.user_peer_card` `### Preferences`, falling
+  back to the global `minir-memory/user/preference.md`. Kinds: `violated`, `temporary_override`,
+  `stale_card`.
+- `ai_self_representation_check`: the session against `base.ai_self_representation`. Kinds:
+  `false_claim`, `missing_work`, `scope_change`.
 - `soul_tool_policy_check`: the session against SOUL `# Precedence`, `# Tool policy`,
-  `# Boundaries`. Kind: `tool_policy_breach`. Not eligible for the repair round.
+  `# Boundaries`. Kind: `tool_policy_breach`.
 - `soul_workflow_check`: the session against SOUL `# Workflow`, `# Verification & failure`,
-  `# Delivery contract`, `# Critical`. Kind: `workflow_breach`. Not eligible for the repair round.
-- `soul_craft_check`: the session against SOUL `# Craft`. Kind: `craft_breach`. Not eligible for
-  the repair round.
+  `# Delivery contract`, `# Critical`. Kind: `workflow_breach`.
+- `soul_craft_check`: the session against SOUL `# Craft`. Kind: `craft_breach`.
+
+COVERAGE
+- Every review reports `coverage` for each enabled consistency target: `clean`, `found`, or
+  `n/a`. A target you did not inspect is omitted; missing is `unknown`, never `clean`.
+- A malformed coverage map does not fail the review; delivery depends on advice, not coverage.
 
 PARALLEL RULES
 - The five consistency targets are parallel and delivered, not candidate-only. There is no `soul`
@@ -57,8 +61,8 @@ PARALLEL RULES
 - One observation produces one advice. A conflict that spans targets is one advice per target; a
   single SOUL sentence that matches several `soul_*` targets takes
   `soul_tool_policy_check` > `soul_workflow_check` > `soul_craft_check` and is not counted twice.
-- Only `ai_self_representation_check` enters the repair round. The other four are handled in the
-  live turn or not at all.
+- All five are handled in the live turn. No target has a follow-up job, a terminal column, or a
+  second delivery path.
 
 CHOOSING
 - Action first within the action/artifact split: a correction that changes what the agent does
@@ -74,8 +78,8 @@ CHOOSING
 - Use `general` when none fits. Never invent or misspell a token to force precision.
 
 REFERENCE MATERIAL
-- `user_preferences_check` reads the full `base.user_card` for the quoted line. The 320-character
-  digest can truncate the preference and is not evidence.
+- `user_preferences_check` reads the full `base.user_peer_card` for the quoted line. The
+  320-character digest can truncate the preference and is not evidence.
 - A `soul_*` target reads only its mapped SOUL sections. `# Role`, `# Character`, `# Priorities`,
   `# Runtime`, `# Delegation & Kanban`, `# Memory & continuity`, `# Communication` and `# Avoid`
   are outside the judgment surface.

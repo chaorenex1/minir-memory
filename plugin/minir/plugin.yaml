@@ -32,6 +32,7 @@ provides_tools:
   - minir_hermes_session_search
   - minir_aiagent_search
   - minir_search
+  - minir_kb_search
   - minir_remember
   - minir_forget
   - minir_todo

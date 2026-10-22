@@ -330,7 +330,9 @@ _ADDED_COLUMNS: dict[str, tuple[tuple[str, str], ...]] = {
                         # Emission-guard outcome, so a silent reviewer is distinguishable
                         # from one that produced only noise/duplicates.
                         ("notes_dropped", "INTEGER NOT NULL DEFAULT 0"),
-                        ("drop_detail", "TEXT NOT NULL DEFAULT '{}'")),
+                        ("drop_detail", "TEXT NOT NULL DEFAULT '{}'"),
+                        # Per-review target coverage: target -> clean / found / n/a.
+                        ("coverage", "TEXT NOT NULL DEFAULT '{}'")),
 }
 
 # Tables a previous release wrote that this one must not keep: earlier versions persisted every
@@ -343,7 +345,6 @@ _DROPPED_TABLES: tuple[str, ...] = ("turns", "notes")
 _LONG_TERM_KINDS: tuple[str, ...] = (
     "base.user_representation",
     "base.user_peer_card",
-    "base.ai_self_representation",
     "base.ai_identity_card",
 )
 
@@ -389,11 +390,37 @@ _KIND_WEIGHT: dict[str, float] = {
 _BASE_CONCLUSION_KINDS: tuple[tuple[str, str, str], ...] = (
     ("user_representation", "base.user_representation", "user"),
     ("user_peer_card", "base.user_peer_card", "user"),
-    ("ai_self_representation", "base.ai_self_representation", "agent"),
+    # The AI self representation drifts per conversation; it is a ruler for the session that
+    # produced it, not a cross-session card.
+    ("ai_self_representation", "base.ai_self_representation", "session"),
     ("ai_identity_card", "base.ai_identity_card", "agent"),
     ("window_summary", "base.window_summary", "session"),
     ("value_markers", "base.value_markers", "session"),
 )
+
+#: Kinds whose keys carry the producing session. Reading one without a session id must fail
+#: loudly instead of returning an empty list, and ``scope="all"`` must not leak them.
+_SESSION_BOUND_KINDS: tuple[str, ...] = tuple(
+    kind for _column, kind, scope in _BASE_CONCLUSION_KINDS if scope == "session")
+
+
+def is_session_bound(kinds: Any) -> bool:
+    """True when every requested kind is owned by the session that produced it."""
+    requested = frozenset(str(kind) for kind in kinds or ())
+    return bool(requested) and requested <= frozenset(_SESSION_BOUND_KINDS)
+
+
+class SessionScopeError(ValueError):
+    """A session-bound kind was requested without the session that owns it."""
+
+
+def _session_scope_message(kinds: frozenset[str], scope: str, session_id: str) -> str:
+    kind = sorted(kinds)[0] if kinds else _SESSION_BOUND_KINDS[0]
+    label = "AI self representation" if kind == "base.ai_self_representation" else kind
+    return (
+        "session_scope_required: " + f"{label} is session-scoped. Provide the main session id "
+        "(minir_search session_id or the provider session) to read it. "
+        f"[kind={kind} scope={scope} session_id={session_id or ''}]")
 
 
 def _split_sections(content: str, headings: tuple[tuple[str, str, str], ...]) -> dict[str, str]:
@@ -1484,7 +1511,8 @@ class MinirStore:
         One conclusion per calibrated column (``_BASE_CONCLUSION_KINDS``), content taken
         verbatim from the
         column (a JSON column stays the JSON string it holds). User and agent rows carry no
-        session id so they stay durable; the window rows carry the session. The guard is
+        session id so they stay durable; the window rows and the AI self representation carry
+        the session. The guard is
         ``base_refreshes.conclusions_published_at`` scanned across the whole session, not an
         in-memory flag: a provider restart or a second instance cannot publish twice, and even a
         losing race only repeats the same six idempotent upserts. Returns the rows written.
@@ -1835,6 +1863,71 @@ class MinirStore:
             self._conn.commit()
             return int(cur.rowcount)
 
+    def review_stats(self, session_id: str, window: int = 8,
+                     targets: tuple[str, ...] = ()) -> list[dict[str, Any]]:
+        """Per-target coverage and advice counters over this session's last *window* reviews.
+
+        Counts only: no transcript, no advice text. ``follow_up`` is re-observation, not
+        adoption — the plugin cannot see whether the operator acted on a note. Safety targets
+        sort first, then by how strongly the target asks to be rechecked.
+        """
+        names = tuple(str(name) for name in targets if str(name).strip())
+        if not names:
+            return []
+        limit = max(1, min(int(window or 8), 50))
+        stats: dict[str, dict[str, Any]] = {
+            name: {"target": name, "reviews": 0, "clean": 0, "found": 0, "n/a": 0,
+                   "adv": 0, "deliv": 0, "recur": 0, "follow_up": "no_followup"}
+            for name in names}
+        with self._lock:
+            if self._conn is None:
+                return []
+            reviews = self._conn.execute(
+                "SELECT id, coverage, drop_detail FROM adviser_reviews "
+                "WHERE session_id = ? ORDER BY id DESC LIMIT ?",
+                (session_id, limit)).fetchall()
+            review_ids = [int(row["id"]) for row in reviews]
+            for row in reviews:
+                try:
+                    coverage = json.loads(str(row["coverage"] or "{}"))
+                except (TypeError, ValueError):
+                    coverage = {}
+                try:
+                    dropped = json.loads(str(row["drop_detail"] or "{}"))
+                except (TypeError, ValueError):
+                    dropped = {}
+                for name in names:
+                    state = str((coverage or {}).get(name) or "").strip().lower()
+                    if state in {"clean", "found", "n/a"}:
+                        stats[name]["reviews"] += 1
+                        stats[name][state] += 1
+                    stats[name]["recur"] += int((dropped or {}).get(f"duplicate/{name}") or 0)
+            if review_ids:
+                marks = ", ".join("?" * len(review_ids))
+                for row in self._conn.execute(
+                        f"SELECT target, COUNT(*) AS n, "
+                        f"SUM(CASE WHEN delivered_at IS NOT NULL THEN 1 ELSE 0 END) AS d "
+                        f"FROM advisories WHERE review_id IN ({marks}) GROUP BY target",
+                        review_ids).fetchall():
+                    name = str(row["target"] or "")
+                    if name in stats:
+                        stats[name]["adv"] += int(row["n"] or 0)
+                        stats[name]["deliv"] += int(row["d"] or 0)
+        rows: list[dict[str, Any]] = []
+        for name in names:
+            item = stats[name]
+            if item["recur"]:
+                item["follow_up"] = "recurred"
+            elif item["adv"]:
+                item["follow_up"] = "not_reobserved"
+            rows.append(item)
+        safety = {"soul_tool_policy_check": 0, "soul_workflow_check": 0}
+        rank = {"recurred": 0, "not_reobserved": 2, "no_followup": 3}
+        rows.sort(key=lambda item: (safety.get(item["target"], 1),
+                                    rank.get(item["follow_up"], 3),
+                                    names.index(item["target"])))
+        return rows
+
     def start_adviser_review(self, session_id: str, turn_id: str, trigger: str,
                              from_seq: int, to_seq: int, adviser: str = "") -> int:
         with self._lock:
@@ -1850,15 +1943,15 @@ class MinirStore:
     def finish_adviser_review(self, review_id: int, *, status: str, model: str = "",
                               api_calls: int = 0, latency_ms: float = 0.0,
                               error: str = "", notes_dropped: int = 0,
-                              drop_detail: str = "") -> None:
+                              drop_detail: str = "", coverage: str = "") -> None:
         with self._lock:
             self._conn.execute(
                 "UPDATE adviser_reviews SET status = ?, model = ?, api_calls = ?, "
-                "latency_ms = ?, error = ?, notes_dropped = ?, drop_detail = ? "
+                "latency_ms = ?, error = ?, notes_dropped = ?, drop_detail = ?, coverage = ? "
                 "WHERE id = ?",
                 (status, model or "", int(api_calls or 0), float(latency_ms or 0.0),
                  (error or "")[:500], int(notes_dropped or 0),
-                 (drop_detail or "{}")[:2000], int(review_id)))
+                 (drop_detail or "{}")[:2000], (coverage or "{}")[:2000], int(review_id)))
             self._conn.commit()
 
     def adviser_reviews(self, session_id: str, limit: int = 10) -> list[dict[str, Any]]:
@@ -1992,7 +2085,8 @@ class MinirStore:
         ``scope="session"`` (the default) is the current conversation's view: its own rows plus
         every durable row (no session id) whose kind is cross-session by contract. A new
         session-level kind is therefore private by default; a new durable kind has to be added
-        to this predicate. ``scope="all"`` drops the isolation entirely.
+        to this predicate. ``scope="all"`` drops the isolation; ``search`` then excludes the
+        session-bound kinds itself, because this predicate cannot see the requested ``kinds``.
         """
         if scope == "all":
             return "1=1", []
@@ -2011,10 +2105,12 @@ class MinirStore:
         FTS5 with the trigram tokenizer is the primary index (CJK-safe). A scan over the same
         rows is the fallback when FTS5 is unavailable or the query terms are too short for
         trigram. Returns ``{conclusions_id, kind, key, text, when, author, subject, session_id,
-        score, rank}``; there is no window field because a conclusion has none. ``scope="all"``
-        searches every session; the default searches the current one plus durable cards and
-        markers. ``kinds`` restricts the SQL candidate set, so a filtered recall cannot be
-        crowded out by rows the caller would discard.
+        ``score, rank}``; there is no window field because a conclusion has none. ``scope="all"``
+        searches every session but never returns a session-bound kind; naming only session-bound
+        kinds there, or reading one with no session id, raises :class:`SessionScopeError`
+        (``session_scope_required``) instead of returning an empty list. ``kinds`` restricts the
+        SQL candidate set, so a filtered recall cannot be crowded out by rows the caller would
+        discard.
         """
         terms = _terms(query)
         if not terms:
@@ -2025,7 +2121,23 @@ class MinirStore:
         scope = str(scope).lower()
         if scope != "all":
             scope = "session"
+        bound = frozenset(_SESSION_BOUND_KINDS)
+        explicit = frozenset(kinds) if kinds is not None else None
+        if explicit:
+            if explicit <= bound and (scope == "all" or not session_id):
+                raise SessionScopeError(_session_scope_message(explicit, scope, session_id))
+            if scope == "all" and explicit & bound:
+                explicit = explicit - bound
+                if not explicit:
+                    return []
         visibility, visible_params = self._visibility_sql(session_id, scope)
+        if scope == "all":
+            # A generic cross-session query must not surface another conversation's ruler;
+            # only an explicit session scope (with its id) may read it.
+            marks = ", ".join("?" * len(bound))
+            visibility = f"({visibility} AND c.kind NOT IN ({marks}))"
+            visible_params = [*visible_params, *bound]
+        kinds = explicit
         kind_sql, kind_params = "", []
         if kinds is not None:
             marks = ",".join("?" * len(kinds))

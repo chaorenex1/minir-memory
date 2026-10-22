@@ -24,13 +24,14 @@ SEVERITY CEILINGS BY TARGET
 - `user_preferences_check`: blocker for a safety or process preference already sent or
   irreversible; concern for an expressive preference; nit for wording. Stop or correct now.
 - `ai_self_representation_check`: blocker for a completion claim about to be sent or already
-  sent; concern for a drift that has not become a claim; nit for wording. The repair round is
-  follow-up, never a substitute for the live correction.
-- `soul_tool_policy_check`: blocker for `# Precedence` or `# Boundaries`; concern for a procedural
-  `# Tool policy`; no nit.
-- `soul_workflow_check`: blocker for `# Delivery contract` or `# Critical`; concern for
-  `# Workflow` or `# Verification & failure`; no nit.
-- `soul_craft_check`: nit for surface rules; concern for code economy; no blocker.
+  sent; concern for a drift that has not become a claim; nit for wording. Correct it in the
+  live turn; there is no follow-up job.
+- `soul_tool_policy_check`: blocker for SOUL `# Precedence` or `# Boundaries`; concern for the
+  dispatch skill's `# Tool policy`; no nit.
+- `soul_workflow_check`: blocker for SOUL `# Delivery contract` or `# Critical`; concern for the
+  dispatch skill's `# Workflow` or `# Verification & failure`; no nit.
+- `soul_craft_check`: source is the dispatch skill's `# Craft`; nit for surface rules, concern for
+  code economy; no blocker.
 
 EVIDENCE GATE
 - Cite the event, tool result, quoted line, or reference sentence that proves the finding. No
@@ -59,6 +60,8 @@ EMIT GATE
 - `temporary_override`: ask which one wins; do not call it a violation.
 - SOUL unreadable: disable all three `soul_*` targets for the round, record `soul_unavailable`,
   and emit no `soul_*` finding.
+- Dispatch skill unreadable: keep the SOUL-sourced checks (`# Precedence`, `# Boundaries`,
+  `# Delivery contract`, `# Critical`) and emit no finding that would cite a skill section.
 - A blocker with complete evidence is never suppressed by history, statistics, or a clean streak.
 
 DEDUPE
@@ -83,13 +86,12 @@ CANDIDATES
   cite the candidate ids in evidence.
 
 STATISTICS
-- The stats block orders observation only: `recurred`, then `repair: unresolved`, then
-  `not_reobserved`, then `no_followup`.
+- The stats block orders observation only: `recurred`, then `not_reobserved`, then
+  `no_followup`.
 - `recurred`: re-check the file or command named by the earlier evidence. It is a recheck, not a
   new finding, and the same advice is not delivered again.
-- `repair: unresolved`: recheck the same place first; do not open a second repair round.
-- `not_reobserved`: lower the scan priority until a reference changes (card write, SOUL mtime,
-  `base.ai_self` publish) or a new evidence point appears.
+- `not_reobserved`: lower the scan priority until a reference changes (card write, SOUL or
+  dispatch-skill mtime, `base.ai_self_representation` publish) or a new evidence point appears.
 - `no_followup` is not a conclusion; it only means no later review exists.
 - `soul_tool_policy_check` and `soul_workflow_check` always stay ahead; a blocker is never gated.
 - Statistics never change severity, `severity_floor`, `max_advices`, fingerprints, or delivery,
@@ -97,14 +99,6 @@ STATISTICS
 - Coverage is `clean`, `found`, or `n/a`; missing or unparsable is `unknown`, not clean.
 - Record only `recurred`, `not_reobserved`, and `no_followup`. Never record `acted`, `adopted`,
   or `ignored`.
-
-REPAIR
-- Only `ai_self_representation_check` queues a repair job, one per session, in the idle window.
-- Repair fixes behavior and artifacts. It never edits `base.ai_self`, cards, the transcript, git
-  state, dependencies, or credentials.
-- Repair touches only the files named in the evidence and their direct dependencies. It may run
-  verification commands (pytest, ruff, tsc, mypy); other commands are refused.
-- Repair is not retried. `unresolved` is terminal and leaves a note saying what is missing.
 
 PRECEDENCE AND BUDGET
 - A factual or action blocker comes first; artifact advice never outranks it.
@@ -124,11 +118,10 @@ PRECEDENCE AND BUDGET
 - A `soul_*` finding exceeds its severity ceiling, or `soul_craft_check` carries a blocker.
 - `stale_card` is treated as a violation, or `temporary_override` is resolved without asking.
 - A consistency advice is missing the turn uid, the reference quote, the observation, or the kind.
-- A SOUL line outside the mapped sections is used, or the SOUL line is not quoted.
-- SOUL is unreadable and a `soul_*` finding is still produced.
+- A line outside the mapped sections of SOUL or the dispatch skill is used, or the quoted line is
+  not present in the cited document.
+- SOUL is unreadable and a `soul_*` finding is still produced, or the dispatch skill is unreadable
+  and a finding cites one of its sections.
 - A knowledge reference is accepted while outside the root, missing, unread, over three, or
   duplicated.
 - Statistics lower a severity, gate a blocker, or are recorded as `acted` or `adopted`.
-- A repair job is queued for any target other than `ai_self_representation_check`, or a second
-  job is queued for the same session.
-- Repair edits `base.ai_self`, a card, the transcript, git state, or credentials.

@@ -66,6 +66,26 @@ def test_prefetch_injects_only_a_knowledge_path_block(plugin_package, make_provi
     assert "Use unless-stopped." not in block, "paths, never file contents"
 
 
+def test_prefetch_hands_the_profile_home_to_the_page_selector(plugin_package, make_provider,
+                                                              monkeypatch):
+    """The tool store is profile-local: the selector must not fall back to the process env."""
+    provider = make_provider({})
+    plugin_package.knowledge.write_unit(
+        {"id": "u1", "org": "tools", "category": "KNOWLEDGE", "epistemic": "fact",
+         "topic": "Docker restart policy", "content": "Use unless-stopped.",
+         "time": "2026-10-21", "relations": [], "objects": ["tools:docker"]},
+        root=plugin_package.knowledge.knowledge_dir(provider._hermes_home))
+    seen = {}
+
+    def fake_search(pattern, root, **kwargs):
+        seen["hermes_home"] = kwargs.get("hermes_home")
+        return []
+
+    monkeypatch.setattr(plugin_package.knowledge.rgtool, "search", fake_search)
+    provider.prefetch("how do I set a docker restart policy")
+    assert seen["hermes_home"] == provider._hermes_home
+
+
 def test_an_aux_run_writes_its_own_transcript(plugin_package, store, transcript, tmp_path):
     instance = plugin_package.worker.LayerWorker(store, transcript)
     result = SimpleNamespace(answer="{}", messages=({"role": "user", "content": "hi"},))

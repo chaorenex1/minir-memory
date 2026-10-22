@@ -667,13 +667,16 @@ def test_publish_base_conclusions_writes_the_six_fields_once(store):
         "s1", user_subject="user:ada", ai_subject="agent:default:minir") == 6
 
     rows = {row["kind"]: dict(row) for row in store._conn.execute(
-        "SELECT kind, session_id, content FROM conclusions WHERE kind LIKE 'base.%'")}
+        "SELECT kind, session_id, key, content FROM conclusions WHERE kind LIKE 'base.%'")}
     assert set(rows) == {"base.user_representation", "base.user_peer_card",
                          "base.ai_self_representation", "base.ai_identity_card",
                          "base.window_summary", "base.value_markers"}
     for kind in ("base.user_representation", "base.user_peer_card",
-                 "base.ai_self_representation", "base.ai_identity_card"):
+                 "base.ai_identity_card"):
         assert rows[kind]["session_id"] == "", f"{kind} must stay durable"
+    # The AI self representation is a ruler for the session that produced it.
+    assert rows["base.ai_self_representation"]["session_id"] == "s1"
+    assert rows["base.ai_self_representation"]["key"].startswith("session:s1:")
     assert rows["base.window_summary"]["session_id"] == "s1"
     assert rows["base.value_markers"]["session_id"] == "s1"
     assert rows["base.value_markers"]["content"] == '{"value_markers": []}', \
@@ -693,3 +696,22 @@ def test_publish_base_conclusions_writes_the_six_fields_once(store):
         "s1", user_subject="user:ada", ai_subject="agent:default:minir") == 0
     assert store.get_conclusion(
         "base.user_representation", "user:ada")["content"] == "- [goal] ship"
+
+
+def test_session_bound_kind_needs_a_session_and_never_leaks_into_all(plugin_package, store):
+    store.save_conclusion("base.ai_self_representation", "ruler text",
+                          key="session:s1:agent", session_id="s1")
+    kinds = frozenset({"base.ai_self_representation"})
+
+    with pytest.raises(plugin_package.store.SessionScopeError) as exc:
+        store.search("ruler", kinds=kinds)
+    assert "session_scope_required" in str(exc.value)
+    assert "main session id" in str(exc.value)
+
+    with pytest.raises(plugin_package.store.SessionScopeError):
+        store.search("ruler", scope="all", kinds=kinds)
+
+    assert store.search("ruler", scope="all") == []
+    assert store.search("ruler", scope="session", session_id="s2") == []
+    assert store.search("ruler", scope="session", session_id="s1")[0]["kind"] == \
+        "base.ai_self_representation"

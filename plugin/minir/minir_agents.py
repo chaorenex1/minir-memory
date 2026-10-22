@@ -14,6 +14,10 @@ aux namespace::
 
 ``layer_session_id`` is the provider session that called the tool. If the provider has no session
 id (early/manual call), a timestamped name is used instead of a shared ``session.jsonl``.
+
+The system prompt is a lookup, not only an argument: the first readable prompt file in
+:data:`PROMPT_DIRS` scan order is the agent's definition, and the ``system_prompts`` argument is
+the last fallback. ``model`` pins the route as ``provider:model``.
 """
 
 from __future__ import annotations
@@ -42,6 +46,18 @@ MAX_DEPTH = 3
 #: is a ContextVar, so the tool executor threads spawned by the run inherit it.
 _DEPTH: contextvars.ContextVar[int] = contextvars.ContextVar("minir_agents_depth", default=0)
 
+#: Where an agent's system prompt may live, in scan order: the operator's own files first, the
+#: packaged pass cores last. ``{skill}`` directories are skipped without a ``skill_name``. The
+#: first readable, non-empty file is the agent's definition; the name is the identity, so a
+#: second file with the same name is never loaded.
+PROMPT_DIRS: tuple[str, ...] = (
+    ".agents",
+    "agents",
+    "skills/{skill}/agents",
+    "plugins/minir/agents",
+    "plugins/minir/skills/{skill}/agents",
+)
+
 
 def _text(value: Any) -> str:
     """A string argument; a list is joined with blank lines (models sometimes send lists)."""
@@ -59,15 +75,45 @@ def _flag(args: dict[str, Any], name: str, default: bool) -> bool:
     return bool(value)
 
 
+def _segment(value: Any, label: str) -> str:
+    """One path-free name: an agent name or a skill folder, never a path."""
+    name = _text(value)
+    if len(name) > MAX_AGENT_NAME_CHARS:
+        raise ValueError(f"{label} must be at most {MAX_AGENT_NAME_CHARS} characters")
+    if name in {".", ".."} or any(char in name for char in ("/", "\\", "\x00")):
+        raise ValueError(f"{label} must not contain path separators or NUL bytes")
+    return name
+
+
 def _agent_name(args: dict[str, Any]) -> str:
-    name = _text(args.get("agent_name"))
+    name = _segment(args.get("agent_name"), "agent_name")
     if not name:
         raise ValueError("agent_name is required")
-    if len(name) > MAX_AGENT_NAME_CHARS:
-        raise ValueError(f"agent_name must be at most {MAX_AGENT_NAME_CHARS} characters")
-    if name in {".", ".."} or any(char in name for char in ("/", "\\", "\x00")):
-        raise ValueError("agent_name must not contain path separators or NUL bytes")
     return name
+
+
+def _skill_name(args: dict[str, Any]) -> str:
+    """The optional skill folder the two ``skills/<skill_name>/agents`` directories use."""
+    return _segment(args.get("skill_name"), "skill_name")
+
+
+def _model_route(args: dict[str, Any]) -> tuple[str, str]:
+    """``(provider, model)`` from ``"provider:model"``; a bare value pins only the model.
+
+    The split is on the first colon, so an OpenRouter-style model id keeps its own slash and
+    namespace (``openrouter:anthropic/claude-sonnet-4``). With no colon the gateway's provider
+    stays in charge and only the model name is overridden.
+    """
+    raw = _text(args.get("model"))
+    if not raw:
+        return "", ""
+    provider, sep, model = raw.partition(":")
+    if not sep:
+        return "", raw
+    provider, model = provider.strip(), model.strip()
+    if not provider or not model:
+        raise ValueError(f"model must be 'provider:model' or a bare model name, got {raw!r}")
+    return provider, model
 
 
 def _tool_sets(args: dict[str, Any]) -> tuple[list[str], bool]:
@@ -141,6 +187,63 @@ def _context_files(provider: Any, args: dict[str, Any],
     return header + "\n\n" + "\n\n".join(chunks), len(names)
 
 
+def _front_matter(text: str) -> str:
+    """*text* without a leading YAML front-matter block.
+
+    An imported agent definition (``hermes import-agent``) carries ``name``/``description``/
+    ``tools``/``model`` above the prompt; those are metadata, not instructions. The block is only
+    stripped when it really is front matter (every row a ``key:`` pair or a continuation), so a
+    prose section between two horizontal rules stays part of the prompt.
+    """
+    if not text.startswith("---"):
+        return text
+    lines = text.splitlines()
+    if not lines or lines[0].strip() != "---":
+        return text
+    for index, line in enumerate(lines[1:], start=1):
+        if line.strip() != "---":
+            continue
+        block = lines[1:index]
+        if block and all(not row.strip() or row[:1].isspace() or ":" in row.split()[0]
+                         for row in block):
+            return "\n".join(lines[index + 1:])
+        return text
+    return text
+
+
+def _prompt_path(directory: Path, agent_name: str) -> Optional[Path]:
+    for candidate in (directory / f"{agent_name}.md", directory / agent_name):
+        if candidate.is_file():
+            return candidate
+    return None
+
+
+def _system_prompt(provider: Any, agent_name: str, skill_name: str,
+                   argument: str) -> tuple[str, str]:
+    """The agent's system prompt and where it came from: first prompt file, then the argument.
+
+    The scan is :data:`PROMPT_DIRS` order under ``HERMES_HOME``; an unreadable or empty file is
+    skipped rather than ending the scan. An empty return string means no prompt at all: the host's
+    own system prompt is the only one.
+    """
+    home = str(getattr(provider, "_hermes_home", "") or "").strip()
+    if home:
+        for template in PROMPT_DIRS:
+            if "{skill}" in template and not skill_name:
+                continue
+            path = _prompt_path(Path(home) / template.format(skill=skill_name), agent_name)
+            if path is None:
+                continue
+            try:
+                body = _front_matter(path.read_text(encoding="utf-8-sig")).strip()
+            except (OSError, UnicodeError) as exc:
+                logger.warning("minir_agents prompt %s unreadable: %s", path, exc)
+                continue
+            if body:
+                return body, str(path)
+    return argument, ("argument" if argument else "")
+
+
 def run(provider: Any, args: dict[str, Any]) -> str:
     """Validate, run one custom agent, persist its transcript, and return the JSON payload."""
     try:
@@ -148,7 +251,9 @@ def run(provider: Any, args: dict[str, Any]) -> str:
         user_prompt = _text(args.get("user_prompts"))
         if not user_prompt:
             raise ValueError("user_prompts is required")
-        system_prompt = _text(args.get("system_prompts"))
+        skill_name = _skill_name(args)
+        provider_name, model_name = _model_route(args)
+        system_argument = _text(args.get("system_prompts"))
         project = _project(args.get("project_dir"))
         toolsets, all_tools = _tool_sets(args)
     except ValueError as exc:
@@ -157,6 +262,7 @@ def run(provider: Any, args: dict[str, Any]) -> str:
     depth = _DEPTH.get()
     if depth >= MAX_DEPTH:
         return tool_error(f"minir_agents recursion limit ({MAX_DEPTH}) reached")
+    system_prompt, prompt_source = _system_prompt(provider, name, skill_name, system_argument)
     try:
         context, context_count = _context_files(provider, args, project)
     except ValueError as exc:
@@ -177,6 +283,8 @@ def run(provider: Any, args: dict[str, Any]) -> str:
             user_prompt,
             context=context,
             system_message=system_prompt,
+            model=model_name,
+            provider=provider_name,
             toolsets=toolsets,
             all_tools=all_tools,
             project_dir=str(project) if project else "",
@@ -226,6 +334,7 @@ def run(provider: Any, args: dict[str, Any]) -> str:
         "provider": result.provider,
         "toolsets": list(result.toolsets),
         "all_tools": all_tools,
+        "system_prompt_source": prompt_source,
         "context_files": context_count,
         "transcript_path": str(path) if path is not None else "",
         "transcript_written": written,

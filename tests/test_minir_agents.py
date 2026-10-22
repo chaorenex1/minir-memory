@@ -37,6 +37,7 @@ def test_a_custom_agent_defaults_to_all_tools_and_the_host_knobs(provider, fake_
 
     assert data["answer"] == "the answer"
     assert data["toolsets"] == ["*"] and data["all_tools"] is True
+    assert data["system_prompt_source"] == "argument", "no prompt file, so the argument is used"
     (message, kwargs) = fake_run[0]
     assert message == "Find the cause."
     assert kwargs["system_message"] == "You research."
@@ -112,4 +113,91 @@ def test_agent_name_and_user_prompt_are_required(provider, fake_run):
     assert "agent_name" in _payload(provider, user_prompts="x")["error"]
     assert "user_prompts" in _payload(provider, agent_name="a")["error"]
     assert "path separators" in _payload(provider, agent_name="../x", user_prompts="x")["error"]
+    assert "path separators" in _payload(provider, agent_name="a", user_prompts="x",
+                                         skill_name="../b")["error"]
     assert fake_run == []
+
+
+def test_a_model_route_is_split_at_the_first_colon(provider, fake_run):
+    _payload(provider, agent_name="coder", user_prompts="Fix it.",
+             model="openrouter:anthropic/claude-sonnet-4")
+
+    kwargs = fake_run[0][1]
+    assert kwargs["provider"] == "openrouter"
+    assert kwargs["model"] == "anthropic/claude-sonnet-4"
+
+
+def test_a_bare_model_keeps_the_gateway_provider(provider, fake_run):
+    _payload(provider, agent_name="coder", user_prompts="Fix it.", model="gpt-5")
+
+    kwargs = fake_run[0][1]
+    assert (kwargs["provider"], kwargs["model"]) == ("", "gpt-5")
+
+
+def test_a_malformed_model_route_is_refused(provider, fake_run):
+    data = _payload(provider, agent_name="coder", user_prompts="Fix it.", model="openrouter:")
+
+    assert "provider:model" in data["error"]
+    assert fake_run == []
+
+
+def test_the_first_prompt_file_in_scan_order_wins(provider, fake_run, tmp_path):
+    (tmp_path / ".agents").mkdir()
+    (tmp_path / ".agents" / "researcher.md").write_text("The .agents definition.\n",
+                                                        encoding="utf-8")
+    (tmp_path / "agents").mkdir()
+    (tmp_path / "agents" / "researcher.md").write_text("The agents definition.\n",
+                                                       encoding="utf-8")
+
+    data = _payload(provider, agent_name="researcher", user_prompts="Go.",
+                    system_prompts="The argument.")
+
+    assert fake_run[0][1]["system_message"] == "The .agents definition."
+    assert data["system_prompt_source"] == str(tmp_path / ".agents" / "researcher.md")
+
+
+def test_an_imported_agent_prompt_loses_its_front_matter(provider, fake_run, tmp_path):
+    (tmp_path / "agents").mkdir()
+    (tmp_path / "agents" / "code-reviewer.md").write_text(
+        "---\nname: code-reviewer\ntools: Read, Grep\nmodel: sonnet\n---\n\n## Review\n\n"
+        "Find bugs.\n", encoding="utf-8")
+
+    _payload(provider, agent_name="code-reviewer", user_prompts="Review it.")
+
+    assert fake_run[0][1]["system_message"] == "## Review\n\nFind bugs."
+
+
+def test_an_empty_prompt_file_is_skipped(provider, fake_run, tmp_path):
+    (tmp_path / ".agents").mkdir()
+    (tmp_path / ".agents" / "researcher.md").write_text("  \n", encoding="utf-8")
+    (tmp_path / "agents").mkdir()
+    (tmp_path / "agents" / "researcher.md").write_text("The next definition.\n", encoding="utf-8")
+
+    _payload(provider, agent_name="researcher", user_prompts="Go.")
+
+    assert fake_run[0][1]["system_message"] == "The next definition."
+
+
+def test_the_skill_scoped_prompt_needs_skill_name(provider, fake_run, tmp_path):
+    agents = tmp_path / "skills" / "code-review" / "agents"
+    agents.mkdir(parents=True)
+    (agents / "reviewer.md").write_text("The skill definition.\n", encoding="utf-8")
+
+    _payload(provider, agent_name="reviewer", user_prompts="Go.", skill_name="code-review")
+    _payload(provider, agent_name="reviewer", user_prompts="Go.", system_prompts="The argument.")
+
+    assert fake_run[0][1]["system_message"] == "The skill definition."
+    assert fake_run[1][1]["system_message"] == "The argument."
+
+
+def test_the_packaged_pass_core_beats_the_argument(provider, fake_run, tmp_path):
+    packaged = tmp_path / "plugins" / "minir" / "agents"
+    packaged.mkdir(parents=True)
+    (packaged / "b3_window_summary.md").write_text("The packaged core.\n", encoding="utf-8")
+
+    data = _payload(provider, agent_name="b3_window_summary", user_prompts="Summarize.",
+                    system_prompts="The argument.")
+
+    assert fake_run[0][1]["system_message"] == "The packaged core."
+    assert data["system_prompt_source"] == str(packaged / "b3_window_summary.md")
+

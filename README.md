@@ -6,8 +6,8 @@ and grow into a real provider.
 
 It keeps explicit value markers and every derived conclusion in a per-profile SQLite database,
 recalls them through an FTS5 trigram index (CJK-safe, with a token-scan fallback), and exposes
-six tools (`minir_search`, `minir_remember`, `minir_forget`, `minir_todo`, `minir_stats`,
-`minir_agents`). On top of that it runs
+seven tools (`minir_search`, `minir_kb_search`, `minir_remember`, `minir_forget`, `minir_todo`,
+`minir_stats`, `minir_agents`). On top of that it runs
 two **independent** reasoning layers: the base layer builds the user/AI cards every 24 turns, the
 dialectic reviews them every 8 turns against its own evidence window, and corrects the newest base
 artifact (a pre-overwrite snapshot and an FTS index are kept). The review publishes a short
@@ -22,9 +22,9 @@ A fourth pass closes the loop after a conversation goes quiet: `on_session_end` 
 turn's final token usage, captures the session's value markers and arms a 24-hour timer. Typing in
 the session again cancels it; otherwise a **session-summary agent** (the Task Handoff is its first
 user prompt input) and a **knowledge-extraction agent** turn the session into a durable summary
-and knowledge pages. The five store tools are also registered as the `minir` toolset, so every agent
-this plugin runs can use the store directly; the same toolset carries the layer-scoped transcript
-search.
+and knowledge pages. The seven tools are also registered as the `minir` toolset, so every agent
+this plugin runs can use the store and the knowledge search directly; the same toolset carries the
+layer-scoped transcript search.
 
 It also ships an optional **main adviser**: a fast, per-turn side channel that watches the live
 tool loop (user goal, assistant intent, tool results) and injects its advice before the next
@@ -99,6 +99,7 @@ plugin/minir/          the deployable plugin directory (copy this to plugins/min
   worker.py            drains base and review jobs FIFO per session, publishes artifacts
   card_review.py       three-day review: four card files, validation, revisions, anchor policy
   knowledge.py         one page per unit, path-hint retrieval block
+  rgtool.py            managed ripgrep: facts.json discovery + the selection's search call
   tools.py             the minir toolset: store tools + agent transcript search; file/skills grant
   agent_history.py     minir_aiagent_search: the caller's own layer stream, layer from contextvar
   minir_agents.py      run one named custom agent and flush its transcript under sessions/
@@ -200,18 +201,19 @@ process-wide active provider, since the host can construct the plugin twice.
 
 ## Tools
 
-The provider exposes five store tools; every response is a JSON string (errors are `{"error": ...}`).
-The same five are registered as the `minir` **registry toolset**, so the plugin's own agents can
+The provider exposes seven tools; every response is a JSON string (errors are `{"error": ...}`).
+The same schemas are registered as the `minir` **registry toolset**, so the plugin's own agents can
 be granted them explicitly (see "The `minir` toolset" below).
 
 | Tool | Parameters | Behaviour |
 | --- | --- | --- |
 | `minir_search` | `query` (required), `limit`, `scope`, `type`, `session_id` | Ranked FTS5 recall. Default `scope="session"`: the current session plus durable cards and markers. `scope="all"` searches every session; `session_id` targets one explicitly. `limit` defaults to `prefetch_limit` and is capped at 20; `type` keeps only that conclusion kind. Each result carries `conclusions_id`, `kind`, `key`, `text` (600-char excerpt), `when`, `author`, `subject`, `session_id`, `score` and `rank`. |
+| `minir_kb_search` | `query` (required), `org`, `category`, `limit` | Read-only search of the knowledge directory the hint block points at. `query` is a ripgrep (Rust regex) pattern matched case-insensitively; `org`/`category` filter front-matter; `limit` defaults to 8, capped at 25. A result carries `path` (absolute), `relative`, `org`, `category`, `topic`, `summary`, `revisions`, `updated_at` and up to two matched body lines (`line` + `text`); `total` counts every matching page, so `total > count` means "narrow the pattern". Hits outside `<org>/<page>.md` under the knowledge root are never reported. |
 | `minir_remember` | `type` (required), `content` (required) | Stores one conclusion of that kind (`note`, `entities`, `trajectories`, `experiences`, `tools`, `projects`, `todo`) in the single memory table, bound to the current session and indexed for FTS. Returns `{stored, conclusions_id, type, session_id}`. |
 | `minir_forget` | `type` (required), `conclusions_id` (required) | Deletes that row only when its stored kind matches. Returns `{deleted, conclusions_id, type}`; a wrong kind or unknown id yields `deleted: false`. |
-| `minir_todo` | `todos` (required) | Replaces this session's todo list, at most two levels deep (`parent` names a top-level id) and 256 items. It is stored as one row (`kind="todo"`), rendered as a markdown table into the final answer, and summarised as `open/total` in the next turn's recall. An empty list deletes the row. |
+| `minir_todo` | `todos` (required) | Replaces this session's todo list, at most two levels deep (`parent` names a top-level id) and 256 items. It is stored as one row (`kind="todo"`), rendered as a markdown table into the final answer, and carried by every prefetch block for the session. An empty list deletes the row. |
 | `minir_stats` | none | Store counts (with `conclusions_by_kind` for this session), layer counters, the scheduler ledger, published artifacts, buffered messages, in-memory tool metrics, the session's token usage and its newest turn rows, and the database path. |
-| `minir_agents` | `agent_name` (required), `user_prompts` (required), `system_prompts`, `context_files`, `project_dir`, `tool_sets`, `skip_memory`, `skip_context_files`, `skip_background_review`, `load_soul_identity` | Runs a named in-process agent; omitting `tool_sets` grants every host tool. The full run is flushed to `sessions/<agent_name>/<layer_session_id>.json`. |
+| `minir_agents` | `agent_name` (required), `user_prompts` (required), `skill_name`, `model`, `system_prompts`, `context_files`, `project_dir`, `tool_sets`, `skip_memory`, `skip_context_files`, `skip_background_review`, `load_soul_identity` | Runs a named in-process agent; omitting `tool_sets` grants every host tool. `model` is `provider:model`. The system prompt is the first prompt file found under `HERMES_HOME` (see "Custom agents"); `system_prompts` is the last fallback, and `system_prompt_source` reports which one won. The full run is flushed to `sessions/<agent_name>/<layer_session_id>.jsonl`. |
 
 Explicit markers are separate from the base layer's automatic value markers: the worker keeps
 merging its own five-key inventory per refresh, while a remembered marker is a session-bound,
@@ -229,7 +231,7 @@ main-agent surface):
 
 ## The `minir` toolset
 
-The five store tools have two delivery paths. The memory-provider surface (`get_tool_schemas`)
+The seven tools have two delivery paths. The memory-provider surface (`get_tool_schemas`)
 injects them into a main agent that has the host's `memory` toolset enabled. For the plugin's own
 agents — the adviser, the layer worker, the hand-off and session-summary agents, the idle
 extraction — the same schemas are registered through the plugin context under a registry toolset
@@ -249,10 +251,31 @@ the provider path cannot drift.
 ## Custom agents: `minir_agents`
 
 `minir_agents` runs one named in-process agent on the gateway's model route. `agent_name` and
-`user_prompts` are required; `system_prompts` is its system message, and `context_files` are read
-under the same `file_guard` scope as the agent's own file tools, with relative paths resolved
-against `project_dir` (at most 20 files and 200 KB in total).
+`user_prompts` are required; `context_files` are read under the same `file_guard` scope as the
+agent's own file tools, with relative paths resolved against `project_dir` (at most 20 files and
+200 KB in total).
 
+- `model` pins the route as `provider:model` (split at the first colon, so
+  `openrouter:anthropic/claude-sonnet-4` keeps its namespaced model id). A bare model name pins
+  only the model and keeps the gateway's provider; omitted, the gateway route is used.
+- The system prompt is a lookup, not just an argument. The first readable, non-empty prompt file
+  wins, each directory accepting `<agent_name>.md` or a bare `<agent_name>` file; `skill_name`
+  gates the two skill-scoped directories:
+
+  | # | Path |
+  | --- | --- |
+  | 1 | `$HERMES_HOME/.agents/<agent_name>` |
+  | 2 | `$HERMES_HOME/agents/<agent_name>` |
+  | 3 | `$HERMES_HOME/skills/<skill_name>/agents/<agent_name>` |
+  | 4 | `$HERMES_HOME/plugins/minir/agents/<agent_name>` |
+  | 5 | `$HERMES_HOME/plugins/minir/skills/<skill_name>/agents/<agent_name>` |
+  | 6 | the `system_prompts` argument |
+
+  The name is the identity: the same agent name never loads twice, and a file found at an earlier
+  step is not merged with a later one. A leading YAML front-matter block (the shape
+  `hermes import-agent` writes: `name`, `description`, `tools`, `model`) is metadata and is
+  stripped; its `tools` and `model` do not override `tool_sets` or `model`. The payload's
+  `system_prompt_source` is the winning path, `"argument"`, or `""` when neither supplied one.
 - `tool_sets` omitted, empty or `["*"]` grants every host tool; an explicit list is passed to the
   agent unchanged.
 - `skip_memory=False`, `skip_context_files=False`, `skip_background_review=True` and
@@ -261,8 +284,8 @@ against `project_dir` (at most 20 files and 200 KB in total).
   soul identity.
 - The run's `AgentRun.messages` are recorded with `TranscriptBuffer.record_aux` and flushed
   before the tool returns, at
-  `<HERMES_HOME>/minir-memory/sessions/<agent_name>/<layer_session_id>.json`. The path is returned
-  as `transcript_path`; `transcript_written` says whether the flush reached disk.
+  `<HERMES_HOME>/minir-memory/sessions/<agent_name>/<layer_session_id>.jsonl`. The path is
+  returned as `transcript_path`; `transcript_written` says whether the flush reached disk.
 - `minir_agents` may recurse when the custom agent is granted the `minir` toolset; the tool caps
   the depth at three.
 
@@ -569,10 +592,14 @@ pass runs it, with `rules/markers-category.md` and `rules/markers-org.md` append
 prompt, to write pages from a finished session. The marker-to-page write path still renders a body
 from the unit itself and calls a `render` callable only when a caller supplies one.
 
-Retrieval is by **path, never by content**: `prefetch()` scores the front-matter against the query
-(objects 2x, word overlap 1x, recency 0.5x), selects at most 6 paths within 700 characters and
-injects them as `[knowledge — retrieve on demand] ... [end knowledge]`. Paths selected in the last
-three turns are skipped. The model opens a page with its file tool when the hint is relevant.
+Retrieval is by **path, never by content**: `prefetch()` asks the profile's managed `rg` (found
+through `<HERMES_HOME>/tools/facts.json`, `PATH` as fallback) which pages mention a query term,
+then scores only those front-matters (objects 2x, word overlap 1x, recency 0.5x), selects at most
+6 paths within 700 characters and injects them as `[knowledge — retrieve on demand] ... [end
+knowledge]`. Without ripgrep the selection scans the org folders instead of going blind. Paths
+selected in the last three turns are skipped. The model opens a page with its file tool when the
+hint is relevant, or calls `minir_kb_search` to search the directory's text when the hint is not
+enough.
 
 ### The transcript event store
 
@@ -877,9 +904,9 @@ first, and one oversized event is kept whole. Each review continues that
 adviser's own `AdvisorRuntime` through `conversation_history`, so it can build on its earlier
 tool reads instead of re-deriving them. It may call `minir_hermes_session_search` to ground a claim.
 Its system block is composed dynamically from
-`memory.minir.adviser_mode.enabled`: severity, all 11 advice targets (definition + usage),
-the severity × target handling matrix, the nit-report table, and the language rule. When the mode
-is off, those sections are absent.
+`memory.minir.adviser_mode.enabled`: severity, every target in `prompting.ADVICE_TARGETS`
+(definition + usage), the severity × target handling matrix, the nit-report table, and the
+language rule. When the mode is off, those sections are absent.
 
 Delivery is one chain with one producer: the live reviewer writes advice, the guard filters it,
 the ledger stages it, and the hooks deliver it.

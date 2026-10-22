@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import importlib
 import json
+from pathlib import Path
 
 import pytest
 
@@ -223,6 +224,112 @@ def test_selection_is_empty_without_a_query_or_directory(knowledge, tmp_path):
     _seed(knowledge, tmp_path, count=2)
     assert knowledge.select_paths("", tmp_path) == []
     assert knowledge.select_paths("docker", tmp_path / "missing") == []
+
+
+def test_selection_scores_only_the_pages_ripgrep_returned(knowledge, monkeypatch, tmp_path):
+    _seed(knowledge, tmp_path, count=3)
+    calls = {}
+
+    def fake_search(pattern, root, **kwargs):
+        calls.update(pattern=pattern, root=root, **kwargs)
+        return [tmp_path / "tools" / "METHOD-Docker-cleanup-1.md"]
+
+    monkeypatch.setattr(knowledge.rgtool, "search", fake_search)
+    rows = knowledge.select_paths("docker cleanup", tmp_path, hermes_home="profile-home")
+
+    assert [row["topic"] for row in rows] == ["Docker cleanup 1"]
+    assert calls["root"] == tmp_path and calls["glob"] == "*.md"
+    assert calls["ignore_case"] is True
+    assert calls["hermes_home"] == "profile-home"
+    assert calls["pattern"] == "cleanup|docker"
+
+
+def test_selection_drops_hits_that_are_not_org_pages(knowledge, monkeypatch, tmp_path):
+    _seed(knowledge, tmp_path, count=1)
+    monkeypatch.setattr(knowledge.rgtool, "search", lambda *args, **kwargs: [
+        tmp_path / "_failed" / "page.md",
+        tmp_path / "tools" / "nested" / "page.md",
+        tmp_path / "loose.md"])
+    assert knowledge.select_paths("docker", tmp_path) == []
+
+
+def test_selection_scans_every_page_when_ripgrep_is_unavailable(knowledge, monkeypatch, tmp_path):
+    _seed(knowledge, tmp_path, count=2)
+    knowledge.write_unit(_unit(id="k9", topic="Postgres 备份", content="pg_dump nightly"),
+                         root=tmp_path)
+    monkeypatch.setattr(knowledge.rgtool, "search", lambda *args, **kwargs: None)
+
+    rows = knowledge.select_paths("docker", tmp_path, limit=6)
+    assert len(rows) == 3, "the org-folder scan keeps pages ripgrep could not pre-filter"
+
+
+def test_search_pages_returns_matches_and_front_matter(knowledge, tmp_path):
+    if knowledge.rgtool.find(str(tmp_path)) is None:
+        pytest.skip("ripgrep is not installed")
+    knowledge.write_unit(_unit(id="k1", topic="Docker prune"), root=tmp_path)
+
+    found = knowledge.search_pages("docker.*prune", tmp_path, hermes_home=str(tmp_path))
+
+    assert found["count"] == 1 and found["total"] == 1
+    row = found["results"][0]
+    assert (row["org"], row["category"], row["topic"]) == ("tools", "METHOD", "Docker prune")
+    assert row["relative"] == "tools/METHOD-Docker-prune.md"
+    assert Path(row["path"]).is_file()
+    assert row["revisions"] == 1 and row["summary"]
+    assert not row["matches"][0]["text"].lstrip().startswith("topic:"), "body lines come first"
+    assert any("system prune" in hit["text"] for hit in row["matches"])
+    assert row["matches"][0]["line"] >= 1
+
+
+def test_search_pages_filters_and_caps(knowledge, monkeypatch, tmp_path):
+    knowledge.write_unit(_unit(id="k1", topic="Docker cleanup"), root=tmp_path)
+    knowledge.write_unit(_unit(id="k2", org="entities", category="KNOWLEDGE",
+                               topic="Docker compose", content="docker compose up"),
+                         root=tmp_path)
+    hits = [
+        {"path": str(tmp_path / "tools" / "METHOD-Docker-cleanup.md"), "line": 9,
+         "text": "docker prune one"},
+        {"path": str(tmp_path / "tools" / "METHOD-Docker-cleanup.md"), "line": 10,
+         "text": "docker prune two"},
+        {"path": str(tmp_path / "tools" / "METHOD-Docker-cleanup.md"), "line": 11,
+         "text": "docker prune three"},
+        {"path": str(tmp_path / "entities" / "KNOWLEDGE-Docker-compose.md"), "line": 2,
+         "text": "docker compose up"},
+        {"path": str(tmp_path / "_failed" / "notes.md"), "line": 1, "text": "docker prune"},
+    ]
+    seen = {}
+
+    def fake_matches(pattern, root, **kwargs):
+        seen.update(kwargs)
+        return hits
+
+    monkeypatch.setattr(knowledge.rgtool, "matches", fake_matches)
+
+    everyone = knowledge.search_pages("docker", tmp_path, limit=5)
+    assert [row["org"] for row in everyone["results"]] == ["tools", "entities"]
+    assert len(everyone["results"][0]["matches"]) == 2, "per_page caps the quoted lines"
+    assert seen["ignore_case"] is True and seen["max_per_file"] == 12
+
+    only_entities = knowledge.search_pages("docker", tmp_path, org="entities")
+    assert [row["org"] for row in only_entities["results"]] == ["entities"]
+    only_knowledge = knowledge.search_pages("docker", tmp_path, category="knowledge")
+    assert [row["category"] for row in only_knowledge["results"]] == ["KNOWLEDGE"]
+
+    capped = knowledge.search_pages("docker", tmp_path, limit=1)
+    assert capped["count"] == 1 and capped["total"] == 2
+
+
+def test_search_pages_rejects_unknown_filters(knowledge, tmp_path):
+    with pytest.raises(ValueError):
+        knowledge.search_pages("docker", tmp_path, org="nope")
+    with pytest.raises(ValueError):
+        knowledge.search_pages("docker", tmp_path, category="NOPE")
+
+
+def test_search_pages_is_none_without_ripgrep(knowledge, monkeypatch, tmp_path):
+    (tmp_path / "tools").mkdir()
+    monkeypatch.setattr(knowledge.rgtool, "matches", lambda *args, **kwargs: None)
+    assert knowledge.search_pages("docker", tmp_path) is None
 
 
 def test_block_never_exceeds_its_cap(knowledge):

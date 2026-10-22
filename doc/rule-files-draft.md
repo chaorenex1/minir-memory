@@ -16,8 +16,10 @@
 | `rules/ai-identity.md` | AI 身份卡 13 字段与硬字段取证 | B2 全文；dialectic 与复盘读 REVIEW CHECKS |
 | `rules/markers-category.md` | 维度 A：K/V/I/M/G 覆盖范围、四态认识状态、10 对判定（带正反例）、3 条特殊规则、topic 与 unit 身份 | B3 全文 |
 | `rules/markers-org.md` | 维度 B：五种组织类型的核心问题与覆盖、选择顺序、category×org 组合示例、objects、relations | B3 全文 |
+| `rules/advice_target.md` | advice target 词表、准绳、判定类型、coverage 与知识引用 | `adviser:review` 全文 |
+| `rules/advice_judgment.md` | severity 上限、证据与发出门槛、去重、统计 | `adviser:review` 全文 |
 
-窗口摘要与知识页规则不进这 6 份。前者是 8 个字段的结构约定，跟着 B3 的 OUTPUT 走；后者是单层格式，跟着 knowledge_render 走。它们没有跨层复用的需要。
+窗口摘要与知识页规则不进这 8 份。前者是 8 个字段的结构约定，跟着 B3 的 OUTPUT 走；后者是单层格式，跟着 knowledge_render 走。它们没有跨层复用的需要。
 
 ## 2. 文件格式
 

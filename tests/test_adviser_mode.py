@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import importlib
 import sqlite3
 import time
 from pathlib import Path
@@ -654,3 +655,72 @@ def test_old_advisories_table_migrates_before_staged_reset(plugin_package, tmp_p
             "pending", "", 0, 0)
     finally:
         store.close()
+
+
+def test_unknown_check_target_is_refused_not_degraded(plugin_package):
+    dropped: dict[str, int] = {}
+    rows = plugin_package.adviser_mode.parse_review(json.dumps({
+        "action": "advise", "advices": [
+            {"severity": "concern", "target": "soul_typo_check", "text": "misspelt",
+             "evidence": ["#1"]},
+            {"severity": "concern", "target": "tool_choice", "text": "real",
+             "evidence": ["#1"]},
+        ]}), dropped=dropped)
+    assert [row["target"] for row in rows] == ["tool_choice"]
+    assert dropped == {"bad_target": 1}
+
+
+def test_coverage_is_parsed_only_for_consistency_targets(plugin_package):
+    parse = plugin_package.adviser_mode.parse_coverage
+    payload = json.dumps({"action": "silent", "coverage": {
+        "soul_craft_check": "found", "tool_choice": "clean", "user_preferences_check": "x"}})
+    assert parse(payload) == {"soul_craft_check": "found"}
+    assert parse(json.dumps({"coverage": ["bad"]})) == {"__malformed": "unknown"}
+    assert parse(json.dumps({"action": "silent"})) == {}
+
+
+def test_review_prompt_carries_rulers_stats_and_soul(plugin_package, make_provider):
+    provider = _mode_provider(make_provider)
+    provider._store.save_conclusion("base.user_peer_card", "- [style] terse answers",
+                                    key="user:default", subject="user:default")
+    provider._store.save_conclusion(
+        "base.ai_self_representation", "- [process] lead with the result",
+        key="session:session-test:agent", session_id="session-test")
+    Path(provider._hermes_home, "SOUL.md").write_text(
+        "# Craft\nNo em dashes in prose.\n", encoding="utf-8")
+
+    prompt = provider._adviser_mode._prompt(
+        "session-test", "t1", "tool", [{"kind": "user", "text": "ship it"}])
+
+    assert "<rulers>" in prompt and "lead with the result" in prompt
+    assert "terse answers" in prompt
+    assert "<soul_constraints>" in prompt and "No em dashes in prose." in prompt
+    assert "<target_stats>" in prompt and "TARGET STATS" in prompt
+
+
+def test_knowledge_citation_suffix_is_validated(plugin_package, make_provider):
+    provider = _mode_provider(make_provider)
+    knowledge = importlib.import_module(f"{plugin_package.__name__}.knowledge")
+    root = knowledge.knowledge_dir(provider._hermes_home)
+    root.mkdir(parents=True, exist_ok=True)
+    page = root / "note.md"
+    page.write_text("# note", encoding="utf-8")
+
+    notes, counts = provider._adviser_mode._validate_knowledge_refs([
+        {"content": f"use x，记忆引用:{page} {root / 'missing.md'} {page}"},
+        {"content": "plain"},
+    ])
+
+    assert notes[0]["content"] == f"use x，记忆引用:{page}"
+    assert counts == {"invalid knowledge ref": 1}
+    assert notes[1]["content"] == "plain"
+
+
+def test_consistency_targets_are_delivered_and_handled(plugin_package):
+    prompting = plugin_package.prompting
+    assert set(prompting.CONSISTENCY_TARGETS) <= set(prompting.DELIVERED_TARGETS)
+    for target in prompting.CONSISTENCY_TARGETS:
+        assert target in prompting.ADVICE_HANDLING["blocker"]
+        assert target in prompting.ADVICE_HANDLING["concern"]
+    # The existing seven columns and the five consistency columns are two tables.
+    assert prompting.advice_handling_section().count("| severity |") == 2

@@ -2,8 +2,9 @@
 
 A complete, dependency-free reference implementation of the ``MemoryProvider``
 contract (``agent/memory_provider.py``): explicit memories are conclusions in a per-profile
-SQLite database, recall is a keyword search over them, and six tools let the model search,
-remember, forget, keep a todo list, inspect the store, and run a named custom agent.
+SQLite database, recall is a keyword search over them, and seven tools let the model search the
+store, search the knowledge pages, remember, forget, keep a todo list, inspect the store, and run a
+named custom agent.
 
 **The conversation is an append-only event store, not a database table.** The layers read the host's
 own ``state.db`` (plus an in-memory buffer for uncommitted turns) and persist what they *derived*
@@ -71,6 +72,7 @@ from . import session_summary
 from . import tools as plugin_tools
 from .adviser_mode import AdviserMode
 from .prompting import (
+    CONSISTENCY_TARGETS,
     advice_handling_section,
     advice_language_line,
     advice_nit_report_section,
@@ -79,7 +81,8 @@ from .prompting import (
     craft_rules_section,
     marker_glossary,
 )
-from .store import CONCLUSION_KINDS, MinirStore, format_when
+from .store import (CONCLUSION_KINDS, MinirStore, SessionScopeError, format_when,
+                    is_session_bound)
 # The same stored-text bound the store truncates at: a longer todo payload must be refused
 # rather than silently cut into invalid JSON.
 from .store import _MAX_CONTENT as _MAX_CONCLUSION_CHARS
@@ -573,7 +576,8 @@ class MinirMemoryProvider(MemoryProvider):
         try:
             rows = knowledge.select_paths(
                 query, knowledge.knowledge_dir(self._hermes_home), limit=6, max_chars=700,
-                recent=[path for turn in self._recent_knowledge for path in turn])
+                recent=[path for turn in self._recent_knowledge for path in turn],
+                hermes_home=self._hermes_home)
         except Exception as exc:
             logger.debug("Minir knowledge selection failed: %s", exc)
             return "", 0
@@ -609,15 +613,16 @@ class MinirMemoryProvider(MemoryProvider):
             f"{marker_glossary(bullet='- ')}\n"
             "\nTOOLS\n"
             "- minir_search: look up prior decisions, preferences, projects and conclusions. It "
-            "searches the current session by default; scope=\"all\" searches every session. "
-            "Search before asking the user to repeat history.\n"
+            "searches the current session by default; scope=\"all\" searches every session but "
+            "not the session-bound base kinds; limit is capped at 20. Search before asking the "
+            "user to repeat history.\n"
             "- minir_remember: record one durable item under a kind (note, entities, "
             "trajectories, experiences, tools, projects, todo) with its content. Store what "
             "should outlive this turn, not transient state, and never store secrets or "
             "credentials.\n"
             "- minir_forget: delete one stored conclusion by conclusions_id and kind.\n"
             "- minir_todo: replace this session's todo list; it is rendered into the final "
-            "answer and summarised in the next turn's recall.\n"
+            "answer and carried by every prefetch block for the session.\n"
             "- minir_stats: inspect the store and the published layer artifacts.\n"
             "\nWORKFLOW\n"
             "1. Search before asking the user to repeat history.\n"
@@ -1630,9 +1635,18 @@ class MinirMemoryProvider(MemoryProvider):
                     return tool_error(
                         f"type must be one of: {', '.join(CONCLUSION_KINDS)}")
                 kinds = frozenset({kind_filter})
-            rows = self._search(query, limit=args.get("limit"),
-                                session_id=str(args.get("session_id") or self._session_id),
-                                scope=scope, kinds=kinds)
+            explicit_session = str(args.get("session_id") or "").strip()
+            session_id = explicit_session or str(self._session_id or "")
+            # A session-bound kind must not fall back to the provider's current session when
+            # the caller named none: that would silently read another conversation's ruler.
+            # The empty id reaches store.search, which raises session_scope_required.
+            if kinds and is_session_bound(kinds) and not explicit_session:
+                session_id = ""
+            try:
+                rows = self._search(query, limit=args.get("limit"),
+                                    session_id=session_id, scope=scope, kinds=kinds)
+            except SessionScopeError as exc:
+                return tool_error(str(exc))
             results = [{
                 "conclusions_id": row["conclusions_id"],
                 "kind": row["kind"],
@@ -1646,6 +1660,27 @@ class MinirMemoryProvider(MemoryProvider):
                 "rank": row.get("rank") or 0.0,
             } for row in rows]
             return json.dumps({"count": len(rows), "scope": scope, "results": results})
+        if tool_name == "minir_kb_search":
+            pattern = str(args.get("query") or "").strip()
+            if not pattern:
+                return tool_error("query is required")
+            try:
+                limit = int(args.get("limit") or knowledge.DEFAULT_SEARCH_LIMIT)
+            except (TypeError, ValueError):
+                return tool_error("limit must be an integer")
+            try:
+                payload = knowledge.search_pages(
+                    pattern, knowledge.knowledge_dir(self._hermes_home),
+                    org=str(args.get("org") or "").strip(),
+                    category=str(args.get("category") or "").strip(),
+                    limit=max(1, min(limit, 25)), hermes_home=self._hermes_home)
+            except ValueError as exc:
+                return tool_error(str(exc))
+            if payload is None:
+                return tool_error("minir_kb_search needs ripgrep; it is not installed or it "
+                                  "refused the pattern (Rust regex: no lookaround, no "
+                                  "backreferences)")
+            return json.dumps(payload)
         if tool_name == "minir_remember":
             kind = str(args.get("type") or "").strip()
             if not kind:
@@ -1688,6 +1723,10 @@ class MinirMemoryProvider(MemoryProvider):
                                    "usage": (self._adviser_mode.usage_stats(self._session_id)
                                              if self._adviser_mode else {}),
                                },
+                               "targets": self._store.review_stats(
+                                   self._session_id,
+                                   window=self._review_stats_window(),
+                                   targets=CONSISTENCY_TARGETS),
                                "artifacts": self._store.all_layer_states(),
                                "transcript": self._transcript.stats(),
                                "buffered_messages": len(self._transcript.messages(self._session_id)),
@@ -1702,6 +1741,16 @@ class MinirMemoryProvider(MemoryProvider):
         return tool_error(f"Unknown tool: {tool_name}")
 
     # -- three-day card review ------------------------------------------------
+
+    def _review_stats_window(self) -> int:
+        """The review-statistics window; the provider may be built without adviser config."""
+        section = self._config.get("adviser_mode")
+        if not isinstance(section, dict):
+            return 8
+        try:
+            return max(1, min(int(section.get("review_stats_window") or 8), 50))
+        except (TypeError, ValueError):
+            return 8
 
     def _run_card_review(self, since: float) -> list[int]:
         """Run one global card review; the scheduler owns its anchor and retries."""

@@ -8,6 +8,8 @@ import sys
 import time
 import types
 
+import pytest
+
 
 def _no_model_call(*args, **kwargs):
     """Poisons the layer model call: any test that reaches it fails loudly."""
@@ -275,6 +277,7 @@ def test_tools_roundtrip(provider):
                          "conclusions_id": str(conclusions_id)}))["deleted"] is False
     stats = json.loads(provider.handle_tool_call("minir_stats", {}))
     assert "notes" not in stats and "markers" not in stats and "db_path" in stats
+    assert len(stats["targets"]) == 5, "one row per consistency target"
     assert stats["conclusions_by_kind"] == {}, "every row of this session is gone"
 
 
@@ -317,6 +320,50 @@ def test_tool_argument_validation(provider):
         "minir_forget", {"type": "nonsense", "conclusions_id": 1}))
     assert "error" in json.loads(provider.handle_tool_call(
         "minir_search", {"query": "x", "type": "nonsense"}))
+
+
+def test_kb_search_answers_from_the_knowledge_directory(provider, plugin_package):
+    root = plugin_package.knowledge.knowledge_dir(provider._hermes_home)
+    plugin_package.knowledge.write_unit(
+        {"id": "u1", "org": "tools", "category": "METHOD", "topic": "Docker prune",
+         "content": "docker system prune -af", "time": "2026-10-21", "relations": [],
+         "objects": ["tools:Docker"]}, root=root)
+    if plugin_package.knowledge.rgtool.find(provider._hermes_home) is None:
+        pytest.skip("ripgrep is not installed")
+
+    payload = json.loads(provider.handle_tool_call("minir_kb_search",
+                                                   {"query": "docker.*prune"}))
+
+    assert payload["count"] == 1 and payload["total"] == 1
+    assert payload["root"] == str(root)
+    row = payload["results"][0]
+    assert (row["org"], row["category"], row["topic"]) == ("tools", "METHOD", "Docker prune")
+    assert row["path"].endswith("METHOD-Docker-prune.md")
+    assert not row["matches"][0]["text"].startswith("topic:"), "body lines are quoted first"
+    assert any("system prune" in hit["text"] for hit in row["matches"])
+
+
+def test_kb_search_rejects_bad_arguments_and_never_leaves_the_root(provider, plugin_package,
+                                                                  monkeypatch):
+    assert "error" in json.loads(provider.handle_tool_call("minir_kb_search", {"query": " "}))
+    assert "error" in json.loads(provider.handle_tool_call(
+        "minir_kb_search", {"query": "x", "org": "nope"}))
+    assert "error" in json.loads(provider.handle_tool_call(
+        "minir_kb_search", {"query": "x", "category": "NOPE"}))
+    assert "error" in json.loads(provider.handle_tool_call(
+        "minir_kb_search", {"query": "x", "limit": "lots"}))
+
+    root = plugin_package.knowledge.knowledge_dir(provider._hermes_home)
+    root.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setattr(plugin_package.knowledge.rgtool, "matches", lambda *args, **kwargs: [
+        {"path": str(root.parent / "outside.md"), "line": 1, "text": "docker"},
+        {"path": str(root / "loose.md"), "line": 1, "text": "docker"}])
+    payload = json.loads(provider.handle_tool_call("minir_kb_search", {"query": "docker"}))
+    assert payload["count"] == 0, "only <org>/<page>.md inside the knowledge root is a page"
+
+    monkeypatch.setattr(plugin_package.knowledge.rgtool, "matches",
+                        lambda *args, **kwargs: None)
+    assert "error" in json.loads(provider.handle_tool_call("minir_kb_search", {"query": "x"}))
 
 
 def test_search_scope_all_crosses_sessions(provider):
@@ -1046,8 +1093,9 @@ def test_prefetch_does_not_inject_any_base_artifact(provider):
     payload = json.loads(provider.handle_tool_call("minir_search", {"query": "zebraword"}))
     kinds = {row["kind"] for row in payload["results"]}
     assert {"base.user_representation", "base.user_peer_card",
-            "base.ai_self_representation", "base.value_markers"} <= kinds, \
-        "minir_search still exposes the base conclusions"
+            "base.value_markers"} <= kinds, "minir_search still exposes the base conclusions"
+    assert "base.ai_self_representation" not in kinds, (
+        "the AI self representation is session-bound and must not leak into a durable search")
 
 
 def test_system_prompt_block_gates_adviser_sections(plugin_package, make_provider):

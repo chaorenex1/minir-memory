@@ -174,7 +174,7 @@
 | 知识渲染 | `knowledge_render` | 把标记写成主题页的 pass。会话收尾时批量读整场会话；`agents/knowledge_render.md` 是当前唯一资产。 | `agents/knowledge_render.md` |
 | 知识管道 | `KnowledgePipeline` | 每 profile 一个守护线程 + 有界队列；发布不等页面。 | `knowledge.py` |
 | 路径块 | path block | `[knowledge — retrieve on demand]` 到 `[end knowledge]`，只有路径与摘要。 | `knowledge.render_paths_block` |
-| 路径选择 | `select_paths` | 按 front-matter 选最多 6 条、700 字符。 | `knowledge.select_paths` |
+| 路径选择 | `select_paths` | 先用 `rg` 收窄候选页（`facts.json` 定位二进制），再按 front-matter 选最多 6 条、700 字符；无 `rg` 时退回目录扫描。 | `knowledge.select_paths` / `rgtool.search` |
 | 阶段号 | “stage P6” `[草案]` | 模块 docstring 的说法；仓库没有 P1–P5 的定义。 | `knowledge.py` docstring |
 
 ## 7. 会话收尾

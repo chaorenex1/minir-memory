@@ -11,8 +11,11 @@ need?" without reading them. It is stage P6 of the layer pipeline and deliberate
   over-budget body is retried once with its oldest evidence lines dropped; still over means the
   write fails, the previous file stays intact and the failure lands in ``_failed/``. Shortening
   a page silently would turn a budget breach into a page that looks complete.
-* **Front-matter is the index.** :func:`select_paths` reads only the head of each file, so a turn
-  pays for metadata, not for every page body. There is no index database and no embedding model.
+* **ripgrep finds, front-matter scores.** :func:`select_paths` asks the host's managed ``rg``
+  (see :mod:`minir.rgtool`) which pages mention a query term and reads only those heads, so a
+  turn pays for metadata, not for every page body. A host without ripgrep keeps the org-folder
+  scan; either way the score comes from the front-matter, never from the hit. There is no index
+  database and no embedding model.
 * **Production is off the hot path.** :class:`KnowledgePipeline` owns one daemon thread and one
   bounded queue per profile; a base publish never waits for a page, and a failed render is logged
   and counted, never raised into the caller that published the artifact.
@@ -37,6 +40,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Iterable, Mapping, Optional, Sequence
 
+from . import rgtool
 from .layers import CATEGORIES, ORGS
 from .rules import estimate_tokens
 
@@ -50,6 +54,8 @@ SLUG_MAX = 60
 DEFAULT_BUDGET = 2000
 DEFAULT_LIMIT = 6
 DEFAULT_MAX_CHARS = 700
+DEFAULT_SEARCH_LIMIT = 8
+MATCH_PREVIEW = 240
 MAX_BLOCK_CHARS = 700
 QUEUE_MAX = 512
 RECENCY_DAYS = 30.0
@@ -616,14 +622,57 @@ def _recent_keys(recent: Iterable[Any]) -> set[str]:
     return keys
 
 
+def _scan_pages(directory: Path) -> list[Path]:
+    """Every page under a known org: the superset used when ripgrep cannot run."""
+    pages: list[Path] = []
+    for org in ORGS:
+        try:
+            pages.extend(sorted((directory / org).glob("*.md")))
+        except OSError:  # an unreadable org directory must not empty the whole index
+            continue
+    return pages
+
+
+def _candidate_pages(directory: Path, terms: set[str], hermes_home: Any) -> list[Path]:
+    """Pages worth scoring: ripgrep's term hits, or every page when ripgrep cannot run.
+
+    The pattern is the same term set the scorer uses, escaped and OR-joined, so ripgrep can only
+    narrow what the score would accept: a page carrying an object hit or a topic/summary overlap
+    already contains that text. ``None`` from :func:`minir.rgtool.search` means no binary, an
+    error exit or a timeout, and then :func:`_scan_pages` returns the superset instead — the
+    selection must not go blind because a tool directory moved.
+
+    Only ``<org>/<page>.md`` under a known org is a page: ripgrep also reports anything else a
+    stray ``*.md`` under the root matches, and those are not part of the index.
+    """
+    pattern = "|".join(re.escape(term)
+                       for term in sorted(terms, key=lambda term: (-len(term), term)))
+    hits = rgtool.search(pattern, directory, glob="*.md", ignore_case=True,
+                         hermes_home=hermes_home)
+    if hits is None:
+        return _scan_pages(directory)
+    pages: list[Path] = []
+    for hit in hits:
+        path = hit if hit.is_absolute() else directory / hit
+        try:
+            relative = path.relative_to(directory)
+        except ValueError:
+            continue
+        if len(relative.parts) == 2 and relative.parts[0] in ORGS:
+            pages.append(path)
+    return pages
+
+
 def select_paths(query: str, knowledge_dir: Any, limit: int = DEFAULT_LIMIT,
                  max_chars: int = DEFAULT_MAX_CHARS,
-                 recent: Sequence[Any] = ()) -> list[dict[str, Any]]:
+                 recent: Sequence[Any] = (), hermes_home: Any = "") -> list[dict[str, Any]]:
     """Rank knowledge pages for one query, reading front-matter only.
 
     Score is exactly ``2 * objects_hit + 1 * word_overlap + 0.5 * recency``: an object named in
     the query is the strongest signal, a topic/summary word overlap the next, and freshness only
-    breaks ties. Paths in ``recent`` were already delivered; they keep their score but sort after
+    breaks ties. The candidates come from the host's ``rg`` (``hermes_home`` locates its tool
+    store) and are scored on their front-matter; without ``rg`` every page under a known org is
+    a candidate. Paths in ``recent`` were already delivered; they keep their score but sort after
     everything else, which lets the caller implement the "do not repeat three turns running" rule
     without hiding pages permanently. The selection also stops before the rendered block would
     exceed ``max_chars``, so a turn never gets a pointer list it cannot afford.
@@ -639,40 +688,32 @@ def select_paths(query: str, knowledge_dir: Any, limit: int = DEFAULT_LIMIT,
     current = datetime.now(timezone.utc).timestamp()
     scored: list[tuple[float, bool, float, str, dict[str, Any]]] = []
 
-    for org in ORGS:
-        folder = directory / org
-        if not folder.is_dir():
+    for path in _candidate_pages(directory, terms, hermes_home):
+        meta = read_front_matter(path)
+        if not meta:
             continue
-        try:
-            pages = sorted(folder.glob("*.md"))
-        except OSError:
+        category = str(meta.get("category") or "").strip().upper()
+        if category not in CATEGORIES:
             continue
-        for path in pages:
-            meta = read_front_matter(path)
-            if not meta:
-                continue
-            category = str(meta.get("category") or "").strip().upper()
-            if category not in CATEGORIES:
-                continue
-            topic = str(meta.get("topic") or "").strip()
-            if not topic:
-                continue
-            relative = path.relative_to(directory).as_posix()
-            hits = 0
-            for item in _as_list(meta.get("objects")):
-                name = str(item).partition(":")[2].strip() or str(item).strip()
-                if len(name) >= 2 and name.casefold() in query_folded:
-                    hits += 1
-            overlap = len(terms & _terms(f"{topic} {meta.get('summary') or ''}"))
-            freshness = _recency(meta.get("updated_at"), now=current)
-            # Quantize so a few milliseconds of clock drift cannot outrank the recent-path
-            # demotion: freshness is a tie-breaker, not a second relevance signal.
-            score = round(2.0 * hits + 1.0 * overlap + 0.5 * freshness, 3)
-            stamp = _parse_time(meta.get("updated_at"))
-            row = {"category": category, "org": org, "topic": topic,
-                   "path": relative, "updated_at": str(meta.get("updated_at") or "")}
-            scored.append((score, relative.casefold() in recall or Path(relative).name.casefold()
-                           in recall, stamp.timestamp() if stamp else 0.0, relative, row))
+        topic = str(meta.get("topic") or "").strip()
+        if not topic:
+            continue
+        relative = path.relative_to(directory).as_posix()
+        hits = 0
+        for item in _as_list(meta.get("objects")):
+            name = str(item).partition(":")[2].strip() or str(item).strip()
+            if len(name) >= 2 and name.casefold() in query_folded:
+                hits += 1
+        overlap = len(terms & _terms(f"{topic} {meta.get('summary') or ''}"))
+        freshness = _recency(meta.get("updated_at"), now=current)
+        # Quantize so a few milliseconds of clock drift cannot outrank the recent-path
+        # demotion: freshness is a tie-breaker, not a second relevance signal.
+        score = round(2.0 * hits + 1.0 * overlap + 0.5 * freshness, 3)
+        stamp = _parse_time(meta.get("updated_at"))
+        row = {"category": category, "org": relative.split("/")[0], "topic": topic,
+               "path": relative, "updated_at": str(meta.get("updated_at") or "")}
+        scored.append((score, relative.casefold() in recall or Path(relative).name.casefold()
+                       in recall, stamp.timestamp() if stamp else 0.0, relative, row))
 
     scored.sort(key=lambda entry: (-entry[0], entry[1], -entry[2], entry[3]))
     selected: list[dict[str, Any]] = []
@@ -686,6 +727,105 @@ def select_paths(query: str, knowledge_dir: Any, limit: int = DEFAULT_LIMIT,
         selected.append(row)
         used += cost
     return selected
+
+
+def _body_start(path: Path) -> int:
+    """1-based number of the first body line; 1 when the file has no complete front-matter.
+
+    The result rows quote body lines before front-matter lines, because the front-matter fields
+    already travel as ``topic``/``summary``/``updated_at``; without this a page whose topic and
+    objects match would spend its whole snippet budget on metadata.
+    """
+    try:
+        lines = path.read_text(encoding="utf-8-sig", errors="replace").splitlines()
+    except OSError:
+        return 1
+    if not lines or lines[0].strip() != "---":
+        return 1
+    end = next((index for index, line in enumerate(lines[1:], 1) if line.strip() == "---"), None)
+    return 1 if end is None else end + 2
+
+
+def _page_row(path: Path, relative: str, category: str) -> Optional[dict[str, Any]]:
+    """One search result from a page's front-matter; ``None`` when it is not an index page."""
+    meta = read_front_matter(path)
+    if not meta:
+        return None
+    page_category = str(meta.get("category") or "").strip().upper()
+    if page_category not in CATEGORIES or (category and page_category != category):
+        return None
+    topic = str(meta.get("topic") or "").strip()
+    if not topic:
+        return None
+    return {"path": str(path), "relative": relative, "org": relative.split("/")[0],
+            "category": page_category, "topic": topic,
+            "summary": str(meta.get("summary") or ""), "revisions": _revisions(meta),
+            "updated_at": str(meta.get("updated_at") or ""), "matches": []}
+
+
+def search_pages(pattern: str, knowledge_dir: Any, *, org: str = "", category: str = "",
+                 limit: int = DEFAULT_SEARCH_LIMIT, per_page: int = 2,
+                 hermes_home: Any = "") -> Optional[dict[str, Any]]:
+    """Pages whose text matches *pattern*, with the matched lines; ``None`` without ripgrep.
+
+    :func:`select_paths` only hints at pages for one turn; this is the explicit lookup behind the
+    ``minir_kb_search`` tool, so the pattern is the caller's own instead of a term set derived
+    from a prompt. Scope and page rules are the selector's: an ``<org>/<page>.md`` under
+    :data:`ORGS` with a known category and a topic. ``org``/``category`` filter front-matter,
+    ``per_page`` caps the lines quoted from one page (body lines first, since the front-matter
+    already travels as fields; a page that matches only in its front-matter still shows that
+    line), and ``total`` counts every matching page before ``limit`` — a caller seeing
+    ``total > count`` should narrow the pattern rather than raise the limit.
+
+    ``None`` means ripgrep is missing or refused the pattern (Rust regex syntax, so no lookaround
+    or backreferences). A bad ``org`` or ``category`` raises ``ValueError``: that is a caller
+    mistake with a fix the model can apply.
+    """
+    if org and org not in ORGS:
+        raise ValueError(f"org must be one of: {', '.join(ORGS)}")
+    wanted = str(category or "").strip().upper()
+    if wanted and wanted not in CATEGORIES:
+        raise ValueError(f"category must be one of: {', '.join(CATEGORIES)}")
+    directory = Path(knowledge_dir)
+    found: dict[str, Any] = {"root": str(directory), "count": 0, "total": 0, "results": []}
+    if not directory.is_dir():
+        return found
+    hits = rgtool.matches(pattern, directory, glob="*.md", ignore_case=True,
+                          max_per_file=max(per_page * 4, 12), hermes_home=hermes_home)
+    if hits is None:
+        return None
+    grouped: dict[str, list[dict[str, Any]]] = {}
+    order: list[str] = []
+    for hit in hits:
+        path = Path(hit["path"])
+        try:
+            relative = path.relative_to(directory)
+        except ValueError:
+            continue
+        if len(relative.parts) != 2 or relative.parts[0] not in ORGS:
+            continue
+        if org and relative.parts[0] != org:
+            continue
+        key = relative.as_posix()
+        if key not in grouped:
+            grouped[key] = []
+            order.append(key)
+        grouped[key].append(hit)
+    pages: list[dict[str, Any]] = []
+    for key in order:
+        path = directory / key
+        row = _page_row(path, key, wanted)
+        if row is None:
+            continue
+        body_start = _body_start(path)
+        quoted = [hit for hit in grouped[key] if int(hit["line"]) >= body_start]
+        row["matches"] = [{"line": int(hit["line"]),
+                           "text": str(hit["text"])[:MATCH_PREVIEW]}
+                          for hit in (quoted or grouped[key])[:per_page]]
+        pages.append(row)
+    found.update(count=len(pages[:max(1, limit)]), total=len(pages),
+                 results=pages[:max(1, limit)])
+    return found
 
 
 def render_paths_block(rows: Sequence[Mapping[str, Any]]) -> str:

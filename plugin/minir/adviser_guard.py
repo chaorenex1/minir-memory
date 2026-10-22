@@ -133,18 +133,19 @@ class EmissionGuard:
             severity = str(note.get("severity") or "concern").strip().lower()
             if severity not in SEVERITY_RANK:
                 severity = "concern"
+            target = str(note.get("target") or "").strip().lower()
             if not key:
-                self._drop(verdict, index, "empty", key)
+                self._drop(verdict, index, "empty", key, target)
                 continue
             if is_noise(content):
-                self._drop(verdict, index, "noise", key)
+                self._drop(verdict, index, "noise", key, target)
                 continue
             previous = prior.get(key) or self.seen(key)
             if previous is not None and severity_rank(severity) <= severity_rank(previous):
-                self._drop(verdict, index, "duplicate", key)
+                self._drop(verdict, index, "duplicate", key, target)
                 continue
             if severity != "blocker" and non_blockers >= limit:
-                self._drop(verdict, index, "rate-limit", key)
+                self._drop(verdict, index, "rate-limit", key, target)
                 continue
             accepted = dict(note)
             accepted["content"] = content
@@ -158,6 +159,13 @@ class EmissionGuard:
         return verdict
 
     @staticmethod
-    def _drop(verdict: GuardVerdict, index: int, reason: str, key: str) -> None:
-        verdict.dropped[reason] = verdict.count(reason) + 1
-        verdict.detail.append({"index": index, "reason": reason, "key": key[:80]})
+    def _drop(verdict: GuardVerdict, index: int, reason: str, key: str,
+              target: str = "") -> None:
+        # The aggregate key carries the target so the statistics block can tell which target
+        # recurred; the detail row keeps the bare reason for the audit trail.
+        bucket = f"{reason}/{target}" if target else reason
+        verdict.dropped[bucket] = verdict.dropped.get(bucket, 0) + 1
+        entry = {"index": index, "reason": reason, "key": key[:80]}
+        if target:
+            entry["target"] = target
+        verdict.detail.append(entry)

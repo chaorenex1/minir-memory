@@ -161,9 +161,9 @@ def test_noise_only_review_is_silent_and_records_drop_reason(
     review = provider._store.adviser_reviews("session-test")[0]
     assert review["status"] == "silent"
     assert review["notes_dropped"] == 1
-    assert json.loads(review["drop_detail"]) == {"noise": 1}
+    assert json.loads(review["drop_detail"]) == {"noise/tool_choice": 1}
     stats = provider._store.adviser_mode_stats("session-test")
-    assert stats["dropped"] == {"noise": 1}
+    assert stats["dropped"] == {"noise/tool_choice": 1}
 
 
 def test_repeat_across_reviews_is_dropped(plugin_package, make_provider, monkeypatch):
@@ -178,7 +178,7 @@ def test_repeat_across_reviews_is_dropped(plugin_package, make_provider, monkeyp
     rows = provider._store.pending_advisories("session-test", source="adviser_mode")
     assert len(rows) == 1
     assert json.loads(provider._store.adviser_reviews("session-test")[0]["drop_detail"]) == {
-        "duplicate": 1}
+        "duplicate/tool_choice": 1}
 
 
 # -- gates --------------------------------------------------------------------

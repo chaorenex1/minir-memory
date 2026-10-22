@@ -24,6 +24,7 @@ RESERVED_LABELS: frozenset[str] = frozenset({
     "first_user_message",
     "focus_topic",
     "initial_draft",
+    "knowledge_index",
     "live_turn_events",
     "long_term_context",
     "operator_identity",
@@ -35,9 +36,12 @@ RESERVED_LABELS: frozenset[str] = frozenset({
     "previous_user_cards",
     "previous_value_markers",
     "provider_memory_context",
+    "rulers",
     "self_audit_correction",
     "session_handoff",
     "session_summary",
+    "soul_constraints",
+    "target_stats",
     "token_usage",
     "user_cards_this_window",
     "value_markers",
@@ -76,6 +80,18 @@ def marker_section(*, heading: str = "VALUE MARKERS — DEFINITIONS",
 # Advice targets, shared by every producer and consumer of advice. ``usage`` is what the
 # receiving agent should do with that target; keeping it beside the definition prevents the
 # system block and the reviewer prompt from drifting apart.
+#
+# The five consistency targets are flat: there is no ``soul`` parent, and each one owns a
+# disjoint ruler (the user preference card, the AI self representation, one group of SOUL
+# sections). One advice carries exactly one target token.
+CONSISTENCY_TARGETS: tuple[str, ...] = (
+    "user_preferences_check",
+    "ai_self_representation_check",
+    "soul_tool_policy_check",
+    "soul_workflow_check",
+    "soul_craft_check",
+)
+
 ADVICE_TARGETS: tuple[tuple[str, str, str], ...] = (
     ("tool_choice", "the tool or arguments the turn is using",
      "blocker -> do not execute; re-check name, args, scope, permissions. "
@@ -97,17 +113,34 @@ ADVICE_TARGETS: tuple[tuple[str, str, str], ...] = (
     ("code_economy", "the amount or structure of code being added",
      "blocker -> do not add; reuse the existing capability. concern -> check git, the license, "
      "the framework, or the stdlib first; justify or drop. nit -> optional."),
+    ("user_preferences_check", "the session against the user preference card",
+     "blocker -> a safety or process preference was breached and the action is out; stop, "
+     "report. concern -> correct the expression now. nit -> optional."),
+    ("ai_self_representation_check", "the session against its own published self representation",
+     "blocker -> the completion claim is false; do not send, verify now. concern -> recalibrate "
+     "now. nit -> optional."),
+    ("soul_tool_policy_check", "the session against SOUL Precedence and Boundaries plus the "
+     "dispatch skill's Tool policy",
+     "blocker -> stop; report; do not restate sensitive content. concern -> correct the "
+     "procedure now. no nit."),
+    ("soul_workflow_check", "the session against SOUL Delivery contract and Critical plus the "
+     "dispatch skill's Workflow and Verification",
+     "blocker -> stop; report; do not restate sensitive content. concern -> correct the step "
+     "now. no nit."),
+    ("soul_craft_check", "the session against the dispatch skill's Craft",
+     "concern -> correct the code economy now. nit -> fold at the next boundary. no blocker."),
 )
 
 ACTION_TARGETS: tuple[str, ...] = (
     "tool_choice", "current_step", "final_answer", "user_intent", "general")
 ARTIFACT_TARGETS: tuple[str, ...] = ("output_surface", "code_economy")
-DELIVERED_TARGETS: tuple[str, ...] = (*ACTION_TARGETS, *ARTIFACT_TARGETS)
+DELIVERED_TARGETS: tuple[str, ...] = (*ACTION_TARGETS, *ARTIFACT_TARGETS, *CONSISTENCY_TARGETS)
 
 # Ordered groups for the system block.
 ADVICE_TARGET_GROUPS: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("Action targets:", ACTION_TARGETS),
     ("Artifact targets:", ARTIFACT_TARGETS),
+    ("Consistency targets:", CONSISTENCY_TARGETS),
 )
 
 ADVICE_SEVERITIES: tuple[tuple[str, str], ...] = (
@@ -130,6 +163,11 @@ ADVICE_HANDLING: dict[str, dict[str, str]] = {
         "general": "stop; verify",
         "output_surface": "do not send; cut or rewrite the cited element",
         "code_economy": "do not add; reuse the existing capability",
+        "user_preferences_check": "stop; report; do not continue",
+        "ai_self_representation_check": "do not send; verify now",
+        "soul_tool_policy_check": "stop; report; do not restate sensitive content",
+        "soul_workflow_check": "stop; report; do not restate sensitive content",
+        "soul_craft_check": "no blocker; surface stays at nit",
     },
     "concern": {
         "tool_choice": "verify before executing",
@@ -139,6 +177,11 @@ ADVICE_HANDLING: dict[str, dict[str, str]] = {
         "general": "decide",
         "output_surface": "check the craft rules; adjust only if honesty or clarity changes",
         "code_economy": "check git, the license, the framework, or the stdlib first; justify or drop",
+        "user_preferences_check": "correct the expression now",
+        "ai_self_representation_check": "recalibrate now",
+        "soul_tool_policy_check": "correct the procedure now",
+        "soul_workflow_check": "correct the step now",
+        "soul_craft_check": "correct the code economy now",
     },
     "nit": {target: "fold or ignore" for target in DELIVERED_TARGETS},
 }
@@ -188,8 +231,7 @@ def advice_severity_section(*, heading: str = "ADVICE SEVERITY") -> str:
                                      for name, meaning in ADVICE_SEVERITIES)
 
 
-def advice_handling_section(*, heading: str = "ADVICE HANDLING") -> str:
-    targets = DELIVERED_TARGETS
+def _handling_table(targets: tuple[str, ...]) -> list[str]:
     header = "| severity | " + " | ".join(targets) + " |"
     rule = "|" + "---|" * (len(targets) + 1)
     rows = [
@@ -197,7 +239,18 @@ def advice_handling_section(*, heading: str = "ADVICE HANDLING") -> str:
                                        for target in targets]]) + " |"
         for severity, _ in ADVICE_SEVERITIES
     ]
-    return "\n".join([heading, header, rule, *rows])
+    return [header, rule, *rows]
+
+
+def advice_handling_section(*, heading: str = "ADVICE HANDLING") -> str:
+    """The disposition matrix, split so twelve long target names stay readable.
+
+    Every delivered target still has a blocker and a concern cell in ``ADVICE_HANDLING``;
+    the nit row is generated for all of them. The consistency group gets its own table.
+    """
+    parts = [heading, *_handling_table((*ACTION_TARGETS, *ARTIFACT_TARGETS)),
+             "", "Consistency targets:", *_handling_table(CONSISTENCY_TARGETS)]
+    return "\n".join(parts)
 
 
 def advice_nit_report_section(*, heading: str = "NIT REPORTING") -> str:
