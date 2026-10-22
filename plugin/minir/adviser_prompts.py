@@ -107,6 +107,9 @@ MODE_REVIEW = (
     " \"text\":\"...\",\"decision\":\"...\",\"evidence\":[\"...\"],\n"
     " \"candidate_id\": 12}]}\n\n"
     "- candidate_id is optional; include it when the advice came from a candidate.\n"
+    "- deferred: true holds this note for the end-of-turn aggregate instead of a mid-turn\n"
+    "  channel. Use it when the note matters but not before the turn finishes; never defer a\n"
+    "  blocker.\n"
     "- If you merge several candidates, cite their ids in evidence.\n"
     "- Write text and decision in the user's language; keep JSON keys, severity, and target "
     "tokens in English. Preserve code, paths, commands, identifiers, and quoted errors "
@@ -175,6 +178,23 @@ MAIN_CONSULT_SECTION = (
 def consult_prompt() -> str:
     """The shared core plus the synchronous output contract."""
     return f"{ADVISER_CORE}\n\n{MODE_CONSULT}"
+
+
+BOUNDARY_GUIDANCE = (
+    "Boundary check: pause and re-read the user's current goal. Does the last block of work "
+    "still serve it, or has the path drifted? Name any stale assumption before continuing; "
+    "do not restate the plan."
+)
+
+
+def boundary_guidance(turn: int, every: int = 50) -> str:
+    """The 50-turn boundary reminder; empty on every other turn."""
+    try:
+        step = max(1, int(every))
+        value = int(turn)
+    except (TypeError, ValueError):
+        return ""
+    return BOUNDARY_GUIDANCE if value > 0 and value % step == 0 else ""
 
 
 def review_prompt(*, severities: str = "", budget: str = "", targets: str = "") -> str:

@@ -120,7 +120,7 @@ def test_the_process_does_not_share_content_across_sessions(plugin_package):
 # -- persistence: the audit trail (§4.9) --------------------------------------
 
 CONTRACT_KEYS = {"session_id", "layer", "started_at", "updated_at", "model", "provider",
-                 "toolsets", "system_message", "messages"}
+                 "toolsets", "system_message", "messages", "usage"}
 
 
 def test_a_host_session_is_one_json_file_with_the_contract_keys(persisted):
@@ -139,6 +139,7 @@ def test_a_host_session_is_one_json_file_with_the_contract_keys(persisted):
     assert data["updated_at"] >= 10.0
     assert (data["model"], data["provider"], data["toolsets"], data["system_message"]) \
         == ("", "", [], "")
+    assert data["usage"] == {}
     assert [(row["role"], row["content"], row["author_id"]) for row in data["messages"]] \
         == [("user", "deploy it", "u-1"), ("assistant", "done", "")]
     assert not list(root.glob("*.tmp"))              # temp + os.replace leaves nothing behind
@@ -159,6 +160,21 @@ def test_a_plugin_layer_session_lands_under_its_layer_directory(persisted):
     assert (data["model"], data["provider"], data["toolsets"], data["system_message"]) \
         == ("aux-model", "deepseek", ["file", "web"], "be blunt")
     assert data["messages"] == [{"role": "assistant", "content": "critique"}]
+    assert data["usage"] == {}
+
+
+def test_plugin_layer_usage_is_persisted_with_the_snapshot(persisted):
+    make, root = persisted
+    buffer = make()
+
+    buffer.record_aux("adviser", "session-1--quality", [{"role": "user", "content": "q"}],
+                      model="aux-model", usage={"total_tokens": 1234,
+                                                 "estimated_cost_usd": 0.0042})
+    assert buffer.flush_aux("adviser", "session-1--quality") is True
+
+    data = json.loads((root / "adviser" / "session-1--quality.json")
+                      .read_text(encoding="utf-8"))
+    assert data["usage"] == {"total_tokens": 1234, "estimated_cost_usd": 0.0042}
 
 
 def test_flush_aux_waits_for_one_custom_agent_snapshot(persisted):

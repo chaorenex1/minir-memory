@@ -67,9 +67,9 @@ def test_the_provider_and_the_toolset_share_one_schema_source(provider, plugin_p
 
 
 def test_agent_toolsets_always_carry_the_plugin_surfaces(plugin_package):
-    assert plugin_package.plugin_tools.agent_toolsets(["file"]) == ["file", "minir", "adviser"]
-    assert plugin_package.plugin_tools.agent_toolsets(None) == ["file", "minir", "adviser"]
-    assert plugin_package.plugin_tools.agent_toolsets("web") == ["web", "file", "minir", "adviser"]
+    assert plugin_package.plugin_tools.agent_toolsets(["file"]) == ["file", "minir", "adviser", "skills"]
+    assert plugin_package.plugin_tools.agent_toolsets(None) == ["file", "minir", "adviser", "skills"]
+    assert plugin_package.plugin_tools.agent_toolsets("web") == ["web", "file", "minir", "adviser", "skills"]
 
 
 def test_session_end_finalises_each_turns_token_usage(make_provider):

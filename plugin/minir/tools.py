@@ -34,6 +34,7 @@ from .store import VALUE_MARKER_TYPES
 logger = logging.getLogger(__name__)
 
 TOOLSET = "minir"
+SKILL_TOOLSET= "skills"
 ADVISER_TOOLSET = "adviser"
 #: The host's four file tools (``read_file``, ``write_file``, ``patch``, ``search_files``).
 #: This plugin does not re-register them: it grants the host toolset to every in-process
@@ -128,16 +129,17 @@ SCHEMAS: tuple[dict[str, Any], ...] = (
 def agent_toolsets(base: Any = None) -> list[str]:
     """*base* plus this plugin's fixed toolsets, order kept, duplicates dropped.
 
-    Every in-process agent this plugin runs gets all three surfaces: the host's ``file``
-    toolset, ``minir`` for the store tools and ``adviser`` for the read-only session search
-    (and the adviser entry point). ``file`` is granted here, not left to the caller, so a
-    route that configures no toolsets still gets the file surface ``file_guard`` scopes;
-    ``None`` becomes the three, never ``None`` — the host reads ``None`` as "every tool".
+    Every in-process agent this plugin runs gets all four surfaces: the host's ``file``
+    toolset, ``minir`` for the store tools, ``adviser`` for the read-only session search
+    (and the adviser entry point), and ``skills`` so a reviewer can consult a loaded skill.
+    ``file`` is granted here, not left to the caller, so a route that configures no toolsets
+    still gets the file surface ``file_guard`` scopes; ``None`` becomes the four, never
+    ``None`` — the host reads ``None`` as "every tool".
     """
     if isinstance(base, str):
         base = [base]
     toolsets = [str(tool) for tool in (base or []) if str(tool).strip()]
-    for name in (FILE_TOOLSET, TOOLSET, ADVISER_TOOLSET):
+    for name in (FILE_TOOLSET, TOOLSET, ADVISER_TOOLSET,SKILL_TOOLSET):
         if name not in toolsets:
             toolsets.append(name)
     return toolsets

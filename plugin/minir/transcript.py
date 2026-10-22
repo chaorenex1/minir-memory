@@ -52,7 +52,7 @@ import threading
 import time
 from collections import deque
 from pathlib import Path
-from typing import Any, Iterable, Optional
+from typing import Any, Iterable, Mapping, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -103,8 +103,8 @@ class _Record:
     """
 
     __slots__ = ("session_id", "layer", "folder", "stem", "messages", "model", "provider",
-                 "toolsets", "system_message", "started_at", "first_pending_at", "pending",
-                 "last_written", "writing")
+                 "toolsets", "system_message", "usage", "started_at", "first_pending_at",
+                 "pending", "last_written", "writing")
 
     def __init__(self, *, session_id: str, layer: str, folder: str, stem: str,
                  started_at: float) -> None:
@@ -117,6 +117,8 @@ class _Record:
         self.provider = ""
         self.toolsets: tuple[str, ...] = ()
         self.system_message = ""
+        #: Token/cost counters the caller reported for this snapshot (aux runs only).
+        self.usage: dict[str, Any] = {}
         self.started_at = started_at
         self.first_pending_at = 0.0
         self.pending = 0                  # messages added since the last write attempt
@@ -243,7 +245,7 @@ class TranscriptBuffer:
 
     def record_aux(self, layer: str, session_id: str, messages: Iterable[dict[str, Any]], *,
                    model: str = "", provider: str = "", toolsets: Iterable[str] = (),
-                   system_message: str = "") -> None:
+                   system_message: str = "", usage: Optional[Mapping[str, Any]] = None) -> None:
         """Queue one plugin-layer session for the audit trail.
 
         ``layer`` is ``base``, ``dialectic`` or ``card_review`` and becomes a directory under
@@ -258,10 +260,51 @@ class TranscriptBuffer:
         rows = [dict(row) for row in (messages or ()) if isinstance(row, dict)]
         meta = (str(model or ""), str(provider or ""),
                 tuple(str(tool) for tool in (toolsets or ())), str(system_message or ""),
-                str(layer or folder))
+                str(layer or folder), dict(usage or {}))
         with self._cv:
             if self._enqueue_locked(("snapshot", folder, str(session_id or ""), rows, meta)):
                 self._cv.notify()
+
+    def read_aux(self, layer: str, session_id: str) -> list[dict[str, Any]]:
+        """Read one aux session's audit rows back (both shards, oldest first).
+
+        The adviser runtime uses this to resume its own conversation after a process
+        restart; the transcript layer still treats these files as audit data, so a missing
+        or malformed file returns an empty list rather than raising.
+        """
+        if self._persist_dir is None:
+            return []
+        folder = self._persist_dir / _file_stem(layer or "aux", "aux")
+        stem = _file_stem(str(session_id or ""), "session")
+        rows: list[dict[str, Any]] = []
+        for name in (f"{stem}.json", f"{stem}.part2.json"):
+            try:
+                payload = json.loads((folder / name).read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                continue
+            messages = payload.get("messages") if isinstance(payload, dict) else None
+            if isinstance(messages, list):
+                rows.extend(dict(row) for row in messages if isinstance(row, dict))
+        return rows
+
+    def append_text(self, layer: str, session_id: str, text: str,
+                    *, suffix: str = ".log") -> None:
+        """Append raw text to one aux file, unbounded.
+
+        Used for the full reasoning stream: the in-memory excerpt is bounded for the prompt,
+        but the on-disk copy must not drop the middle of a long thought. The caller batches a
+        turn's deltas and calls this once, so this is not on the token path.
+        """
+        if self._persist_dir is None or not text:
+            return
+        folder = self._persist_dir / _file_stem(layer or "aux", "aux")
+        path = folder / f"{_file_stem(str(session_id or ''), 'session')}{suffix}"
+        try:
+            folder.mkdir(parents=True, exist_ok=True)
+            with open(path, "a", encoding="utf-8") as handle:
+                handle.write(text)
+        except OSError:
+            logger.debug("transcript: append_text failed for %s", path, exc_info=True)
 
     def clear(self, session_id: Optional[str] = None) -> None:
         """Drop one session's messages, or every session's.
@@ -538,13 +581,14 @@ class TranscriptBuffer:
                     self._trim_locked(record)
                     self._pending_locked(record, 1, now)
                 else:  # snapshot: one layer run replaces that session's transcript
-                    model, provider, toolsets, system_message, layer = meta
+                    model, provider, toolsets, system_message, layer, usage = meta
                     record = self._record_locked(layer, folder, session_id, started_at=now)
                     record.layer = layer
                     record.model = model
                     record.provider = provider
                     record.toolsets = toolsets
                     record.system_message = system_message
+                    record.usage = usage
                     record.messages = payload
                     self._trim_locked(record)
                     record.pending = 0
@@ -609,6 +653,7 @@ class TranscriptBuffer:
             "provider": record.provider,
             "toolsets": list(record.toolsets),
             "system_message": record.system_message,
+            "usage": record.usage,
         }
         written = 0
         for part in (1, 2):

@@ -32,6 +32,34 @@ synchronous entry point, not a separate personality. Unlike the dialectic layer 
 base cards or revisions. It is controlled by configuration only
 (`memory.minir.adviser_mode.enabled`; there is no `/adviser` command).
 
+The adviser has two delivery tiers. Without host changes it uses `llm_request`, the
+turn-boundary aside, `pre_tool_call` and `pre_verify`. With the **host patch series** in
+`plugin/minir/host-patches/` installed it also steers the live turn (a queued
+`agent.steer(kind="adviser")` through `hermes_cli.plugin_runtime`), **interrupts the current
+tool batch for blocker advice** (`agent.interrupt`; tools that poll stop, tools that never
+poll are abandoned), can keep a finished turn open for one more answer (the plugin stop gate, budget
+`agent.max_plugin_continuations`), and can hand the surface one fresh turn after a terminal
+blocker (the existing `pending_steer` contract; bounded per session). The Desktop transcript
+draws its durable rows as an **adviser card** (severity, label, Markdown body) instead of a
+user bubble, **including a live `message.adviser` event while the turn runs**.
+`scripts/install.py` applies the patch series on install, verifies it, records it, and
+`--revert` takes it back off. On an unpatched host every bridge call is a no-op and the ledger
+channels remain in charge; the Desktop patch degrades to showing the self-describing text row.
+
+A plan-mode publisher can call `plugin_runtime.set_flag(session, "plan_mode", True)`; the adviser
+also mirrors the `plan_mode` tool's `on/off/submit/status` results when that plugin is installed.
+In plan mode it advises without steering, interrupting, or triggering turns. With no publisher
+and no tool, the flag is absent and behaviour is unchanged.
+
+The reviewer runs **read-only**: the `file` toolset supplies `read_file`/`search_files`, and
+`agent_loop` strips `write_file`/`patch` plus the memory-write/spawn tools before the run. Its
+conversation is persisted by
+`TranscriptBuffer` as `<HERMES_HOME>/minir-memory/sessions/adviser/<session>--<adviser>.json`
+(one file per adviser session, appended across reviews); no conversation row goes into
+`state.db`. The last three advice batches are fed back into the next prompt for continuity.
+A project `WATCHDOG.yml` can declare `advisors[]` (name, model, tools, instructions, cadence,
+review_mode); config `roster` entries override it field by field.
+
 **SQLite holds no transcripts.** The worker reads `(from_ts, to_ts]` messages from
 `$HERMES_HOME/state.db` read-only (plus the in-process buffer for turns not yet committed) and
 persists only what the layers *derived* from them plus notes you asked to keep. What the provider
@@ -84,9 +112,13 @@ plugin/minir/          the deployable plugin directory (copy this to plugins/min
   adviser.py           adviser route + tool adapter: adviser_consult delegates to the main adviser
   adviser_prompts.py   one adviser core plus the CONSULT/REVIEW mode contracts
   adviser_mode.py      the only advice producer: event ring, review, guard, delivery channels
+  host_bridge.py       optional bridge to hermes_cli.plugin_runtime (steer / continuation)
+  host-patches/        git patch series for the host control surface + manifest.json
   session_search.py    read-only multi-shape search over the host's session store (state.db)
   prompts/             operator-supplied Task Handoff template
 tests/                 pytest suite: contract, store, transcript, provider, counting, worker, engine
+scripts/install.py               copy the plugin + apply/verify the host patch series
+scripts/install_host_patches.py  apply/check/revert the series on a hermes-agent checkout
 scripts/verify_against_host.py   end-to-end check against the real Hermes install
 ```
 
@@ -749,7 +781,8 @@ adviser_mode:
   max_advices: 3            # rows per injected block
   max_chars: 900
   toolsets: [adviser]       # read-only by default; never inherits the base/dialectic route
-  # omp `advisor` parity (see doc/omp-adviser-hermes-integration.md)
+  # omp `advisor` parity knobs; remaining host-only bounds are in doc/omp-adviser-hermes-
+  # integration.md §5, and the closed reviewer-side list is §9.8.
   review_mode: turn         # turn | agent-end (only the finished turn)
   review_interval: 1        # every N tool-triggered updates
   max_notes_per_update: 4   # non-blockers accepted per review; blockers exempt
@@ -763,11 +796,20 @@ adviser_mode:
   notify_gateway: true      # gateway turns: send preserved advice to the chat
   project_context: true     # AGENTS.md + WATCHDOG.md into the review prompt
   max_project_chars: 1500
-  roster: []                # empty = one `default` adviser; see below
+  include_reasoning: false  # needs host plugins.stream_reasoning_deltas too
+  reasoning_log: true       # with include_reasoning: full stream to sessions/reasoning/
+  pause_seconds: 300        # usage/rate-limit pause for one adviser
+  failure_pause_seconds: 60 # repeated generic failures pause the same member briefly
+  max_consecutive_failures: 3
+  boundary_every: 50        # turn-end blocks carry a boundary guidance line
+  history_messages: 60      # model-facing adviser history cap
+  history_chars: 120000
+  roster: []                # empty = one `default` adviser; no fixed cap; see below
 ```
 
-A roster pays for one review per member. Each member reviews the same delta with its own
-cursor, model and instructions, and its name is stamped on every row it publishes:
+A roster pays for one review per member. There is no fixed cap; a member with `paused: true`
+is skipped until the flag is removed. Each member reviews the same delta with its own cursor,
+model, instructions and persistent runtime, and its name is stamped on every row it publishes:
 
 ```yaml
   roster:
@@ -780,11 +822,16 @@ cursor, model and instructions, and its name is stamped on every row it publishe
 
 Changes are read when the provider opens a session; restart Hermes to apply them to a running one.
 
-The main adviser runs on the same `auxiliary.adviser` route with a three-iteration tool budget.
-Its input is a bounded in-memory event ring (no transcript is written): `pre_llm_call` records the
-user goal, `on_interim_message`/`post_api_request` record the assistant's intent,
-`post_tool_call` records the tool outcome, and `post_llm_call` records the final answer. It may
-call `adviser_session_search` to ground a claim. Its system block is composed dynamically from
+The main adviser runs on the same `auxiliary.adviser` route with a five-iteration tool budget.
+Its input is a bounded transcript delta: `pre_llm_call` records the user goal,
+`on_interim_message`/`post_api_request` record the assistant's intent, `post_tool_call` records
+the tool arguments/result/error plus the reasoning since the previous event, and `post_llm_call`
+records the final answer. Tool rows keep the full result up to the per-field cap and mark every
+kept without a per-field cap. The delta budget is 24k of whole events: the oldest events drop
+first, and one oversized event is kept whole. Each review continues that
+adviser's own `AdvisorRuntime` through `conversation_history`, so it can build on its earlier
+tool reads instead of re-deriving them. It may call `adviser_session_search` to ground a claim.
+Its system block is composed dynamically from
 `memory.minir.adviser_mode.enabled`: severity, all 11 advice targets (definition + usage),
 the severity × target handling matrix, the nit-report table, and the language rule. When the mode
 is off, those sections are absent.
@@ -806,6 +853,9 @@ the ledger stages it, and the hooks deliver it.
    (`notes_dropped`, `drop_detail`) and surface in `minir_stats`.
 4. Turn boundary (`pre_llm_call`) — advice below the floor (nits, and concerns inside the immune
    window) rides the next turn's user message once, then is marked `injected`.
+   A note marked `deferred`, or a non-blocker from an earlier turn, waits for the turn-end
+   aggregate. The final review renders every pending row once, with `(N turns ago)` and, every
+   `boundary_every` turns, a `[boundary-guidance]` line.
 5. Gates — a live blocker refuses the next mutating tool through `pre_tool_call` (at most twice
    per turn, consumed by the refusal), and with `verify_continue` keeps one code-editing turn
    going through `pre_verify`.
@@ -929,9 +979,33 @@ provider name** and point `memory.provider` at it:
 ```bash
 # Windows (git-bash); use $HERMES_HOME on Linux/macOS
 git clone <your-fork-url> ~/src/minir-memory
-mkdir -p "$LOCALAPPDATA/hermes/plugins"
-cp -R ~/src/minir-memory/plugin/minir "$LOCALAPPDATA/hermes/plugins/minir"
+cd ~/src/minir-memory
+python scripts/install.py --check   # report: plugin target + patch status, change nothing
+python scripts/install.py           # copy the plugin, apply + verify the host series
 ```
+
+`scripts/install.py` is the one-command install. It mirrors `plugin/minir` into
+`$HERMES_HOME/plugins/minir` (backing up the previous copy under
+`$HERMES_HOME/minir-memory/plugin-backup/`), then applies `plugin/minir/host-patches/` to
+`$HERMES_HOME/hermes-agent` with `git apply`. The series adds the plugin control bridge
+(`hermes_cli/plugin_runtime.py`), the stop-gate continuation channel, the live `message.adviser`
+event with a labelled adviser block on every host surface (Desktop card, TUI card that the web
+chat inherits over its PTY, classic CLI block, web session-inspector row), and the
+history/compaction guards that keep an adviser row from being treated as a human turn;
+without it the adviser falls back to the ledger channels (see the adviser section). The installer
+is idempotent, refuses to apply over overlapping local edits, verifies the patched host by
+importing both Python modules, and rolls back if verification fails. Its record lives in
+`$HERMES_HOME/minir-memory/host-patches.json`; `--revert` undoes the series in reverse order.
+
+```bash
+python scripts/install_host_patches.py --check     # patch status only
+python scripts/install_host_patches.py --revert    # undo what this install applied
+python scripts/install.py --no-copy                # plugin installed by hermes; patch only
+```
+
+Hermes has no post-install hook, so the patch step belongs to this script rather than
+`hermes plugins install`; re-run it after a host update (the update overwrites patched files, the
+state file remembers what was applied).
 
 `pip install .` is the alternative for the **memory provider**: the wheel ships
 `plugin/minir` as a top-level `minir` package and declares the `hermes_agent.memory_providers`
@@ -957,11 +1031,20 @@ memory:
     knowledge_token_budget: 2000  # hard per-file budget for one knowledge page
     session_extraction_enabled: true  # final summary + knowledge extraction after the idle window
     knowledge_idle_hours: 24      # quiet hours after session end before that run (0 = next tick)
+    adviser_mode:
+      enabled: false              # the optional main adviser
+      host_steer: true            # use the host control bridge when the patch series is installed
+      host_continue: true         # let a finished turn be kept open for advice
+      watchdog_roster: true       # merge advisors[] from the nearest WATCHDOG.yml
+      roster: []                  # [{name, model?, instructions?, toolsets?, cadence?, review_mode?}]
+      include_reasoning: false    # needs plugins.stream_reasoning_deltas too
+      sync_backlog: off           # off | wait | strict (strict is capped by strict_max_ms)
+      strict_max_ms: 30000
 ```
 
 `memory.minir.*` is the block this plugin reads and the one `hermes memory setup` writes
 (`memory_setup.py` persists the schema answers under `memory.<provider>`), so the wizard and a
-hand-edited config.yaml are equivalent. Every key also has an env override —
+hand-edited config.yaml are equivalent. Most keys also have an env override —
 `MINIR_CONTEXT_CADENCE`, `MINIR_DIALECTIC_CADENCE`, `MINIR_DIALECTIC_DEPTH`,
 `MINIR_BASE_INTERVAL`, `MINIR_DIALECTIC_INTERVAL`, `MINIR_REASONING_ENABLED`,
 `MINIR_HANDOFF_ENABLED`, `MINIR_SESSION_MODE`, `MINIR_PREFETCH_LIMIT`, `MINIR_CONTENT_LANGUAGE`,
@@ -1010,6 +1093,11 @@ python scripts/verify_against_host.py
 # 4. Hermes' own registration validator / discovery doctor
 hermes plugins validate plugin/minir
 hermes plugins doctor plugin/minir
+
+# 5. host patch series: installer logic is covered without a host; the series itself is
+#    verified against the real checkout by the installer's post-apply probe
+python -m pytest tests/test_install_host_patches.py -q
+python scripts/install_host_patches.py --check
 ```
 
 `tests/conftest.py` reports which mode it ran in (`contract mode = host|partial|shim`).

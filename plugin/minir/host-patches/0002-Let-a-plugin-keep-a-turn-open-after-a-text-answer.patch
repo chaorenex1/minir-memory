@@ -1,0 +1,280 @@
+From 68086dd9003c6f6bd146e5d3c44f5b2d0eb0aad5 Mon Sep 17 00:00:00 2001
+From: chaorenex1 <24537608z@gmail.com>
+Date: Thu, 22 Oct 2026 03:55:04 +0800
+Subject: [PATCH 2/2] Let a plugin keep a turn open after a text answer
+
+The stop gates could only continue a turn for code edits (pre_verify) or the
+kanban protocol, so a plugin that found a blocker while the final model call ran
+had no way to act on it. Drain hermes_cli.plugin_runtime's continuation slot
+before verify-on-stop, append the text as a durable user row typed
+display_kind=adviser, and bound the behaviour with agent.max_plugin_continuations
+(default 2, separate from the verify budget). An over-budget request is discarded
+with token state expired, so the plugin returns its rows to pending instead of
+assuming delivery.
+---
+ agent/turn_context.py                        |   3 +
+ agent/turn_stop_gates.py                     |  66 ++++++++++
+ cli-config.yaml.example                      |   6 +
+ hermes_cli/config_defaults.py                |   5 +
+ tests/agent/test_plugin_continuation_gate.py | 121 +++++++++++++++++++
+ 5 files changed, 201 insertions(+)
+ create mode 100644 tests/agent/test_plugin_continuation_gate.py
+
+diff --git a/agent/turn_context.py b/agent/turn_context.py
+index fa61b311c9..0306ee7d63 100644
+--- a/agent/turn_context.py
++++ b/agent/turn_context.py
+@@ -614,6 +614,9 @@ _PER_TURN_RESET_STATE: tuple[tuple[str, Any], ...] = (
+     ("_iteration_budget_warning_injected", False),
+     ("_run_budget_wrapup_injected", False), ("_verification_stop_nudges", 0),
+     ("_pre_verify_nudges", 0),
++    # Plugin stop-gate continuations (`hermes_cli.plugin_runtime`); a per-turn
++    # budget so a plugin asking to continue forever cannot trap the loop.
++    ("_plugin_continue_nudges", 0),
+ )
+ 
+ 
+diff --git a/agent/turn_stop_gates.py b/agent/turn_stop_gates.py
+index 9580c635d4..cf8396f950 100644
+--- a/agent/turn_stop_gates.py
++++ b/agent/turn_stop_gates.py
+@@ -76,6 +76,50 @@ def _pre_verify_nudge(agent, final_response, attempt: int) -> Optional[str]:
+     return None
+ 
+ 
++def _plugin_continuation(agent) -> Optional[dict]:
++    """A plugin's stop-gate request for one more round, or ``None``.
++
++    Unlike ``pre_verify`` this is not tied to file edits: it is the only channel a
++    plugin has to act on something it noticed while the final model call ran. The
++    per-turn budget (``agent.max_plugin_continuations``, default 2) bounds a plugin
++    that always asks to continue; a request over budget is discarded so it cannot
++    leak into the next turn.
++    """
++    session = str(getattr(agent, "session_id", "") or "")
++    if not session:
++        return None
++    try:
++        from hermes_cli import plugin_runtime
++
++        used = int(getattr(agent, "_plugin_continue_nudges", 0) or 0)
++        if used >= plugin_runtime.max_continuations():
++            # Dropped, not deferred: the plugin sees `expired` and returns its rows to
++            # pending instead of losing them to a delivery that never happened.
++            plugin_runtime.discard_continuation(session)
++            return None
++        return plugin_runtime.take_continuation(session)
++    except Exception:
++        logger.debug("plugin continuation gate failed", exc_info=True)
++        return None
++
++
++def _plugin_continuation_row(pending: dict) -> dict:
++    """The durable user-role row a plugin continuation is delivered as.
++
++    Not flagged synthetic: the advice stays visible in the transcript and is
++    replayed on resume, which is the point of the channel. ``display_kind`` lets
++    history renderers label it apart from a human prompt.
++    """
++    from hermes_cli.plugin_runtime import DISPLAY_KIND
++
++    return {
++        "role": "user",
++        "content": str(pending.get("text") or "").strip(),
++        "display_kind": DISPLAY_KIND,
++        "plugin_source": str(pending.get("source") or ""),
++    }
++
++
+ def _kanban_stop_nudge(agent, messages) -> Optional[str]:
+     """Workers must end with a terminal board tool (kanban_complete / kanban_block /
+     kanban_request_review / kanban_request_changes); a narrated stop is recorded
+@@ -129,6 +173,28 @@ def apply_stop_gates(
+             ),
+         )
+ 
++    _plugin_pending = _plugin_continuation(agent)
++    if _plugin_pending:
++        agent._plugin_continue_nudges = getattr(agent, "_plugin_continue_nudges", 0) + 1
++        final_msg["finish_reason"] = "plugin_continue"
++        _append_interim_answer(
++            agent, final_msg, messages, conversation_history,
++            "plugin continuation interim flush failed",
++        )
++        append_message(messages, _plugin_continuation_row(_plugin_pending))
++        agent._session_messages = messages
++        logger.debug(
++            "plugin continuation nudge issued (attempt %d, source=%s)",
++            agent._plugin_continue_nudges, _plugin_pending.get("source") or "",
++        )
++        return StopGateVerdict(
++            continue_turn=True, final_response=None,
++            pending_verification_response=final_response,
++            pending_verification_response_previewed=agent._interim_content_was_streamed(
++                final_response or ""
++            ),
++        )
++
+     _verify_nudge = _verify_on_stop_nudge(agent)
+     if _verify_nudge:
+         agent._verification_stop_nudges = getattr(agent, "_verification_stop_nudges", 0) + 1
+diff --git a/cli-config.yaml.example b/cli-config.yaml.example
+index 629ea2ea93..bafb2c674c 100644
+--- a/cli-config.yaml.example
++++ b/cli-config.yaml.example
+@@ -1292,6 +1292,12 @@ agent:
+   # Default 3.
+   # max_verify_nudges: 3
+ 
++  # A plugin may also keep the turn open through the plugin control surface
++  # (`hermes_cli.plugin_runtime.request_continuation`), independent of code edits.
++  # This caps those continuations per turn so a plugin cannot trap the loop.
++  # Default 2.
++  # max_plugin_continuations: 2
++
+   # Enable verbose logging
+   verbose: false
+   
+diff --git a/hermes_cli/config_defaults.py b/hermes_cli/config_defaults.py
+index 76b6fbd23a..514cc42b85 100644
+--- a/hermes_cli/config_defaults.py
++++ b/hermes_cli/config_defaults.py
+@@ -213,6 +213,11 @@ DEFAULT_CONFIG = {
+         "verify_guidance": True,
+         # Max consecutive `pre_verify` "continue" nudges per turn (hooks can't trap the loop).
+         "max_verify_nudges": 3,
++        # Max consecutive plugin stop-gate continuations per turn
++        # (`hermes_cli.plugin_runtime.request_continuation`). Separate from the
++        # verify budget: an adviser acting on its own finding must not consume the
++        # coding-verification allowance.
++        "max_plugin_continuations": 2,
+         # Verification closure: after code edits in a workspace, refuse a final answer until fresh
+         # verification evidence exists or the agent explains why it can't check (bounded loop,
+         # passive ledger). False (default) because the nudges proved more noise than signal; true =
+diff --git a/tests/agent/test_plugin_continuation_gate.py b/tests/agent/test_plugin_continuation_gate.py
+new file mode 100644
+index 0000000000..104397ab17
+--- /dev/null
++++ b/tests/agent/test_plugin_continuation_gate.py
+@@ -0,0 +1,121 @@
++"""End-to-end coverage for the plugin stop gate (`plugin_runtime.request_continuation`)."""
++
++from types import SimpleNamespace
++from unittest.mock import patch
++
++import pytest
++
++from hermes_cli import plugin_runtime
++from run_agent import AIAgent
++
++SESSION = "plugin-continuation-test"
++
++
++def _response(content="answer"):
++    message = SimpleNamespace(content=content, tool_calls=None)
++    return SimpleNamespace(
++        choices=[SimpleNamespace(message=message, finish_reason="stop")],
++        model="test/model",
++        usage=None,
++    )
++
++
++@pytest.fixture
++def agent(tmp_path, monkeypatch):
++    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
++    monkeypatch.setenv("HERMES_VERIFY_ON_STOP", "0")
++    with (
++        patch("model_tools.get_tool_definitions", return_value=[]),
++        patch("model_tools.check_toolset_requirements", return_value={}),
++        patch("agent.process_bootstrap.OpenAI"),
++    ):
++        instance = AIAgent(
++            session_id=SESSION,
++            api_key="test-key",
++            base_url="https://example.invalid/v1",
++            provider="openai-compat",
++            model="test/model",
++            max_iterations=10,
++            quiet_mode=True,
++            skip_context_files=True,
++            skip_memory=True,
++        )
++    instance._cached_system_prompt = "stable test prompt"
++    instance._session_db = None
++    instance.save_trajectories = False
++    instance.compression_enabled = False
++    instance._cleanup_task_resources = lambda *_a, **_kw: None
++    instance._save_trajectory = lambda *_a, **_kw: None
++    yield instance
++    plugin_runtime.clear_session(SESSION)
++
++
++def test_a_plugin_continuation_keeps_the_turn_open_with_a_visible_row(agent):
++    calls = {"n": 0}
++
++    def model_call(_api_kwargs):
++        calls["n"] += 1
++        if calls["n"] == 1:
++            queued = plugin_runtime.request_continuation(
++                SESSION, "[adviser — advisory only]\nre-read the failing test", source="minir",
++            )
++            assert queued["ok"] is True
++            return _response("first answer")
++        return _response("second answer")
++
++    agent._interruptible_api_call = model_call
++    with patch("hermes_cli.plugins.invoke_hook", return_value=[]):
++        result = agent.run_conversation("do the work")
++
++    assert calls["n"] == 2
++    assert result["final_response"] == "second answer"
++    rows = result["messages"]
++    advice = [row for row in rows if row.get("display_kind") == plugin_runtime.DISPLAY_KIND]
++    assert len(advice) == 1
++    assert advice[0]["role"] == "user"
++    assert "re-read the failing test" in advice[0]["content"]
++    # The first answer stays in the transcript as an interim assistant row.
++    assert any(
++        row.get("role") == "assistant" and row.get("content") == "first answer"
++        for row in rows
++    )
++
++
++def test_the_continuation_budget_bounds_a_plugin_that_always_asks(agent):
++    calls = {"n": 0}
++    tokens: list[str] = []
++
++    def model_call(_api_kwargs):
++        calls["n"] += 1
++        queued = plugin_runtime.request_continuation(SESSION, f"advice {calls['n']}", source="minir")
++        if queued.get("token"):
++            tokens.append(queued["token"])
++        return _response(f"answer {calls['n']}")
++
++    agent._interruptible_api_call = model_call
++    with patch("hermes_cli.plugins.invoke_hook", return_value=[]):
++        result = agent.run_conversation("do the work")
++
++    # Default budget is 2: two continuations, then the third answer ends the turn.
++    assert calls["n"] == 3
++    assert result["final_response"] == "answer 3"
++    assert result["completed"] is True
++    # The third request was dropped, not consumed: the token must read expired so a
++    # plugin can put its advice back in the pending queue.
++    assert len(tokens) == 3
++    assert plugin_runtime.continuation_status(SESSION, tokens[-1]) == "expired"
++
++
++def test_a_continuation_queued_by_a_previous_turn_does_not_leak(agent):
++    plugin_runtime.bind_turn(agent)
++    queued = plugin_runtime.request_continuation(SESSION, "stale advice", source="minir")
++    plugin_runtime.unbind_turn(agent)
++    assert plugin_runtime.continuation_status(SESSION, queued["token"]) == "expired"
++
++    agent._interruptible_api_call = lambda _api_kwargs: _response("clean answer")
++    with patch("hermes_cli.plugins.invoke_hook", return_value=[]):
++        result = agent.run_conversation("do the work")
++
++    assert result["final_response"] == "clean answer"
++    assert not [row for row in result["messages"]
++                if row.get("display_kind") == plugin_runtime.DISPLAY_KIND]

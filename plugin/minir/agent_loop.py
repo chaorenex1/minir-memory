@@ -44,7 +44,7 @@ import asyncio
 import contextlib
 import logging
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Optional, Sequence
 
 from . import file_guard
@@ -74,12 +74,56 @@ class AgentRun:
     #: plus answer alone loses every tool call, which is most of what a peer run actually did.
     #: A tuple so a frozen result cannot be mutated in place; empty when the host returned none.
     messages: tuple[dict[str, Any], ...] = ()
+    #: Token/cost counters the host attached to the turn result (``total_tokens``,
+    #: ``estimated_cost_usd``, ...). Empty when the provider reported no usage.
+    usage: dict[str, Any] = field(default_factory=dict)
 
     def as_dict(self) -> dict[str, Any]:
         # ``messages`` stays out on purpose: this dict is the adviser tool's JSON payload, and a
         # full transcript would flood the caller's context (and the socket) with the run's input.
         return {"answer": self.answer, "api_calls": self.api_calls, "model": self.model,
-                "provider": self.provider, "toolsets": list(self.toolsets)}
+                "provider": self.provider, "toolsets": list(self.toolsets),
+                "usage": dict(self.usage)}
+
+
+#: Per-turn counters copied from the host result; names match ``turn_finalizer``.
+_USAGE_KEYS = (
+    "input_tokens", "output_tokens", "cache_read_tokens", "cache_write_tokens",
+    "reasoning_tokens", "prompt_tokens", "completion_tokens", "total_tokens",
+    "estimated_cost_usd", "cost_status", "cost_source",
+)
+#: Tools a read-only peer must not hold. Writes are already path-scoped to scratch; a reviewer
+#: still should not spend its budget mutating scratch or believe it can fix what it finds. The
+#: memory write/spawn/consult surfaces are stripped too: a reviewer reads and advises only.
+READ_ONLY_DROPPED_TOOLS = frozenset({
+    "write_file", "patch", "minir_remember", "minir_forget", "minir_agents", "adviser_consult",
+    "skill_manage",
+})
+
+
+def _usage(result: Mapping[str, Any]) -> dict[str, Any]:
+    return {key: result[key] for key in _USAGE_KEYS if result.get(key) is not None}
+
+
+def apply_read_only(agent: Any) -> list[str]:
+    """Strip mutating file tools from an already-built agent; returns what was removed."""
+    dropped: list[str] = []
+    tools = getattr(agent, "tools", None)
+    if isinstance(tools, list):
+        kept: list[Any] = []
+        for tool in tools:
+            name = ""
+            if isinstance(tool, Mapping):
+                name = str((tool.get("function") or {}).get("name") or "")
+            if name in READ_ONLY_DROPPED_TOOLS:
+                dropped.append(name)
+                continue
+            kept.append(tool)
+        agent.tools = kept
+    names = getattr(agent, "valid_tool_names", None)
+    if isinstance(names, (set, frozenset, list)):
+        agent.valid_tool_names = {name for name in names if name not in READ_ONLY_DROPPED_TOOLS}
+    return sorted(set(dropped))
 
 
 def _transcript(result: dict[str, Any]) -> tuple[dict[str, Any], ...]:
@@ -162,6 +206,9 @@ def run(message: str, *, context: str = "", model: str = "", provider: str = "",
         api_mode: str = "", toolsets: Optional[Sequence[str]] = None,
         system_message: str = "", max_iterations: int = MAX_ITERATIONS,
         project_dir: Optional[str] = None, all_tools: bool = False,
+        read_only: bool = False,
+        history: Optional[Sequence[Mapping[str, Any]]] = None,
+        session_id: str = "",
         skip_memory: bool = True, skip_context_files: bool = True,
         skip_background_review: bool = True,
         load_soul_identity: bool = False) -> AgentRun:
@@ -170,6 +217,12 @@ def run(message: str, *, context: str = "", model: str = "", provider: str = "",
     ``max_iterations`` is the tool-call budget for this peer run. The default is the Feishu
     comment agent's 15; a narrow reviewer should pass a smaller bound (adviser mode uses 5: one
     knowledge search round, up to two page reads, then the object).
+
+    ``history`` is the prior conversation for a continuing peer (adviser mode's persistent
+    runtime). It is passed to the host as ``conversation_history`` so the model sees its own
+    earlier tool calls and results; the host returns the merged list in ``AgentRun.messages``.
+    A ``session_id`` keeps that peer's host-side session distinct from the main agent's (and
+    from every other roster member's).
 
     ``project_dir`` grants read-only access to that project root. Every peer run inherits the
     cwd's git root by default (``None``); a caller passes ``""`` only to opt out, or an explicit
@@ -186,10 +239,17 @@ def run(message: str, *, context: str = "", model: str = "", provider: str = "",
     final_model = str(model or "").strip() or str(resolved_model or "").strip()
     final_provider = str(provider or "").strip() or str(runtime.get("provider") or "")
     tools = [str(tool) for tool in (toolsets or [])]
+    # A system row belongs to the caller's system_message, not to the message history; the
+    # host prepends its own. Anything that is not a mapping is ignored rather than guessed.
+    conversation = [dict(row) for row in (history or ())
+                    if isinstance(row, Mapping) and str(row.get("role") or "") != "system"]
 
     agent = AIAgent(
         model=final_model,
         **_agent_kwargs(final_provider, final_model, runtime, api_mode),
+        # A stable per-peer id gives the host one session for this adviser's tool calls; an
+        # empty value keeps the host's own default for one-shot peers.
+        session_id=str(session_id or "").strip() or None,
         # ``None`` means every tool only when the caller explicitly asks (``all_tools``); an
         # empty list is "no tools", and a list is exactly that surface. The plugin's own
         # ``agent_toolsets`` always adds file/minir/adviser before it reaches here.
@@ -203,6 +263,10 @@ def run(message: str, *, context: str = "", model: str = "", provider: str = "",
         skip_background_review=bool(skip_background_review),
         load_soul_identity=bool(load_soul_identity),
     )
+    if read_only:
+        dropped = apply_read_only(agent)
+        if dropped:
+            logger.debug("agent_loop: read-only peer dropped %s", ", ".join(dropped))
     try:
         # A plugin agent's file tools are the host's own four, scoped by ``file_guard``: reads
         # stay under HERMES_HOME plus an explicitly granted project root, writes under
@@ -211,7 +275,9 @@ def run(message: str, *, context: str = "", model: str = "", provider: str = "",
         system = str(system_message or "").strip() or None
         root = project_dir if project_dir is not None else str(file_guard.project_root() or "")
         with file_guard.aux_scope(root):
-            result = agent.run_conversation(_prompt(message, context), system_message=system)
+            result = agent.run_conversation(
+                _prompt(message, context), system_message=system,
+                conversation_history=conversation or None)
         return AgentRun(
             answer=(result.get("final_response") or "").strip(),
             api_calls=result.get("api_calls", 0),
@@ -219,6 +285,7 @@ def run(message: str, *, context: str = "", model: str = "", provider: str = "",
             provider=final_provider,
             toolsets=("*",) if all_tools else tuple(tools),
             messages=_transcript(result),
+            usage=_usage(result),
         )
     finally:
         # One agent per run in a long-lived host: close() releases tool subprocesses and HTTP
@@ -231,6 +298,9 @@ async def run_async(message: str, *, context: str = "", model: str = "", provide
                     api_mode: str = "", toolsets: Optional[Sequence[str]] = None,
                     system_message: str = "", max_iterations: int = MAX_ITERATIONS,
                     project_dir: Optional[str] = None, all_tools: bool = False,
+                    read_only: bool = False,
+                    history: Optional[Sequence[Mapping[str, Any]]] = None,
+                    session_id: str = "",
                     skip_memory: bool = True, skip_context_files: bool = True,
                     skip_background_review: bool = True,
                     load_soul_identity: bool = False) -> AgentRun:
@@ -238,6 +308,8 @@ async def run_async(message: str, *, context: str = "", model: str = "", provide
     return await asyncio.to_thread(
         run, message, context=context, model=model, provider=provider, api_mode=api_mode,
         toolsets=toolsets, system_message=system_message, max_iterations=max_iterations,
-        project_dir=project_dir, all_tools=all_tools, skip_memory=skip_memory,
+        project_dir=project_dir, all_tools=all_tools, read_only=read_only,
+        history=history, session_id=session_id,
+        skip_memory=skip_memory,
         skip_context_files=skip_context_files, skip_background_review=skip_background_review,
         load_soul_identity=load_soul_identity)

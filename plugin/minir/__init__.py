@@ -1306,7 +1306,11 @@ class MinirMemoryProvider(MemoryProvider):
                                "profile": self._profile,
                                "layers": TRACKER.snapshot(self._session_id),
                                "scheduler": self._scheduler.snapshot(),
-                               "adviser_mode": self._store.adviser_mode_stats(self._session_id),
+                               "adviser_mode": {
+                                   **self._store.adviser_mode_stats(self._session_id),
+                                   "usage": (self._adviser_mode.usage_stats(self._session_id)
+                                             if self._adviser_mode else {}),
+                               },
                                "artifacts": self._store.all_layer_states(),
                                "buffered_messages": len(self._transcript.messages(self._session_id)),
                                "prefetch_limit": self._prefetch_limit,
@@ -1496,6 +1500,7 @@ def register(ctx) -> None:
     # Adviser mode observers: the event ring needs the assistant's intent (interim text and
     # successful API responses with tool calls), the tool outcome, and the final answer.
     ctx.register_hook("on_interim_message", _hook(_on_interim_message, provider))
+    ctx.register_hook("on_stream_delta", _hook(_on_stream_delta, provider))
     ctx.register_hook("post_api_request", _hook(_on_post_api_request, provider))
     ctx.register_hook("api_request_error", _hook(_on_api_request_error, provider))
     # Adviser mode's mid-loop delivery seam. The memory-provider context forwards register_* to
@@ -1701,6 +1706,22 @@ def _on_interim_message(session_id: str = "", turn_id: str = "", text: Any = Non
     if resolved is not None:
         resolved._adviser_mode.on_interim_message(
             session_id=session_id, turn_id=turn_id, text=text, iteration=iteration)
+
+
+def _on_stream_delta(session_id: str = "", turn_id: str = "", delta: Any = None,
+                     kind: str = "text", provider: Optional[MinirMemoryProvider] = None,
+                     **kwargs) -> None:
+    """Keep a bounded reasoning excerpt when the adviser is explicitly opted in.
+
+    The host only delivers reasoning deltas when ``plugins.stream_reasoning_deltas`` is on and
+    the plugin's own ``include_reasoning`` is on; either switch off makes this a no-op. The
+    excerpt is never persisted: it lives in the review prompt only.
+    """
+    if str(kind or "") != "reasoning":
+        return
+    resolved = _resolve_provider(provider)
+    if resolved is not None:
+        resolved._adviser_mode.on_stream_delta(session_id, str(delta or ""))
 
 
 def _on_post_api_request(session_id: str = "", turn_id: str = "", api_request_id: str = "",

@@ -134,7 +134,7 @@ def test_prompt_is_passed_through_the_host_redactor(plugin_package, make_provide
 
     _review_event(provider, "some work")
     provider._adviser_mode.review_once("session-test", "test")
-    assert seen and "<live_turn_events>" in seen[0]
+    assert seen and "<transcript_delta>" in seen[0]
 
 
 def test_recorded_events_drop_injected_advisory_blocks(plugin_package, make_provider):
@@ -338,3 +338,57 @@ def test_cli_turn_does_not_notify(plugin_package, make_provider, monkeypatch):
         session_id="session-test", turn_id="t1", assistant_response="done")
     assert provider._adviser_mode.wait_idle(3.0)
     assert sent == []
+
+
+def test_review_interval_counts_the_final_update(plugin_package, make_provider, monkeypatch):
+    provider = _provider(make_provider, cadence=1, review_interval=3)
+    run, calls = _fake_run(lambda message, index: _advice("third update only"))
+    monkeypatch.setattr(plugin_package.agent_loop, "run", run)
+
+    _review_event(provider)
+    assert provider._adviser_mode.wait_idle(1.0)
+    assert calls == [], "first update is below the interval"
+
+    provider._adviser_mode.on_post_llm_call(
+        session_id="session-test", turn_id="t1", assistant_response="done")
+    assert provider._adviser_mode.wait_idle(1.0)
+    assert calls == [], "the finished turn is the second eligible update, not the third"
+
+    _review_event(provider)
+    assert provider._adviser_mode.wait_idle(2.0)
+    assert len(calls) == 1
+
+
+def test_reasoning_is_enabled_by_default(plugin_package, make_provider):
+    provider = _provider(make_provider)
+    assert provider._adviser_mode._cfg()["include_reasoning"] is True
+
+
+def test_session_end_waits_for_an_in_flight_review(plugin_package, make_provider, monkeypatch):
+    import threading
+
+    provider = _provider(make_provider, cadence=1, shutdown_wait_ms=3000)
+    started = threading.Event()
+    release = threading.Event()
+    completed = threading.Event()
+
+    def run(message, **kwargs):
+        started.set()
+        release.wait(2.0)
+        completed.set()
+        return SimpleNamespace(answer=_silent(), api_calls=1, model="reviewer",
+                               provider="test", toolsets=())
+
+    monkeypatch.setattr(plugin_package.agent_loop, "run", run)
+    _review_event(provider)
+    assert started.wait(2.0), "the review did not start"
+
+    ending = threading.Thread(
+        target=provider._adviser_mode.session_end, args=("session-test",))
+    ending.start()
+    assert ending.is_alive(), "session_end dropped the queued review instead of waiting"
+
+    release.set()
+    ending.join(3.0)
+    assert not ending.is_alive()
+    assert completed.is_set()

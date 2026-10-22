@@ -1,0 +1,61 @@
+{
+ "series": "plugin-runtime-v1",
+ "capability": "plugin_runtime_v2",
+ "base_version": "0.22.2",
+ "base_commit": "d923a5eb48",
+ "description": "Plugin control bridge (steer/continuation/interrupt), post-turn triggers, cooperative flags, live adviser events, a preserved card at the turn end, labeled adviser-triggered turns, and adviser rows on every host surface: Desktop card, TUI card, classic CLI block, web session inspector, and a native web chat transcript (the PTY stays available as a fallback).",
+ "patches": [
+  {
+   "name": "0001-Add-a-session-scoped-plugin-control-bridge.patch",
+   "sha256": "0128b2687f187f69cf72668bf00ac4edaa442aa41f898c76b9830e9395bc677b"
+  },
+  {
+   "name": "0002-Let-a-plugin-keep-a-turn-open-after-a-text-answer.patch",
+   "sha256": "ee605d154dfdcae9191a50872edece9485eea384a2e8347112997d7d4fda4942"
+  },
+  {
+   "name": "0003-Render-plugin-adviser-guidance-as-a-transcript-card.patch",
+   "sha256": "c098c26afa814db390181bfa905713def539c66a4c6af4d7eb072cc302b6f923"
+  },
+  {
+   "name": "0004-Keep-adviser-rows-out-of-user-turn-merging-and-tool-rounds.patch",
+   "sha256": "2c9a5c373071b6af416ff4aa8c93f5dee29a7257377a0da6014409b377bcaa2d"
+  },
+  {
+   "name": "0005-Let-a-plugin-interrupt-a-tool-batch-start-the-next-turn.patch",
+   "sha256": "462ef9feab16e4aebd3022953930fa54efadcf452afaed6fdfa839737bad8dbc"
+  },
+  {
+   "name": "0006-Announce-plugin-injected-adviser-rows-to-the-live-surface.patch",
+   "sha256": "1af9db3d74a148d8e21855697f055979b1318f0a733143c1afc6fa11402c710d"
+  },
+  {
+   "name": "0007-Render-plugin-adviser-rows-as-cards-in-the-TUI.patch",
+   "sha256": "db395b201e9cac92ea3721717bc2009e554a5d56c676c06471b0aa0d751833fa"
+  },
+  {
+   "name": "0008-Draw-plugin-adviser-rows-in-the-classic-CLI.patch",
+   "sha256": "5ef2e9f48293029fa0b58fee5d7dd1eceeed64aa6dc056229ff5d3ccb969945a"
+  },
+  {
+   "name": "0009-Label-plugin-adviser-rows-in-the-web-session-inspect.patch",
+   "sha256": "d5cc43f445151dd8ee6ac4a588f3bbd3ee700482dea04e2d16e08acc43c58528"
+  },
+  {
+   "name": "0010-Preserve-plugin-advice-as-a-card-at-the-turn-end.patch",
+   "sha256": "cfdc43bbea567db81dfec6de4527e987c033f303b0f1d92c23ba66da9013935e"
+  },
+  {
+   "name": "0011-Color-adviser-cards-by-severity-in-the-web-inspector.patch",
+   "sha256": "b647d659a7d5327deeddf4d4df6c388077ee1d8b32a372094e30efe93f4535f0"
+  },
+  {
+   "name": "0012-Label-adviser-triggered-turns-and-keep-adviser-steers-out-of-user-intervention.patch",
+   "sha256": "64f63c73501cf0b6654a83f22cbe9f60405a2bd044d7f238de7673b6b495cf87"
+  },
+  {
+   "name": "0013-Render-chat-natively-in-the-web-dashboard.patch",
+   "sha256": "2408f5a103ca31a7c03c8f01131b0c79229d1aeceae077de242ac667c2d1ca1a"
+  }
+ ]
+}

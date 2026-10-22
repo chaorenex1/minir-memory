@@ -751,7 +751,7 @@ def test_register_wires_the_provider_and_its_hooks(plugin_package):
     assert set(ctx.hooks) == {"on_session_start", "on_session_reset", "on_session_finalize",
                               "pre_llm_call", "post_llm_call", "post_tool_call",
                               "pre_tool_call", "pre_verify", "on_interim_message",
-                              "post_api_request", "api_request_error"}
+                              "on_stream_delta", "post_api_request", "api_request_error"}
     # A non-None result would be injected into the user message (pre_llm_call) or sent to
     # the chat (on_session_finalize), so every handler must return None.
     for callback in ctx.hooks.values():

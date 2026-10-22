@@ -1,0 +1,302 @@
+From 0b6662c759a3e6ebd9facbbcaca286f529af23af Mon Sep 17 00:00:00 2001
+From: chaorenex1 <24537608z@gmail.com>
+Date: Thu, 22 Oct 2026 05:18:40 +0800
+Subject: [PATCH] Let a plugin interrupt a tool batch, start the next turn, and
+ publish flags
+
+Three seams the adviser needs, all reusing host machinery:
+
+- interrupt(): steer first, then agent.interrupt(tool_reason=...), so queued
+  advice survives and the executor stops waiting for the current tool batch.
+- queue_post_turn(): one text slot merged into the result's existing
+  pending_steer contract, which CLI/gateway/TUI already run as a fresh turn.
+- set_flag()/get_flags(): cooperative session metadata (plan_mode), exposed
+  through turn_state; never authorization.
+
+The interrupt is cooperative: tools that poll is_interrupted() stop, the rest
+are abandoned rather than killed.
+---
+ agent/conversation_loop.py                   |   3 +
+ hermes_cli/plugin_runtime.py                 | 126 +++++++++++++++++++
+ tests/agent/test_plugin_continuation_gate.py |  17 +++
+ tests/agent/test_plugin_runtime.py           |  37 ++++++
+ 4 files changed, 183 insertions(+)
+
+diff --git a/agent/conversation_loop.py b/agent/conversation_loop.py
+index a1bd8775ba..809fe15bcb 100644
+--- a/agent/conversation_loop.py
++++ b/agent/conversation_loop.py
+@@ -1763,6 +1763,9 @@ def run_conversation(
+                 title_user_message=title_user_message,
+                 prelude=prelude,
+             )
++            # A plugin that finished its review after the final answer can hand the surface one
++            # more turn through the existing pending_steer contract.
++            plugin_runtime.attach_post_turn(agent, result)
+         finally:
+             plugin_runtime.unbind_turn(agent)
+             end_voice_turn_route(agent)
+diff --git a/hermes_cli/plugin_runtime.py b/hermes_cli/plugin_runtime.py
+index 33d01dd862..16fbf2ff5c 100644
+--- a/hermes_cli/plugin_runtime.py
++++ b/hermes_cli/plugin_runtime.py
+@@ -51,6 +51,10 @@ _LIVE: dict[str, weakref.ReferenceType] = {}
+ _TURNS: dict[str, dict[str, Any]] = {}
+ #: session id -> the one continuation waiting for the stop gate.
+ _CONTINUATIONS: dict[str, dict[str, Any]] = {}
++#: session id -> the one post-turn text the surface should run as a fresh turn.
++_POST_TURN: dict[str, dict[str, Any]] = {}
++#: session id -> cooperative flags published by plugins (plan_mode, ...); not turn-scoped.
++_FLAGS: dict[str, dict[str, Any]] = {}
+ #: token -> {"state": pending|taken|expired, "session", "created_at", "taken_at"}
+ _TOKENS: dict[str, dict[str, Any]] = {}
+ 
+@@ -136,6 +140,7 @@ def turn_state(session_id: str) -> dict[str, Any]:
+         agent = _agent_for(session)
+         facts = dict(_TURNS.get(session) or {})
+         pending = _CONTINUATIONS.get(session)
++        flags = dict(_FLAGS.get(session) or {})
+     bound_at = float(facts.pop("bound_at", 0.0) or 0.0)
+     return {
+         "capability": CAPABILITY_VERSION,
+@@ -147,9 +152,121 @@ def turn_state(session_id: str) -> dict[str, Any]:
+         "coding": facts.get("coding"),
+         "bound_seconds": round(now - bound_at, 3) if bound_at else 0.0,
+         "pending_continuation": bool(pending),
++        "flags": flags,
+     }
+ 
+ 
++def set_flag(session_id: str, key: str, value: Any) -> bool:
++    """Publish a cooperative session flag (``plan_mode``, ``review_only``...).
++
++    Flags are not turn-scoped: a plugin sets one when its mode changes and the adviser reads it
++    through :func:`turn_state`. Only a live session can publish; a flag is advisory metadata,
++    never an authorization.
++    """
++    session = str(session_id or "")
++    key = str(key or "").strip()[:64]
++    if not session or not key:
++        return False
++    with _LOCK:
++        if _agent_for(session) is None:
++            return False
++        _FLAGS.setdefault(session, {})[key] = value
++    return True
++
++
++def get_flags(session_id: str) -> dict[str, Any]:
++    with _LOCK:
++        return dict(_FLAGS.get(str(session_id or "")) or {})
++
++
++def request_interrupt(session_id: str, *, source: str = "plugin") -> dict[str, Any]:
++    """Ask the live turn to stop treating the current tool batch as authoritative.
++
++    Reuses the host's cross-thread ``interrupt``: the executor cancels queued tool futures and
++    stops waiting for running ones; cooperative tools see ``is_interrupted()``. A tool that
++    never polls is abandoned, not killed.
++    """
++    session = str(session_id or "")
++    with _LOCK:
++        agent = _agent_for(session)
++    if agent is None:
++        return {"ok": False, "reason": "no_live_turn"}
++    interrupt_fn = getattr(agent, "interrupt", None)
++    if not callable(interrupt_fn):
++        return {"ok": False, "reason": "host_unsupported"}
++    try:
++        interrupt_fn(tool_reason=str(source or "plugin"))
++    except Exception as exc:
++        logger.warning("plugin_runtime.interrupt failed (%s): %s", source, exc)
++        return {"ok": False, "reason": "host_error"}
++    return {"ok": True, "reason": ""}
++
++
++def interrupt(session_id: str, text: str, *, source: str = "plugin") -> dict[str, Any]:
++    """Queue advice and interrupt the running tool batch in one call.
++
++    Steer first, interrupt second: an interrupt can clear transient state, and the queued row
++    must survive it. When the interrupt is refused (race with turn end) the text is still
++    queued, so the caller gets ``mode="steer"`` instead of losing it.
++    """
++    queued = steer(session_id, text, source=source)
++    if not queued.get("ok"):
++        return queued
++    stopped = request_interrupt(session_id, source=source)
++    return {"ok": True, "mode": "interrupt" if stopped.get("ok") else "steer",
++            "reason": stopped.get("reason") or ""}
++
++
++def queue_post_turn(session_id: str, text: str, *, source: str = "plugin",
++                    kind: str = "adviser") -> dict[str, Any]:
++    """Leave text for the surface to run as a fresh turn after this one ends.
++
++    The surfaces already auto-submit a leftover ``pending_steer`` as the next user input
++    (CLI/gateway/TUI), so this is a turn trigger, not a new API. Only a live turn may queue one;
++    one per session, and the caller must enforce its own loop budget.
++    """
++    session = str(session_id or "")
++    body = _clip(text)
++    if not body:
++        return {"ok": False, "reason": "empty_text"}
++    with _LOCK:
++        _prune()
++        if _agent_for(session) is None:
++            return {"ok": False, "reason": "no_live_turn"}
++        if session in _POST_TURN:
++            return {"ok": False, "reason": "already_pending"}
++        _POST_TURN[session] = {"text": body, "source": str(source or ""),
++                               "kind": str(kind or "adviser"), "created_at": time.time()}
++    return {"ok": True, "reason": ""}
++
++
++def take_post_turn(session_id: str) -> Optional[dict[str, Any]]:
++    with _LOCK:
++        return _POST_TURN.pop(str(session_id or ""), None)
++
++
++def attach_post_turn(agent: Any, result: Any) -> None:
++    """Merge a queued post-turn text into the conversation result the surface reads.
++
++    The result's ``pending_steer`` is the contract all surfaces already honour; the extra
++    ``pending_steer_kind`` lets a surface label an adviser-triggered turn instead of showing it
++    as leftover operator input. Never raises into the turn path.
++    """
++    try:
++        session = str(getattr(agent, "session_id", "") or "")
++        pending = take_post_turn(session)
++        if not pending or not isinstance(result, dict):
++            return
++        existing = str(result.get("pending_steer") or "")
++        text = str(pending.get("text") or "")
++        result["pending_steer"] = f"{existing}\n{text}" if existing else text
++        result["pending_steer_kind"] = str(pending.get("kind") or "adviser")
++        logger.debug("plugin post-turn queued (session=%s, source=%s)",
++                     session, pending.get("source") or "")
++    except Exception:
++        logger.debug("plugin_runtime.attach_post_turn failed", exc_info=True)
++
++
+ def steer(session_id: str, text: str, *, source: str = "") -> dict[str, Any]:
+     """Queue plugin advice for the live turn.
+ 
+@@ -280,6 +397,8 @@ def clear_session(session_id: str) -> None:
+     with _LOCK:
+         _LIVE.pop(session, None)
+         _TURNS.pop(session, None)
++        _POST_TURN.pop(session, None)
++        _FLAGS.pop(session, None)
+         pending = _CONTINUATIONS.pop(session, None)
+         if pending is not None:
+             _TOKENS.pop(pending["token"], None)
+@@ -291,15 +410,22 @@ __all__ = [
+     "CAPABILITY_VERSION",
+     "DISPLAY_KIND",
+     "MAX_TEXT_CHARS",
++    "attach_post_turn",
+     "bind_turn",
+     "clear_session",
+     "continuation_status",
+     "discard_continuation",
++    "get_flags",
++    "interrupt",
+     "live_turn",
+     "max_continuations",
++    "queue_post_turn",
+     "request_continuation",
++    "request_interrupt",
++    "set_flag",
+     "steer",
+     "take_continuation",
++    "take_post_turn",
+     "turn_state",
+     "unbind_turn",
+ ]
+diff --git a/tests/agent/test_plugin_continuation_gate.py b/tests/agent/test_plugin_continuation_gate.py
+index 104397ab17..37bc9b83b9 100644
+--- a/tests/agent/test_plugin_continuation_gate.py
++++ b/tests/agent/test_plugin_continuation_gate.py
+@@ -106,6 +106,23 @@ def test_the_continuation_budget_bounds_a_plugin_that_always_asks(agent):
+     assert plugin_runtime.continuation_status(SESSION, tokens[-1]) == "expired"
+ 
+ 
++def test_a_plugin_can_trigger_the_next_turn(agent):
++    def model_call(_api_kwargs):
++        queued = plugin_runtime.queue_post_turn(
++            SESSION, "[adviser — advisory only]\nfinish the failing test", source="minir")
++        assert queued["ok"] is True
++        return _response("first pass done")
++
++    agent._interruptible_api_call = model_call
++    with patch("hermes_cli.plugins.invoke_hook", return_value=[]):
++        result = agent.run_conversation("do the work")
++
++    assert result["final_response"] == "first pass done"
++    # The surface (CLI/gateway/TUI) already submits a leftover pending_steer as the next turn.
++    assert result["pending_steer"].startswith("[adviser — advisory only]")
++    assert result["pending_steer_kind"] == "adviser"
++
++
+ def test_a_continuation_queued_by_a_previous_turn_does_not_leak(agent):
+     plugin_runtime.bind_turn(agent)
+     queued = plugin_runtime.request_continuation(SESSION, "stale advice", source="minir")
+diff --git a/tests/agent/test_plugin_runtime.py b/tests/agent/test_plugin_runtime.py
+index e7f2420c64..e0baf3b1a4 100644
+--- a/tests/agent/test_plugin_runtime.py
++++ b/tests/agent/test_plugin_runtime.py
+@@ -15,6 +15,7 @@ class _Agent:
+         self._resolved_is_coding = True
+         self.steered: list[tuple[str, str]] = []
+         self.redirected: list[str] = []
++        self.interrupts: list[str] = []
+ 
+     def steer(self, text: str, *, kind: str = "user") -> bool:
+         self.steered.append((text, kind))
+@@ -24,6 +25,9 @@ class _Agent:
+         self.redirected.append(text)
+         return True
+ 
++    def interrupt(self, *, tool_reason: str = "") -> None:
++        self.interrupts.append(tool_reason)
++
+ 
+ class _LegacyAgent(_Agent):
+     """A host whose ``steer`` predates the ``kind`` keyword."""
+@@ -126,3 +130,36 @@ def test_text_is_bounded():
+     result = plugin_runtime.steer("session-1", "x" * (plugin_runtime.MAX_TEXT_CHARS + 100))
+     assert result["ok"] is True
+     assert len(agent.steered[0][0]) <= plugin_runtime.MAX_TEXT_CHARS
++
++
++def test_interrupt_queues_advice_before_stopping_the_tool_batch():
++    agent = _Agent()
++    plugin_runtime.bind_turn(agent)
++    result = plugin_runtime.interrupt("session-1", "stop, the premise is wrong", source="minir")
++
++    assert result["ok"] is True and result["mode"] == "interrupt"
++    assert agent.steered == [("stop, the premise is wrong", "adviser")]
++    assert agent.interrupts == ["minir"]
++
++
++def test_post_turn_is_merged_into_the_surface_contract():
++    agent = _Agent()
++    plugin_runtime.bind_turn(agent)
++    first = plugin_runtime.queue_post_turn("session-1", "[adviser] finish the test", source="minir")
++    assert first["ok"] is True
++    assert plugin_runtime.queue_post_turn("session-1", "second")["reason"] == "already_pending"
++
++    result = {"pending_steer": "leftover operator text"}
++    plugin_runtime.attach_post_turn(agent, result)
++    assert result["pending_steer"] == "leftover operator text\n[adviser] finish the test"
++    assert result["pending_steer_kind"] == "adviser"
++
++
++def test_session_flags_are_readable_only_while_live():
++    agent = _Agent()
++    plugin_runtime.bind_turn(agent)
++    assert plugin_runtime.set_flag("session-1", "plan_mode", True) is True
++    assert plugin_runtime.turn_state("session-1")["flags"] == {"plan_mode": True}
++
++    plugin_runtime.unbind_turn(agent)
++    assert plugin_runtime.set_flag("session-1", "plan_mode", False) is False

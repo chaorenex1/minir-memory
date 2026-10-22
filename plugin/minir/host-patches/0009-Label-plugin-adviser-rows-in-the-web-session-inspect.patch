@@ -1,0 +1,161 @@
+From 462ef684dab5a102213ed8ba102595b8f65c9ba9 Mon Sep 17 00:00:00 2001
+From: chaorenex1 <24537608z@gmail.com>
+Date: Thu, 22 Oct 2026 11:25:46 +0800
+Subject: [PATCH 3/3] Label plugin adviser rows in the web session inspector
+
+The REST transcript keeps display_kind=adviser, which the dashboard rendered with the user bubble style. Show the severity label and advice body, with the block's bracketed header/footer stripped.
+---
+ web/src/lib/api.ts                  |  2 +
+ web/src/pages/SessionsPage.test.tsx | 35 +++++++++++++++++
+ web/src/pages/SessionsPage.tsx      | 58 ++++++++++++++++++++++++-----
+ 3 files changed, 86 insertions(+), 9 deletions(-)
+
+diff --git a/web/src/lib/api.ts b/web/src/lib/api.ts
+index 629c886378..e0bb5ca9a4 100644
+--- a/web/src/lib/api.ts
++++ b/web/src/lib/api.ts
+@@ -2227,6 +2227,8 @@ export interface WhatsAppOnboardingApplyResponse {
+ export interface SessionMessage {
+   role: "user" | "assistant" | "system" | "tool";
+   content: string | null;
++  /** Persisted row kind; "adviser" marks model-facing plugin guidance, not a human prompt. */
++  display_kind?: string;
+   tool_calls?: Array<{
+     id: string;
+     function: { name: string; arguments: string };
+diff --git a/web/src/pages/SessionsPage.test.tsx b/web/src/pages/SessionsPage.test.tsx
+index 5bcf6396d1..06082a7e0f 100644
+--- a/web/src/pages/SessionsPage.test.tsx
++++ b/web/src/pages/SessionsPage.test.tsx
+@@ -259,3 +259,38 @@ describe("structured reasoning rendering (#59957)", () => {
+     expect(document.querySelectorAll("pre code").length).toBe(0);
+   });
+ });
++
++describe("adviser transcript rows", () => {
++  it("labels plugin adviser guidance as adviser, never as a user turn", async () => {
++    apiMocks.getSessionMessages.mockResolvedValue({
++      session_id: "sid-adviser",
++      messages: [
++        { role: "user", content: "run the migration" },
++        {
++          role: "user",
++          display_kind: "adviser",
++          content:
++            "[adviser — advisory only]\n- [blocker · reviewer] Stop: the migration drops the index.\n[end adviser]",
++        },
++      ],
++    });
++    await renderSessionsPage([
++      { id: "sid-adviser", profile: "default", source: "cli", model: null, title: "Advised", started_at: 1,
++        ended_at: null, last_active: 1, is_active: false, message_count: 2, tool_call_count: 0,
++        input_tokens: 1, output_tokens: 1, preview: "run" },
++    ]);
++    await act(async () => click(button("Delete session")!.closest("div.cursor-pointer")));
++    await waitFor(() => (document.body.textContent ?? "").includes("drops the index"));
++
++    const text = document.body.textContent ?? "";
++    expect(text).toContain("adviser · blocker · reviewer");
++    expect(text).toContain("Stop: the migration drops the index.");
++    expect(text).not.toContain("[adviser — advisory only]");
++    expect(text).not.toContain("[end adviser]");
++    // Only the real prompt wears the User label.
++    const userLabels = Array.from(document.querySelectorAll("span")).filter(
++      (span) => span.textContent?.trim() === "User",
++    );
++    expect(userLabels).toHaveLength(1);
++  });
++});
+diff --git a/web/src/pages/SessionsPage.tsx b/web/src/pages/SessionsPage.tsx
+index b391f1ccb0..ef00f0acbe 100644
+--- a/web/src/pages/SessionsPage.tsx
++++ b/web/src/pages/SessionsPage.tsx
+@@ -210,6 +210,26 @@ function splitCompactionContent(content: string): CompactionSplit | null {
+   };
+ }
+ 
++// A plugin adviser row persists as user-role content with ``display_kind="adviser"``:
++// model-facing guidance, never a human prompt. Its bracketed header/footer are machine
++// chrome, so the inspector shows the severity label + advice body instead.
++const ADVISER_HEADER_RE = /^\[adviser[^\n]*\]\s*/;
++const ADVISER_FOOTER_RE = /\s*\[end adviser\]\s*$/;
++const ADVISER_ITEM_RE = /^- \[([^\]]+)\]\s*(.+)$/gm;
++
++function splitAdviserContent(
++  content: string,
++): { label: string; body: string } | null {
++  const raw = content.trim();
++  if (!ADVISER_HEADER_RE.test(raw)) return null;
++  const body = raw
++    .replace(ADVISER_HEADER_RE, "")
++    .replace(ADVISER_FOOTER_RE, "")
++    .trim();
++  const items = [...body.matchAll(ADVISER_ITEM_RE)];
++  return { label: items[0]?.[1]?.trim() || "advisory", body };
++}
++
+ 
+ function MessageBubble({
+   msg,
+@@ -252,6 +272,12 @@ function MessageBubble({
+       text: "text-muted-foreground italic",
+       label: "Context handoff",
+     },
++    // Plugin adviser guidance: model-facing, so it must never read as a user turn.
++    adviser: {
++      bg: "bg-muted/50",
++      text: "text-muted-foreground",
++      label: "adviser",
++    },
+   };
+ 
+   // When a compaction handoff is merged into the front of the first
+@@ -290,14 +316,22 @@ function MessageBubble({
+   }
+ 
+   const isCompaction = compactionSplit !== null;
+-  const style = isCompaction
+-    ? ROLE_STYLES.compaction
+-    : ROLE_STYLES[msg.role] ?? ROLE_STYLES.system;
+-  const label = isCompaction
+-    ? ROLE_STYLES.compaction.label
+-    : msg.tool_name
+-      ? `${t.sessions.roles.tool}: ${msg.tool_name}`
+-      : style.label;
++  const adviserSplit =
++    msg.display_kind === "adviser" && typeof msg.content === "string"
++      ? splitAdviserContent(msg.content)
++      : null;
++  const style = adviserSplit
++    ? ROLE_STYLES.adviser
++    : isCompaction
++      ? ROLE_STYLES.compaction
++      : ROLE_STYLES[msg.role] ?? ROLE_STYLES.system;
++  const label = adviserSplit
++    ? `${ROLE_STYLES.adviser.label} · ${adviserSplit.label}`
++    : isCompaction
++      ? ROLE_STYLES.compaction.label
++      : msg.tool_name
++        ? `${t.sessions.roles.tool}: ${msg.tool_name}`
++        : style.label;
+ 
+   // Check if any search term appears as a prefix of any word in content
+   const isHit = (() => {
+@@ -329,7 +363,13 @@ function MessageBubble({
+           </span>
+         )}
+       </div>
+-      {msg.content &&
++      {adviserSplit && (
++        <div className="text-sm text-foreground whitespace-pre-wrap leading-relaxed">
++          {adviserSplit.body}
++        </div>
++      )}
++      {!adviserSplit &&
++        msg.content &&
+         (msg.role === "system" ? (
+           <div className="text-sm text-foreground whitespace-pre-wrap leading-relaxed">
+             {msg.content}
+-- 
+2.53.0.windows.3
+

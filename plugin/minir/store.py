@@ -217,6 +217,8 @@ CREATE TABLE IF NOT EXISTS advisories (
     request_id TEXT NOT NULL DEFAULT '',
     expires_at REAL,
     turn_id TEXT NOT NULL DEFAULT '',
+    turn INTEGER NOT NULL DEFAULT 0,
+    deferred INTEGER NOT NULL DEFAULT 0,
     adviser TEXT NOT NULL DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS idx_advisories_pending
@@ -321,7 +323,11 @@ _ADDED_COLUMNS: dict[str, tuple[tuple[str, str], ...]] = {
                    ("request_id", "TEXT NOT NULL DEFAULT ''"),
                    ("expires_at", "REAL"),
                    # Which adviser in the roster produced the note; '' on pre-roster rows.
-                   ("adviser", "TEXT NOT NULL DEFAULT ''")),
+                   ("adviser", "TEXT NOT NULL DEFAULT ''"),
+                   # Numeric turn the note was produced in (turns_ago) and whether it waits
+                   # for the turn-end aggregate instead of a mid-turn channel.
+                   ("turn", "INTEGER NOT NULL DEFAULT 0"),
+                   ("deferred", "INTEGER NOT NULL DEFAULT 0")),
     "adviser_reviews": (("adviser", "TEXT NOT NULL DEFAULT ''"),
                         # Emission-guard outcome, so a silent reviewer is distinguishable
                         # from one that produced only noise/duplicates.
@@ -1594,13 +1600,15 @@ class MinirStore:
                 cur = self._conn.execute(
                     "INSERT OR IGNORE INTO advisories (revision_id, review_id, session_id, "
                     "source, severity, target, content, decision, evidence, fingerprint, status, "
-                    "created_at, expires_at, adviser) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?)",
+                    "created_at, expires_at, turn, deferred, adviser) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?, ?)",
                     (int(revision_id), int(review_id), session_id, str(source),
                      str(item.get("severity") or "concern"), str(item.get("target") or ""),
                      content, str(item.get("decision") or ""),
                      json.dumps(item.get("evidence") or []), fingerprint, time.time(),
-                     float(expires_at or 0.0) or None, str(adviser or "")))
+                     float(expires_at or 0.0) or None, int(item.get("turn") or 0),
+                     1 if str(item.get("deferred")).lower() in {"1", "true", "yes", "on"} else 0,
+                     str(adviser or "")))
                 if cur.rowcount:
                     inserted.append(int(cur.lastrowid))
             self._conn.commit()
@@ -1671,12 +1679,31 @@ class MinirStore:
     def mark_advisories_injected(self, ids: list[int], turn_id: str = "") -> int:
         if not ids:
             return 0
-        marks = ",".join("?" * len(ids))
+        marks = ", ".join("?" * len(ids))
         with self._lock:
             cur = self._conn.execute(
                 f"UPDATE advisories SET status = 'injected', injected_at = ?, turn_id = ? "
-                f"WHERE id IN ({marks}) AND status = 'pending'",
+                f"WHERE id IN ({marks}) AND status IN ('pending', 'staged')",
                 (time.time(), turn_id or "", *[int(item) for item in ids]))
+            self._conn.commit()
+            return int(cur.rowcount)
+
+    def release_advisories(self, ids: list[int]) -> int:
+        """Return injected rows to ``pending`` after an accepted host delivery did not land.
+
+        A continuation is accepted while the turn is live but drained later by the stop gate;
+        if that turn ends first (error, interrupt, a new surface), the advice never reached the
+        model. Only ``injected`` rows are touched, so an independent delivery is not undone.
+        """
+        if not ids:
+            return 0
+        marks = ", ".join("?" * len(ids))
+        with self._lock:
+            cur = self._conn.execute(
+                f"UPDATE advisories SET status = 'pending', request_id = '', turn_id = '', "
+                f"injected_at = NULL "
+                f"WHERE id IN ({marks}) AND status = 'injected'",
+                (*[int(item) for item in ids],))
             self._conn.commit()
             return int(cur.rowcount)
 

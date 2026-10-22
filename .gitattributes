@@ -1,0 +1,5 @@
+# The host patch series is applied with `git apply` and its bytes are checked
+# against manifest.json digests. Line-ending normalisation would break both, so
+# patches are stored and checked out verbatim.
+*.patch -text
+plugin/minir/host-patches/** -text

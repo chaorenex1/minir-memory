@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "minir-memory"
-version = "0.9.0"
+version = "0.14.0"
 description = "Local-first Hermes memory plugin: base/dialectic layer artifacts in SQLite, FTS5 recall, per-turn adviser mode, the minir toolset, idle-session knowledge extraction, and progressive context management."
 readme = "README.md"
 requires-python = ">=3.11"
@@ -46,7 +46,8 @@ include = ["minir*"]
 # rules (`rules.py`) and the Window Summary shape (`window_summary.py`) all resolve them
 # next to their module.
 [tool.setuptools.package-data]
-minir = ["plugin.yaml", "prompts/*.md", "agents/*.md", "templates/*.md", "rules/*.md"]
+minir = ["plugin.yaml", "prompts/*.md", "agents/*.md", "templates/*.md", "rules/*.md",
+         "host-patches/*.patch", "host-patches/manifest.json"]
 
 [tool.setuptools.exclude-package-data]
 minir = ["__pycache__/*", "*.py[cod]"]

@@ -1,0 +1,221 @@
+From 1be764e0047af754af2fe61bda136fbd0fb963c0 Mon Sep 17 00:00:00 2001
+From: chaorenex1 <24537608z@gmail.com>
+Date: Thu, 22 Oct 2026 11:25:46 +0800
+Subject: [PATCH 2/3] Draw plugin adviser rows in the classic CLI
+
+The classic CLI installs plugin_message_callback: an injected adviser row prints as a labelled block, held to the reply box footer while streaming, and the resume recap lists it as adviser guidance instead of a You: turn. Rows whose display_kind is not adviser (a mid-turn steer) are left to the prompt path.
+---
+ hermes_cli/cli_agent_setup_mixin.py           | 42 +++++++++++++++++++
+ hermes_cli/cli_stream_mixin.py                | 26 ++++++++++++
+ tests/hermes_cli/test_resume_display.py       | 24 +++++++++++
+ ...est_status_lines_held_during_stream_box.py | 39 +++++++++++++++++
+ 4 files changed, 131 insertions(+)
+
+diff --git a/hermes_cli/cli_agent_setup_mixin.py b/hermes_cli/cli_agent_setup_mixin.py
+index 52907c5183..192cb77c0a 100644
+--- a/hermes_cli/cli_agent_setup_mixin.py
++++ b/hermes_cli/cli_agent_setup_mixin.py
+@@ -4,6 +4,7 @@ imported lazily inside each method (import cycle)."""
+ 
+ from __future__ import annotations
+ 
++import re
+ import sys
+ 
+ from rich.markup import escape as _escape
+@@ -11,6 +12,31 @@ from rich.markup import escape as _escape
+ from agent.i18n import t
+ from utils import base_url_host_matches
+ 
++# One `- [severity · target · adviser] text` line inside a plugin adviser row.
++_ADVISER_ITEM_RE = re.compile(r"^- \[([^\]]+)\]\s*(.*)$")
++
++
++def _adviser_rows(content) -> tuple[str, list[str]]:
++    """``(label, body lines)`` for a plugin adviser row.
++
++    The bracketed header/footer are machine chrome around the rendered block; neither the
++    live line nor the resume recap should show them.
++    """
++    label = "adviser"
++    body: list[str] = []
++    for line in str(content or "").splitlines():
++        text = line.strip()
++        if not text or text.startswith("[adviser") or text == "[end adviser]":
++            continue
++        match = _ADVISER_ITEM_RE.match(text)
++        if match:
++            label = match.group(1).strip() or label
++            if match.group(2).strip():
++                body.append(match.group(2).strip())
++        else:
++            body.append(text)
++    return label, body
++
+ 
+ def _single_query_clarify_callback(questions: list) -> dict:
+     """Headless clarify answer for ``hermes chat -q``.
+@@ -173,6 +199,17 @@ def _collect_resume_entries(display_history, disp: dict, clean_assistant):
+             label = metadata.get("display_text") if display_kind in ("async_delegation_complete", "process_complete") else None
+             entries.append(("event", _sanitize_display_text(label or t(_RESUME_EVENT_KEYS[display_kind]))))
+             continue
++        if display_kind == "adviser":
++            # Plugin guidance, not a human prompt: show the severity/label and the advice
++            # body, never the rendered block's brackets.
++            adviser_label, adviser_body = _adviser_rows(content)
++            text = _sanitize_display_text(" ".join(adviser_body)).strip()
++            if not text:
++                continue
++            if len(text) > max_user_len:
++                text = text[:max_user_len] + "..."
++            entries.append(("adviser", f"{adviser_label}: {text}"))
++            continue
+         if role == "user":
+             text = _sanitize_display_text(_user_display_text(content))
+             if len(text) > max_user_len:
+@@ -697,6 +734,9 @@ class CLIAgentSetupMixin:
+             # patch_stdout's StdoutProxy (#2262), holding lines while a response box streams so a
+             # subagent/background completion notice never splits the reply mid-paragraph.
+             self.agent._print_fn = self._agent_status_print
++            # Plugin-injected adviser rows (host `plugin_message_callback`): draw the guidance
++            # at injection time instead of letting the next prompt repaint show a bare user turn.
++            self.agent.plugin_message_callback = self._on_adviser_row
+             # Hydrate credits notices at session OPEN (parity with the TUI) so a depletion
+             # warning shows before the first message. Idempotent + fail-open in the helper.
+             try:
+@@ -831,8 +871,10 @@ class CLIAgentSetupMixin:
+         # role -> (label, label style, body style, continuation indent)
+         you_label = f"  {t('cli.resume.label_you')} "
+         assistant_label = f"  {t('cli.resume.label_assistant', agent_name='Hermes')} "
++        adviser_label = "  ◆ adviser "
+         role_styles = {
+             "user": (you_label, f"dim bold {_session_label_c}", "dim", " " * len(you_label)),
++            "adviser": (adviser_label, f"dim bold {_assistant_label_c}", "dim", " " * len(adviser_label)),
+             "assistant": (assistant_label, f"dim bold {_assistant_label_c}", "dim", " " * len(assistant_label)),
+             "assistant_last": (assistant_label, f"bold {_assistant_label_c}", "", " " * len(assistant_label)),  # full, non-dim
+         }
+diff --git a/hermes_cli/cli_stream_mixin.py b/hermes_cli/cli_stream_mixin.py
+index cb8efde892..5cb2cf824b 100644
+--- a/hermes_cli/cli_stream_mixin.py
++++ b/hermes_cli/cli_stream_mixin.py
+@@ -291,6 +291,32 @@ class CLIStreamMixin:
+         for line in held:
+             _cprint(line)
+ 
++    def _on_adviser_row(self, row) -> None:
++        """Render one plugin-injected adviser row (minir host series) above the prompt.
++
++        The row is a real user-role message the model saw, but the human never typed it, so
++        it must not surface as an unlabelled prompt. Lines go through ``_agent_status_print``
++        so a streaming reply box holds them to its footer instead of splitting the answer.
++        """
++        try:
++            from hermes_cli.cli_agent_setup_mixin import _adviser_rows
++            if not isinstance(row, dict) or row.get("display_kind") != "adviser":
++                return
++            if getattr(getattr(self, "agent", None), "_mute_notification_reply", False):
++                return
++            content = row.get("content")
++            label, body = _adviser_rows(content)
++            if not body:
++                return
++            severity = label.split(" · ")[0].strip().lower()
++            color = "\033[31m" if severity == "blocker" else "\033[33m" if severity == "concern" else ""
++            reset = "\033[0m" if color else ""
++            self._agent_status_print(f"  {color}◆ adviser · {label}{reset}")
++            for line in body:
++                self._agent_status_print(f"    {color}{line}{reset}")
++        except Exception:
++            pass
++
+     def _close_reasoning_box(self) -> None:
+         """Close the live reasoning box if it's open (renders the buffered reasoning tail)."""
+         from cli import _DIM, _RST, _cprint
+diff --git a/tests/hermes_cli/test_resume_display.py b/tests/hermes_cli/test_resume_display.py
+index e1c3bb90c2..78b92aec5e 100644
+--- a/tests/hermes_cli/test_resume_display.py
++++ b/tests/hermes_cli/test_resume_display.py
+@@ -151,6 +151,30 @@ class TestDisplayResumedHistory:
+         assert "opaque" not in output
+ 
+ 
++    def test_adviser_rows_render_as_guidance_not_user_input(self):
++        cli = _make_cli()
++        cli.conversation_history = [
++            {"role": "user", "content": "run the migration"},
++            {
++                "role": "user",
++                "display_kind": "adviser",
++                "content": (
++                    "[adviser — advisory only]\n"
++                    "- [blocker · reviewer] Stop: the migration drops the index.\n"
++                    "[end adviser]"
++                ),
++            },
++        ]
++
++        output = self._capture_display(cli)
++
++        assert "◆ adviser" in output
++        assert "blocker · reviewer: Stop: the migration drops the index." in output
++        assert "[adviser — advisory only]" not in output
++        assert "[end adviser]" not in output
++        assert output.count("You:") == 1
++
++
+ 
+     def test_tool_only_message_skipped_by_default(self):
+         """Assistant messages with only tool_calls (no text) are skipped when
+diff --git a/tests/hermes_cli/test_status_lines_held_during_stream_box.py b/tests/hermes_cli/test_status_lines_held_during_stream_box.py
+index 4a67daedd5..b908fdaa3b 100644
+--- a/tests/hermes_cli/test_status_lines_held_during_stream_box.py
++++ b/tests/hermes_cli/test_status_lines_held_during_stream_box.py
+@@ -76,6 +76,45 @@ def test_status_line_prints_immediately_outside_a_box(cli_stub):
+     assert not getattr(cli, "_held_status_lines", [])
+ 
+ 
++def test_adviser_row_renders_a_labelled_block_after_the_box_footer(cli_stub):
++    """A plugin-injected adviser row is model-facing guidance, not a human prompt: the CLI
++    labels it and parks it behind an open reply box instead of showing a bare user turn."""
++    cli, emitted = cli_stub
++    row = {
++        "content": "[adviser — advisory only]\n- [blocker · reviewer] Stop: the migration drops the index.\n[end adviser]",
++        "display_kind": "adviser",
++        "plugin_message_id": "abc123",
++        "role": "user",
++    }
++
++    cli._stream_delta("First paragraph.\n")
++    cli._on_adviser_row(row)
++    cli._flush_stream()
++
++    lines = [_plain(e) for e in emitted]
++    header = next(i for i, l in enumerate(lines) if "adviser · blocker · reviewer" in l)
++    body = next(i for i, l in enumerate(lines) if "drops the index" in l)
++    footer = next(i for i, l in enumerate(lines) if l.startswith("╰"))
++    assert footer < header < body, lines
++    assert not any("[adviser — advisory only]" in l for l in lines)
++    assert not any(l.startswith("  You:") for l in lines)
++
++
++def test_adviser_row_without_advice_text_is_ignored(cli_stub):
++    cli, emitted = cli_stub
++    cli._on_adviser_row({"content": "[adviser — advisory only]\n[end adviser]", "display_kind": "adviser", "role": "user"})
++    assert emitted == []
++
++
++def test_plain_steer_row_is_not_drawn_as_adviser_guidance(cli_stub):
++    """The same callback fires for a mid-turn steer; that row is the operator's words."""
++    cli, emitted = cli_stub
++    cli._stream_delta("Streaming.\n")
++    cli._on_adviser_row({"content": "[steer] Ship the smaller patch.", "display_kind": "steer", "role": "user"})
++    cli._flush_stream()
++    assert not any("adviser" in _plain(e) for e in emitted)
++
++
+ @pytest.mark.parametrize("response, expect_panel", [
+     ("Partial answer.", False),  # the streamed text itself: already on screen
+     ("Operation interrupted: waiting for model response (3.0s elapsed).", True),  # never streamed
+-- 
+2.53.0.windows.3
+

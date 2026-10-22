@@ -568,3 +568,18 @@ def test_latest_refresh_is_scoped_to_the_session(store):
     assert store.latest_base_refresh("s1")["user_peer_card"] == "terse"
     assert store.latest_base_refresh("s2")["user_peer_card"] == "other session"
     assert store.base_refreshes("s2")[0]["user_peer_card"] == "other session"
+
+
+def test_release_advisories_only_returns_injected_rows(store):
+    """An accepted host delivery that never landed must not strand its advice."""
+    ids = store.add_advisories(
+        "s1", [{"content": "re-read the diff", "severity": "concern"}], source="adviser_mode")
+    assert store.mark_advisories_injected(ids) == 1
+    assert store.release_advisories(ids) == 1
+    row = store.pending_advisories("s1", source="adviser_mode")[0]
+    assert row["status"] == "pending" and row["injected_at"] is None
+    # A second release is a no-op; a staged row belongs to reset_staged instead.
+    assert store.release_advisories(ids) == 0
+    store.stage_advisories(ids, "req-1")
+    assert store.release_advisories(ids) == 0
+    assert store.reset_staged(ids) == 1

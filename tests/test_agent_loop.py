@@ -29,6 +29,12 @@ class FakeAgent:
         self.prompt = ""
         self.system_message = "<unset>"
         self.closed = False
+        # Enough shape for the read-only filter; the loop's tests do not run a tool.
+        self.tools = [{"function": {"name": "read_file"}},
+                      {"function": {"name": "write_file"}},
+                      {"function": {"name": "patch"}},
+                      {"function": {"name": "minir_remember"}}]
+        self.valid_tool_names = {"read_file", "write_file", "patch", "minir_remember"}
         FakeAgent.instances.append(self)
 
     def run_conversation(self, prompt, system_message=None, **_kwargs):
@@ -37,7 +43,8 @@ class FakeAgent:
         if FakeAgent.fail_with is not None:
             raise FakeAgent.fail_with
         return {"final_response": "  do the simple thing\n", "api_calls": 3,
-                "messages": list(FakeAgent.result_messages)}
+                "messages": list(FakeAgent.result_messages),
+                "total_tokens": 42, "estimated_cost_usd": 0.001}
 
     def close(self):
         self.closed = True
@@ -188,7 +195,7 @@ def test_only_the_intended_constructor_kwargs_are_passed(loop, host):
     assert set(agent.kwargs) == {
         "model", "provider", "reasoning_config",
         "api_key", "base_url", "api_mode", "credential_pool", "request_overrides",
-        "requested_provider", "capabilities", "command", "args",
+        "requested_provider", "capabilities", "command", "args", "session_id",
         "enabled_toolsets", "max_iterations", "quiet_mode", "skip_context_files", "skip_memory",
         "skip_background_review", "load_soul_identity",
     }
@@ -354,3 +361,19 @@ def test_async_runs_on_a_worker_thread_not_the_event_loop(loop, host):
         FakeAgent.run_conversation = original
 
     assert seen["worker"] != threading.main_thread().name
+
+
+def test_read_only_drops_mutating_tools_and_usage_is_captured(loop, host):
+    run = loop.run("q", read_only=True)
+
+    (agent,) = FakeAgent.instances
+    assert [tool["function"]["name"] for tool in agent.tools] == ["read_file"]
+    assert agent.valid_tool_names == {"read_file"}
+    assert run.usage == {"total_tokens": 42, "estimated_cost_usd": 0.001}
+
+
+def test_apply_read_only_is_idempotent_without_mutating_tools(loop):
+    agent = types.SimpleNamespace(tools=[{"function": {"name": "read_file"}}],
+                                  valid_tool_names={"read_file"})
+    assert loop.apply_read_only(agent) == []
+    assert agent.tools == [{"function": {"name": "read_file"}}]

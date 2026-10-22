@@ -1,0 +1,637 @@
+From b867a4e93181a364c3c5ee5be3d2163e6afd40f1 Mon Sep 17 00:00:00 2001
+From: chaorenex1 <24537608z@gmail.com>
+Date: Thu, 22 Oct 2026 03:55:02 +0800
+Subject: [PATCH 1/2] Add a session-scoped plugin control bridge
+
+Plugins see a session id in every hook payload but never the agent, so a
+background reviewer has no way to steer the live turn. hermes_cli.plugin_runtime
+binds the running agent for the duration of run_conversation and exposes steer
+(queue text at the next safe boundary), a one-slot turn continuation queue with an
+observable token, and a read-only turn_state probe.
+
+The advice is queued through a new steer(kind="adviser") path and delivered as a
+display_kind=adviser row, not the operator /steer frame: a reviewer's advice must
+not claim the user's authority. redirect() is deliberately not used because it
+persists a user correction.
+---
+ agent/agent_init.py                |   5 +-
+ agent/agent_runtime_helpers.py     |   5 +-
+ agent/conversation_loop.py         |   7 +
+ agent/interrupt_control.py         |  12 +-
+ agent/prompt_builder.py            |  20 ++
+ agent/turn_iteration_prep.py       |   5 +-
+ hermes_cli/plugin_runtime.py       | 305 +++++++++++++++++++++++++++++
+ tests/agent/test_plugin_runtime.py | 128 ++++++++++++
+ 8 files changed, 479 insertions(+), 8 deletions(-)
+ create mode 100644 hermes_cli/plugin_runtime.py
+ create mode 100644 tests/agent/test_plugin_runtime.py
+
+diff --git a/agent/agent_init.py b/agent/agent_init.py
+index 938ca517a5..d3b4dcbb8a 100644
+--- a/agent/agent_init.py
++++ b/agent/agent_init.py
+@@ -543,8 +543,11 @@ _CONTROL_STATE: dict[str, Any] = {
+     "_model_request_active": threading.Event,
+     "_supports_active_turn_redirect": True,
+     # /steer: the drain hook appends the note to the last tool result after the current
+-    # batch — no interrupt, no new user turn (role alternation preserved).
++    # batch — no interrupt, no new user turn (role alternation preserved). ``kind`` is
++    # "user" for an operator steer and "adviser" for plugin advice, which must not be
++    # framed as a direct user message.
+     "_pending_steer": None,
++    "_pending_steer_kind": "user",
+     "_pending_steer_lock": threading.Lock,
+     # Active-turn redirect: keep the valid turn prefix, cancel only the in-flight request,
+     # rebuild the tail with the correction. Drained at a role-safe boundary.
+diff --git a/agent/agent_runtime_helpers.py b/agent/agent_runtime_helpers.py
+index 15cd862855..6e463920ad 100644
+--- a/agent/agent_runtime_helpers.py
++++ b/agent/agent_runtime_helpers.py
+@@ -21,7 +21,7 @@ from agent.message_sanitization import (
+ )
+ from agent.message_metadata import (
+     TOOL_CALL_UIDS, merge_tool_call_uids, per_occurrence_tool_call_uids, record_absorbed_message)
+-from agent.prompt_builder import STEER_DISPLAY_KIND, steer_user_row
++from agent.prompt_builder import STEER_DISPLAY_KIND, steer_row
+ from agent.tool_dispatch_helpers import _trajectory_normalize_msg, make_tool_result_message
+ from agent.think_scrubber import THINK_TAG_NAMES
+ from agent.trajectory import convert_scratchpad_to_think
+@@ -3780,6 +3780,7 @@ def apply_pending_steer_to_tool_results(agent, messages: list, num_tool_msgs: in
+     steer_text = agent._drain_pending_steer()
+     if not steer_text:
+         return
++    steer_kind = str(getattr(agent, "_pending_steer_kind", "user") or "user")
+     # Skip non-tool messages in the tail in case something else is appended at the boundary.
+     tail = range(len(messages) - 1, max(len(messages) - num_tool_msgs - 1, -1), -1)
+     target = next((messages[j] for j in tail if isinstance(messages[j], dict) and messages[j].get("role") == "tool"), None)
+@@ -3789,7 +3790,7 @@ def apply_pending_steer_to_tool_results(agent, messages: list, num_tool_msgs: in
+         # user message (which persists like any other user turn).
+         _requeue_pending_steer(agent, steer_text)
+         return
+-    messages.append(steer_user_row(steer_text))
++    messages.append(steer_row(steer_text, steer_kind))
+     _ra().logger.info(
+         "Delivered /steer to agent after tool batch (%d chars) as new user message: %s", len(steer_text),
+         steer_text[:120] + ("..." if len(steer_text) > 120 else ""),
+diff --git a/agent/conversation_loop.py b/agent/conversation_loop.py
+index 411134b41a..a1bd8775ba 100644
+--- a/agent/conversation_loop.py
++++ b/agent/conversation_loop.py
+@@ -1732,6 +1732,7 @@ def run_conversation(
+     """
+     from agent.turn_context import export_current_turn_boundary
+     from agent.voice_turn_route import end_voice_turn_route
++    from hermes_cli import plugin_runtime
+     from tools.vision_tools_history_budget import native_turn_images
+ 
+     # Steer / redirect / interrupt set this mid-turn; the result reports whether the turn ran untouched.
+@@ -1740,6 +1741,11 @@ def run_conversation(
+     # it does not embed the same pixels a second time into the same request (#76411).
+     with native_turn_images(user_message):
+         try:
++            # A plugin with a background reviewer needs a handle to this live turn:
++            # `plugin_runtime.steer` / `request_continuation` are keyed by session id and
++            # released here. Bind inside the try so a failing binder cannot skip the
++            # voice-route teardown below.
++            plugin_runtime.bind_turn(agent)
+             result = _run_conversation_turn(
+                 agent,
+                 user_message,
+@@ -1758,6 +1764,7 @@ def run_conversation(
+                 prelude=prelude,
+             )
+         finally:
++            plugin_runtime.unbind_turn(agent)
+             end_voice_turn_route(agent)
+     result = export_current_turn_boundary(agent, result, user_message)
+     if isinstance(result, dict):
+diff --git a/agent/interrupt_control.py b/agent/interrupt_control.py
+index 06117c1c9a..956676278d 100644
+--- a/agent/interrupt_control.py
++++ b/agent/interrupt_control.py
+@@ -262,17 +262,23 @@ class InterruptControlMixin:
+             # hard_cancel, so a soft clear dropped a live user message with no trace.
+             with _ic_lock(self, "_pending_steer_lock"):
+                 self._pending_steer = None
++                self._pending_steer_kind = "user"
+         return True
+ 
+-    def steer(self, text: str) -> bool:
+-        """Queue user text for delivery as its own user row after the current tool batch finishes (no
+-        interrupt); multiple calls concatenate with newlines. Returns False for empty text."""
++    def steer(self, text: str, *, kind: str = "user") -> bool:
++        """Queue text for delivery as its own user row after the current tool batch finishes (no
++        interrupt); multiple calls concatenate with newlines. Returns False for empty text.
++
++        ``kind="adviser"`` marks the row so the model is not told the text is a direct user
++        message: a plugin reviewer's advice must not borrow the user's authority.
++        """
+         if not text or not text.strip():
+             return False
+         cleaned = text.strip()
+         with _ic_lock(self, "_pending_steer_lock"):
+             existing = _ic_slot(self, "_pending_steer_lock", "_pending_steer")
+             self._pending_steer = (existing + "\n" + cleaned) if existing else cleaned
++            self._pending_steer_kind = "adviser" if str(kind or "").lower() == "adviser" else "user"
+         # The turn no longer ran on its own (first-task-done detection reads this off the result).
+         self._turn_user_intervened = True
+         return True
+diff --git a/agent/prompt_builder.py b/agent/prompt_builder.py
+index 21d36c2815..bcf2d68c53 100644
+--- a/agent/prompt_builder.py
++++ b/agent/prompt_builder.py
+@@ -584,6 +584,9 @@ def format_steer_marker(steer_text: str) -> str:
+ 
+ 
+ STEER_DISPLAY_KIND = "steer"
++#: Row kind for plugin advice delivered mid-turn. Not a user steer: the text carries its own
++#: `[adviser — advisory only]` frame and must not claim the user's authority.
++ADVISER_DISPLAY_KIND = "adviser"
+ 
+ 
+ def steer_user_row(steer_text: str) -> dict[str, Any]:
+@@ -595,6 +598,23 @@ def steer_user_row(steer_text: str) -> dict[str, Any]:
+             "display_kind": STEER_DISPLAY_KIND}
+ 
+ 
++def advisory_user_row(text: str) -> dict[str, Any]:
++    """Plugin advice as a user-role row without the user-authority marker.
++
++    Providers need a user/tool row at the delivery point, but an adviser is not the user. The
++    body already opens with ``[adviser — advisory only]``; ``display_kind`` keeps it out of the
++    "human input" bucket in history/compaction code that checks the kind.
++    """
++    return {"role": "user", "content": str(text), "display_kind": ADVISER_DISPLAY_KIND}
++
++
++def steer_row(text: str, kind: str = "user") -> dict[str, Any]:
++    """Pick the row shape for a drained steer: operator text or plugin advice."""
++    if str(kind or "").lower() == ADVISER_DISPLAY_KIND:
++        return advisory_user_row(text)
++    return steer_user_row(text)
++
++
+ STEER_CHANNEL_NOTE = (
+     # Only what the marker cannot say about itself: it is the ONLY trusted shape and carries full user authority.
+     # Dieted (#95681, maintainer-directed). History: #40240 added this note when the marker was bare and
+diff --git a/agent/turn_iteration_prep.py b/agent/turn_iteration_prep.py
+index e4a9df850c..fcf6ea7566 100644
+--- a/agent/turn_iteration_prep.py
++++ b/agent/turn_iteration_prep.py
+@@ -287,8 +287,9 @@ def _inject_steer_after_newest_tool_result(agent: Any, messages: Any, steer_text
+     for _si in range(len(messages) - 1, -1, -1):
+         _sm = messages[_si]
+         if isinstance(_sm, dict) and _sm.get("role") == "tool":
+-            from agent.prompt_builder import steer_user_row
+-            messages.insert(_si + 1, steer_user_row(steer_text))
++            from agent.prompt_builder import steer_row
++            steer_kind = str(getattr(agent, "_pending_steer_kind", "user") or "user")
++            messages.insert(_si + 1, steer_row(steer_text, steer_kind))
+             logger.debug("Pre-API-call steer drain: appended user row after tool msg at index %d", _si)
+             return
+     from agent.agent_runtime_helpers import _requeue_pending_steer
+diff --git a/hermes_cli/plugin_runtime.py b/hermes_cli/plugin_runtime.py
+new file mode 100644
+index 0000000000..33d01dd862
+--- /dev/null
++++ b/hermes_cli/plugin_runtime.py
+@@ -0,0 +1,305 @@
++"""Session-scoped control surface for plugins: steer, interrupt, continue a turn.
++
++A plugin hook receives a session id but no agent handle, so a plugin that decides
++mid-turn that the agent is heading the wrong way has no way to say so before the
++turn ends. This module is the single bridge for that decision:
++
++* :func:`steer` queues text for the next safe boundary (after the current tool
++  batch) or, with ``interrupt=True``, also aborts the in-flight model request so
++  the text lands one iteration earlier. It reuses the host's ``/steer``
++  machinery: one standalone user row, never a mutation of an already-persisted
++  row.
++* :func:`request_continuation` leaves text for the stop gate: when the model
++  answers, the gate keeps the turn open, appends the text, and lets the model
++  respond once more. Bounded by ``agent.max_plugin_continuations`` per turn.
++* :func:`turn_state` reports what a plugin can safely know about the live turn.
++
++Only the running turn is bound (``bind_turn`` in ``agent.conversation_loop``).
++A call after the turn ended returns ``{"ok": False, "reason": "no_live_turn"}``;
++the plugin must fall back to its own queue instead of assuming delivery.
++
++Everything here is in-memory and thread-safe: a plugin's background worker may
++call it while the turn loop runs. It never calls a model and never blocks.
++"""
++
++from __future__ import annotations
++
++import logging
++import threading
++import time
++import weakref
++from typing import Any, Optional
++
++logger = logging.getLogger(__name__)
++
++#: Bumped when the callable surface changes so a plugin can feature-detect.
++CAPABILITY_VERSION = "plugin_runtime_v1"
++#: ``display_kind`` on the durable row a continuation is delivered as. Clients
++#: that do not know it still render the text; the value keeps it distinguishable
++#: from a human prompt in the transcript.
++DISPLAY_KIND = "adviser"
++#: A single steer/continuation text is a device-side message; cap it like a tool result.
++MAX_TEXT_CHARS = 4000
++DEFAULT_MAX_CONTINUATIONS = 2
++#: Continuation/steer tokens are only queried within the turn and the one after it.
++_TOKEN_TTL_SECONDS = 600.0
++
++_LOCK = threading.RLock()
++#: session id -> weakref to the agent whose turn is running.
++_LIVE: dict[str, weakref.ReferenceType] = {}
++#: session id -> read-only facts about the live turn.
++_TURNS: dict[str, dict[str, Any]] = {}
++#: session id -> the one continuation waiting for the stop gate.
++_CONTINUATIONS: dict[str, dict[str, Any]] = {}
++#: token -> {"state": pending|taken|expired, "session", "created_at", "taken_at"}
++_TOKENS: dict[str, dict[str, Any]] = {}
++
++
++def _clip(text: Any) -> str:
++    cleaned = str(text or "").strip()
++    if len(cleaned) <= MAX_TEXT_CHARS:
++        return cleaned
++    return cleaned[: MAX_TEXT_CHARS - 1].rstrip() + "…"
++
++
++def _prune(now: Optional[float] = None) -> None:
++    cutoff = (now if now is not None else time.time()) - _TOKEN_TTL_SECONDS
++    for token, record in list(_TOKENS.items()):
++        if float(record.get("created_at") or 0.0) < cutoff:
++            _TOKENS.pop(token, None)
++
++
++def _agent_for(session_id: str) -> Optional[Any]:
++    ref = _LIVE.get(session_id)
++    if ref is None:
++        return None
++    agent = ref()
++    if agent is None:
++        _LIVE.pop(session_id, None)
++        _TURNS.pop(session_id, None)
++    return agent
++
++
++def bind_turn(agent: Any) -> bool:
++    """Register the agent whose turn is starting. Fail-open; never raises."""
++    try:
++        session = str(getattr(agent, "session_id", "") or "")
++        if not session:
++            return False
++        with _LOCK:
++            _LIVE[session] = weakref.ref(agent)
++            coding = getattr(agent, "_resolved_is_coding", None)
++            _TURNS[session] = {
++                "turn_id": str(getattr(agent, "_current_turn_id", "") or ""),
++                "platform": str(getattr(agent, "platform", "") or ""),
++                "coding": None if coding is None else bool(coding),
++                "bound_at": time.time(),
++            }
++        return True
++    except Exception:
++        logger.debug("plugin_runtime.bind_turn failed", exc_info=True)
++        return False
++
++
++def unbind_turn(agent: Any) -> None:
++    """Release the turn. A continuation nobody consumed is marked expired."""
++    try:
++        session = str(getattr(agent, "session_id", "") or "")
++        if not session:
++            return
++        with _LOCK:
++            ref = _LIVE.get(session)
++            if ref is not None and ref() is not agent:
++                return
++            _LIVE.pop(session, None)
++            _TURNS.pop(session, None)
++            pending = _CONTINUATIONS.pop(session, None)
++            if pending is not None:
++                record = _TOKENS.get(pending["token"])
++                if record is not None and record.get("state") == "pending":
++                    record["state"] = "expired"
++                    record["expired_at"] = time.time()
++    except Exception:
++        logger.debug("plugin_runtime.unbind_turn failed", exc_info=True)
++
++
++def live_turn(session_id: str) -> bool:
++    with _LOCK:
++        return _agent_for(str(session_id or "")) is not None
++
++
++def turn_state(session_id: str) -> dict[str, Any]:
++    """Facts a plugin may branch on. Absent values are ``None``, never guessed."""
++    session = str(session_id or "")
++    now = time.time()
++    with _LOCK:
++        agent = _agent_for(session)
++        facts = dict(_TURNS.get(session) or {})
++        pending = _CONTINUATIONS.get(session)
++    bound_at = float(facts.pop("bound_at", 0.0) or 0.0)
++    return {
++        "capability": CAPABILITY_VERSION,
++        "live": agent is not None,
++        "session_id": session,
++        # Read live: bind_turn runs before the turn context stamps _current_turn_id.
++        "turn_id": str(getattr(agent, "_current_turn_id", "") or facts.get("turn_id") or ""),
++        "platform": facts.get("platform") or "",
++        "coding": facts.get("coding"),
++        "bound_seconds": round(now - bound_at, 3) if bound_at else 0.0,
++        "pending_continuation": bool(pending),
++    }
++
++
++def steer(session_id: str, text: str, *, source: str = "") -> dict[str, Any]:
++    """Queue plugin advice for the live turn.
++
++    Always the host's queued-steer path, never ``redirect``: redirect persists a *user
++    correction* row, and a reviewer's advice must not borrow the user's authority. The row is
++    typed ``display_kind="adviser"`` (see ``agent.prompt_builder.advisory_user_row``), so the
++    model is not told the text is a direct user message.
++
++    Returns ``{"ok": bool, "mode": "steer"|"", "reason": str}``.
++    """
++    session = str(session_id or "")
++    body = _clip(text)
++    if not body:
++        return {"ok": False, "mode": "", "reason": "empty_text"}
++    with _LOCK:
++        agent = _agent_for(session)
++    if agent is None:
++        return {"ok": False, "mode": "", "reason": "no_live_turn"}
++    try:
++        accepted = bool(agent.steer(body, kind="adviser"))
++    except TypeError:
++        # A host that predates the ``kind`` keyword still accepts the text; the row then
++        # carries the operator marker, which is the pre-patch behaviour.
++        try:
++            accepted = bool(agent.steer(body))
++        except Exception as exc:
++            logger.warning("plugin_runtime.steer failed (%s): %s", source, exc)
++            return {"ok": False, "mode": "", "reason": "host_error"}
++    except Exception as exc:
++        logger.warning("plugin_runtime.steer failed (%s): %s", source, exc)
++        return {"ok": False, "mode": "", "reason": "host_error"}
++    return {"ok": accepted, "mode": "steer" if accepted else "",
++            "reason": "" if accepted else "host_refused"}
++
++
++def request_continuation(session_id: str, text: str, *, source: str = "",
++                         token: str = "") -> dict[str, Any]:
++    """Leave one message for the stop gate of the live turn.
++
++    At most one continuation may wait per session: the first wins so a noisy
++    reviewer cannot stack a queue the model reads as several user turns.
++    """
++    session = str(session_id or "")
++    body = _clip(text)
++    if not body:
++        return {"ok": False, "token": "", "reason": "empty_text"}
++    now = time.time()
++    with _LOCK:
++        _prune(now)
++        if _agent_for(session) is None:
++            return {"ok": False, "token": "", "reason": "no_live_turn"}
++        if session in _CONTINUATIONS:
++            return {"ok": False, "token": "", "reason": "already_pending"}
++        token = token or f"{session}:{time.time_ns()}"
++        _CONTINUATIONS[session] = {
++            "token": token, "text": body, "source": str(source or ""), "created_at": now,
++        }
++        _TOKENS[token] = {
++            "state": "pending", "session": session, "created_at": now,
++        }
++    return {"ok": True, "token": token, "reason": ""}
++
++
++def take_continuation(session_id: str) -> Optional[dict[str, Any]]:
++    """The stop gate's drain: pop the pending continuation for this session."""
++    session = str(session_id or "")
++    with _LOCK:
++        pending = _CONTINUATIONS.pop(session, None)
++        if pending is None:
++            return None
++        record = _TOKENS.get(pending["token"])
++        if record is not None:
++            record["state"] = "taken"
++            record["taken_at"] = time.time()
++    return pending
++
++
++def discard_continuation(session_id: str) -> Optional[dict[str, Any]]:
++    """Drop a continuation nobody will consume (budget exhausted).
++
++    Distinct from :func:`take_continuation` on purpose: the caller never appends
++    the text, so the token must read ``expired`` and the plugin must return its
++    advice rows to the pending queue instead of assuming delivery.
++    """
++    session = str(session_id or "")
++    with _LOCK:
++        pending = _CONTINUATIONS.pop(session, None)
++        if pending is None:
++            return None
++        record = _TOKENS.get(pending["token"])
++        if record is not None and record.get("state") == "pending":
++            record["state"] = "expired"
++            record["expired_at"] = time.time()
++    return pending
++
++
++def continuation_status(session_id: str, token: str) -> str:
++    """``pending`` / ``taken`` / ``expired`` / ``unknown`` for one token."""
++    if not token:
++        return "unknown"
++    with _LOCK:
++        _prune()
++        record = _TOKENS.get(str(token))
++        if record is None:
++            return "unknown"
++        state = str(record.get("state") or "unknown")
++        if state == "pending" and str(record.get("session") or "") != str(session_id or ""):
++            return "unknown"
++        return state
++
++
++def max_continuations() -> int:
++    """Per-turn budget for the stop gate (``agent.max_plugin_continuations``)."""
++    try:
++        from hermes_cli.config import load_config
++
++        agent_cfg = (load_config() or {}).get("agent") or {}
++        return max(0, int(agent_cfg.get("max_plugin_continuations", DEFAULT_MAX_CONTINUATIONS)))
++    except (TypeError, ValueError):
++        return DEFAULT_MAX_CONTINUATIONS
++    except Exception:
++        return DEFAULT_MAX_CONTINUATIONS
++
++
++def clear_session(session_id: str) -> None:
++    """Drop every record for a session (``/new``, teardown, tests)."""
++    session = str(session_id or "")
++    with _LOCK:
++        _LIVE.pop(session, None)
++        _TURNS.pop(session, None)
++        pending = _CONTINUATIONS.pop(session, None)
++        if pending is not None:
++            _TOKENS.pop(pending["token"], None)
++        for token in [t for t, rec in _TOKENS.items() if rec.get("session") == session]:
++            _TOKENS.pop(token, None)
++
++
++__all__ = [
++    "CAPABILITY_VERSION",
++    "DISPLAY_KIND",
++    "MAX_TEXT_CHARS",
++    "bind_turn",
++    "clear_session",
++    "continuation_status",
++    "discard_continuation",
++    "live_turn",
++    "max_continuations",
++    "request_continuation",
++    "steer",
++    "take_continuation",
++    "turn_state",
++    "unbind_turn",
++]
+diff --git a/tests/agent/test_plugin_runtime.py b/tests/agent/test_plugin_runtime.py
+new file mode 100644
+index 0000000000..e7f2420c64
+--- /dev/null
++++ b/tests/agent/test_plugin_runtime.py
+@@ -0,0 +1,128 @@
++"""Unit coverage for the plugin control bridge (`hermes_cli.plugin_runtime`)."""
++
++from __future__ import annotations
++
++import pytest
++
++from hermes_cli import plugin_runtime
++
++
++class _Agent:
++    def __init__(self, session_id: str = "session-1"):
++        self.session_id = session_id
++        self.platform = "cli"
++        self._current_turn_id = "turn-1"
++        self._resolved_is_coding = True
++        self.steered: list[tuple[str, str]] = []
++        self.redirected: list[str] = []
++
++    def steer(self, text: str, *, kind: str = "user") -> bool:
++        self.steered.append((text, kind))
++        return True
++
++    def redirect(self, text: str) -> bool:
++        self.redirected.append(text)
++        return True
++
++
++class _LegacyAgent(_Agent):
++    """A host whose ``steer`` predates the ``kind`` keyword."""
++
++    def steer(self, text: str) -> bool:
++        self.steered.append((text, "user"))
++        return True
++
++
++@pytest.fixture(autouse=True)
++def _clean_runtime():
++    plugin_runtime.clear_session("session-1")
++    plugin_runtime.clear_session("session-2")
++    yield
++    plugin_runtime.clear_session("session-1")
++    plugin_runtime.clear_session("session-2")
++
++
++def test_unbound_session_refuses_to_pretend_it_delivered():
++    result = plugin_runtime.steer("session-1", "look at this")
++    assert result == {"ok": False, "mode": "", "reason": "no_live_turn"}
++    assert plugin_runtime.turn_state("session-1")["live"] is False
++
++
++def test_bind_publishes_only_the_running_turn():
++    agent = _Agent()
++    assert plugin_runtime.bind_turn(agent) is True
++    state = plugin_runtime.turn_state("session-1")
++    assert state["live"] is True
++    assert state["turn_id"] == "turn-1"
++    assert state["coding"] is True
++    agent._current_turn_id = "turn-2"
++    assert plugin_runtime.turn_state("session-1")["turn_id"] == "turn-2"
++    plugin_runtime.unbind_turn(agent)
++    assert plugin_runtime.live_turn("session-1") is False
++
++
++def test_steer_marks_advice_and_never_uses_the_user_correction_path():
++    agent = _Agent()
++    plugin_runtime.bind_turn(agent)
++    result = plugin_runtime.steer("session-1", "stop and re-read the diff")
++    assert result["ok"] is True and result["mode"] == "steer"
++    assert agent.steered == [("stop and re-read the diff", "adviser")]
++    # redirect would persist a "user correction"; plugin advice must not borrow that.
++    assert agent.redirected == []
++
++    legacy = _LegacyAgent(session_id="session-2")
++    plugin_runtime.bind_turn(legacy)
++    result = plugin_runtime.steer("session-2", "fallback text")
++    assert result["ok"] is True and legacy.steered == [("fallback text", "user")]
++
++
++def test_one_continuation_at_a_time_and_its_status_is_observable():
++    agent = _Agent()
++    plugin_runtime.bind_turn(agent)
++    first = plugin_runtime.request_continuation("session-1", "first advice", source="minir")
++    assert first["ok"] is True
++    second = plugin_runtime.request_continuation("session-1", "second advice", source="minir")
++    assert second == {"ok": False, "token": "", "reason": "already_pending"}
++    assert plugin_runtime.continuation_status("session-1", first["token"]) == "pending"
++
++    taken = plugin_runtime.take_continuation("session-1")
++    assert taken["text"] == "first advice"
++    assert plugin_runtime.continuation_status("session-1", first["token"]) == "taken"
++    assert plugin_runtime.take_continuation("session-1") is None
++
++
++def test_unconsumed_continuation_expires_at_turn_end():
++    agent = _Agent()
++    plugin_runtime.bind_turn(agent)
++    queued = plugin_runtime.request_continuation("session-1", "late advice", source="minir")
++    plugin_runtime.unbind_turn(agent)
++    assert plugin_runtime.continuation_status("session-1", queued["token"]) == "expired"
++
++
++def test_discard_marks_the_token_expired_not_taken():
++    agent = _Agent()
++    plugin_runtime.bind_turn(agent)
++    queued = plugin_runtime.request_continuation("session-1", "over budget", source="minir")
++    assert plugin_runtime.discard_continuation("session-1")["token"] == queued["token"]
++    assert plugin_runtime.continuation_status("session-1", queued["token"]) == "expired"
++    assert plugin_runtime.take_continuation("session-1") is None
++
++
++def test_advisory_row_does_not_claim_user_authority():
++    from agent.prompt_builder import STEER_DISPLAY_KIND, advisory_user_row, steer_row
++
++    advice = advisory_user_row("[adviser — advisory only]\nre-read the diff")
++    assert advice["role"] == "user" and advice["display_kind"] == "adviser"
++    assert "OUT-OF-BAND USER MESSAGE" not in advice["content"]
++
++    operator = steer_row("hello")
++    assert operator["display_kind"] == STEER_DISPLAY_KIND
++    assert "OUT-OF-BAND USER MESSAGE" in operator["content"]
++
++
++def test_text_is_bounded():
++    agent = _Agent()
++    plugin_runtime.bind_turn(agent)
++    result = plugin_runtime.steer("session-1", "x" * (plugin_runtime.MAX_TEXT_CHARS + 100))
++    assert result["ok"] is True
++    assert len(agent.steered[0][0]) <= plugin_runtime.MAX_TEXT_CHARS

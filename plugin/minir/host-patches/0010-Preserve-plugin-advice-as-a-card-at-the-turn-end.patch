@@ -1,0 +1,162 @@
+From 0000000000000000000000000000000000000010 Mon Sep 17 00:00:00 2001
+From: chaorenex1 <24537608z@gmail.com>
+Date: 周四, 22 10月 2026 12:52:31 +0800
+Subject: [PATCH] Preserve plugin advice as a card at the turn end
+
+A review that decides to keep advice for later runs after the turn, when the plugin
+no longer has an agent handle. Capture a writer while the turn is live, append one
+adviser row at the end of the turn, flush it to the session DB, and notify the live
+surface, so the card is visible in order and hydrates as a card on resume.
+---
+
+ hermes_cli/plugin_runtime.py       |   61 +++++++++++++++++++++++++++++++++++-
+ tests/agent/test_plugin_runtime.py |   44 ++++++++++++++++++++++++++
+ 2 files changed, 103 insertions(+), 2 deletions(-)
+
+diff --git a/hermes_cli/plugin_runtime.py b/hermes_cli/plugin_runtime.py
+--- a/hermes_cli/plugin_runtime.py
++++ b/hermes_cli/plugin_runtime.py
+@@ -28,12 +28,12 @@
+ import threading
+ import time
+ import weakref
+-from typing import Any, Optional
++from typing import Any, Callable, Optional
+ 
+ logger = logging.getLogger(__name__)
+ 
+ #: Bumped when the callable surface changes so a plugin can feature-detect.
+-CAPABILITY_VERSION = "plugin_runtime_v1"
++CAPABILITY_VERSION = "plugin_runtime_v2"
+ #: ``display_kind`` on the durable row a continuation is delivered as. Clients
+ #: that do not know it still render the text; the value keeps it distinguishable
+ #: from a human prompt in the transcript.
+@@ -267,6 +267,61 @@
+         logger.debug("plugin_runtime.attach_post_turn failed", exc_info=True)
+ 
+ 
++def preserve_handle(session_id: str) -> Optional[Callable[..., dict[str, Any]]]:
++    """Capture a turn-end card writer, or ``None`` when no turn is bound.
++
++    A review that decides to *preserve* advice finishes after the turn, when the plugin no
++    longer has an agent handle. Call this while the turn is live (the plugin does it in
++    ``post_llm_call``) and keep the closure: it appends one adviser row at the end of the
++    turn, flushes that row to the session DB, and notifies the surface. The row is a real
++    transcript message (``display_kind=adviser``), so it hydrates as a card on resume.
++    """
++    agent = _agent_for(str(session_id or ""))
++    if agent is None:
++        return None
++    session = str(getattr(agent, "session_id", "") or session_id)
++
++    def _append(text: str, metadata: Optional[dict[str, Any]] = None) -> dict[str, Any]:
++        body = _clip(text)
++        if not body:
++            return {"ok": False, "reason": "empty_text"}
++        if str(getattr(agent, "session_id", "") or "") != session:
++            return {"ok": False, "reason": "session_changed"}
++        try:
++            from agent.plugin_events import notify_plugin_message
++            from agent.prompt_builder import advisory_user_row
++        except Exception:
++            logger.debug("plugin_runtime.preserve: host API missing", exc_info=True)
++            return {"ok": False, "reason": "host_api_missing"}
++        row = advisory_user_row(body)
++        if isinstance(metadata, dict) and metadata:
++            row["display_metadata"] = dict(metadata)
++        messages = getattr(agent, "messages", None)
++        if not isinstance(messages, list):
++            return {"ok": False, "reason": "no_transcript"}
++        with _LOCK:
++            messages.append(row)
++        flush = getattr(agent, "_flush_messages_to_session_db", None)
++        if callable(flush):
++            try:
++                flush(messages)
++            except Exception:
++                logger.debug("plugin_runtime.preserve: flush failed", exc_info=True)
++        notify_plugin_message(agent, row)
++        return {"ok": True, "id": str(row.get("plugin_message_id") or ""), "reason": ""}
++
++    return _append
++
++
++def preserve(session_id: str, text: str, *,
++             metadata: Optional[dict[str, Any]] = None) -> dict[str, Any]:
++    """One-shot form of :func:`preserve_handle`."""
++    handle = preserve_handle(session_id)
++    if handle is None:
++        return {"ok": False, "reason": "no_live_turn"}
++    return handle(text, metadata)
++
++
+ def steer(session_id: str, text: str, *, source: str = "") -> dict[str, Any]:
+     """Queue plugin advice for the live turn.
+ 
+@@ -419,6 +474,8 @@
+     "interrupt",
+     "live_turn",
+     "max_continuations",
++    "preserve",
++    "preserve_handle",
+     "queue_post_turn",
+     "request_continuation",
+     "request_interrupt",
+diff --git a/tests/agent/test_plugin_runtime.py b/tests/agent/test_plugin_runtime.py
+--- a/tests/agent/test_plugin_runtime.py
++++ b/tests/agent/test_plugin_runtime.py
+@@ -37,6 +37,19 @@
+         return True
+ 
+ 
++class _PreserveAgent(_Agent):
++    """A minimal agent with the transcript + flush surface ``preserve`` needs."""
++
++    def __init__(self, session_id: str = "session-1"):
++        super().__init__(session_id)
++        self.messages: list[dict] = [{"role": "assistant", "content": "done"}]
++        self.flushed: list[list[dict]] = []
++        self.plugin_message_callback = None
++
++    def _flush_messages_to_session_db(self, messages):
++        self.flushed.append(list(messages))
++
++
+ @pytest.fixture(autouse=True)
+ def _clean_runtime():
+     plugin_runtime.clear_session("session-1")
+@@ -163,3 +176,34 @@
+ 
+     plugin_runtime.unbind_turn(agent)
+     assert plugin_runtime.set_flag("session-1", "plan_mode", False) is False
++
++
++def test_preserve_writer_survives_the_turn_and_appends_a_card():
++    agent = _PreserveAgent()
++    seen: list[dict] = []
++    agent.plugin_message_callback = seen.append
++    plugin_runtime.bind_turn(agent)
++
++    # Captured while the turn is live; the review that preserves runs after it.
++    handle = plugin_runtime.preserve_handle("session-1")
++    assert callable(handle)
++    plugin_runtime.unbind_turn(agent)
++
++    result = handle("[adviser] keep this card", {"preserved": True, "severity": "concern"})
++
++    assert result["ok"] is True
++    row = agent.messages[-1]
++    assert row["role"] == "user" and row["display_kind"] == "adviser"
++    assert row["display_metadata"] == {"preserved": True, "severity": "concern"}
++    assert agent.flushed and agent.flushed[-1][-1] is row
++    assert seen and seen[-1]["plugin_message_id"] == row["plugin_message_id"]
++    assert "keep this card" in seen[-1]["content"]
++
++
++def test_preserve_one_shot_refuses_after_the_turn():
++    agent = _PreserveAgent()
++    assert plugin_runtime.preserve("session-1", "too late") == {
++        "ok": False, "reason": "no_live_turn"}
++    plugin_runtime.bind_turn(agent)
++    assert plugin_runtime.preserve("session-1", "on time")["ok"] is True
++    assert agent.messages[-1]["display_kind"] == "adviser"
