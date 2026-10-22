@@ -1,6 +1,6 @@
 # 会话一致性的五个并列建议目标（草稿）
 
-状态：草稿，供评审（v6）。代码基线：`plugin/minir/` 工作区 `7b46a12`，含 `adviser_prompts.py`、`prompts/adviser/`、`rules/advice_*.md` 的未提交改动。
+状态：草稿，供评审（v7）。代码基线：`plugin/minir/` 提交 `088b355`（工作区干净）；`adviser_prompts.py`、`prompts/adviser/`、`rules/advice_target.md`、`rules/advice_judgment.md` 已随该提交落地。
 
 本稿把「会话历史是否与某个准绳一致」做成五个并列建议目标，直接进入 advice target 词表：
 
@@ -80,7 +80,7 @@ _BASE_CONCLUSION_KINDS (store.py:389)
 `_ARTIFACT_SECTIONS` 没有 base 项，parser 也不再切 `## AI Card`。所以本稿不新增子节规则，也不改 `render_ai_card`（`layers.py:428`），只改一个 scope：
 
 - `_BASE_CONCLUSION_KINDS` 的 `ai_self_representation` 行改为 `session`。
-- `_scope_key("session", subject, session_id)` 生成 `session:<sid>:<subject>`（store.py:416-419）；`publish_base_conclusions` 已经按 scope 决定是否写 `session_id`（store.py:1511），不需要新分支。
+- `_scope_key("session", subject, session_id)` 生成 `session:<sid>:<subject>`（store.py:416-419；sid 为空时回退用 subject，这正是 §2.3 要改成报错的原因）；`publish_base_conclusions` 已经按 scope 决定是否写 `session_id`（store.py:1511），不需要新分支。
 - `_LONG_TERM_KINDS` 去掉 `base.ai_self_representation`，保留另外三项。
 - `_KIND_WEIGHT` 不动：它是打分权重，不是可见性。
 
@@ -155,7 +155,7 @@ _BASE_CONCLUSION_KINDS (store.py:389)
 | 处置矩阵 | `ADVICE_HANDLING`（prompting.py:124） | 五个 target 各补 blocker / concern 两格；`nit` 由 `DELIVERED_TARGETS` 生成。少一格会在 `advice_handling_section()`（prompting.py:191）拼系统块时 `KeyError`，不是静默 |
 | 表格渲染 | `advice_handling_section` | 现有 7 列一张表不动，Consistency 五列另起一张，避免 12 列宽表 |
 | 解析接受 | `adviser_mode.DELIVERED_TARGET_NAMES`（adviser_mode.py:55） | 改为直接取 `prompting.DELIVERED_TARGETS`，删掉本地 `ACTION_TARGETS + ARTIFACT_TARGETS` 重组。不并会让 `parse_review` 把五个一致性 target 降级成 `general` |
-| 顾问指令 | `rules/advice_target.md` + `rules/advice_judgment.md`（未提交） | 五个 token 的准绳、判定类型、证据要求、严重度上限已写入；只补 `coverage` 字段与 `bad_target` 拒收 |
+| 顾问指令 | `rules/advice_target.md` + `rules/advice_judgment.md`（已随 088b355 落地） | 五个 token 的准绳、判定类型、证据要求、严重度上限已写入；只补 `coverage` 字段与 `bad_target` 拒收 |
 | 解析 | `parse_review`（adviser_mode.py:439） | `_check` 结尾但不在 `CONSISTENCY_TARGETS` 的值拒收并记 `bad_target`；无 check 字段；`coverage` 状态图单独解析 |
 | 投递渲染 | `render_block`（adviser_mode.py:498） | 标签显示 target 与 severity；长 token 由 `MAX_BLOCK_CHARS` 截断兜底 |
 | 覆盖状态 | `adviser_reviews.coverage`（新列，JSON） | 五 target × `clean` / `found` / `n/a` |
@@ -212,7 +212,7 @@ _BASE_CONCLUSION_KINDS (store.py:389)
 - `# Craft` 的表面禁令判 nit，代码经济（重写 stdlib、给一次性任务加防御层）判 concern；不把「读起来像生成的」当证据，必须引原句。
 - 同一句话只归属一个目标。三个 `soul_*` 命中同一句话时按 `soul_tool_policy_check` > `soul_workflow_check` > `soul_craft_check` 取第一个；它们没有共同的 `soul` 父目标，各自独立成条。
 
-这组上限已经写进 `rules/advice_judgment.md` 的 `SEVERITY CEILINGS BY TARGET`（未提交），本节只记录口径，不再新增第二份词表。
+这组上限已经写进 `rules/advice_judgment.md` 的 `SEVERITY CEILINGS BY TARGET`，本节只记录口径，不再新增第二份词表。
 
 不进判定的节：`# Role`、`# Character`、`# Priorities`、`# Runtime`、`# Delegation & Kanban`、`# Memory & continuity`、`# Communication`、`# Avoid`。前七节是身份、能力与风格叙述，不是可引用原句的硬约束；`# Avoid` 是其他节的摘要，直接引源节，避免同一句话被两次计数。
 
@@ -328,7 +328,7 @@ on_session_end                         __init__.py:1165
 | 项 | 取值 |
 | --- | --- |
 | 队列 | 复用 `jobs` 表，`layer='repair'`，新列 `due_at`；不新建 repair 表 |
-| 认领 | `claim_jobs` 的 WHERE 现在固定 `layer IN ('base','dialectic')`（store.py:1045），repair 要么纳入该集合，要么新增 `claim_repair_jobs`；`_process` 对非 dialectic 一律走 base 分支（worker.py:1089-1091），所以必须在窗口解析前分流 `layer == 'repair'` |
+| 认领 | `claim_jobs` 的 WHERE 现在固定 `layer IN ('base','dialectic')`（store.py:1045），repair 要么纳入该集合，要么新增 `claim_repair_jobs`；`_process` 只在 `layer == BASE_LAYER` 时走 base 分支，其余层（含 repair）落进 dialectic 分支（worker.py:1089-1095），所以必须在窗口解析前分流 `layer == 'repair'` |
 | 输入 | 按 session 重读 `status='repair'` 的 advisories 行（含 `evidence`）、会话 id、工作目录、本会话变更过的文件清单；job 只存窗口与时间 |
 | 执行 | `agent_loop.run(..., toolsets=agent_toolsets(...), read_only=False, layer='repair')`；`agent_toolsets()` 固定追加 host `file` + `minir` + `skills`（tools.py:147），没有 adviser 这个 toolset |
 | 写权限 | 必须新增 scope。现行 `file_guard.check` 的写分支只允许 `$HERMES_HOME/minir-memory/scratch`（file_guard.py:235-239），项目文件一律拒绝。修复要改项目文件，需一个 `file_guard.REPAIR_SCOPE` contextvar：项目根内可写，仍拒绝 `.git`、`.env` 与凭据、四张卡文件、transcript、`minir-memory.db`。没有这一项，修复轮只能写 scratch，等于不修 |
