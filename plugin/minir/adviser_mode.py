@@ -31,7 +31,7 @@ import re
 import threading
 import time
 from collections import deque
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any, Optional
 
 from .adviser_guard import DEFAULT_BUDGET, EmissionGuard, GuardVerdict, key_for
@@ -66,6 +66,8 @@ MAX_RING = 96
 MAX_EVENT_CHARS = 12_000
 MAX_PROMPT_CHARS = 24000
 MAX_ADVICES = 3
+#: Hard ceiling for the configured row cap; the block budget bounds the rendered text.
+MAX_ADVICES_CEILING = 10
 MAX_BLOCK_CHARS = 900
 ADVICE_TTL = 3600.0
 MAX_PROJECT_CHARS = 1500
@@ -172,7 +174,7 @@ _DEFAULTS: dict[str, Any] = {
 def _review_brief(cfg: dict[str, Any], *, hermes_home: str = "") -> str:
     """The reviewer contract, the live budget, and the two rule bodies."""
     try:
-        max_advices = max(1, min(int(cfg.get("max_advices") or MAX_ADVICES), 8))
+        max_advices = max(1, min(int(cfg.get("max_advices") or MAX_ADVICES), MAX_ADVICES_CEILING))
     except (TypeError, ValueError):
         max_advices = MAX_ADVICES
     try:
@@ -454,14 +456,82 @@ def _json_object(answer: str) -> Optional[dict[str, Any]]:
     return value if isinstance(value, dict) else None
 
 
-def _repair_prompt(prompt: str) -> str:
-    """Second attempt after a non-JSON reply: restate the format contract, ban tool calls."""
-    return (
-        "Your previous reply was not the required JSON object. Return ONLY the JSON object "
-        "described in the system message, with no prose, markdown or code fence. Do not call "
-        "any tool: the evidence this review needs is already in the original task.\n\n"
-        f"Original task:\n{prompt}"
-    )
+#: The reviewer's envelope as a provider-side schema (``prompts/adviser/review.md`` plus
+#: ``rules/advice_judgment.md``). A provider that honours structured output builds the object
+#: itself, so nothing has to recover it from prose.
+REVIEW_RESPONSE_FORMAT: dict[str, Any] = {
+    "type": "json_schema",
+    "json_schema": {
+        "name": "adviser_review",
+        "strict": False,
+        "schema": {
+            "type": "object",
+            "properties": {
+                "action": {"type": "string", "enum": ["silent", "advise"]},
+                "advices": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "severity": {"type": "string",
+                                         "enum": ["nit", "concern", "blocker"]},
+                            "target": {"type": "string",
+                                       "enum": list(DELIVERED_TARGET_NAMES)},
+                            "text": {"type": "string"},
+                            "decision": {"type": "string"},
+                            "evidence": {"type": "array", "items": {"type": "string"}},
+                            "candidate_id": {"type": ["integer", "null"]},
+                            "deferred": {"type": "boolean"},
+                        },
+                        "required": ["severity", "target", "text"],
+                        "additionalProperties": False,
+                    },
+                },
+                "coverage": {
+                    "type": "object",
+                    "additionalProperties": {
+                        "type": "string", "enum": ["clean", "found", "n/a"]},
+                },
+            },
+            "required": ["action"],
+            "additionalProperties": False,
+        },
+    },
+}
+
+#: Plain JSON mode, for a provider that rejects a ``json_schema`` envelope.
+_JSON_OBJECT_FORMAT: dict[str, str] = {"type": "json_object"}
+
+
+def structured_review(answer: str, prompt: str, cfg: dict[str, Any], *,
+                      hermes_home: str = "") -> tuple[str, int]:
+    """Recover the review object from a prose answer using provider-side structured output.
+
+    The reviewer runs as an agent — it reads files and searches knowledge — so its loop has no
+    ``response_format`` hook of its own. When the final answer is not the contract object, one
+    auxiliary call on the same route gets the reviewer's brief plus ``response_format``, and the
+    provider emits the object instead of the parser guessing at prose. ``json_schema`` is tried
+    first and plain ``json_object`` second; the client strips the field on a provider that
+    rejects it, so the last attempt is a plain completion. Returns ``(object text, calls made)``;
+    the text is ``""`` when no attempt produced one.
+    """
+    from .worker import call_model
+
+    task = (
+        "The review below was written as prose. Restate it as the required JSON object. Keep "
+        "every advice, severity, target and quoted evidence it states, and emit an advice for "
+        "each finding or recommendation it makes; use {\"action\": \"silent\"} only when the "
+        "review states no finding at all. Do not invent advice the review does not state.\n\n"
+        f"Review answer:\n{_bounded(answer, 6000)}\n\n"
+        f"Original task (context only):\n{_bounded(prompt, 6000)}")
+    system = _review_brief(cfg, hermes_home=hermes_home)
+    calls = 0
+    for response_format in (REVIEW_RESPONSE_FORMAT, _JSON_OBJECT_FORMAT):
+        calls += 1
+        text = call_model("adviser", system, task, response_format=response_format)
+        if _json_object(text) is not None:
+            return text, calls
+    return "", calls
 
 
 def parse_review(answer: str, *, severity_floor: str = "concern",
@@ -529,7 +599,7 @@ def parse_review(answer: str, *, severity_floor: str = "concern",
             # A deferred note waits for the turn-end aggregate; never a blocker.
             "deferred": _truthy(item.get("deferred"), False) and severity != "blocker",
         })
-        if len(out) >= max(1, min(int(max_advices or MAX_ADVICES), 8)):
+        if len(out) >= max(1, min(int(max_advices or MAX_ADVICES), MAX_ADVICES_CEILING)):
             break
     return out
 
@@ -768,7 +838,7 @@ class AdviserMode:
         except (TypeError, ValueError):
             cfg["max_reviews_per_turn"] = 6
         try:
-            cfg["max_advices"] = max(1, min(8, int(cfg.get("max_advices") or 3)))
+            cfg["max_advices"] = max(1, min(MAX_ADVICES_CEILING, int(cfg.get("max_advices") or 3)))
         except (TypeError, ValueError):
             cfg["max_advices"] = 3
         try:
@@ -1671,30 +1741,23 @@ class AdviserMode:
             api_calls = int(result.api_calls)
             if _json_object(result.answer) is None:
                 # A weak route can answer in prose or burn its tool budget before writing the
-                # object (the host log showed exactly that). Restate the contract once with no
-                # tool budget; only a second malformed reply fails the review, and every
-                # candidate stays pending either way.
-                retry = agent_loop.run(
-                    _repair_prompt(prompt), model=model, provider=provider,
-                    toolsets=toolsets,
-                    system_message=_review_brief(cfg, hermes_home=self._hermes_home()),
-                    max_iterations=1,
-                    project_dir=adviser.project_dir(route), read_only=True,
-                    history=runtime.messages or None,
-                    session_id=_host_session_id(session, name),
-                    layer="adviser", history_session=f"{session}--{name}",
-                )
-                api_calls += int(retry.api_calls)
-                if _json_object(retry.answer) is None:
+                # object (the host log showed exactly that). Ask the provider for the object
+                # directly: the answer already holds the review, and a json_schema request
+                # cannot come back as prose. The agent is not re-run, so no second tool budget
+                # is spent on a round that has no tools to use.
+                text, calls = structured_review(
+                    result.answer, prompt, cfg, hermes_home=self._hermes_home())
+                api_calls += calls
+                if not text:
                     self._finish_safe(
-                        review_id, status="failed", model=retry.model,
+                        review_id, status="failed", model=result.model,
                         api_calls=api_calls,
                         latency_ms=(time.time() - started) * 1000.0,
                         error="reviewer returned non-JSON")
                     logger.warning("adviser mode: %s returned non-JSON", name)
                     self._note_failure(runtime, "reviewer returned non-JSON", cfg)
                     return {"called": True}
-                result = retry
+                result = replace(result, answer=text)
             refused: dict[str, int] = {}
             parsed = parse_review(
                 result.answer, severity_floor=str(cfg["severity_floor"]),

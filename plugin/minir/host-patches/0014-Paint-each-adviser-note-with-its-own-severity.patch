@@ -1,0 +1,584 @@
+From 0000000000000000000000000000000000000014 Mon Sep 17 00:00:00 2001
+From: chaorenex1 <24537608z@gmail.com>
+Date: Fri, 23 Oct 2026 15:50:04 
+Subject: [PATCH] Paint each adviser note with its own severity
+
+One adviser block can carry notes at different severities, but every surface took the
+first note's severity for the whole card and drew the body in one tone. Parse each
+note's `[severity · target · adviser]` label, let the strongest note set the card badge, and
+draw each note as its own line in the Desktop card (live and hydrated), the TUI card, the
+web inspector, and the classic CLI.
+
+---
+ .../app/session/hooks/use-message-stream/index.ts  |  8 ++-
+ .../assistant-ui/thread/system-message.test.tsx    | 24 +++++++++
+ .../assistant-ui/thread/system-message.tsx         | 29 +++++++---
+ apps/desktop/src/lib/chat-messages/adviser.test.ts | 14 +++++
+ apps/desktop/src/lib/chat-messages/hydration.ts    | 14 +++--
+ hermes_cli/cli_agent_setup_mixin.py                | 14 +++++
+ hermes_cli/cli_stream_mixin.py                     | 31 +++++++----
+ tests/hermes_cli/test_adviser_items.py             | 25 +++++++++
+ ui-tui/src/__tests__/messages.test.ts              | 63 ++++++++++++++++++++++
+ ui-tui/src/components/messageLine.tsx              | 22 +++++---
+ ui-tui/src/domain/messages.ts                      |  9 +++-
+ web/src/pages/SessionsPage.test.tsx                | 28 ++++++++++
+ web/src/pages/SessionsPage.tsx                     | 55 ++++++++++++++-----
+ 13 files changed, 293 insertions(+), 43 deletions(-)
+---
+diff --git a/apps/desktop/src/app/session/hooks/use-message-stream/index.ts b/apps/desktop/src/app/session/hooks/use-message-stream/index.ts
+index 55204f6736..840673c492 100644
+--- a/apps/desktop/src/app/session/hooks/use-message-stream/index.ts
++++ b/apps/desktop/src/app/session/hooks/use-message-stream/index.ts
+@@ -22,6 +22,7 @@ import {
+   toolCallOwnerMessageId,
+   upsertToolPart
+ } from '@/lib/chat-messages'
++import { adviserFromMessage } from '@/lib/chat-messages/hydration'
+ import type { ErrorSurface } from '@/lib/error-surface'
+ import {
+   dedupeGeneratedImageEchoesInParts,
+@@ -633,6 +634,9 @@ export function useMessageStream({
+ 
+         const label = String(payload?.label || 'advisory')
+         const severity = String(payload?.severity || 'advisory')
++        // The live row carries the rendered block, so parse it here too: otherwise a live
++        // card would keep one tone until the session is reopened.
++        const parsed = adviserFromMessage(text)
+ 
+         return {
+           ...state,
+@@ -642,7 +646,9 @@ export function useMessageStream({
+               id: `adviser-${id}`,
+               role: 'system',
+               parts: [textPart(text, occurredAt)],
+-              adviser: { severity, label, body: text, items: [] },
++              adviser: parsed
++                ? { ...parsed, label, severity }
++                : { severity, label, body: text, items: [] },
+               pluginMessageId: id,
+               timestamp: occurredAt
+             }
+diff --git a/apps/desktop/src/components/assistant-ui/thread/system-message.test.tsx b/apps/desktop/src/components/assistant-ui/thread/system-message.test.tsx
+index 33d58ca92f..b1c5af3659 100644
+--- a/apps/desktop/src/components/assistant-ui/thread/system-message.test.tsx
++++ b/apps/desktop/src/components/assistant-ui/thread/system-message.test.tsx
+@@ -125,6 +125,30 @@ describe('adviser card', () => {
+     expect(card?.textContent).toContain('stop now and re-read the diff')
+     expect(card?.textContent).not.toContain('advisory only')
+   })
++
++  it('paints each advice row with its own severity in a mixed block', () => {
++    const { container } = render(
++      <Harness
++        adviser={{
++          severity: 'blocker',
++          label: 'blocker · ai_self_representation_check · default',
++          body: '',
++          items: [
++            { label: 'concern · tool_choice · default', severity: 'concern', text: 'read the file first' },
++            { label: 'blocker · ai_self_representation_check · default', severity: 'blocker', text: 'the test never ran' }
++          ]
++        }}
++        text="[adviser — advisory only] x [end adviser]"
++      />
++    )
++
++    const rows = container.querySelectorAll('[data-slot="aui_adviser-message-root"] div[data-severity]')
++    expect(rows).toHaveLength(2)
++    expect(rows[0]?.getAttribute('data-severity')).toBe('concern')
++    expect(rows[1]?.getAttribute('data-severity')).toBe('blocker')
++    expect(rows[0]?.textContent).toContain('concern · tool_choice · default')
++    expect(rows[1]?.textContent).toContain('the test never ran')
++  })
+ })
+ 
+ describe('system message timestamp text separation', () => {
+diff --git a/apps/desktop/src/components/assistant-ui/thread/system-message.tsx b/apps/desktop/src/components/assistant-ui/thread/system-message.tsx
+index 7a3923ec82..4a330ef41d 100644
+--- a/apps/desktop/src/components/assistant-ui/thread/system-message.tsx
++++ b/apps/desktop/src/components/assistant-ui/thread/system-message.tsx
+@@ -61,6 +61,15 @@ export const BackgroundResult: FC<BackgroundResultProps> = ({ text, report, proc
+   )
+ }
+ 
++/** One tone per advice row: a mixed block must not paint every note as its loudest one. */
++function adviserTone(severity: string): string {
++  return severity === 'blocker'
++    ? 'text-(--ui-red)'
++    : severity === 'concern'
++      ? 'text-(--ui-orange)'
++      : 'text-(--ui-text-tertiary)'
++}
++
+ export const SystemMessage: FC = () => {
+   const text = useAuiState(s => messageContentText(s.message.content))
+   const asyncResult = useAuiState(s => s.message.metadata.custom?.asyncResult)
+@@ -68,12 +77,7 @@ export const SystemMessage: FC = () => {
+   const adviser = useAuiState(s => s.message.metadata.custom?.adviser as AdviserDisplay | undefined)
+ 
+   if (adviser) {
+-    const tone =
+-      adviser.severity === 'blocker'
+-        ? 'text-(--ui-red)'
+-        : adviser.severity === 'concern'
+-          ? 'text-(--ui-orange)'
+-          : 'text-(--ui-text-tertiary)'
++    const tone = adviserTone(adviser.severity)
+ 
+     return (
+       <MessagePrimitive.Root
+@@ -91,7 +95,18 @@ export const SystemMessage: FC = () => {
+             </span>
+             <MessageTimelineTimestamp />
+           </div>
+-          <MarkdownTextContent isRunning={false} text={adviser.body} />
++          {adviser.items.length > 0 ? (
++            <div className="flex min-w-0 flex-col gap-1">
++              {adviser.items.map((item, index) => (
++                <div className="min-w-0" data-severity={item.severity} key={`${index}-${item.label}`}>
++                  <span className={cn(SCAFFOLD_LABEL_CLASS, adviserTone(item.severity))}>{item.label}</span>
++                  <MarkdownTextContent isRunning={false} text={item.text} />
++                </div>
++              ))}
++            </div>
++          ) : (
++            <MarkdownTextContent isRunning={false} text={adviser.body} />
++          )}
+         </div>
+       </MessagePrimitive.Root>
+     )
+diff --git a/apps/desktop/src/lib/chat-messages/adviser.test.ts b/apps/desktop/src/lib/chat-messages/adviser.test.ts
+index ee92890530..c5aed24b9f 100644
+--- a/apps/desktop/src/lib/chat-messages/adviser.test.ts
++++ b/apps/desktop/src/lib/chat-messages/adviser.test.ts
+@@ -21,6 +21,20 @@ it('hydrates an adviser row as a system card, not a user prompt', () => {
+   expect(message.adviser?.items).toHaveLength(2)
+ })
+ 
++it('lets a blocker listed second raise the card severity', () => {
++  const block = [
++    '[adviser — advisory only]',
++    '- [concern · tool_choice · Architecture] check the import',
++    '- [blocker · ai_self_representation_check · default] the test never ran',
++    '[end adviser]'
++  ].join('\n')
++  const [message] = toChatMessages([{ role: 'user', content: block, display_kind: 'adviser', timestamp: 4 }])
++
++  expect(message.adviser?.severity).toBe('blocker')
++  expect(message.adviser?.label).toBe('blocker · ai_self_representation_check · default')
++  expect(message.adviser?.items.map(item => item.severity)).toEqual(['concern', 'blocker'])
++})
++
+ it('keeps an unparseable adviser row visible instead of dropping it', () => {
+   const [message] = toChatMessages([
+     { role: 'user', content: 'plain advice from an older host', display_kind: 'adviser', timestamp: 2 }
+diff --git a/apps/desktop/src/lib/chat-messages/hydration.ts b/apps/desktop/src/lib/chat-messages/hydration.ts
+index 3a4844176c..176e660962 100644
+--- a/apps/desktop/src/lib/chat-messages/hydration.ts
++++ b/apps/desktop/src/lib/chat-messages/hydration.ts
+@@ -175,9 +175,10 @@ const NOTICE_DISPLAY_KINDS = [
+ const ADVISER_HEADER_RE = /^\[adviser[^\n]*\]\s*/
+ const ADVISER_FOOTER_RE = /\s*\[end adviser\]\s*$/
+ const ADVISER_ITEM_RE = /^- \[([^\]]+)\]\s*(.*)$/gm
++const ADVISER_SEVERITY_RANK: Record<string, number> = { blocker: 3, concern: 2, nit: 1 }
+ 
+ /** Parse the rendered adviser block into the card's label and body. Display-only. */
+-function adviserFromMessage(content: string): ChatMessage['adviser'] | undefined {
++export function adviserFromMessage(content: string): ChatMessage['adviser'] | undefined {
+   const raw = String(content || '').trim()
+   if (!raw) {
+     return undefined
+@@ -189,10 +190,17 @@ function adviserFromMessage(content: string): ChatMessage['adviser'] | undefined
+ 
+     return { label, severity: label.split(' · ')[0]?.trim() || 'advisory', text: match[2].trim() }
+   })
++  // The card's own badge must not understate a mixed block: one blocker in the rows makes
++  // the card a blocker even when a concern was listed first.
++  const top = items.reduce<(typeof items)[number] | undefined>(
++    (best, item) =>
++      !best || (ADVISER_SEVERITY_RANK[item.severity] ?? 0) > (ADVISER_SEVERITY_RANK[best.severity] ?? 0) ? item : best,
++    undefined
++  )
+ 
+   return {
+-    severity: items[0]?.severity ?? 'advisory',
+-    label: items[0]?.label ?? 'advisory',
++    severity: top?.severity ?? 'advisory',
++    label: top?.label ?? 'advisory',
+     body,
+     items
+   }
+diff --git a/hermes_cli/cli_agent_setup_mixin.py b/hermes_cli/cli_agent_setup_mixin.py
+index 192cb77c0a..2f8f88616e 100644
+--- a/hermes_cli/cli_agent_setup_mixin.py
++++ b/hermes_cli/cli_agent_setup_mixin.py
+@@ -38,6 +38,20 @@ def _adviser_rows(content) -> tuple[str, list[str]]:
+     return label, body
+ 
+ 
++def _adviser_items(content) -> list[tuple[str, str]]:
++    """``(label, text)`` for each note row in a plugin adviser row.
++
++    The resume recap only needs the block summary, but the live CLI line paints each note
++    with its own severity, so callers need the rows separately.
++    """
++    items: list[tuple[str, str]] = []
++    for line in str(content or "").splitlines():
++        match = _ADVISER_ITEM_RE.match(line.strip())
++        if match and match.group(2).strip():
++            items.append((match.group(1).strip(), match.group(2).strip()))
++    return items
++
++
+ def _single_query_clarify_callback(questions: list) -> dict:
+     """Headless clarify answer for ``hermes chat -q``.
+ 
+diff --git a/hermes_cli/cli_stream_mixin.py b/hermes_cli/cli_stream_mixin.py
+index 5cb2cf824b..d42e766dac 100644
+--- a/hermes_cli/cli_stream_mixin.py
++++ b/hermes_cli/cli_stream_mixin.py
+@@ -299,21 +299,32 @@ class CLIStreamMixin:
+         so a streaming reply box holds them to its footer instead of splitting the answer.
+         """
+         try:
+-            from hermes_cli.cli_agent_setup_mixin import _adviser_rows
++            from hermes_cli.cli_agent_setup_mixin import _adviser_items, _adviser_rows
+             if not isinstance(row, dict) or row.get("display_kind") != "adviser":
+                 return
+             if getattr(getattr(self, "agent", None), "_mute_notification_reply", False):
+                 return
+             content = row.get("content")
+-            label, body = _adviser_rows(content)
+-            if not body:
+-                return
+-            severity = label.split(" · ")[0].strip().lower()
+-            color = "\033[31m" if severity == "blocker" else "\033[33m" if severity == "concern" else ""
+-            reset = "\033[0m" if color else ""
+-            self._agent_status_print(f"  {color}◆ adviser · {label}{reset}")
+-            for line in body:
+-                self._agent_status_print(f"    {color}{line}{reset}")
++            items = _adviser_items(content)
++            if not items:
++                # Rows written before per-note labels existed still carry a body.
++                label, body = _adviser_rows(content)
++                if not body:
++                    return
++                items = [(label, " ".join(body))]
++
++            def tone(label: str) -> tuple[str, str]:
++                severity = label.split(" · ")[0].strip().lower()
++                color = "\033[31m" if severity == "blocker" else "\033[33m" if severity == "concern" else ""
++                return color, ("\033[0m" if color else "")
++
++            rank = {"blocker": 3, "concern": 2, "nit": 1}
++            top_label = max(items, key=lambda item: rank.get(item[0].split(" · ")[0].strip().lower(), 0))[0]
++            color, reset = tone(top_label)
++            self._agent_status_print(f"  {color}◆ adviser · {top_label}{reset}")
++            for label, text in items:
++                row_color, row_reset = tone(label)
++                self._agent_status_print(f"    {row_color}· {label} — {text}{row_reset}")
+         except Exception:
+             pass
+ 
+diff --git a/tests/hermes_cli/test_adviser_items.py b/tests/hermes_cli/test_adviser_items.py
+new file mode 100644
+index 0000000000..88d2401a16
+--- /dev/null
++++ b/tests/hermes_cli/test_adviser_items.py
+@@ -0,0 +1,25 @@
++"""An adviser row keeps one label per note, so the CLI can paint each note by severity."""
++
++from hermes_cli.cli_agent_setup_mixin import _adviser_items
++
++
++def test_adviser_items_keep_per_note_labels():
++    content = "\n".join(
++        [
++            "[adviser — advisory only]",
++            "- [concern · reviewer] read the import first",
++            "- [blocker · reviewer] the test never ran",
++            "[end adviser]",
++        ]
++    )
++
++    assert _adviser_items(content) == [
++        ("concern · reviewer", "read the import first"),
++        ("blocker · reviewer", "the test never ran"),
++    ]
++
++
++def test_adviser_items_skip_the_bracketed_chrome():
++    content = "[adviser — advisory only]\nplain advice from an older host\n[end adviser]"
++
++    assert _adviser_items(content) == []
+diff --git a/ui-tui/src/__tests__/messages.test.ts b/ui-tui/src/__tests__/messages.test.ts
+index 93dbb8e5bd..c67e431602 100644
+--- a/ui-tui/src/__tests__/messages.test.ts
++++ b/ui-tui/src/__tests__/messages.test.ts
+@@ -73,6 +73,20 @@ describe('toTranscriptMessages', () => {
+     expect(message.adviser?.items).toHaveLength(2)
+   })
+ 
++  it('lets a blocker listed second raise the card severity', () => {
++    const text = [
++      '[adviser — advisory only]',
++      '- [concern · reviewer] The patch drops the retry path.',
++      '- [blocker · reviewer] The migration never ran.',
++      '[end adviser]'
++    ].join('\n')
++
++    const [message] = toTranscriptMessages([{ role: 'user', text, display_kind: 'adviser' }])
++
++    expect(message.adviser).toMatchObject({ severity: 'blocker' })
++    expect(message.adviser?.items.map(item => item.severity)).toEqual(['concern', 'blocker'])
++  })
++
+   it('projects async_delegation_complete with task_count metadata', () => {
+     const rows = [
+       { role: 'user', text: 'do work' },
+@@ -200,6 +214,55 @@ describe('MessageLine', () => {
+     expect(rendered).toContain('The patch drops the retry path.')
+   })
+ 
++  it('renders each advice row with its own label in a mixed block', () => {
++    const stdout = new PassThrough()
++    const stdin = new PassThrough()
++    const stderr = new PassThrough()
++    let output = ''
++
++    Object.assign(stdout, { columns: 80, isTTY: false, rows: 24 })
++    Object.assign(stdin, { isTTY: false })
++    Object.assign(stderr, { isTTY: false })
++    stdout.on('data', chunk => {
++      output += chunk.toString()
++    })
++
++    const instance = renderSync(
++      React.createElement(MessageLine, {
++        cols: 80,
++        msg: {
++          adviser: {
++            items: [
++              { label: 'concern · reviewer', severity: 'concern', text: 'read the import first' },
++              { label: 'blocker · reviewer', severity: 'blocker', text: 'the test never ran' }
++            ],
++            label: 'blocker · reviewer',
++            severity: 'blocker'
++          },
++          role: 'system',
++          text: 'read the import first\nthe test never ran'
++        },
++        t: DEFAULT_THEME
++      }),
++      {
++        patchConsole: false,
++        stderr: stderr as NodeJS.WriteStream,
++        stdin: stdin as NodeJS.ReadStream,
++        stdout: stdout as NodeJS.WriteStream
++      }
++    )
++
++    instance.unmount()
++    instance.cleanup()
++
++    const rendered = stripAnsi(output)
++
++    expect(rendered).toContain('adviser · blocker · reviewer')
++    expect(rendered).toContain('concern · reviewer')
++    expect(rendered).toContain('blocker · reviewer')
++    expect(rendered).toContain('the test never ran')
++  })
++
+   it('keeps historical thinking blocks collapsed by default', () => {
+     const stdout = new PassThrough()
+     const stdin = new PassThrough()
+diff --git a/ui-tui/src/components/messageLine.tsx b/ui-tui/src/components/messageLine.tsx
+index f401a8f5cb..a1c691a223 100644
+--- a/ui-tui/src/components/messageLine.tsx
++++ b/ui-tui/src/components/messageLine.tsx
+@@ -148,12 +148,9 @@ export const MessageLine = memo(function MessageLine({
+   // Plugin adviser guidance: a card, not a "you" bubble — the model saw this row,
+   // the human never typed it.
+   if (msg.adviser) {
+-    const tone =
+-      msg.adviser.severity === 'blocker'
+-        ? t.color.error
+-        : msg.adviser.severity === 'concern'
+-          ? t.color.warn
+-          : t.color.muted
++    const toneFor = (severity: string) =>
++      severity === 'blocker' ? t.color.error : severity === 'concern' ? t.color.warn : t.color.muted
++    const tone = toneFor(msg.adviser.severity)
+     const adviserGutter = transcriptGutterWidth('system', t.brand.prompt)
+     const adviserWidth = transcriptBodyWidth(cols, 'system', t.brand.prompt, TERMUX_TUI_MODE)
+ 
+@@ -169,8 +166,17 @@ export const MessageLine = memo(function MessageLine({
+           <NoSelect flexShrink={0} fromLeftEdge width={adviserGutter}>
+             <Text> </Text>
+           </NoSelect>
+-          <Box width={adviserWidth}>
+-            <Md cols={adviserWidth} compact={compact} t={t} text={msg.text} />
++          <Box width={adviserWidth} flexDirection="column">
++            {msg.adviser.items.length > 0 ? (
++              msg.adviser.items.map((item, index) => (
++                <Box key={`${index}-${item.label}`} flexDirection="column">
++                  <Text color={toneFor(item.severity)}>{item.label}</Text>
++                  <Md cols={adviserWidth} compact={compact} t={t} text={item.text} />
++                </Box>
++              ))
++            ) : (
++              <Md cols={adviserWidth} compact={compact} t={t} text={msg.text} />
++            )}
+           </Box>
+         </Box>
+       </Box>
+diff --git a/ui-tui/src/domain/messages.ts b/ui-tui/src/domain/messages.ts
+index e0aaf02ea9..b3a164d718 100644
+--- a/ui-tui/src/domain/messages.ts
++++ b/ui-tui/src/domain/messages.ts
+@@ -8,6 +8,7 @@ import type { AdviserMeta, Msg, SessionInfo } from '../types.js'
+ const ADVISER_HEADER_RE = /^\[adviser[^\n]*\]\s*/
+ const ADVISER_FOOTER_RE = /\s*\[end adviser\]\s*$/
+ const ADVISER_ITEM_RE = /^- \[([^\]]+)\]\s*(.*)$/gm
++const ADVISER_SEVERITY_RANK: Record<string, number> = { blocker: 3, concern: 2, nit: 1 }
+ 
+ /** Split an adviser block into its display body and card metadata. */
+ export const adviserFromText = (content: string): { body: string; meta: AdviserMeta } | undefined => {
+@@ -23,10 +24,16 @@ export const adviserFromText = (content: string): { body: string; meta: AdviserM
+ 
+     return { label, severity: label.split(' · ')[0]?.trim() || 'advisory', text: match[2].trim() }
+   })
++  // A mixed block is as loud as its strongest row, not as its first one.
++  const top = items.reduce<(typeof items)[number] | undefined>(
++    (best, item) =>
++      !best || (ADVISER_SEVERITY_RANK[item.severity] ?? 0) > (ADVISER_SEVERITY_RANK[best.severity] ?? 0) ? item : best,
++    undefined
++  )
+ 
+   return {
+     body,
+-    meta: { items, label: items[0]?.label ?? 'advisory', severity: items[0]?.severity ?? 'advisory' }
++    meta: { items, label: top?.label ?? 'advisory', severity: top?.severity ?? 'advisory' }
+   }
+ }
+ 
+diff --git a/web/src/pages/SessionsPage.test.tsx b/web/src/pages/SessionsPage.test.tsx
+index 46de94346d..7cf828e514 100644
+--- a/web/src/pages/SessionsPage.test.tsx
++++ b/web/src/pages/SessionsPage.test.tsx
+@@ -300,4 +300,32 @@ describe("adviser transcript rows", () => {
+     );
+     expect(userLabels).toHaveLength(1);
+   });
++
++  it("gives each advice row its own severity in a mixed block", async () => {
++    apiMocks.getSessionMessages.mockResolvedValue({
++      session_id: "sid-adviser-mixed",
++      messages: [
++        {
++          role: "user",
++          display_kind: "adviser",
++          content:
++            "[adviser — advisory only]\n- [concern · reviewer] read the import first\n- [blocker · reviewer] the test never ran\n[end adviser]",
++        },
++      ],
++    });
++    await renderSessionsPage([
++      { id: "sid-adviser-mixed", profile: "default", source: "cli", model: null, title: "Mixed", started_at: 1,
++        ended_at: null, last_active: 1, is_active: false, message_count: 1, tool_call_count: 0,
++        input_tokens: 1, output_tokens: 1, preview: "advice" },
++    ]);
++    await act(async () => click(button("Delete session")!.closest("div.cursor-pointer")));
++    await waitFor(() => (document.body.textContent ?? "").includes("the test never ran"));
++
++    const rows = Array.from(document.querySelectorAll("div.whitespace-pre-wrap"));
++    const concern = rows.find((row) => row.textContent?.includes("read the import first"));
++    const blocker = rows.find((row) => row.textContent?.includes("the test never ran"));
++
++    expect(concern?.querySelector("span")?.className).toContain("text-warning");
++    expect(blocker?.querySelector("span")?.className).toContain("text-destructive");
++  });
+ });
+diff --git a/web/src/pages/SessionsPage.tsx b/web/src/pages/SessionsPage.tsx
+index 3141c84c69..3e7cbdba7e 100644
+--- a/web/src/pages/SessionsPage.tsx
++++ b/web/src/pages/SessionsPage.tsx
+@@ -220,27 +220,41 @@ const ADVISER_TURNS_RE = /\((\d+) turns? ago\)/i;
+ 
+ function splitAdviserContent(
+   content: string,
+-): { label: string; body: string; severity: string; turnsAgo: number | null } | null {
++): {
++  label: string;
++  body: string;
++  severity: string;
++  turnsAgo: number | null;
++  items: { label: string; severity: string; text: string }[];
++} | null {
+   const raw = content.trim();
+   if (!ADVISER_HEADER_RE.test(raw)) return null;
+   const body = raw
+     .replace(ADVISER_HEADER_RE, "")
+     .replace(ADVISER_FOOTER_RE, "")
+     .trim();
+-  const items = [...body.matchAll(ADVISER_ITEM_RE)];
+-  const label = items[0]?.[1]?.trim() || "advisory";
+-  // The per-note header is `severity · name` (the outer row label adds `adviser · `),
+-  // so find the known severity token instead of trusting a fixed position.
+-  const severity = label
+-    .split(" · ")
+-    .map((part) => part.trim().toLowerCase())
+-    .find((part) => part in ADVISER_SEVERITY_STYLES) || "advisory";
++  // The per-note header is `severity · target · adviser`; find the known severity token
++  // instead of trusting a fixed position.
++  const items = [...body.matchAll(ADVISER_ITEM_RE)].map((match) => {
++    const itemLabel = match[1].trim();
++    const itemSeverity =
++      itemLabel
++        .split(" · ")
++        .map((part) => part.trim().toLowerCase())
++        .find((part) => part in ADVISER_SEVERITY_STYLES) || "advisory";
++    return { label: itemLabel, severity: itemSeverity, text: match[2].trim() };
++  });
++  const top = items.reduce<(typeof items)[number] | undefined>((best, item) => {
++    const rank = (value: string) => ({ blocker: 3, concern: 2, nit: 1 })[value] ?? 0;
++    return !best || rank(item.severity) > rank(best.severity) ? item : best;
++  }, undefined);
+   const turns = ADVISER_TURNS_RE.exec(body);
+   return {
+-    label,
++    label: top?.label ?? "advisory",
+     body,
+-    severity,
++    severity: top?.severity ?? "advisory",
+     turnsAgo: turns ? Number(turns[1]) : null,
++    items,
+   };
+ }
+ 
+@@ -395,8 +409,23 @@ function MessageBubble({
+         )}
+       </div>
+       {adviserSplit && (
+-        <div className="text-sm text-foreground whitespace-pre-wrap leading-relaxed">
+-          {adviserSplit.body}
++        <div className="flex flex-col gap-1 text-sm text-foreground leading-relaxed">
++          {adviserSplit.items.length > 0 ? (
++            adviserSplit.items.map((item, index) => (
++              <div className="whitespace-pre-wrap" key={`${index}-${item.label}`}>
++                <span
++                  className={`text-xs font-semibold ${
++                    (ADVISER_SEVERITY_STYLES[item.severity] ?? ADVISER_SEVERITY_STYLES.nit).text
++                  }`}
++                >
++                  {item.label}
++                </span>{" "}
++                <span>{item.text}</span>
++              </div>
++            ))
++          ) : (
++            <div className="whitespace-pre-wrap">{adviserSplit.body}</div>
++          )}
+         </div>
+       )}
+       {!adviserSplit &&

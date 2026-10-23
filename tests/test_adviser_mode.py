@@ -10,12 +10,13 @@ from pathlib import Path
 from types import SimpleNamespace
 
 
-def _run(answer: str, calls: list | None = None):
+def _run(answer: str, calls: list | None = None, agent_run_cls=None):
     def _fake(message, **kwargs):
         if calls is not None:
             calls.append({"message": message, **kwargs})
-        return SimpleNamespace(answer=answer, api_calls=1, model="reviewer",
-                               provider="test", toolsets=tuple(kwargs.get("toolsets") or ()))
+        payload = dict(answer=answer, api_calls=1, model="reviewer", provider="test",
+                       toolsets=tuple(kwargs.get("toolsets") or ()))
+        return SimpleNamespace(**payload) if agent_run_cls is None else agent_run_cls(**payload)
     return _fake
 
 
@@ -254,39 +255,87 @@ def test_failed_review_inserts_nothing_and_records_failure(
     assert provider._store.adviser_reviews("session-test")[0]["status"] == "failed"
 
 
-def test_a_non_json_review_is_repaired_once(plugin_package, make_provider, monkeypatch):
-    """The host log showed reviews that answered in prose after spending the tool budget; one
-    no-tools repair pass turns those into advice instead of a lost review."""
+def test_a_non_json_review_is_restated_with_structured_output(plugin_package, make_provider,
+                                                              monkeypatch):
+    """The host log showed reviews answering in prose after spending the tool budget; the answer
+    goes to the provider's JSON mode instead of a second agent run, so the review still lands."""
     provider = _mode_provider(make_provider, cadence=99)
     calls: list = []
-    replies = iter(["not json", _advice("check the timeout")])
+    monkeypatch.setattr(plugin_package.agent_loop, "run",
+                        _run("the timeout looks wrong", calls, plugin_package.agent_loop.AgentRun))
+    seen: dict = {}
 
-    def _fake(message, **kwargs):
-        calls.append({"message": message, **kwargs})
-        return SimpleNamespace(answer=next(replies), api_calls=1, model="reviewer",
-                               provider="test", toolsets=tuple(kwargs.get("toolsets") or ()))
+    def _structured(task, system, prompt, *, response_format=None, **kwargs):
+        seen.update(task=task, response_format=response_format, prompt=prompt, system=system)
+        if (response_format or {}).get("type") == "json_schema":
+            return _advice("check the timeout")
+        return ""
 
-    monkeypatch.setattr(plugin_package.agent_loop, "run", _fake)
+    monkeypatch.setattr(plugin_package.worker, "call_model", _structured)
     provider._adviser_mode.record_tool("session-test", "read_file", turn_id="t1",
                                        status="ok", result="contents")
 
     assert provider._adviser_mode.review_once("session-test", "test") is True
-    assert len(calls) == 2
-    assert "Return ONLY the JSON object" in calls[1]["message"]
-    assert calls[1]["max_iterations"] == 1
+    assert len(calls) == 1, "the agent runs once; the restatement spends no tool budget"
+    assert seen["task"] == "adviser"
+    assert seen["response_format"]["type"] == "json_schema"
+    assert "the timeout looks wrong" in seen["prompt"]
     pending = provider._store.pending_advisories("session-test", source="adviser_mode")
     assert [row["content"] for row in pending] == ["check the timeout"]
+
+
+def test_the_structured_restatement_requests_json_mode(plugin_package, monkeypatch):
+    """The restatement goes through the aux client with response_format on the wire: json_schema
+    first, plain json_object when the provider refuses the schema envelope."""
+    import sys
+    import types as pytypes
+
+    calls: list[dict] = []
+    object_text = _advice("check the timeout")
+
+    def _call_llm(**kwargs):
+        calls.append(kwargs)
+        structured = (kwargs.get("extra_body") or {}).get("response_format") or {}
+        content = object_text if structured.get("type") == "json_object" else "prose only"
+        return pytypes.SimpleNamespace(
+            choices=[pytypes.SimpleNamespace(
+                message=pytypes.SimpleNamespace(content=content))])
+
+    fake = pytypes.ModuleType("agent.auxiliary_client")
+    fake.call_llm = _call_llm
+    parent = sys.modules.get("agent") or pytypes.ModuleType("agent")
+    monkeypatch.setitem(sys.modules, "agent", parent)
+    monkeypatch.setattr(parent, "auxiliary_client", fake, raising=False)
+    monkeypatch.setitem(sys.modules, "agent.auxiliary_client", fake)
+
+    text, made = plugin_package.adviser_mode.structured_review(
+        "the timeout looks wrong", "review the turn", {}, hermes_home="")
+    assert made == 2
+    assert plugin_package.adviser_mode._json_object(text)["action"] == "advise"
+    formats = [call["extra_body"]["response_format"]["type"] for call in calls]
+    assert formats == ["json_schema", "json_object"]
+    assert calls[0]["task"] == "adviser"
+    assert "the timeout looks wrong" in calls[0]["messages"][1]["content"]
 
 
 def test_non_json_review_inserts_nothing(plugin_package, make_provider, monkeypatch):
     provider = _mode_provider(make_provider, cadence=99)
     calls: list = []
-    monkeypatch.setattr(plugin_package.agent_loop, "run", _run("not json", calls))
+    monkeypatch.setattr(plugin_package.agent_loop, "run",
+                        _run("not json", calls, plugin_package.agent_loop.AgentRun))
+    attempts: list = []
+
+    def _empty(task, system, prompt, *, response_format=None, **kwargs):
+        attempts.append(response_format)
+        return ""
+
+    monkeypatch.setattr(plugin_package.worker, "call_model", _empty)
     provider._adviser_mode.record_tool("session-test", "read_file", turn_id="t1",
                                        status="ok", result="contents")
 
     assert provider._adviser_mode.review_once("session-test", "test") is False
-    assert len(calls) == 2, "the repair pass runs before the review is failed"
+    assert len(calls) == 1
+    assert [fmt["type"] for fmt in attempts] == ["json_schema", "json_object"]
     assert provider._store.pending_advisories("session-test") == []
     assert provider._store.adviser_reviews("session-test")[0]["status"] == "failed"
 
@@ -575,6 +624,36 @@ def test_one_advice_target_vocabulary(plugin_package):
     assert parsed[0]["target"] == "general"
     assert mode.parse_review(json.dumps({"action": "advise", "advices": [
         {"severity": "concern", "text": "no target"}]}))[0]["target"] == "general"
+
+
+def test_ten_advices_and_2000_char_budget_survive_config(plugin_package, make_provider):
+    provider = make_provider({"adviser_mode": {
+        "enabled": True, "max_advices": 10, "max_chars": 2000}})
+    cfg = provider._adviser_mode._cfg()
+    assert cfg["max_advices"] == 10
+    assert cfg["max_chars"] == 2000
+    assert "at most 10 advice objects" in plugin_package.adviser_mode._review_brief(
+        {"max_advices": 10})
+
+
+def test_parse_review_stops_at_ten(plugin_package):
+    advices = [{"severity": "concern", "target": "current_step", "text": f"note {i}"}
+               for i in range(12)]
+
+    rows = plugin_package.adviser_mode.parse_review(
+        json.dumps({"action": "advise", "advices": advices}), max_advices=10)
+
+    assert len(rows) == 10
+
+
+def test_block_budget_2000_keeps_more_rows(plugin_package):
+    rows = [{"id": index, "severity": "concern", "target": "current_step",
+             "content": "x" * 300} for index in range(1, 11)]
+
+    block, included = plugin_package.adviser_mode.render_block(rows, max_chars=2000)
+
+    assert len(block) <= 2000
+    assert len(included) >= 4
 
 
 def test_block_rendering_is_bounded(plugin_package):

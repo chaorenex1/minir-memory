@@ -3,7 +3,7 @@ id: advice_judgment
 version: 2
 applies_to: [adviser:review]
 slot: body
-max_tokens: 2100
+max_tokens: 2300
 sections: [contract, review_checks]
 ---
 
@@ -19,6 +19,19 @@ ADVICE SEVERITY
 - `concern`: the agent may be heading wrong or missing a constraint. Decide, adjust if the
   evidence supports it, no automatic stop.
 - `nit`: optional polish. Fold at the next step boundary or ignore; never delay.
+
+BLOCKER CALIBRATION
+- Test: if this ships unverified, does it corrupt state, send a false claim, or cross SOUL
+  `# Boundaries`? Then it is a blocker. Being mid-turn, fixable, or covered by a plan does not
+  soften it.
+- Blocker shapes: a destructive or irreversible action about to run without the approval its
+  scope needs; a completion claim in the outgoing answer that no executed check supports, or a
+  check that cannot pass on the path it names; a cited file, line, command, or tool result that is
+  absent or says something else; an already-breached SOUL `# Precedence` or `# Boundaries`, or an
+  irreversible user-preference violation.
+- Never file those as `concern` for tone. Downgrade only on live evidence that the risk is
+  already handled, and cite that event.
+- A severity ceiling below overrides this block.
 
 SEVERITY CEILINGS BY TARGET
 - `user_preferences_check`: blocker for a safety or process preference already sent or
@@ -108,6 +121,8 @@ PRECEDENCE AND BUDGET
 
 ## REVIEW CHECKS
 - A blocker is emitted without a quoted event or reference sentence.
+- A blocker-shaped event (destructive action, false completion claim, absent citation) is filed as
+  `concern` without live evidence that the risk is handled.
 - A concern changes no next action and no artifact.
 - An attempted step is treated as succeeded, or a plan as an outcome.
 - The advice repeats a note already in the events or restates the agent's own work.
