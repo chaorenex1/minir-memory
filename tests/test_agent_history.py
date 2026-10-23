@@ -13,8 +13,8 @@ def history(plugin_package, tmp_path):
     from contextlib import contextmanager
 
     buffer = plugin_package.transcript.TranscriptBuffer(
-        persist_dir=tmp_path / "sessions", run_dir=tmp_path / "run", platform="cli")
-    provider = SimpleNamespace(_transcript=buffer, _platform="cli",
+        persist_dir=tmp_path / "sessions", run_dir=tmp_path / "run", profile="default")
+    provider = SimpleNamespace(_transcript=buffer, _profile="default",
                                _session_id="session-test")
     module = plugin_package.agent_history
 
@@ -27,14 +27,14 @@ def history(plugin_package, tmp_path):
             module.reset_layer(tokens)
 
     buffer.append_event("base", "session-test", "user", text="deploy the staging tag",
-                        platform="cli")
+                        profile="default")
     buffer.append_event("base", "session-test", "assistant", text="checking the manifest",
-                        tool_calls=[{"id": "c1", "name": "exec", "args": "{}"}], platform="cli")
+                        tool_calls=[{"id": "c1", "name": "exec", "args": "{}"}], profile="default")
     buffer.append_event("base", "session-test", "tool", text="", result="staging tag is 1.2.3",
-                        name="exec", tool_call_id="c1", platform="cli")
-    buffer.append_event("base", "older-run", "user", text="an earlier base run", platform="cli")
+                        name="exec", tool_call_id="c1", profile="default")
+    buffer.append_event("base", "older-run", "user", text="an earlier base run", profile="default")
     buffer.append_event("dialectic", "session-test", "user", text="a dialectic secret",
-                        platform="cli")
+                        profile="default")
     yield buffer, provider, module, bound
     buffer.close()
 
@@ -54,7 +54,7 @@ def test_the_schema_takes_no_layer_or_store_argument(history):
     _buffer, _provider, module, _bound = history
     properties = module.SCHEMA["parameters"]["properties"]
     assert "layer" not in properties
-    assert "platform" not in properties
+    assert "profile" not in properties
     assert "path" not in properties
     assert module.SCHEMA["name"] == "minir_aiagent_search"
 
@@ -65,7 +65,7 @@ def test_messages_reads_the_callers_stream_only(history):
         payload = _call(module, provider, {"mode": "messages", "limit": 10})
     data = payload["data"]
     assert payload["success"] is True
-    assert data["layer"] == "base" and data["platform"] == "cli"
+    assert data["layer"] == "base" and data["profile"] == "default"
     assert [row["role"] for row in data["rows"]] == ["user", "assistant", "tool"]
     assert data["coverage"] == [1, 3] and data["source"] == "buffer"
     assert "a dialectic secret" not in json.dumps(data)

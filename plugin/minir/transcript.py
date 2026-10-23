@@ -8,7 +8,7 @@ reversal of that contract — the file is the record and the layers read it:
   character cut, no whitespace collapse. Tool results and code blocks survive.
 * **Append-only, permanent.** No rewrite, no compression, no deletion. Parts rotate at
   ``EVENTS_PER_PART`` lines and are never removed; a read continues across parts by ``seq``.
-* **A stream is ``platform/layer/session``.** ``<persist_dir>/<platform>/<layer>/<session>.jsonl``
+* **A stream is ``profile/layer/session``.** ``<persist_dir>/<profile>/<layer>/<session>.jsonl``
   and ``.partN.jsonl`` for later parts.
 * **Memory is a cache of the disk, not the reverse.** ``read_events`` is the single read entry
   point: memory first, this stream's own file for anything the cache no longer holds, and the
@@ -203,13 +203,13 @@ def _count_lines(path: Path) -> int:
 
 
 class _Stream:
-    """One ``platform/layer/session`` stream, as this process caches it."""
+    """One ``profile/layer/session`` stream, as this process caches it."""
 
-    __slots__ = ("platform", "layer", "session_id", "rows", "chars", "size", "last_seq",
+    __slots__ = ("profile", "layer", "session_id", "rows", "chars", "size", "last_seq",
                  "turn", "step", "last_seen", "evicted_before", "updated_at", "lock", "loaded")
 
-    def __init__(self, platform: str, layer: str, session_id: str, lock: Any = None) -> None:
-        self.platform = platform
+    def __init__(self, profile: str, layer: str, session_id: str, lock: Any = None) -> None:
+        self.profile = profile
         self.layer = layer
         self.session_id = session_id
         self.rows: deque[dict[str, Any]] = deque()
@@ -228,7 +228,7 @@ class _Stream:
 
     @property
     def key(self) -> tuple[str, str, str]:
-        return (self.platform, self.layer, self.session_id)
+        return (self.profile, self.layer, self.session_id)
 
     def coverage(self) -> tuple[int, int]:
         if not self.rows:
@@ -243,7 +243,7 @@ class TranscriptBuffer:
                  max_sessions: int = BUFFER_STREAMS,
                  persist_dir: Optional[os.PathLike[str] | str] = None,
                  run_dir: Optional[os.PathLike[str] | str] = None,
-                 platform: str = "cli",
+                 profile: str = "default",
                  buffer_events_per_stream: int = BUFFER_EVENTS_PER_STREAM,
                  buffer_bytes: int = BUFFER_BYTES,
                  events_per_part: int = EVENTS_PER_PART,
@@ -256,7 +256,7 @@ class TranscriptBuffer:
         self._max_messages = max(1, int(max_messages))
         self._max_chars = max(1, int(max_chars))
         self._max_sessions = max(1, int(max_sessions))
-        self._platform = str(platform or "cli")
+        self._profile = str(profile or "default")
         self._events_per_stream = max(1, int(buffer_events_per_stream))
         self._buffer_bytes = max(1, int(buffer_bytes))
         self._events_per_part = max(1, int(events_per_part))
@@ -294,14 +294,14 @@ class TranscriptBuffer:
 
     # -- lifecycle -------------------------------------------------------------
 
-    def bind(self, session_id: str, *, layer: str = HOST_LAYER, platform: str = "") -> bool:
+    def bind(self, session_id: str, *, layer: str = HOST_LAYER, profile: str = "") -> bool:
         """Pin the live session/layer and, when this is the first process, replay the cache.
 
         Returns True when a rebuild ran. The pin keeps the current session and the caller's layer
         out of the LRU; the replay is bounded by stream count, events and bytes.
         """
-        if str(platform or "").strip():
-            self._platform = str(platform).strip()
+        if str(profile or "").strip():
+            self._profile = str(profile).strip()
         self._pinned_session = str(session_id or "")
         self._pinned_layer = str(layer or "")
         if self._process is None:
@@ -325,25 +325,25 @@ class TranscriptBuffer:
                 parts = path.relative_to(self._persist_dir).parts
                 if len(parts) < 3:
                     continue
-                platform, layer = parts[-3], parts[-2]
+                profile, layer = parts[-3], parts[-2]
                 stem = path.name[:-6] if path.name.endswith(".jsonl") else path.name
                 match = _PART_RE.match(path.name)
                 if match:
                     stem = match.group("stem")
-                key = (platform, layer, stem)
+                key = (profile, layer, stem)
                 if key not in newest or mtime > newest[key][0]:
                     newest[key] = (mtime, path)
         except OSError:
             return 0
         streams = sorted(newest.items(), key=lambda item: item[1][0], reverse=True)
-        pinned = (self._platform, self._pinned_layer or HOST_LAYER, self._pinned_session)
+        pinned = (self._profile, self._pinned_layer or HOST_LAYER, self._pinned_session)
         ordered = [item for item in streams if item[0] == pinned] + \
                   [item for item in streams if item[0] != pinned]
         loaded = 0
-        for (platform, layer, stem), _info in ordered:
+        for (profile, layer, stem), _info in ordered:
             if loaded >= self._max_sessions or (loaded and self._total_bytes >= self._buffer_bytes):
                 break
-            stream = self._stream(platform, layer, stem)
+            stream = self._stream(profile, layer, stem)
             self._replay_marker(stream)
             loaded += 1
         return loaded
@@ -391,15 +391,15 @@ class TranscriptBuffer:
 
     # -- event writes ----------------------------------------------------------
 
-    def configure_platform(self, platform: str) -> None:
-        self._platform = str(platform or "cli")
+    def configure_profile(self, profile: str) -> None:
+        self._profile = str(profile or "default")
 
     @property
-    def platform(self) -> str:
-        return self._platform
+    def profile(self) -> str:
+        return self._profile
 
     def append_event(self, layer: str, session_id: str, role: str, *, kind: str = "msg",
-                     text: str = "", platform: str = "", turn: Optional[int] = None,
+                     text: str = "", profile: str = "", turn: Optional[int] = None,
                      step: Optional[int] = None, run_id: str = "", redacted: bool = True,
                      ts: Optional[float] = None, **fields: Any) -> dict[str, Any]:
         """Append one full-fidelity event row; returns the row as written.
@@ -407,7 +407,7 @@ class TranscriptBuffer:
         ``text`` is stored verbatim. Role-specific fields (``tool_calls``, ``result``, ``fp``,
         ...) ride through ``fields``. A ``marker``/``gap`` row has no role.
         """
-        stream = self._stream(platform or self._platform, str(layer or HOST_LAYER),
+        stream = self._stream(profile or self._profile, str(layer or HOST_LAYER),
                               str(session_id or ""))
         with stream.lock:
             self._ensure_loaded(stream)
@@ -421,7 +421,7 @@ class TranscriptBuffer:
             now = float(ts) if isinstance(ts, (int, float)) else time.time()
             row: dict[str, Any] = {
                 "v": 1, "seq": stream.last_seq, "ts": now, "iso": _iso(now),
-                "platform": stream.platform, "layer": stream.layer,
+                "profile": stream.profile, "layer": stream.layer,
                 "session_id": stream.session_id, "turn": turn, "step": step,
                 "role": str(role or ""), "kind": str(kind or "msg"), "run_id": str(run_id or ""),
                 "redacted": bool(redacted),
@@ -438,10 +438,10 @@ class TranscriptBuffer:
         return row
 
     def ingest(self, layer: str, session_id: str, messages: Iterable[Mapping[str, Any]], *,
-               platform: str = "", redacted: bool = True, run_id: str = "",
+               profile: str = "", redacted: bool = True, run_id: str = "",
                source: str = "host") -> int:
         """Append the tail of a whole-conversation slice after the stream's ``fp`` anchor."""
-        stream = self._stream(platform or self._platform, str(layer or HOST_LAYER),
+        stream = self._stream(profile or self._profile, str(layer or HOST_LAYER),
                               str(session_id or ""))
         normalized = [dict(item) for item in (messages or ()) if isinstance(item, Mapping)]
         normalized = [row for row in normalized if str(row.get("role") or "") in ROLES]
@@ -460,7 +460,7 @@ class TranscriptBuffer:
                 start = self._anchor_offset(fingerprints, anchor)
                 if start is None:
                     self.append_event(layer, session_id, "", kind="gap", dropped=0,
-                                      reason="compaction", platform=platform,
+                                      reason="compaction", profile=profile,
                                       redacted=redacted)
                     start = 0
             appended = 0
@@ -518,7 +518,7 @@ class TranscriptBuffer:
                 fields["error"] = str(row.get("error") or "")
             text = ""  # the full body is in ``result``
         self.append_event(stream.layer, stream.session_id, role, kind="msg", text=text,
-                          platform=stream.platform, redacted=redacted, run_id=run_id,
+                          profile=stream.profile, redacted=redacted, run_id=run_id,
                           ts=_row_stamp(row), **fields)
         previous = list((stream.last_seen or {}).get("fps") or ())
         previous.append(fp)
@@ -526,7 +526,7 @@ class TranscriptBuffer:
         reasoning = row.get("reasoning_content") or row.get("reasoning")
         if role == "assistant" and str(reasoning or "").strip():
             self.append_event(stream.layer, stream.session_id, "reasoning", kind="msg",
-                              text=str(reasoning), platform=stream.platform,
+                              text=str(reasoning), profile=stream.profile,
                               redacted=redacted, run_id=run_id, ts=_row_stamp(row),
                               fp=fingerprint("reasoning", str(reasoning)),
                               model=str(row.get("model") or ""))
@@ -534,19 +534,19 @@ class TranscriptBuffer:
         return 1
 
     def append_reasoning(self, layer: str, session_id: str, text: str, *, model: str = "",
-                         platform: str = "", redacted: bool = True) -> Optional[dict[str, Any]]:
+                         profile: str = "", redacted: bool = True) -> Optional[dict[str, Any]]:
         """Append one assistant message's aggregated reasoning (never per delta)."""
         body = str(text or "")
         if not body.strip():
             return None
-        return self.append_event(layer, session_id, "reasoning", text=body, platform=platform,
+        return self.append_event(layer, session_id, "reasoning", text=body, profile=profile,
                                  redacted=redacted, model=str(model or ""),
                                  fp=fingerprint("reasoning", body))
 
     def record_aux(self, layer: str, session_id: str, messages: Iterable[dict[str, Any]], *,
                    model: str = "", provider: str = "", toolsets: Iterable[str] = (),
                    system_message: str = "", usage: Optional[Mapping[str, Any]] = None,
-                   platform: str = "", run_id: str = "") -> None:
+                   profile: str = "", run_id: str = "") -> None:
         """Append one plugin-layer conversation, deduped by ``fp`` (append-only, not a snapshot).
 
         The adviser passes its merged history on every review; only the tail after the last
@@ -555,11 +555,11 @@ class TranscriptBuffer:
         """
         if self._persist_dir is None:
             return
-        use_platform = platform or self._platform
+        use_profile = profile or self._profile
         rows = [dict(row) for row in (messages or ()) if isinstance(row, dict)]
         run = run_id or f"run-{int(time.time() * 1000)}"
         system_text = str(system_message or "")
-        stream = self._stream(use_platform, layer, session_id)
+        stream = self._stream(use_profile, layer, session_id)
         with stream.lock:
             before = int(stream.last_seq)
             digest = fingerprint("system", system_text)[3:] if system_text.strip() else ""
@@ -576,13 +576,13 @@ class TranscriptBuffer:
                 # The system role has no host source here either: the run's system message is
                 # the text it actually ran under. One row per distinct prompt.
                 self.append_event(layer, session_id, "system", text=system_text,
-                                  platform=use_platform, redacted=True, chars=len(system_text),
+                                  profile=use_profile, redacted=True, chars=len(system_text),
                                   hash=digest, fp=fingerprint("system", system_text))
-        appended = self.ingest(layer, session_id, rows, platform=use_platform,
+        appended = self.ingest(layer, session_id, rows, profile=use_profile,
                                run_id=run, source="aux")
         if not appended:
             return
-        self.append_event(layer, session_id, "", kind="run_end", platform=use_platform,
+        self.append_event(layer, session_id, "", kind="run_end", profile=use_profile,
                           run_id=run, status="ok", usage=dict(usage or {}),
                           model=str(model or ""), provider=str(provider or ""),
                           toolsets=list(toolsets or ()), messages=appended,
@@ -681,7 +681,7 @@ class TranscriptBuffer:
 
     # -- reads ---------------------------------------------------------------
 
-    def read_events(self, platform: str, layer: str, session_id: str, *,
+    def read_events(self, profile: str, layer: str, session_id: str, *,
                     cursor: Optional[int] = None, last_n: Optional[int] = None,
                     since: Optional[float] = None, until: Optional[float] = None,
                     turn: Any = None, step: Any = None,
@@ -696,7 +696,7 @@ class TranscriptBuffer:
         only the requested page or the ``last_n`` ring, and stops once the page is full and one
         more match proves ``truncated``.
         """
-        stream = self._stream(platform, layer, session_id)
+        stream = self._stream(profile, layer, session_id)
         with stream.lock:
             memory = sorted(stream.rows, key=lambda row: int(row.get("seq") or 0))
             coverage = stream.coverage()
@@ -812,19 +812,19 @@ class TranscriptBuffer:
             except OSError:
                 logger.debug("transcript: cannot read %s", path, exc_info=True)
 
-    def read_all(self, platform: str, layer: str, session_id: str) -> list[dict[str, Any]]:
-        return self.read_events(platform, layer, session_id, limit=10 ** 9)["rows"]
+    def read_all(self, profile: str, layer: str, session_id: str) -> list[dict[str, Any]]:
+        return self.read_events(profile, layer, session_id, limit=10 ** 9)["rows"]
 
-    def stats(self, platform: Optional[str] = None, layer: Optional[str] = None) -> dict[str, Any]:
+    def stats(self, profile: Optional[str] = None, layer: Optional[str] = None) -> dict[str, Any]:
         """Per-stream counts: the in-memory view plus what the files hold."""
         with self._lock:
-            streams = [{"platform": stream.platform, "layer": stream.layer,
+            streams = [{"profile": stream.profile, "layer": stream.layer,
                         "session_id": stream.session_id, "events": len(stream.rows),
                         "last_seq": stream.last_seq, "bytes": stream.size,
                         "evicted_before": stream.evicted_before,
                         "updated_at": stream.updated_at}
                        for stream in self._streams.values()
-                       if (platform is None or stream.platform == platform)
+                       if (profile is None or stream.profile == profile)
                        and (layer is None or stream.layer == layer)]
         disk: dict[tuple[str, str], dict[str, int]] = {}
         if self._persist_dir is not None:
@@ -842,21 +842,21 @@ class TranscriptBuffer:
         return {"streams": streams,
                 "count": len(streams),
                 "bytes": sum(entry["bytes"] for entry in disk.values()),
-                "disk": [{"platform": key[0], "layer": key[1], **value}
+                "disk": [{"profile": key[0], "layer": key[1], **value}
                          for key, value in sorted(disk.items())],
                 "coverage": {stream["session_id"]: [stream["evicted_before"] + 1,
                                                     stream["last_seq"]]
                              for stream in streams}}
 
-    def digest(self, platform: str, layer: str, session_id: str, **kwargs: Any) -> str:
+    def digest(self, profile: str, layer: str, session_id: str, **kwargs: Any) -> str:
         """Plain-text transcript digest for a prompt block (see ``transcript_prompt``)."""
         from .transcript_prompt import render_digest
 
-        return render_digest(self, platform, layer, session_id, **kwargs)
+        return render_digest(self, profile, layer, session_id, **kwargs)
 
     def read_aux(self, layer: str, session_id: str) -> list[dict[str, Any]]:
         """Read one aux run's conversation back as host-shaped messages."""
-        rows = self.read_all(self._platform, layer, session_id)
+        rows = self.read_all(self._profile, layer, session_id)
         messages: list[dict[str, Any]] = []
         for row in rows:
             if str(row.get("kind") or "") != "msg":
@@ -884,12 +884,12 @@ class TranscriptBuffer:
 
     def path_for_aux(self, layer: str, session_id: str) -> Optional[Path]:
         """The JSONL path a layer stream lands on, or ``None`` when memory-only."""
-        return self.path_for_stream(self._platform, layer, session_id)
+        return self.path_for_stream(self._profile, layer, session_id)
 
-    def path_for_stream(self, platform: str, layer: str, session_id: str) -> Optional[Path]:
+    def path_for_stream(self, profile: str, layer: str, session_id: str) -> Optional[Path]:
         if self._persist_dir is None:
             return None
-        folder = self._persist_dir / _file_stem(platform, "cli") / _file_stem(layer, "aux")
+        folder = self._persist_dir / _file_stem(profile, "default") / _file_stem(layer, "aux")
         return folder / f"{_file_stem(session_id, 'session')}.jsonl"
 
     def append_text(self, layer: str, session_id: str, text: str,
@@ -897,7 +897,7 @@ class TranscriptBuffer:
         """Append raw text to one stream file, unbounded (the reasoning log)."""
         if self._persist_dir is None or not text:
             return
-        folder = self._persist_dir / _file_stem(self._platform, "cli") / _file_stem(layer, "aux")
+        folder = self._persist_dir / _file_stem(self._profile, "default") / _file_stem(layer, "aux")
         path = folder / f"{_file_stem(str(session_id or ''), 'session')}{suffix}"
         try:
             folder.mkdir(parents=True, exist_ok=True)
@@ -975,7 +975,7 @@ class TranscriptBuffer:
                 stream.last_seq += 1
                 now = time.time()
                 row = {"v": 1, "seq": stream.last_seq, "ts": now, "iso": _iso(now),
-                       "platform": key[0], "layer": key[1], "session_id": key[2], "turn": 0,
+                       "profile": key[0], "layer": key[1], "session_id": key[2], "turn": 0,
                        "step": 0, "role": "", "kind": "marker", "run_id": "",
                        "redacted": True, "marker": "last_cache",
                        "from_seq": int(from_seq), "to_seq": int(to_seq)}
@@ -1025,8 +1025,8 @@ class TranscriptBuffer:
 
     # -- cache ---------------------------------------------------------------
 
-    def _stream(self, platform: str, layer: str, session_id: str) -> _Stream:
-        key = (str(platform or "cli"), str(layer or HOST_LAYER), str(session_id or ""))
+    def _stream(self, profile: str, layer: str, session_id: str) -> _Stream:
+        key = (str(profile or "default"), str(layer or HOST_LAYER), str(session_id or ""))
         with self._lock:
             stream = self._streams.get(key)
             if stream is None:
@@ -1037,7 +1037,7 @@ class TranscriptBuffer:
 
     def _pinned(self, stream: _Stream) -> bool:
         return (stream.session_id == self._pinned_session
-                and stream.platform == self._platform
+                and stream.profile == self._profile
                 and stream.layer == (self._pinned_layer or HOST_LAYER))
 
     def _cache_row(self, stream: _Stream, row: dict[str, Any]) -> None:

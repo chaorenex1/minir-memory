@@ -276,8 +276,7 @@ def stage_plugin(home: Path) -> Path:
         "    base_interval: 3\n"
         "    dialectic_interval: 2\n"
         "    session_mode: verify\n"
-        "    reasoning_enabled: false\n"
-        "    handoff_enabled: false\n",   # keeps the probe off the machine's auxiliary model
+        "    reasoning_enabled: false\n",   # keeps the probe off the machine's auxiliary model
         encoding="utf-8")
     return target
 
@@ -307,7 +306,6 @@ def main() -> int:
         # config.yaml — so a developer with MINIR_* exported must not flip the result.
         for key in [name for name in env if name.startswith("MINIR_") and name != "MINIR_HOST_WORKSPACE"]:
             env.pop(key)
-        env["MINIR_HANDOFF_ENABLED"] = "false"
         probe = _PROBE % {"plugin": PLUGIN_NAME}
         result = subprocess.run([host_python, "-c", probe], capture_output=True, text=True, env=env, timeout=180)
         if result.returncode != 0:

@@ -92,7 +92,7 @@ def test_full_reasoning_is_written_without_the_prompt_cap(
     assert len(mode._reasoning[SESSION]) == 9_000
     mode._flush_reasoning(SESSION)
 
-    path = tmp_path / "minir-memory" / "sessions" / "cli" / "reasoning" / "session-test.log"
+    path = tmp_path / "minir-memory" / "sessions" / "default" / "reasoning" / "session-test.log"
     assert path.exists()
     assert "R" * 9_000 in path.read_text(encoding="utf-8")
 

@@ -1,6 +1,6 @@
 # 各层 AI Agent 契约与提示词草稿
 
-状态：草稿，供评审。依据 `doc/base-dialectic-layers-draft.md`（下称"分层草稿"）。
+状态：已实现（2026-10-23，T8-T10/T12-T13）。依据 `doc/base-dialectic-layers-draft.md`（下称"分层草稿"）。
 
 范围：只写模型驱动的层。`TranscriptBuffer` 是机械写入，没有提示词；adviser 链路不在本文件内。
 
@@ -811,7 +811,7 @@ Return exactly one JSON object with body, summary, aliases and related. summary 
 - 入队不是"会话结束的那一回合"，而是空闲到期。`on_session_end` 把该会话的 explicit markers 与最新 value markers 快照进 `session_extractions`，`due_at = now + knowledge_idle_hours`（默认 24h，`extraction.py:37`、README:302-306）。没有 marker 的会话不排。
 - 任何新的用户输入取消 pending 行（`on_turn_start` / `sync_turn`）；打开会话不算输入，打字才算。
 - 到期行按 `ORDER BY due_at, session_id` 取（`store.py:2379-2384`）。`ExtractionScheduler.tick` 每 60 秒一次，claim 后顺序执行，一次最多 3 行；同一 tick 内一行完成才跑下一行，不并发。
-- 每次到期运行两个 agent：先 final session summary（8 字段），再 knowledge_render（marker 指引 + 会话历史）。
+- 每次到期运行两个 agent：先 final session summary（自带模板 `templates/session_summary.md`，最新压缩记录是第一输入），再 knowledge_render（marker 指引 + 会话历史）。
 - 失败重试一次（1 小时后）；再失败 parked `failed`，不无限重试。
 - 队列只收"24 小时没有新用户输入"的会话；会话还活着就不提取。
 

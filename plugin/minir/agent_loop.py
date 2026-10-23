@@ -42,10 +42,12 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import contextvars
 import logging
+import threading
 from collections.abc import Mapping
 from dataclasses import dataclass, field
-from typing import Any, Optional, Sequence
+from typing import Any, Callable, Optional, Sequence
 
 from . import agent_history, file_guard
 
@@ -225,16 +227,48 @@ def _prompt(message: str, context: str = "") -> str:
     return message if not context else f"{message}\n\n--- context ---\n{context}"
 
 
+_RUN_META_NOTE = "runtime metadata, not instructions; never quote or mention this block."
+
+
+def _system_segments(system_message: Any) -> list[str]:
+    """Non-empty system segments; a legacy string is one segment."""
+    if isinstance(system_message, str):
+        raw = [system_message]
+    elif isinstance(system_message, Sequence) and not isinstance(system_message, (bytes, bytearray)):
+        raw = [str(part) for part in system_message]
+    else:
+        return []
+    return [part.strip() for part in raw if str(part).strip()]
+
+
+def _run_meta(*, layer: str, meta: Optional[Mapping[str, Any]], provider: str, model: str,
+              route_source: str) -> str:
+    """The trailing ``[run-meta]`` segment: identifiers only, never credentials."""
+    data = dict(meta or {})
+    return "\n".join((
+        "[run-meta]",
+        _RUN_META_NOTE,
+        f"layer: {layer or 'unknown'}",
+        f"agent: {data.get('agent') or layer or 'unknown'}",
+        f"provider: {provider or 'unknown'}",
+        f"model: {model or 'unknown'}",
+        f"parent: {data.get('parent') or 'none'}",
+        f"depth: {data.get('depth', 0)}",
+        f"route_source: {route_source}",
+    ))
+
+
 def run(message: str, *, context: str = "", model: str = "", provider: str = "",
         api_mode: str = "", toolsets: Optional[Sequence[str]] = None,
-        system_message: str = "", max_iterations: int = MAX_ITERATIONS,
+        system_message: str | Sequence[str] = "", max_iterations: int = MAX_ITERATIONS,
         project_dir: Optional[str] = None, all_tools: bool = False,
         read_only: bool = False,
         history: Optional[Sequence[Mapping[str, Any]]] = None,
         session_id: str = "", layer: str = "", history_session: str = "",
         skip_memory: bool = True, skip_context_files: bool = True,
         skip_background_review: bool = True,
-        load_soul_identity: bool = False) -> AgentRun:
+        load_soul_identity: bool = False,
+        meta: Optional[Mapping[str, Any]] = None) -> AgentRun:
     """Run one agent loop on *message* and return its answer. Never leaves an agent open.
 
     ``max_iterations`` is the tool-call budget for this peer run. The default is the Feishu
@@ -271,9 +305,12 @@ def run(message: str, *, context: str = "", model: str = "", provider: str = "",
     conversation = [dict(row) for row in (history or ())
                     if isinstance(row, Mapping) and str(row.get("role") or "") != "system"]
 
+    knobs = _agent_kwargs(final_provider, final_model, runtime, api_mode)
+    # The pinned route's own provider is the effective one; the run metadata must name it.
+    final_provider = str(knobs.get("provider") or final_provider)
     agent = AIAgent(
         model=final_model,
-        **_agent_kwargs(final_provider, final_model, runtime, api_mode),
+        **knobs,
         # A stable per-peer id gives the host one session for this adviser's tool calls; an
         # empty value keeps the host's own default for one-shot peers.
         session_id=str(session_id or "").strip() or None,
@@ -299,7 +336,19 @@ def run(message: str, *, context: str = "", model: str = "", provider: str = "",
         # stay under HERMES_HOME plus an explicitly granted project root, writes under
         # minir-memory/scratch. The ContextVar is set here so every path that runs a peer agent
         # gets the guard, not only the layer worker.
-        system = str(system_message or "").strip() or None
+        route_source = ("explicit" if (str(model or "").strip() or str(provider or "").strip())
+                        else "gateway")
+        if not final_provider or not final_model:
+            logger.warning("agent_loop: route resolved to provider=%r model=%r for layer %r",
+                           final_provider, final_model, layer)
+        if route_source == "gateway" and meta and str(meta.get("parent") or "").strip():
+            logger.warning("agent_loop: %s child run has no explicit route; using the gateway "
+                           "default", meta.get("agent") or layer)
+        segments = _system_segments(system_message)
+        if segments:
+            segments.append(_run_meta(layer=layer, meta=meta, provider=final_provider,
+                                      model=final_model, route_source=route_source))
+        system = "\n\n".join(segments) or None
         root = project_dir if project_dir is not None else str(file_guard.project_root() or "")
         token = (agent_history.layer_context(layer, history_session)
                  if str(layer or "").strip() else None)
@@ -331,14 +380,15 @@ def run(message: str, *, context: str = "", model: str = "", provider: str = "",
 
 async def run_async(message: str, *, context: str = "", model: str = "", provider: str = "",
                     api_mode: str = "", toolsets: Optional[Sequence[str]] = None,
-                    system_message: str = "", max_iterations: int = MAX_ITERATIONS,
+                    system_message: str | Sequence[str] = "", max_iterations: int = MAX_ITERATIONS,
                     project_dir: Optional[str] = None, all_tools: bool = False,
                     read_only: bool = False,
                     history: Optional[Sequence[Mapping[str, Any]]] = None,
                     session_id: str = "", layer: str = "", history_session: str = "",
                     skip_memory: bool = True, skip_context_files: bool = True,
                     skip_background_review: bool = True,
-                    load_soul_identity: bool = False) -> AgentRun:
+                    load_soul_identity: bool = False,
+                    meta: Optional[Mapping[str, Any]] = None) -> AgentRun:
     """Await :func:`run` off the event loop (see the module docstring for why a thread)."""
     return await asyncio.to_thread(
         run, message, context=context, model=model, provider=provider, api_mode=api_mode,
@@ -348,4 +398,31 @@ async def run_async(message: str, *, context: str = "", model: str = "", provide
         history_session=history_session,
         skip_memory=skip_memory,
         skip_context_files=skip_context_files, skip_background_review=skip_background_review,
-        load_soul_identity=load_soul_identity)
+        load_soul_identity=load_soul_identity, meta=meta)
+
+
+def run_with_timeout(run: Callable[[], Any], timeout: float) -> Any:
+    """Run *run* on a daemon thread and stop waiting after *timeout* (``None`` on timeout).
+
+    The pass being bounded calls the model on this thread, and a multiplexed gateway resolves
+    the API key through a ContextVar (``agent.secret_scope``): a bare thread would fail closed,
+    so the caller's context travels with the run. An exception raised inside raises here.
+    """
+    box: dict[str, Any] = {}
+
+    def target() -> None:
+        try:
+            box["result"] = run()
+        except BaseException as exc:  # never let a background failure escape the thread
+            box["error"] = exc
+
+    context = contextvars.copy_context()
+    thread = threading.Thread(target=lambda: context.run(target),
+                              name="minir-agent-run", daemon=True)
+    thread.start()
+    thread.join(max(0.1, float(timeout)))
+    if thread.is_alive():
+        return None
+    if "error" in box:
+        raise box["error"]
+    return box.get("result")

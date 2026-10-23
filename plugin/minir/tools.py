@@ -3,8 +3,8 @@
 The memory-provider surface already hands these schemas to the main agent through
 ``MemoryProvider.get_tool_schemas``. That path only reaches an agent that has the host's
 ``memory`` toolset enabled. This module registers the same functions under a registry toolset
-named ``minir`` so the plugin's own agents (the adviser, the layer worker, the hand-off and
-session-summary agents, the idle knowledge extraction) can be granted them explicitly:
+named ``minir`` so the plugin's own agents (the adviser, the layer worker, the session-summary
+and knowledge-extraction agents) can be granted them explicitly:
 
     enabled_toolsets = ["file", "minir", "skills"]
 
@@ -38,7 +38,7 @@ from tools.registry import tool_error
 from .store import CONCLUSION_KINDS
 from .knowledge import DEFAULT_SEARCH_LIMIT
 from .layers import CATEGORIES, ORGS
-from . import agent_history
+from . import agent_history, content_valid
 
 logger = logging.getLogger(__name__)
 
@@ -50,11 +50,12 @@ SKILL_TOOLSET= "skills"
 FILE_TOOLSET = "file"
 TOOL_NAMES: tuple[str, ...] = (
     "minir_search", "minir_kb_search", "minir_remember", "minir_forget", "minir_todo",
-    "minir_stats", "minir_agents", "minir_aiagent_search")
+    "minir_stats", "minir_agents", content_valid.TOOL_NAME, "minir_aiagent_search")
 
 _EMOJI: dict[str, str] = {
     "minir_search": "🔎", "minir_kb_search": "📚", "minir_remember": "📌", "minir_forget": "🗑️",
     "minir_todo": "✅", "minir_stats": "📊", "minir_agents": "🧩",
+    content_valid.TOOL_NAME: "📏",
 }
 
 
@@ -179,9 +180,23 @@ _TOOL_AGENTS = _tool_schema(
      "load_soul_identity": _prop("Load the operator SOUL identity (default true).", "boolean")},
     ("agent_name", "user_prompts"))
 
+_TOOL_CONTENT_VALID = _tool_schema(
+    "minir_content_valid",
+    "Measure a piece of text against a budget with a local deterministic count. mode='string' "
+    "(default) counts Unicode code points; mode='token' applies the plugin's own token estimate "
+    "(CJK one token per character, otherwise four characters per token, plus a 10% margin). "
+    "Returns ok, measured, limit, over and remaining; it never truncates or rewrites the text. "
+    "Use it on your own draft before returning it: when ok is false, delete the weakest lines by "
+    "'over' and measure again.",
+    {"content": _prop("The text to measure."),
+     "limit": _prop("The budget the text must fit, at least 1.", "integer", minimum=1),
+     "mode": _prop("Count mode: 'string' for characters (default), 'token' for estimated tokens.",
+                   "string", enum=list(content_valid.MODES))},
+    ("content", "limit"))
+
 SCHEMAS: tuple[dict[str, Any], ...] = (
     _TOOL_SEARCH, _TOOL_KB_SEARCH, _TOOL_REMEMBER, _TOOL_FORGET, _TOOL_TODO, _TOOL_STATS,
-    _TOOL_AGENTS)
+    _TOOL_AGENTS, _TOOL_CONTENT_VALID)
 
 
 def agent_toolsets(base: Any = None) -> list[str]:
@@ -222,6 +237,10 @@ def register(ctx: Any, provider: Any = None,
         name = str(schema["name"])
 
         def handler(args: dict[str, Any], _name: str = name, **_kwargs: Any) -> str:
+            # The length check reads no store, so it answers even before initialization; every
+            # other tool needs the live provider.
+            if _name == content_valid.TOOL_NAME:
+                return content_valid.handle(dict(args or {}))
             return _dispatch(_name, args, lookup)
 
         try:

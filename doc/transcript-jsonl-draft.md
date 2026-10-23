@@ -18,7 +18,7 @@ v2 相对 v1：
 | R1 | 一条事件一行 JSON，追加写。不重写、不压缩、不自动删除。 |
 | R2 | host 会话收五类：user / system / assistant / tool / reasoning。 |
 | R3 | 插件内每个 aiagent（层）收同样的五类。 |
-| R4 | 隔离键：`platform / layer / session_id`。platform 在插件初始化时从 host 取得并记录。 |
+| R4 | 隔离键：`profile / layer / session_id`。profile 在插件初始化时从 host 解析并记录。 |
 | R5 | 读取用参数组合表达：全量、增量、滚动、时间、步骤、轮次。不建六套文件。 |
 | R6 | 落盘：周期异步追加 + 会话结束有界落盘；最后一个 host 进程关闭时收尾。 |
 | R7 | 缓存活在内存；磁盘是记录。全退出后的首个进程按 `last_cache` 标记重建内存。 |
@@ -64,8 +64,8 @@ v2 相对 v1：
 ## 3. 路径与文件
 
 ```
-<HERMES_HOME>/minir-memory/sessions/<platform>/<layer>/<session_id>.jsonl
-<HERMES_HOME>/minir-memory/sessions/<platform>/<layer>/<session_id>.part2.jsonl
+<HERMES_HOME>/minir-memory/sessions/<profile>/<layer>/<session_id>.jsonl
+<HERMES_HOME>/minir-memory/sessions/<profile>/<layer>/<session_id>.part2.jsonl
 <HERMES_HOME>/minir-memory/run/<pid>-<rand>.lock
 ```
 

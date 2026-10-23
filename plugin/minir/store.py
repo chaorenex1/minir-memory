@@ -585,6 +585,11 @@ class MinirStore:
         # independent conclusion must not compete with it in FTS recall.
         self._conn.execute(
             "UPDATE conclusions SET status = 'superseded' WHERE kind = 'base.session_summary'")
+        # The compression hand-off pass is retired: a pending row has no writer left to confirm
+        # it, so it must not keep looking like work in flight.
+        self._conn.execute(
+            "UPDATE conclusions SET status = 'expired' WHERE kind = 'handoff' "
+            "AND status = 'pending'")
         # A request staged by a process that died was never confirmed delivered: make it
         # pending again so the next request can carry it.
         self._conn.execute(
@@ -979,6 +984,20 @@ class MinirStore:
                     (kind, session_id)).fetchone()
         return dict(row) if row is not None else None
 
+    def latest_compression_summary(self, session_id: str) -> Optional[dict[str, Any]]:
+        """Newest active compression record for a session — never the idle-closed ``:final`` row.
+
+        The final record is the extraction pass's own output; feeding it back as the next run's
+        input would make a retry read its previous answer as evidence.
+        """
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM conclusions WHERE kind = 'session_summary' AND session_id = ? "
+                "AND status = 'active' AND key NOT LIKE '%:final' "
+                "ORDER BY updated_at DESC, id DESC LIMIT 1",
+                (str(session_id or ""),)).fetchone()
+        return dict(row) if row is not None else None
+
     # -- session chunk chain --------------------------------------------------
 
     def add_chunk_summary(self, session_id: str, from_ts: float, content: str,
@@ -1072,21 +1091,6 @@ class MinirStore:
                 "UPDATE conclusions SET status = 'superseded', updated_at = ? "
                 "WHERE kind = 'window_summary' AND session_id = ? AND status = 'active'",
                 (time.time(), session_id))
-            self._conn.commit()
-            return int(cur.rowcount)
-
-    def expire_pending_handoffs(self, session_id: str, *, before: float) -> int:
-        """Drop pending summaries whose committed message never appeared (TTL sweep).
-
-        ``handoff`` rows only exist in databases from an older release; the current compression
-        pipeline writes ``session_summary`` already ``active`` and has no pending phase.
-        """
-        with self._lock:
-            cur = self._conn.execute(
-                "UPDATE conclusions SET status = 'expired', updated_at = ? "
-                "WHERE kind = 'handoff' "
-                "AND session_id = ? AND status = 'pending' AND created_at < ?",
-                (time.time(), session_id, float(before)))
             self._conn.commit()
             return int(cur.rowcount)
 

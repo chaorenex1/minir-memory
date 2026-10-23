@@ -3,7 +3,7 @@
 The tool takes no layer argument on purpose. The layer comes from a ContextVar that
 ``agent_loop.run`` sets for the duration of one peer run, so a model cannot widen its own scope by
 passing a name: an unbound caller (the host agent, a bare test) gets an error instead of every
-layer. ``platform`` is the provider's partition key; cross-platform reads do not exist.
+layer. ``profile`` is the provider's partition key; cross-profile reads do not exist.
 
 Shapes mirror the buffer's read parameters, not six files:
 
@@ -76,7 +76,7 @@ SCHEMA = {
         "Read your own layer's transcript: user/system/assistant/tool/reasoning events kept as "
         "JSONL, memory-first, with disk fallback. `messages` reads a stream (paged, cursor or "
         "last_n), `search` greps text and tool results, `around` reads a window around one seq, "
-        "`stats` reports what this layer holds. Layer and platform are fixed by the caller; a "
+        "`stats` reports what this layer holds. Layer and profile are fixed by the caller; a "
         "result always says which range it covers (`coverage`) and where it came from (`source`)."),
     "parameters": {
         "type": "object",
@@ -88,7 +88,7 @@ SCHEMA = {
                       "description": "search: all terms must appear in the event text or result."},
             "scope": {"type": "string", "enum": ["session", "layer"],
                       "description": ("session (default): this session only. layer: every "
-                                      "session this layer owns on this platform.")},
+                                      "session this layer owns on this profile.")},
             "session_id": {"type": "string",
                            "description": "Own-layer session to read; defaults to yours."},
             "seq": {"type": "integer", "description": "around: anchor event sequence number."},
@@ -162,7 +162,7 @@ def _clip(row: dict[str, Any], limit: int) -> dict[str, Any]:
     return out
 
 
-def query(args: dict[str, Any], *, buffer: Any, platform: str, layer: str,
+def query(args: dict[str, Any], *, buffer: Any, profile: str, layer: str,
           session_id: str = "") -> dict[str, Any]:
     """Run one shape against the caller's layer; raises :class:`AgentHistoryError`."""
     if not layer:
@@ -178,20 +178,20 @@ def query(args: dict[str, Any], *, buffer: Any, platform: str, layer: str,
     if scope not in {"session", "layer"}:
         raise AgentHistoryError("invalid_args", "scope must be 'session' or 'layer'")
     if mode == "stats":
-        stats = buffer.stats(platform=platform, layer=layer)
-        stats.update({"layer": layer, "platform": platform})
+        stats = buffer.stats(profile=profile, layer=layer)
+        stats.update({"layer": layer, "profile": profile})
         return stats
     sessions = [str(args.get("session_id") or session_id or "")]
     if not sessions[0]:
         raise AgentHistoryError("invalid_args", "session_id is required when the caller has none")
     if scope == "layer":
         sessions = [row["session_id"] for row in
-                    buffer.stats(platform=platform, layer=layer)["streams"]]
+                    buffer.stats(profile=profile, layer=layer)["streams"]]
         if session_id and session_id not in sessions:
             sessions.insert(0, session_id)
         if not sessions:
             return {"rows": [], "coverage": [0, 0], "source": "disk", "dropped_before": 0,
-                    "truncated": False, "layer": layer, "platform": platform,
+                    "truncated": False, "layer": layer, "profile": profile,
                     "sessions": [], "mode": mode}
     limit = _int(args.get("limit"), _DEFAULT_LIMIT, low=1, high=_MAX_LIMIT, name="limit")
     max_chars = _int(args.get("max_chars"), _MAX_CHARS, low=0, high=100_000, name="max_chars")
@@ -205,7 +205,7 @@ def query(args: dict[str, Any], *, buffer: Any, platform: str, layer: str,
         if mode == "around":
             anchor = _int(args.get("seq"), 0, low=0, high=2 ** 62, name="seq")
             distance = _int(args.get("window"), 5, low=1, high=50, name="window")
-            result = buffer.read_events(platform, layer, session,
+            result = buffer.read_events(profile, layer, session,
                                         cursor=max(0, anchor - distance - 1),
                                         limit=distance * 2 + 1,
                                         roles=roles, kinds=kinds)
@@ -213,14 +213,14 @@ def query(args: dict[str, Any], *, buffer: Any, platform: str, layer: str,
             # One part's worth of events, newest first: a search must not materialize a whole
             # permanent stream of multi-megabyte tool results. ``dropped_before`` says the scan
             # was bounded when it was.
-            result = buffer.read_events(platform, layer, session, roles=roles, kinds=kinds,
+            result = buffer.read_events(profile, layer, session, roles=roles, kinds=kinds,
                                         last_n=2_000)
         else:
             turn = args.get("turn")
             if str(turn or "").strip() in {"", "0"}:
                 turn = None  # 0 means "every turn" in the schema
             result = buffer.read_events(
-                platform, layer, session, cursor=args.get("cursor"),
+                profile, layer, session, cursor=args.get("cursor"),
                 last_n=args.get("last_n"), since=args.get("since"), until=args.get("until"),
                 turn=turn, step=args.get("step"),
                 roles=roles, kinds=kinds, limit=args.get("limit"), page=args.get("page"))
@@ -244,7 +244,7 @@ def query(args: dict[str, Any], *, buffer: Any, platform: str, layer: str,
               else "mixed" if any(item == "buffer" for item in sources) else "disk")
     coverage = ([min(item[0] for item in coverages), max(item[1] for item in coverages)]
                 if coverages else [0, 0])
-    return {"mode": mode, "layer": layer, "platform": platform, "sessions": sessions,
+    return {"mode": mode, "layer": layer, "profile": profile, "sessions": sessions,
             "rows": rows, "count": len(rows), "coverage": coverage, "source": source,
             "dropped_before": max(dropped) if dropped else 0, "truncated": truncated}
 
@@ -252,10 +252,10 @@ def query(args: dict[str, Any], *, buffer: Any, platform: str, layer: str,
 def handle(args: dict[str, Any], *, provider: Any = None, **_kwargs: Any) -> str:
     """Tool handler: always a JSON string, never raises into the tool loop."""
     transcript = getattr(provider, "_transcript", None) if provider is not None else None
-    platform = str(getattr(provider, "_platform", "") or "cli") if provider is not None else "cli"
+    profile = str(getattr(provider, "_profile", "") or "default") if provider is not None else "default"
     session = str(getattr(provider, "_session_id", "") or "") if provider is not None else ""
     try:
-        data = query(args or {}, buffer=transcript, platform=platform, layer=current_layer(),
+        data = query(args or {}, buffer=transcript, profile=profile, layer=current_layer(),
                      session_id=current_session() or session)
     except AgentHistoryError as exc:
         return json.dumps({"success": False, "error": {"type": exc.kind,

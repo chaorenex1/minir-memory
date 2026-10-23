@@ -8,11 +8,15 @@ import time
 import pytest
 
 SUMMARY = "\n".join([
-    "## Session Goal", "- ship the plugin",
-    "## Work Done", "- wired the toolset",
-    "## Decisions", "- plugin tools are explicit",
-    "## Durable Knowledge", "- FTS5 trigram handles CJK",
-    "## Open Threads", "- none",
+    "## Session Summary",
+    "### Request", "- ship the plugin",
+    "### Outcome", "- done: wired the toolset",
+    "### Decisions", "- plugin tools are explicit",
+    "### Constraints",
+    "### Verified Facts", "- FTS5 trigram handles CJK — evidence: pytest",
+    "### Lessons", "- the idle timer needs a value marker",
+    "### Open Threads",
+    "### References", "- tests/test_session_finalisation.py",
 ])
 
 
@@ -169,14 +173,15 @@ def test_the_scheduler_runs_a_due_session(provider, plugin_package, monkeypatch,
         "s-due", due_at=0, markers=json.dumps({"notes": [], "value_markers": []}), window_to_ts=1.0)
     provider._store.add_base_refresh(
         "s-due", "user:default", window_from_ts=0.0, window_to_ts=1.0,
-        window_from_turn=0, window_to_turn=1, user_representation="",
-        user_peer_card="", ai_self_representation="", ai_identity_card="",
-        window_summary="## Window Summary\n- did things",
+        window_from_turn=0, window_to_turn=1, user_representation=json.dumps("u"),
+        user_peer_card=json.dumps("p"), ai_self_representation=json.dumps("a"),
+        ai_identity_card=json.dumps("i"),
+        window_summary=json.dumps("## Window Summary\n- did things"),
         value_markers=json.dumps({"value_markers": []}))
+    provider._store.save_conclusion(
+        "session_summary", "COMPRESSION RECORD", key="session_summary:1",
+        session_id="s-due", subject="session")
     seen: dict = {}
-
-    monkeypatch.setattr(plugin_package.handoff, "summarize_agent",
-                        lambda *args, **kwargs: "HANDOFF BODY")
 
     def fake_summary(**kwargs):
         seen.update(kwargs)
@@ -192,12 +197,34 @@ def test_the_scheduler_runs_a_due_session(provider, plugin_package, monkeypatch,
 
     row = provider._store.extraction("s-due")
     assert row["status"] == "done" and row["pages"] == 1 and row["summary_chars"] > 0
-    assert seen["handoff"] == "HANDOFF BODY"
+    assert seen["session_record"] == "COMPRESSION RECORD"
     assert seen["session_id"] == "s-due"
     conclusion = provider._store.newest_conclusion("session_summary", session_id="s-due")
-    assert "## Session Goal" in conclusion["content"]
+    assert conclusion["key"].endswith(":final")
+    assert "### Request" in conclusion["content"]
     files = list((tmp_path / "minir-memory" / "knowledge").rglob("*.md"))
     assert files and "trigram" in files[0].read_text(encoding="utf-8")
+
+
+def test_the_session_record_never_reads_the_final_record(provider):
+    """The record is the compression summary; a finished ``:final`` row is not evidence."""
+    assert provider._session_record("s-record") == ""
+    provider._store.add_base_refresh(
+        "s-record", "user:default", window_from_ts=0.0, window_to_ts=1.0,
+        window_from_turn=0, window_to_turn=1, user_representation="", user_peer_card="",
+        ai_self_representation="", ai_identity_card="",
+        window_summary=json.dumps("BASE WINDOW"))
+    assert provider._session_record("s-record") == "BASE WINDOW"
+
+    provider._store.save_conclusion(
+        "session_summary", "FINAL RECORD", key="session_summary:s-record:final",
+        session_id="s-record", subject="session")
+    assert provider._session_record("s-record") == "BASE WINDOW"
+
+    provider._store.save_conclusion(
+        "session_summary", "COMPRESSION RECORD", key="session_summary:s-record:1",
+        session_id="s-record", subject="session")
+    assert provider._session_record("s-record") == "COMPRESSION RECORD"
 
 
 def test_a_failed_extraction_retries_once_then_parks(provider, plugin_package):
@@ -244,7 +271,7 @@ def test_the_page_pass_reads_the_marker_rules(plugin_package, monkeypatch, tmp_p
     monkeypatch.setattr(plugin_package.agent_loop, "run", fake_run)
     monkeypatch.setattr(plugin_package.adviser, "load_config", fake_config)
     plugin_package.extraction.extract_pages(
-        session_id="s1", summary=SUMMARY, handoff="HANDOFF BODY", hermes_home=str(tmp_path))
+        session_id="s1", summary=SUMMARY, hermes_home=str(tmp_path))
 
     system = seen["system"]
     assert route_keys == [plugin_package.adviser.KNOWLEDGE_TASK], \
@@ -254,7 +281,7 @@ def test_the_page_pass_reads_the_marker_rules(plugin_package, monkeypatch, tmp_p
     assert system.rstrip().endswith("no prose."), "the output contract closes the system prompt"
 
 
-def test_the_summary_agent_receives_the_session_handoff(plugin_package, monkeypatch):
+def test_the_summary_agent_receives_the_session_record(plugin_package, monkeypatch):
     seen: dict = {}
 
     class _Run:
@@ -269,35 +296,46 @@ def test_the_summary_agent_receives_the_session_handoff(plugin_package, monkeypa
     monkeypatch.setattr(plugin_package.agent_loop, "run", fake_run)
 
     text = plugin_package.session_summary.summarize_agent(
-        session_id="s1", handoff="HANDOFF BODY", markers={"notes": []},
+        session_id="s1", session_record="RECORD BODY", markers={"notes": []},
         usage={"total_tokens": 5}, window_end=123.0)
 
     assert text == SUMMARY
-    assert "HANDOFF BODY" in seen["message"]
-    assert "<session_handoff>" in seen["message"]
+    assert "RECORD BODY" in seen["message"]
+    assert "<session_record>" in seen["message"]
+    assert "<session_handoff>" not in seen["message"]
     assert {"minir"} <= set(seen["toolsets"])
-    assert "## Durable Knowledge" in seen["system"]
+    assert "## Session Summary" in seen["system"]
+    headings = [line for line in plugin_package.session_summary.load_template().splitlines()
+                if line.startswith("### ")]
+    assert headings and all(heading in seen["system"] for heading in headings), \
+        "every template section must reach the system prompt"
 
 
-def test_the_summary_agent_rejects_a_wrong_shape(plugin_package):
-    assert plugin_package.session_summary.normalize("## Session Goal\n- only one") == ""
-    assert plugin_package.session_summary.normalize(
-        "```\n" + SUMMARY + "\n```").startswith("## Session Goal")
+def test_a_reply_missing_a_section_is_kept(plugin_package):
+    reply = "## Session Summary\n### Request\n- ship it"
+    assert plugin_package.session_summary.normalize(reply) == reply
 
 
-def test_the_hand_off_agent_also_gets_the_plugin_toolset(plugin_package, monkeypatch):
-    seen: dict = {}
+def test_a_reply_with_reordered_sections_is_kept(plugin_package):
+    reply = "## Session Summary\n### References\n- doc/x.md\n### Request\n- ship it"
+    assert plugin_package.session_summary.normalize(reply) == reply
 
-    class _Run:
-        answer = ""
 
-    def fake_run(message, **kwargs):
-        seen["toolsets"] = kwargs.get("toolsets")
-        return _Run()
+def test_thinking_and_fences_are_stripped(plugin_package):
+    reply = "<think>plan</think>\n```markdown\n## Session Summary\n### Request\n- ship\n```"
+    cleaned = plugin_package.session_summary.normalize(reply)
+    assert cleaned.startswith("## Session Summary")
+    assert "<think>" not in cleaned and not cleaned.endswith("```")
 
-    monkeypatch.setattr(plugin_package.agent_loop, "run", fake_run)
-    monkeypatch.setattr(plugin_package.handoff, "load_template", lambda: "# Task Handoff")
 
-    plugin_package.handoff.summarize_agent("chunk", "review", session_id="s1")
+def test_the_summary_is_capped_at_the_budget(plugin_package):
+    cleaned = plugin_package.session_summary.normalize(
+        "## Session Summary\n" + "x" * 20_000)
+    assert len(cleaned) == plugin_package.session_summary.MAX_CHARS
 
-    assert {"minir"} <= set(seen["toolsets"])
+
+def test_a_missing_template_asset_is_an_assembly_failure(plugin_package, tmp_path, monkeypatch):
+    monkeypatch.setattr(plugin_package.session_summary, "TEMPLATE_PATH",
+                        tmp_path / "missing.md")
+    with pytest.raises(plugin_package.session_summary.SessionTemplateError):
+        plugin_package.session_summary.load_template()

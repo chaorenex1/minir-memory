@@ -3,12 +3,11 @@
 One job = "reason over session S's history in ``(from_ts, to_ts]``" (see ``store.py``).
 This module is what turns that row into a published layer artifact:
 
-* **base layer** — one artifact for this profile's user, built in three staged JSON passes on
-  the ``auxiliary.minir_dialectic`` agent route: user representation + user peer card (from the previous
-  cards and this window, plus the first user message as intent anchor on bootstrap), AI
-  self-representation + AI identity card (from the user cards, the previous AI cards and this
-  window), then a local summary + value markers (entities/trajectories/experiences/tools/
-  projects). The six outputs are also written to the ``base_refreshes`` history table as JSON
+* **base layer** — one artifact for this profile's user. B1 writes the user card and starts the
+  B3 (window summary) and B4 (value markers) children through ``minir_agents``; B2 then writes the
+  AI self-representation + identity card from the user card and this window's summary. Value
+  markers are filed under entities/trajectories/experiences/events/tools/projects. The six outputs
+  are also written to the ``base_refreshes`` history table as JSON
   text, with the session, time window, the turn range actually covered and an ``is_latest`` flag
   (latest by window, not by write order). The same JSON is rendered to the fixed Markdown
   headings for the artifact/chunk chain.
@@ -60,6 +59,7 @@ import re
 import threading
 import time
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, Callable, Optional, Sequence
 
 from . import adviser
@@ -455,8 +455,11 @@ def _language_block(language: str) -> str:
 def _base_user_prompt(subject: str, session: str, baseline: dict[str, Any], evidence: str,
                       first: bool, *, from_ts: float = 0.0, to_ts: float = 0.0,
                       first_message: str = "", language: str = "en",
-                      source: str = "session") -> str:
-    """Pass 1: the user card, merged from the baseline plus this window."""
+                      source: str = "session", window_digest_path: str = "",
+                      previous_markers_path: str = "", window_template: str = "",
+                      markers_category: str = "", markers_org: str = "",
+                      previous_summary: str = "") -> str:
+    """B1: the user card plus the two child invocations that close the window."""
     parts = [
         f"Target: {subject}",
         _session_line(session),
@@ -470,6 +473,23 @@ def _base_user_prompt(subject: str, session: str, baseline: dict[str, Any], evid
         parts.append(
             "First user message in this session (intent anchor; the only allowed outside-window "
             "evidence):\n" + data_block("first_user_message", first_message))
+    if window_digest_path.strip():
+        parts.append("WINDOW DIGEST FILE (pass as context_files to both children):\n"
+                     + data_block("window_digest_path", window_digest_path))
+    if previous_markers_path.strip():
+        parts.append("PREVIOUS VALUE MARKERS FILE (pass as context_files to b4):\n"
+                     + data_block("previous_markers_path", previous_markers_path))
+    if window_template.strip():
+        parts.append("WINDOW TEMPLATE (include this text in b3's user_prompts):\n"
+                     + data_block("window_template", window_template))
+    if previous_summary.strip():
+        parts.append("PREVIOUS WINDOW SUMMARY (include this text in b3's user_prompts):\n"
+                     + data_block("previous_summary", previous_summary))
+    if markers_category.strip() or markers_org.strip():
+        parts.append(
+            "MARKER RULES (include both blocks verbatim in b4's user_prompts):\n"
+            + data_block("markers_category", markers_category)
+            + "\n\n" + data_block("markers_org", markers_org))
     parts.append(_json_block("baseline_user_card", baseline) if baseline
                  else "Baseline user card: none")
     return _compose_prompt(
@@ -481,9 +501,9 @@ def _base_user_prompt(subject: str, session: str, baseline: dict[str, Any], evid
 def _base_ai_prompt(subject: str, session: str, user_card: dict[str, Any],
                     previous: dict[str, Any], evidence: str, *,
                     identity: str = "", preference: str = "", plugin_yaml: str = "",
-                    first: bool, from_ts: float = 0.0, to_ts: float = 0.0,
-                    language: str = "en") -> str:
-    """Pass 2: the AI card, grounded in the user card just produced and the operator text."""
+                    window_summary: str = "", first: bool, from_ts: float = 0.0,
+                    to_ts: float = 0.0, language: str = "en") -> str:
+    """Pass B2: the AI card, grounded in the user card and this window's summary."""
     parts = [
         f"Target: {subject}",
         _session_line(session),
@@ -492,6 +512,8 @@ def _base_ai_prompt(subject: str, session: str, user_card: dict[str, Any],
         else "REFRESH KIND: subsequent base refresh (merge the baseline)",
         _language_block(language),
         _json_block("user_card", user_card),
+        "WINDOW SUMMARY (this window's ledger; derive the six ai_self fields from it):\n"
+        + data_block("window_summary", window_summary or "(empty)", empty="(empty)"),
         _json_block("baseline_ai_card", previous) if previous else "Baseline AI card: none",
     ]
     if identity.strip():
@@ -507,51 +529,6 @@ def _base_ai_prompt(subject: str, session: str, user_card: dict[str, Any],
         parts, evidence,
         "Return ONLY the JSON object described in the system prompt.", _MAX_PROMPT_CHARS,
         block=transcript_prompt.BLOCK_NAMES["base_ai"])
-
-
-def _base_summary_prompt(subject: str, session: str, user_card: dict[str, Any],
-                         ai_card: dict[str, Any], evidence: str, *,
-                         previous_summary: str, window_template: str,
-                         from_ts: float = 0.0, to_ts: float = 0.0,
-                         language: str = "en") -> str:
-    """Pass 3: the rolling window summary, shaped by the template passed with it."""
-    parts = [
-        f"Target: {subject}",
-        _session_line(session),
-        _window_line(from_ts, to_ts),
-        _language_block(language),
-        _json_block("window_template", window_template),
-        _json_block("user_card", user_card),
-        _json_block("ai_card", ai_card),
-        _json_block("previous_summary", previous_summary) if previous_summary
-        else "Previous summary: none",
-    ]
-    return _compose_prompt(
-        parts, evidence,
-        "Return ONLY the JSON object described in the system prompt for THIS window.",
-        _MAX_PROMPT_CHARS, block=transcript_prompt.BLOCK_NAMES["window_summary"])
-
-
-def _base_value_markers_prompt(subject: str, session: str, evidence: str, *,
-                               previous_value_markers: list[dict[str, Any]],
-                               markers_category: str, markers_org: str,
-                               from_ts: float = 0.0, to_ts: float = 0.0,
-                               language: str = "en") -> str:
-    """Pass 4: this window's value markers, with the marker rules passed as text."""
-    parts = [
-        f"Target: {subject}",
-        _session_line(session),
-        _window_line(from_ts, to_ts),
-        _language_block(language),
-        _json_block("previous_value_markers", {"value_markers": previous_value_markers or []})
-        if previous_value_markers else "Previous knowledge value markers: none",
-        _json_block("markers-category", markers_category),
-        _json_block("markers-org", markers_org),
-    ]
-    return _compose_prompt(
-        parts, evidence,
-        "Return ONLY the JSON object described in the system prompt for THIS window.",
-        _MAX_PROMPT_CHARS, block=transcript_prompt.BLOCK_NAMES["value_markers"])
 
 
 _MAX_DIALECTIC_PROMPT_CHARS = 24_000
@@ -634,13 +611,12 @@ class LayerWorker:
     def __init__(self, store: MinirStore, transcript: TranscriptBuffer, *, enabled: bool = True,
                  agent_identity: str = "", user_id: str = "", state_db: str = "",
                  profile: str = "", identity: str = "", preference: str = "", depth: int = 2,
-                 content_language: str = "en", hermes_home: str = "", platform: str = "cli",
+                 content_language: str = "en", hermes_home: str = "",
                  complete: Optional[Callable[..., str]] = None,
                  consult: Optional[Callable[[str, str], str]] = None,
                  on_value_markers: Optional[Callable[[str, list[dict[str, Any]]], None]] = None):
         self._store = store
         self._transcript = transcript
-        self._platform = str(platform or "cli")
         self._enabled = bool(enabled)
         self._agent_identity = str(agent_identity or "")
         self._user_id = str(user_id or "")
@@ -661,6 +637,8 @@ class LayerWorker:
         # (the minir toolset attached). An injected ``complete`` keeps tests and bare checkouts
         # on the one-shot path they can stub; production without an injection uses the loop.
         # Both passes share the route, so they also share its one-shot fallback key.
+        #: True when the base consult is the real agent route, which can label its run-meta.
+        self._consult_takes_agent = not (callable(consult) or callable(complete))
         if callable(consult):
             self._consult = consult
             self._dialectic_consult = consult
@@ -669,12 +647,13 @@ class LayerWorker:
             self._dialectic_consult = lambda system, prompt: complete(
                 DIALECTIC_TASK, system, prompt)
         else:
-            self._consult = lambda system, prompt: self._adviser_consult(
-                system, prompt, BASE_LAYER, _BASE_TOOL_HINT)
+            self._consult = self._base_consult
             self._dialectic_consult = lambda system, prompt: self._adviser_consult(
                 system, prompt, DIALECTIC_LAYER, _DIALECTIC_TOOL_HINT)
         self._lock = threading.Lock()
         self._thread: Optional[threading.Thread] = None
+        #: The last resolved layer route (provider, model), so a child retry can inherit it.
+        self._last_route: tuple[str, str] = ("", "")
 
     @property
     def enabled(self) -> bool:
@@ -689,6 +668,10 @@ class LayerWorker:
         return f"user:{self._user_id or 'default'}"
 
     # -- base refresh ---------------------------------------------------------
+
+    def _base_consult(self, system: str, prompt: str, agent: str = "") -> str:
+        """The base route, named so its ``[run-meta]`` says which pass it is."""
+        return self._adviser_consult(system, prompt, BASE_LAYER, _BASE_TOOL_HINT, agent=agent)
 
     def _consult_json(self, system: str, prompt: str, valid: Callable[[str], bool], *,
                       label: str) -> str:
@@ -713,7 +696,8 @@ class LayerWorker:
 
     def _adviser_consult(self, system: str, prompt: str,
                          layer: str = BASE_LAYER,
-                         tool_hint: str = _BASE_TOOL_HINT) -> str:
+                         tool_hint: str = _BASE_TOOL_HINT,
+                         agent: str = "") -> str:
         """One refresh pass on the ``auxiliary.minir_dialectic`` agent route.
 
         The minir toolset is always attached explicitly: ``agent_loop`` does not add it,
@@ -733,8 +717,10 @@ class LayerWorker:
                 prompt, model=str(cfg.get("model") or ""),
                 provider=str(cfg.get("provider") or ""),
                 api_mode=str(cfg.get("api_mode") or ""), toolsets=toolsets,
-                system_message=f"{system}\n\n{tool_hint}",
-                layer=layer)
+                system_message=[system, tool_hint],
+                layer=layer, meta={"agent": agent} if agent else None)
+            self._last_route = (str(getattr(result, "provider", "") or ""),
+                                str(getattr(result, "model", "") or ""))
             self._record_aux(layer, system, result, cfg, toolsets)
             return str(result.answer or "")
         except Exception as exc:
@@ -820,15 +806,22 @@ class LayerWorker:
         parts = [core.strip(), *(rule.strip() for rule in rules), output.strip()]
         return "\n\n".join(part for part in parts if part)
 
+    def _consult_pass(self, system: str, prompt: str, agent: str) -> str:
+        """Call the base route; a stubbed route keeps its two-argument signature."""
+        if agent and self._consult_takes_agent:
+            return self._consult(system, prompt, agent=agent)
+        return self._consult(system, prompt)
+
     def _consult_validated(self, system: str, prompt: str,
-                           validator: Callable[[Any], Any], *, label: str) -> Any:
+                           validator: Callable[[Any], Any], *, label: str,
+                           agent: str = "") -> Any:
         """Run one structured pass; a contract failure is retried once, then fails the job.
 
         The retry restates the format rule and the untrusted-data boundary before the whole
         task. A weak route can echo an instruction from the window instead of following the
         system prompt; it must not be able to write a malformed artifact.
         """
-        text = self._consult(system, prompt)
+        text = self._consult_pass(system, prompt, agent)
         try:
             return validator(_json_object(text))
         except (layers.LayerContractError, summary_template.WindowSummaryError) as exc:
@@ -841,45 +834,136 @@ class LayerWorker:
             f"Original task:\n{prompt}"
         )
         try:
-            return validator(_json_object(self._consult(system, retry)))
+            return validator(_json_object(self._consult_pass(system, retry, agent)))
         except (layers.LayerContractError, summary_template.WindowSummaryError) as exc:
             raise LayerMergeError(f"{label} returned an invalid object: {exc}") from exc
+
+    def _base_scratch(self, session: str, from_ts: float, to_ts: float, evidence: str,
+                      previous_markers: Any) -> tuple[str, str]:
+        """The digest and previous-markers files the children read, under the plugin's scratch.
+
+        B1 gets their paths, not their bodies: the same evidence reaches B3/B4 through
+        ``context_files``. Without a profile home there is nowhere to write, so B1 orchestrates
+        children without files (they can still use ``session_search``).
+        """
+        if not self._hermes_home.strip():
+            return "", ""
+        safe = re.sub(r"[^0-9A-Za-z._-]+", "-", session or "session")[:80]
+        root = Path(self._hermes_home) / "minir-memory" / "scratch"
+        stem = f"window-{safe}-{int(from_ts)}-{int(to_ts)}"
+        try:
+            root.mkdir(parents=True, exist_ok=True)
+            window = root / f"{stem}.txt"
+            window.write_text(evidence, encoding="utf-8")
+            markers = root / f"{stem}-markers.json"
+            markers.write_text(json.dumps(previous_markers, ensure_ascii=False), encoding="utf-8")
+        except OSError as exc:
+            logger.warning("Minir base scratch write failed: %s", exc)
+            return "", ""
+        return str(window), str(markers)
+
+    def _base_child(self, name: str, user_prompt: str, context_files: list[str], session: str,
+                    tool_sets: list[str]) -> str:
+        """Run one failed child once more; the gateway route, no host baggage."""
+        from . import minir_agents
+
+        provider = SimpleNamespace(_hermes_home=self._hermes_home,
+                                   _session_id=session or "",
+                                   _transcript=self._transcript)
+        provider_name, model_name = self._last_route
+        args = {"agent_name": name, "user_prompts": user_prompt, "tool_sets": tool_sets,
+                "context_files": [path for path in context_files if path],
+                "skip_memory": True, "skip_context_files": True,
+                "skip_background_review": True, "load_soul_identity": False}
+        if provider_name and model_name:
+            # Retry on the route B1 actually ran, not on the gateway default.
+            args["model"] = f"{provider_name}:{model_name}"
+        try:
+            payload = json.loads(minir_agents.run(provider, args))
+        except Exception as exc:
+            logger.warning("Minir %s child retry failed: %s", name, exc)
+            return ""
+        if str(payload.get("error") or "").strip():
+            logger.warning("Minir %s child retry returned an error: %s", name, payload["error"])
+            return ""
+        return str(payload.get("answer") or "")
+
+    def _retry_base_child(self, name: str, user_prompt: str, context_files: list[str],
+                          session: str, tool_sets: list[str]) -> Any:
+        """Retry a B3/B4 child and validate its answer; empty value when it still fails."""
+        answer = self._base_child(name, user_prompt, context_files, session, tool_sets)
+        try:
+            if name == "b3_window_summary":
+                return layers.validate_summary_pass({"window_summary": answer})["window_summary"]
+            return layers.validate_value_markers(json.loads(answer))
+        except (ValueError, layers.LayerContractError) as exc:
+            logger.warning("Minir %s child retry failed its contract: %s", name, exc)
+            return "" if name == "b3_window_summary" else []
 
     def _merge_base_cards(self, subject: str, evidence: str, baseline: dict[str, Any], *,
                           session: str = "", first: bool = False,
                           first_message: str = "", from_ts: float = 0.0,
                           to_ts: float = 0.0, source: str = "session",
+                          previous_summary: str = "",
                           rows: Optional[list[dict[str, Any]]] = None
                           ) -> tuple[str, dict[str, str], str]:
-        """Four-pass base refresh: user card, AI card, window summary plus value markers.
+        """B1 (user card + B3/B4 children), then B2 over B1's outputs.
 
-        Each pass returns its complete part. The artifact is rendered from validated objects, so
-        a malformed reply cannot reach the next prompt, and the card the dialectic reviews is the
-        exact card the base pass published. Each pass gets its own transcript projection (§9.2):
-        cards read statements, the summary covers all roles, markers read statements only.
+        B1 writes the user card, starts the two child agents through ``minir_agents`` and copies
+        their answers. A failed child leaves its key empty; the worker retries that one child
+        once and fails the refresh if the summary still cannot be produced. B2 runs last, so the
+        six ai_self fields see this window's summary.
         """
         user_evidence = self._pass_evidence("base_user", session, from_ts, to_ts, rows,
                                             fallback=evidence)
         ai_evidence = self._pass_evidence("base_ai", session, from_ts, to_ts, rows,
                                           fallback=evidence)
-        summary_evidence = self._pass_evidence("window_summary", session, from_ts, to_ts, rows,
-                                               fallback=evidence)
-        markers_evidence = self._pass_evidence("value_markers", session, from_ts, to_ts, rows,
-                                               fallback=evidence)
+        window_path, markers_path = self._base_scratch(
+            session, from_ts, to_ts, evidence, baseline.get("value_markers") or [])
         user_baseline = {
             "user_self_representation": baseline.get("user_self_representation") or {},
             "user_preferences": baseline.get("user_preferences") or {},
         }
         if first and not _has_content(user_baseline["user_self_representation"]):
             user_baseline["user_self_representation"] = layers.preset_user_self_representation(self._language)
+        markers_category = self._rule("markers-category")
+        markers_org = self._rule("markers-org")
         user_system = self._system(layers.load_core("b1_user_card"), layers.OUTPUT_B1,
                                    [self._rule("user-self"), self._rule("user-preferences")])
-        user_card = self._consult_validated(
+        base = self._consult_validated(
             user_system,
             _base_user_prompt(subject, session, user_baseline, user_evidence, first,
                               from_ts=from_ts, to_ts=to_ts, first_message=first_message,
-                              language=self._language, source=source),
-            layers.validate_user_card, label="base user pass")
+                              language=self._language, source=source,
+                              window_digest_path=window_path,
+                              previous_markers_path=markers_path,
+                              window_template=summary_template.load_template(),
+                              markers_category=markers_category, markers_org=markers_org,
+                              previous_summary=previous_summary),
+            layers.validate_base_pass, label="base user pass", agent="b1_user_card")
+        summary = base["window_summary"]
+        value_markers = base["value_markers"]
+        if not summary.strip():
+            logger.warning("Minir base refresh %s: b3 child failed; retrying once", subject)
+            retry_parts = [
+                "Write the window summary for the window in the supplied digest.",
+                _language_block(self._language),
+                data_block("window_template", summary_template.load_template()),
+            ]
+            if previous_summary.strip():
+                retry_parts.append(data_block("previous_summary", previous_summary))
+            summary = self._retry_base_child(
+                "b3_window_summary", "\n\n".join(retry_parts),
+                [window_path], session, ["file", "session_search"])
+        if not value_markers:
+            logger.warning("Minir base refresh %s: b4 child failed; retrying once", subject)
+            value_markers = self._retry_base_child(
+                "b4_value_markers",
+                "Record this window's value markers.\n\n" + markers_category + "\n\n"
+                + markers_org,
+                [window_path, markers_path], session, ["file", "minir", "session_search"])
+        if not summary.strip():
+            raise LayerMergeError("base summary child failed after one retry")
 
         ai_baseline = {}
         if _has_content(baseline.get("ai_self_representation")) or _has_content(baseline.get("ai_identity")):
@@ -887,42 +971,24 @@ class LayerWorker:
                            "ai_identity": baseline.get("ai_identity") or {}}
         ai_system = self._system(layers.load_core("b2_ai_card"), layers.OUTPUT_B2,
                                  [self._rule("ai-self"), self._rule("ai-identity")])
+        user_card = {"user_self_representation": base["user_self_representation"],
+                     "user_preferences": base["user_preferences"]}
         ai_card = self._consult_validated(
             ai_system,
             _base_ai_prompt(subject, session, user_card, ai_baseline, ai_evidence,
                             identity=self._identity, preference=self._preference,
-                            plugin_yaml=self._plugin_yaml, first=first,
+                            plugin_yaml=self._plugin_yaml, window_summary=summary, first=first,
                             from_ts=from_ts, to_ts=to_ts, language=self._language),
             lambda value: layers.validate_ai_card(value),
-            label="base AI pass")
+            label="base AI pass", agent="b2_ai_card")
         if (not self._identity_changed()
                 and _part_has_content("ai_identity", baseline.get("ai_identity") or {})):
             # Sources unchanged: the previous identity card stands, whatever the pass echoed.
             ai_card["ai_identity"] = baseline["ai_identity"]
 
-        summary_system = self._system(layers.load_core("b3_window_summary"), layers.OUTPUT_B3)
-        summary = self._consult_validated(
-            summary_system,
-            _base_summary_prompt(subject, session, user_card, ai_card, summary_evidence,
-                                 previous_summary=baseline.get("window_summary") or "",
-                                 window_template=summary_template.load_template(),
-                                 from_ts=from_ts, to_ts=to_ts, language=self._language),
-            layers.validate_summary_pass,
-            label="base summary pass")["window_summary"]
-        value_markers_system = self._system(layers.load_core("b4_value_markers"), layers.OUTPUT_B4)
-        value_markers = self._consult_validated(
-            value_markers_system,
-            _base_value_markers_prompt(subject, session, markers_evidence,
-                                       previous_value_markers=baseline.get("value_markers") or [],
-                                       markers_category=self._rule("markers-category"),
-                                       markers_org=self._rule("markers-org"),
-                                       from_ts=from_ts, to_ts=to_ts, language=self._language),
-            lambda value: layers.validate_value_markers(
-                value, previous=baseline.get("value_markers") or []),
-            label="base value markers pass")
         # A valid reply with everything empty is a sparse window: nothing durable to publish.
-        if not (_part_has_content("user_self_representation", user_card["user_self_representation"])
-                or _part_has_content("user_preferences", user_card["user_preferences"])
+        if not (_part_has_content("user_self_representation", base["user_self_representation"])
+                or _part_has_content("user_preferences", base["user_preferences"])
                 or _part_has_content("ai_self_representation", ai_card["ai_self_representation"])
                 or _part_has_content("ai_identity", ai_card["ai_identity"])
                 or value_markers or not summary_template.is_empty(summary)):
@@ -930,16 +996,16 @@ class LayerWorker:
                         subject)
             return "", {}, ""
         content = layers.render_artifact(
-            user_self_representation=user_card["user_self_representation"], user_preferences=user_card["user_preferences"],
-            ai_self_representation=ai_card["ai_self_representation"], ai_identity=ai_card["ai_identity"],
-            summary=summary, value_markers=value_markers)
+            user_self_representation=base["user_self_representation"],
+            user_preferences=base["user_preferences"],
+            ai_self_representation=ai_card["ai_self_representation"],
+            ai_identity=ai_card["ai_identity"], summary=summary, value_markers=value_markers)
         if not _valid_artifact(content):
             raise LayerMergeError(f"base refresh for {subject} assembled an invalid artifact")
-        summary_md = summary
-        chunk_text = summary_md.split("\n", 1)[1].strip()
+        chunk_text = summary.split("\n", 1)[1].strip()
         parts = {
-            "user_representation": json.dumps(user_card["user_self_representation"], ensure_ascii=False),
-            "user_peer_card": json.dumps(user_card["user_preferences"], ensure_ascii=False),
+            "user_representation": json.dumps(base["user_self_representation"], ensure_ascii=False),
+            "user_peer_card": json.dumps(base["user_preferences"], ensure_ascii=False),
             "ai_self_representation": json.dumps(ai_card["ai_self_representation"], ensure_ascii=False),
             "ai_identity_card": json.dumps(ai_card["ai_identity"], ensure_ascii=False),
             "window_summary": json.dumps(summary, ensure_ascii=False),
@@ -1138,7 +1204,7 @@ class LayerWorker:
         if session and self._transcript is not None:
             try:
                 digest = transcript_prompt.digest_block(
-                    pass_name, self._transcript, self._platform, HOST_LAYER, session,
+                    pass_name, self._transcript, self._profile, HOST_LAYER, session,
                     since=float(from_ts) if from_ts else None,
                     until=float(to_ts) if to_ts else None)
             except Exception:
@@ -1196,11 +1262,17 @@ class LayerWorker:
                                                 else "preset")
         baseline = layers.artifact_from_columns(previous_row)
         baseline.update({key: value for key, value in global_cards.items() if value})
+        # The window summary merges only inside this session. ``previous_row`` may belong to an
+        # older session (the user card is durable); feeding its summary in would leak the last
+        # session's window into a new session that has no state of its own yet.
+        window_row = self._store.latest_base_refresh(session) if session else None
+        previous_summary = (layers.artifact_from_columns(window_row).get("window_summary") or ""
+                            if window_row else "")
         first_message = self._first_user_message(session) if first else ""
         content, parts, chunk_text = self._merge_base_cards(
             subject, evidence, baseline, session=session, first=first,
             first_message=first_message, from_ts=from_ts, to_ts=to_ts, source=source,
-            rows=rows)
+            previous_summary=previous_summary, rows=rows)
         if not content.strip():
             return [], []  # the model found nothing durable; complete the window
         # ``job["turns"]`` is the dispatch stamp; ``_covered_turns`` maps the messages this

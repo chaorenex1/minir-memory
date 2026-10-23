@@ -25,23 +25,24 @@ def transcript(plugin_package, tmp_path):
 def test_a_base_publish_hands_its_units_to_the_knowledge_pipeline(plugin_package, store, transcript):
     captured: list[tuple[str, list[dict]]] = []
 
+    marker = {
+        "id": "u1", "info_type": "tool behaviour", "topic": "Docker restart policy",
+        "why": "a later deploy needs the restart policy",
+        "relations": [], "render_plan": "write the tools page for Docker restart",
+        "anchor": {"from_ts": 0.0, "to_ts": 20.0, "message_ids": []},
+        "objects": ["tools:docker"]}
+
     def complete(task, system, prompt, **kwargs):
         if "dialectic reviewer" in system:
             return "{}"
-        if "baseline_user_card" in prompt or "Baseline user card" in prompt:
+        if "<window_template>" in prompt:
             return json.dumps({
                 "user_self_representation": "# Who this person is\n\nAn Engineer.\n",
                 "user_preferences": "# How they want answers\n\n- Terse first.\n",
-            })
-        if "baseline_ai_card" in prompt or "Baseline AI card" in prompt:
-            return json.dumps({"ai_self_representation": "# What this task is\n\nidle.\n",
-                               "ai_identity": "# Who the assistant is\n\nminir 0.8.0.\n"})
-        if "previous_value_markers" in prompt or "Previous knowledge value markers" in prompt:
-            return json.dumps({"value_markers": [{
-                "id": "u1", "org": "tools", "category": "KNOWLEDGE", "epistemic": "fact",
-                "topic": "Docker restart policy", "content": "Use unless-stopped.",
-                "time": "2026-10-21", "relations": [], "objects": ["tools:docker"]}]})
-        return json.dumps({"window_summary": plugin_package.window_summary.empty_summary()})
+                "window_summary": plugin_package.window_summary.empty_summary(),
+                "value_markers": [marker]})
+        return json.dumps({"ai_self_representation": "# What this task is\n\nidle.\n",
+                           "ai_identity": "# Who the assistant is\n\nminir 0.8.0.\n"})
 
     transcript.add("s1", "user", "restart docker", created_at=10.0)
     store.record_job("base", "s1", 0.0, 20.0)
@@ -53,37 +54,18 @@ def test_a_base_publish_hands_its_units_to_the_knowledge_pipeline(plugin_package
     assert captured[0][1][0]["topic"] == "Docker restart policy"
 
 
-def test_prefetch_injects_only_a_knowledge_path_block(plugin_package, make_provider, tmp_path):
+def test_prefetch_never_injects_knowledge_paths_or_recall(plugin_package, make_provider):
     provider = make_provider({})
     unit = {"id": "u1", "org": "tools", "category": "KNOWLEDGE", "epistemic": "fact",
             "topic": "Docker restart policy", "content": "Use unless-stopped.",
             "time": "2026-10-21", "relations": [], "objects": ["tools:docker", "tools:restart"]}
     plugin_package.knowledge.write_unit(
         unit, root=plugin_package.knowledge.knowledge_dir(provider._hermes_home))
+    provider.handle_tool_call(
+        "minir_remember", {"type": "tools", "content": "docker restart policy note"})
     block = provider.prefetch("how do I set a docker restart policy")
-    assert "[knowledge — retrieve on demand]" in block
-    assert "tools · Docker restart policy" in block
-    assert "Use unless-stopped." not in block, "paths, never file contents"
-
-
-def test_prefetch_hands_the_profile_home_to_the_page_selector(plugin_package, make_provider,
-                                                              monkeypatch):
-    """The tool store is profile-local: the selector must not fall back to the process env."""
-    provider = make_provider({})
-    plugin_package.knowledge.write_unit(
-        {"id": "u1", "org": "tools", "category": "KNOWLEDGE", "epistemic": "fact",
-         "topic": "Docker restart policy", "content": "Use unless-stopped.",
-         "time": "2026-10-21", "relations": [], "objects": ["tools:docker"]},
-        root=plugin_package.knowledge.knowledge_dir(provider._hermes_home))
-    seen = {}
-
-    def fake_search(pattern, root, **kwargs):
-        seen["hermes_home"] = kwargs.get("hermes_home")
-        return []
-
-    monkeypatch.setattr(plugin_package.knowledge.rgtool, "search", fake_search)
-    provider.prefetch("how do I set a docker restart policy")
-    assert seen["hermes_home"] == provider._hermes_home
+    assert block == "", "neither knowledge paths nor explicit recall ride the turn"
+    assert provider.handle_tool_call("minir_kb_search", {"query": "Docker restart policy"})
 
 
 def test_an_aux_run_writes_its_own_transcript(plugin_package, store, transcript, tmp_path):
@@ -116,7 +98,7 @@ def test_a_primary_turn_persists_the_host_transcript(plugin_package, make_provid
     provider.sync_turn("deploy on Windows", "noted")
     provider._transcript.flush()
     sessions = pathlib.Path(provider._hermes_home) / "minir-memory" / "sessions"
-    files = list(sessions.glob("cli/host/*.jsonl"))
+    files = list(sessions.glob("default/host/*.jsonl"))
     assert files, "the host session was not persisted"
     rows = [json.loads(line) for line in files[0].read_text(encoding="utf-8").splitlines()]
     assert rows[0]["layer"] == "host"
@@ -138,7 +120,7 @@ def test_a_primary_turn_and_the_plugin_block_cover_the_five_roles(plugin_package
         {"role": "tool", "tool_call_id": "c1", "name": "exec", "content": "R" * 6000},
     ])
     provider._transcript.flush()
-    rows = provider._transcript.read_events("cli", "host", "session-test", limit=100,
+    rows = provider._transcript.read_events("default", "host", "session-test", limit=100,
                                             kinds=("msg", "gap"))["rows"]
     roles = {row["role"] for row in rows}
     assert {"system", "user", "assistant", "tool", "reasoning"} <= roles

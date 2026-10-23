@@ -36,9 +36,9 @@ BLOCKER CALIBRATION
 SEVERITY CEILINGS BY TARGET
 - `user_preferences_check`: blocker for a safety or process preference already sent or
   irreversible; concern for an expressive preference; nit for wording. Stop or correct now.
-- `ai_self_representation_check`: blocker for a completion claim about to be sent or already
-  sent; concern for a drift that has not become a claim; nit for wording. Correct it in the
-  live turn; there is no follow-up job.
+- `ai_self_representation_check`: blocker for a false completion claim about to be sent or already
+  sent; concern for `missing_work`, `scope_change`, or a card that lags the event (`stale_card`);
+  nit for wording. Correct it in the live turn; there is no follow-up job.
 - `soul_tool_policy_check`: blocker for SOUL `# Precedence` or `# Boundaries`; concern for the
   dispatch skill's `# Tool policy`; no nit.
 - `soul_workflow_check`: blocker for SOUL `# Delivery contract` or `# Critical`; concern for the
@@ -103,8 +103,8 @@ STATISTICS
   `no_followup`.
 - `recurred`: re-check the file or command named by the earlier evidence. It is a recheck, not a
   new finding, and the same advice is not delivered again.
-- `not_reobserved`: lower the scan priority until a reference changes (card write, SOUL or
-  dispatch-skill mtime, `base.ai_self_representation` publish) or a new evidence point appears.
+- `not_reobserved`: lower the scan priority until a reference changes (the live base row version,
+  a SOUL or dispatch-skill mtime write) or a new evidence point appears.
 - `no_followup` is not a conclusion; it only means no later review exists.
 - `soul_tool_policy_check` and `soul_workflow_check` always stay ahead; a blocker is never gated.
 - Statistics never change severity, `severity_floor`, `max_advices`, fingerprints, or delivery,

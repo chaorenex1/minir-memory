@@ -123,9 +123,6 @@ def _install_memory_provider_shim() -> None:
         def prefetch(self, query: str, *, session_id: str = "") -> str:
             return ""
 
-        def queue_prefetch(self, query: str, *, session_id: str = "") -> None:
-            return None
-
         def recall_status(self):
             return None
 
@@ -378,7 +375,7 @@ def _no_real_adviser_route(plugin_package, monkeypatch, request):
         return
     worker = plugin_package.worker
 
-    def _consult(self, system, prompt, layer=worker.BASE_LAYER, tool_hint=""):
+    def _consult(self, system, prompt, layer=worker.BASE_LAYER, tool_hint="", agent=""):
         return self._complete(worker.DIALECTIC_TASK, system, prompt)
 
     monkeypatch.setattr(worker.LayerWorker, "_adviser_consult", _consult)
@@ -389,7 +386,7 @@ def _clean_minir_env(monkeypatch):
     """Config written by tests must not be shadowed by the developer's environment."""
     for key in ("MINIR_PREFETCH_LIMIT", "MINIR_BASE_INTERVAL", "MINIR_CONTEXT_CADENCE",
                 "MINIR_DIALECTIC_INTERVAL", "MINIR_DIALECTIC_CADENCE",
-                "MINIR_DIALECTIC_DEPTH", "MINIR_HANDOFF_ENABLED", "MINIR_SESSION_MODE"):
+                "MINIR_DIALECTIC_DEPTH", "MINIR_SESSION_MODE"):
         monkeypatch.delenv(key, raising=False)
 
 

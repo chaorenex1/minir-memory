@@ -8,25 +8,25 @@ import pytest
 @pytest.fixture()
 def buffer(plugin_package, tmp_path):
     instance = plugin_package.transcript.TranscriptBuffer(
-        persist_dir=tmp_path / "sessions", run_dir=tmp_path / "run", platform="cli")
+        persist_dir=tmp_path / "sessions", run_dir=tmp_path / "run", profile="default")
     yield instance
     instance.close()
 
 
 def _fill(buffer):
-    buffer.append_event("host", "s1", "system", text="be terse", platform="cli")
-    buffer.append_event("host", "s1", "user", text="deploy the new tag", platform="cli")
+    buffer.append_event("host", "s1", "system", text="be terse", profile="default")
+    buffer.append_event("host", "s1", "user", text="deploy the new tag", profile="default")
     buffer.append_event("host", "s1", "assistant", text="reading the manifest",
-                        tool_calls=[{"id": "c1", "name": "exec", "args": "{}"}], platform="cli")
+                        tool_calls=[{"id": "c1", "name": "exec", "args": "{}"}], profile="default")
     buffer.append_event("host", "s1", "tool", text="", result="R" * 900, name="exec",
-                        tool_call_id="c1", ok=True, duration_ms=1200, platform="cli")
-    buffer.append_event("host", "s1", "reasoning", text="T" * 500, platform="cli")
-    buffer.append_event("host", "s1", "user", text="now verify", platform="cli")
+                        tool_call_id="c1", ok=True, duration_ms=1200, profile="default")
+    buffer.append_event("host", "s1", "reasoning", text="T" * 500, profile="default")
+    buffer.append_event("host", "s1", "user", text="now verify", profile="default")
 
 
 def _render(buffer, plugin_package, **kwargs):
     return plugin_package.transcript_prompt.render_digest(
-        buffer, "cli", "host", "s1", **kwargs)
+        buffer, "default", "host", "s1", **kwargs)
 
 
 def test_a_digest_is_plain_text_with_marked_elisions(buffer, plugin_package):
@@ -56,7 +56,7 @@ def test_tool_results_and_reasoning_are_opt_in(buffer, plugin_package):
 def test_the_character_budget_drops_whole_events_oldest_first(buffer, plugin_package):
     for index in range(30):
         buffer.append_event("host", "s1", "user", text=f"{index:02d} " + "x" * 40,
-                            platform="cli")
+                            profile="default")
     text = _render(buffer, plugin_package, max_chars=200, max_events=50)
     lines = text.splitlines()
     body = lines[:-1]
@@ -69,7 +69,7 @@ def test_the_character_budget_drops_whole_events_oldest_first(buffer, plugin_pac
 def test_an_empty_projection_returns_nothing(buffer, plugin_package):
     assert _render(buffer, plugin_package) == ""
     block = plugin_package.transcript_prompt.digest_block(
-        "base_user", buffer, "cli", "host", "missing")
+        "base_user", buffer, "default", "host", "missing")
     assert block == ""
 
 
@@ -88,10 +88,10 @@ def test_the_window_uses_the_message_timestamp_when_the_host_supplies_one(buffer
                                  {"role": "assistant", "content": "old answer",
                                   "timestamp": 101.0},
                                  {"role": "user", "content": "new question", "timestamp": 300.0}])
-    rows = buffer.read_events("cli", "host", "s3", limit=10, kinds=("msg",))["rows"]
+    rows = buffer.read_events("default", "host", "s3", limit=10, kinds=("msg",))["rows"]
     assert [row["ts"] for row in rows] == [100.0, 101.0, 300.0]
     in_window = plugin_package.transcript_prompt.render_digest(
-        buffer, "cli", "host", "s3", since=90.0, until=150.0)
+        buffer, "default", "host", "s3", since=90.0, until=150.0)
     assert "old question" in in_window and "new question" not in in_window
 
 

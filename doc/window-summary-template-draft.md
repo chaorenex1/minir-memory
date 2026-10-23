@@ -1,6 +1,6 @@
 # 窗口摘要模板草稿
 
-状态：草稿。依据 `doc/base-dialectic-layers-draft.md` 4.5 与 `doc/layer-agent-contracts-draft.md` B3。
+状态：已实现（2026-10-23，T2/T3/T5）。依据 `doc/base-dialectic-layers-draft.md` 4.5 与 `doc/layer-agent-contracts-draft.md` B3。
 
 ## 1. 定位
 

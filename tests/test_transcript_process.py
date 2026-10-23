@@ -44,9 +44,9 @@ def test_a_stream_lock_serialises_and_survives_release(tmp_path, plugin_package)
 
 def test_the_buffer_creates_one_lock_per_live_process(plugin_package, tmp_path):
     first = plugin_package.transcript.TranscriptBuffer(
-        persist_dir=tmp_path / "sessions", run_dir=tmp_path / "run", platform="cli")
+        persist_dir=tmp_path / "sessions", run_dir=tmp_path / "run", profile="default")
     second = plugin_package.transcript.TranscriptBuffer(
-        persist_dir=tmp_path / "sessions", run_dir=tmp_path / "run", platform="cli")
+        persist_dir=tmp_path / "sessions", run_dir=tmp_path / "run", profile="default")
     try:
         assert first.bind("s1") is True
         assert second.bind("s1") is False

@@ -74,11 +74,12 @@ def test_a_missing_template_fails_loudly(summary, tmp_path, monkeypatch):
 
 
 def test_prompt_vars_publish_the_caps(summary):
-    for name in ("MAX_OBJECTIVE_CHARS", "MAX_STATE_ITEMS", "MAX_STATE_ITEM_CHARS",
-                 "MAX_DECISIONS", "MAX_SECTION_ITEMS", "MAX_SECTION_ITEM_CHARS",
-                 "MAX_REFERENCE_CHARS", "MAX_TOTAL_CHARS"):
+    for name in ("MAX_GOAL_CHARS", "MAX_DECISIONS", "MAX_SECTION_ITEMS",
+                 "MAX_SECTION_ITEM_CHARS", "MAX_REFERENCE_CHARS", "MAX_TOTAL_CHARS"):
         assert summary.PROMPT_VARS[name] == getattr(summary, name)
     assert summary.MAX_TOTAL_CHARS == 880
+    assert not hasattr(summary, "MAX_STATE_ITEMS"), \
+        "the goal ledger has no item cap and no 880 share"
     assert summary.PROMPT_VARS["PRIORITIES"] == "high, normal or low"
     assert summary.PROMPT_VARS["REFERENCE_KINDS"] == "file, log, config, url, issue or other"
 
@@ -86,3 +87,18 @@ def test_prompt_vars_publish_the_caps(summary):
 def test_placeholders_are_whole_values(summary):
     assert summary.is_placeholder("N/A") and summary.is_placeholder("待补充")
     assert not summary.is_placeholder("无法复现，暂无结论")
+
+
+def test_for_prompt_keeps_the_goal_ledger_and_cuts_the_rest(summary):
+    text = "\n\n".join([
+        "## Window Summary",
+        "### Objective\n" + "\n".join(f"- goal {index}" for index in range(30)),
+        "### Current State\n#### Done\n#### Doing\n- goal 1\n#### Todo",
+        "### Decisions\n" + "\n".join("- " + "d" * 120 for _ in range(10)),
+        "### Constraints", "### Verified Facts", "### Open Issues", "### Next Actions",
+        "### References"])
+    bounded = summary.for_prompt(text, 800)
+    assert "- goal 29" in bounded, "a goal is never dropped by the prompt budget"
+    assert "[summary truncated]" in bounded
+    assert bounded.count("d" * 120) < 10
+    assert summary.for_prompt("### Objective\n- small", 800) == "### Objective\n- small"

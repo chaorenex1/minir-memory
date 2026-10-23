@@ -140,7 +140,7 @@ completed ──→ pending        （重开，清 done_at）
 
 ### 6.1 目标格式
 
-> 本节已被 `doc/transcript-jsonl-draft.md` 取代：最终路径多一层 `<platform>`，part 只增不删，
+> 本节已被 `doc/transcript-jsonl-draft.md` 取代：最终路径多一层 `<profile>`，part 只增不删，
 > 内存缓存与 `last_cache` 标记也在该稿定义。下面的旧版描述仅保留作历史记录。
 
 ```

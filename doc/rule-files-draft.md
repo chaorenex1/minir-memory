@@ -15,7 +15,7 @@
 | `rules/ai-self.md` | AI 自我表示 6 字段与状态枚举 | B2 全文；dialectic 读 REVIEW CHECKS |
 | `rules/ai-identity.md` | AI 身份卡 13 字段与硬字段取证 | B2 全文；dialectic 与复盘读 REVIEW CHECKS |
 | `rules/markers-category.md` | 维度 A：K/V/I/M/G 覆盖范围、四态认识状态、10 对判定（带正反例）、3 条特殊规则、topic 与 unit 身份 | B3 全文 |
-| `rules/markers-org.md` | 维度 B：五种组织类型的核心问题与覆盖、选择顺序、category×org 组合示例、objects、relations | B3 全文 |
+| `rules/markers-org.md` | 维度 B：六种组织类型的核心问题与覆盖、选择顺序、category×org 组合示例、objects、relations | B3 全文 |
 | `rules/advice_target.md` | advice target 词表、准绳、判定类型、coverage 与知识引用 | `adviser:review` 全文 |
 | `rules/advice_judgment.md` | severity 上限、blocker 校准、证据与发出门槛、去重、统计 | `adviser:review` 全文 |
 
@@ -259,20 +259,21 @@ REVIEW CHECKS：
 CONTRACT：
 
 - WHAT：这条知识围绕什么对象组织，也就是页面落在哪个目录。category 与 org 相互独立，任意主类可以落在任意 org。
-- ORGS：每条给核心问题、覆盖范围、时间属性。entities 是谁或什么（身份、属性、关系，可长期存在）；trajectories 如何随时间变化（技能、进度、决策演变、版本史，强时间序）；experiences 单次发生了什么与得到什么（一次部署、故障、诊断、复盘结论，过去且单次）；tools 有哪些可调用能力与怎么用（软件、API、CLI、模型、库，含输入输出、限制、依赖、失效场景）；projects 围绕什么目标在持续工作（目标、范围、阶段、交付物、分工、决策、约束、风险、验收、状态，有生命周期）。
-- SELECTION：按身份、时间变化、单次事件、能力、持续工作依次匹配；两者都像时取「下个会话会去搜的那个对象」，工具用法落 tools，项目决策落 projects。
-- EXAMPLES：六条 category×org 组合示例。用户→entities+K；部署项目目标与约束→projects+I+G；调用 Docker→tools+K+M；版本冲突导致部署失败→experiences+K（事件与验证后的因果）；部署从失败到恢复→trajectories+K（状态变化）；事后锁定版本→experiences 或 projects+I+M。
+- ORGS：每条给核心问题、覆盖范围、时间属性。entities 是谁或什么（身份、属性、关系，可长期存在）；trajectories 如何随时间变化（技能、进度、决策演变、版本史，强时间序）；experiences 单次发生了什么与得到什么（一次部署、故障、诊断、复盘结论，过去且单次；留下可复用教训的归这里）；events 单次带日期的发生（发布、故障、迁移、会议、部署，有参与者、地点与结果，不承担可复用教训）；tools 有哪些可调用能力与怎么用（软件、API、CLI、模型、库，含输入输出、限制、依赖、失效场景）；projects 什么持续工作服务什么目标（目标、范围、阶段、里程碑、成员、决策、约束、风险、验收、状态，有生命周期）。
+- SELECTION：按身份、时间变化、单次发生（events）、单次教训（experiences）、能力、持续工作依次匹配；两者都像时取「下个会话会去搜的那个对象」，工具用法落 tools，项目决策落 projects，带教训的事件落 experiences。
+- EXAMPLES：七条 category×org 组合示例。用户→entities+K；部署项目目标与约束→projects+I+G；调用 Docker→tools+K+M；版本冲突导致部署失败→experiences+K（事件与验证后的因果）；2026-10-23 的发布无事故→events+K（纯发生）；部署从失败到恢复→trajectories+K（状态变化）；事后锁定版本→experiences 或 projects+I+M。
 - OBJECTS：其他关联对象写成 `type:name` 单数，最多五个，主 org 不重复。
-- RELATIONS：只引用同窗口内的单元；类型限定 `supersedes|caused_by|part_of|contradicts`；`caused_by` 需要正文写明原因或已验证的诊断。
+- RELATIONS：引用同窗口单元用 id，`updates` 可指向已有页面路径或 topic；类型限定 `supersedes|caused_by|part_of|contradicts|updates|instance_of`；`caused_by` 需要正文写明原因或已验证的诊断。
 - BOUNDARIES：一个单元只有一个主 org；不同 org 不合并；org 决定归档位置，不决定内容类别。
 
 REVIEW CHECKS：
 
 - 是否把一次经历写成了轨迹，或把轨迹压成一次经历。
+- 是否把带教训的事件写进 events，或把纯发生写进 experiences。
 - 是否把工具用法写成了项目，或把项目决策写到 tools 下。
 - 是否把项目写成实体，或把项目写成一堆事件。
 - objects 是否没有 `type:` 前缀、用了复数，或重复主 org。
-- relations 是否引用了窗口外的 id，或写了正文没说的因果。
+- relations 是否引用了窗口外的 id 且没有指向已有页面，或写了正文没说的因果。
 - 是否同一内容在两个 org 下各存一份。
 - 是否按主类反推 org（「因为是 INTENT，所以 projects」）而不是按对象选。
 

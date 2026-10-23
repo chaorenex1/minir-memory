@@ -17,27 +17,12 @@ STORE_DIRNAME = "minir-memory"
 DB_FILENAME = "memory.db"
 
 
-def configured_handoff(hermes_home: Any = "") -> bool:
-    """Whether compression may call the summary model; env wins over ``memory.minir``."""
-    override = str(os.environ.get("MINIR_HANDOFF_ENABLED", "")).strip().lower()
-    if override in ("0", "false", "no", "off"):
-        return False
-    if override in ("1", "true", "yes", "on"):
-        return True
-    try:
-        from hermes_cli.config import load_config
+def configured_reasoning() -> bool:
+    """Whether model passes may run; env wins over ``memory.minir``.
 
-        block = (load_config().get("memory") or {}).get("minir") or {}
-        value = block.get("handoff_enabled")
-        if isinstance(value, bool):
-            return value
-        return str(value).strip().lower() not in ("0", "false", "no", "off")
-    except Exception:
-        return True
-
-
-def configured_reasoning(hermes_home: Any = "") -> bool:
-    """Whether layer/compression model calls are allowed; same sources as the provider."""
+    The provider reads the same key for its layer worker. The engine is a separate module
+    instance, so it needs its own reader for the one call compression may make.
+    """
     override = str(os.environ.get("MINIR_REASONING_ENABLED", "")).strip().lower()
     if override in ("0", "false", "no", "off"):
         return False

@@ -348,7 +348,7 @@ def _hand_edited(store: Any, paths: dict[str, Path],
 
 def build_prompt(store: Any, hermes_home: str, profile: str, since: float, *, scope: str,
                  plugin_yaml: str, language: str = "en", transcript: Any = None,
-                 platform: str = "") -> tuple[str, str]:
+                 transcript_profile: str = "") -> tuple[str, str]:
     """One file's system prompt and user message: its card, the evidence, its markers."""
     parts_for_scope = CARD_SCOPE_PARTS[scope]
     side = PART_SCOPE[parts_for_scope[0]]
@@ -403,7 +403,8 @@ def build_prompt(store: Any, hermes_home: str, profile: str, since: float, *, sc
             if not session_id:
                 continue
             text = transcript_prompt.digest_block(
-                "card_review", transcript, platform or "cli", "host", session_id)
+                "card_review", transcript, transcript_profile or profile or "default", "host",
+                session_id)
             if not text or used + len(text) > _CARD_TRANSCRIPT_CHARS:
                 continue
             used += len(text)
@@ -450,7 +451,7 @@ def _load_value_markers(value: Any) -> Any:
 def run_review(store: Any, hermes_home: str, profile: str, *, complete: Callable[[str, str], str],
                since: float, plugin_yaml: str = "", language: str = "en",
                reviewer: str = "model", transcript: Any = None,
-               platform: str = "") -> list[int]:
+               transcript_profile: str = "") -> list[int]:
     """Four single-file passes, one validation boundary, one write.
 
     Each pass writes one global card body and reads one rule file; the database's card_revisions
@@ -462,7 +463,8 @@ def run_review(store: Any, hermes_home: str, profile: str, *, complete: Callable
         expected = CARD_SCOPE_PARTS[scope]
         system, body = build_prompt(store, hermes_home, profile, since, scope=scope,
                                     plugin_yaml=plugin_yaml, language=language,
-                                    transcript=transcript, platform=platform)
+                                    transcript=transcript,
+                                    transcript_profile=transcript_profile)
         payload = _json_object(complete(system, body))
         if not payload:
             raise CardReviewError(

@@ -760,11 +760,14 @@ def test_coverage_is_parsed_only_for_consistency_targets(plugin_package):
 
 def test_review_prompt_carries_rulers_stats_and_soul(plugin_package, make_provider):
     provider = _mode_provider(make_provider)
-    provider._store.save_conclusion("base.user_peer_card", "- [style] terse answers",
-                                    key="user:default", subject="user:default")
-    provider._store.save_conclusion(
-        "base.ai_self_representation", "- [process] lead with the result",
-        key="session:session-test:agent", session_id="session-test")
+    provider._store.add_base_refresh(
+        "session-test", "user:default", window_from_ts=0.0, window_to_ts=1.0,
+        window_from_turn=1, window_to_turn=1,
+        user_representation=json.dumps("- [identity] engineer"),
+        user_peer_card=json.dumps("- [style] terse answers"),
+        ai_self_representation=json.dumps("- [process] lead with the result"),
+        ai_identity_card=json.dumps("### Positioning\n- keep the system honest"),
+        window_summary=json.dumps("### Objective\n- ship it"))
     Path(provider._hermes_home, "SOUL.md").write_text(
         "# Craft\nNo em dashes in prose.\n", encoding="utf-8")
 
@@ -772,9 +775,26 @@ def test_review_prompt_carries_rulers_stats_and_soul(plugin_package, make_provid
         "session-test", "t1", "tool", [{"kind": "user", "text": "ship it"}])
 
     assert "<rulers>" in prompt and "lead with the result" in prompt
-    assert "terse answers" in prompt
+    assert "terse answers" in prompt and "### Window summary" in prompt and "ship it" in prompt
+    assert "### AI identity card" in prompt and "keep the system honest" in prompt
+    assert "<ruler_versions>" in prompt and "session row: id=" in prompt
     assert "<soul_constraints>" in prompt and "No em dashes in prose." in prompt
     assert "<target_stats>" in prompt and "TARGET STATS" in prompt
+
+
+def test_the_ruler_tracks_the_latest_base_row(plugin_package, make_provider):
+    """A once-per-session conclusion would freeze at the first card; the live row does not."""
+    provider = _mode_provider(make_provider)
+    for version, stance in ((1, "first stance"), (2, "second stance")):
+        provider._store.add_base_refresh(
+            "session-test", "user:default", window_from_ts=float(version - 1),
+            window_to_ts=float(version), window_from_turn=version, window_to_turn=version,
+            user_representation="", user_peer_card=json.dumps("- [style] terse"),
+            ai_self_representation=json.dumps(stance), ai_identity_card="",
+            window_summary=json.dumps(f"### Objective\n- goal {version}"))
+    rulers = provider._adviser_mode._rulers("session-test")
+    assert "second stance" in rulers and "first stance" not in rulers
+    assert "goal 2" in rulers and "### Preferences" in rulers
 
 
 def test_knowledge_citation_suffix_is_validated(plugin_package, make_provider):

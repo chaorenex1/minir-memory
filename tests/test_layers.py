@@ -14,9 +14,10 @@ def layers(plugin_package):
 
 
 def _unit(**over):
-    unit = {"id": "k1", "org": "experiences", "category": "KNOWLEDGE", "epistemic": "fact",
-            "topic": "pytest verification", "content": "pytest is the verify command.",
-            "time": "2026-10-21", "relations": [], "objects": []}
+    unit = {"id": "k1", "info_type": "experience", "topic": "pytest verification",
+            "why": "a later build needs the verify command", "relations": [],
+            "render_plan": "write the experiences page", "objects": [],
+            "anchor": {"from_ts": 1.0, "to_ts": 2.0, "message_ids": []}}
     unit.update(over)
     return unit
 
@@ -43,41 +44,33 @@ def test_an_identity_body_is_accepted_as_markdown(layers):
         layers.validate_ai_identity({"name": "minir"})
 
 
-def test_a_knowledge_unit_needs_an_epistemic_value(layers):
+def test_a_marker_needs_an_anchor(layers):
     unit = _unit()
-    unit.pop("epistemic")
-    with pytest.raises(layers.LayerContractError, match="KNOWLEDGE requires"):
+    unit.pop("anchor")
+    with pytest.raises(layers.LayerContractError, match="missing key.*anchor"):
         layers.validate_value_markers({"value_markers": [unit]})
 
 
-def test_a_non_knowledge_unit_drops_a_stray_epistemic_value(layers):
-    """The field is meaningless on a non-KNOWLEDGE marker, so it is dropped, not fatal."""
-    units = layers.validate_value_markers(
-        {"value_markers": [_unit(category="METHOD", epistemic="fact")]})
-    assert units[0]["category"] == "METHOD"
-    assert units[0]["epistemic"] == ""
+def test_an_over_long_why_is_clamped_not_rejected(layers):
+    """The cap bounds storage and prompt cost: the tail goes, the window stays."""
+    why = ("the quick brown fox jumps over the lazy dog " * 5).strip()
+    assert len(why) > layers.MAX_UNIT_WHY
+    units = layers.validate_value_markers({"value_markers": [_unit(why=why)]})
+    assert len(units[0]["why"]) <= layers.MAX_UNIT_WHY
+    assert units[0]["why"].startswith("the quick brown fox")
+    assert not units[0]["why"].endswith(" ")
 
 
-def test_an_over_long_marker_body_is_clamped_not_rejected(layers):
-    """The cap bounds storage and prompt cost: a 174-character body loses its tail, not the
-    whole window (a rejected pass costs two more model calls and the evidence it merged)."""
-    body = ("the quick brown fox jumps over the lazy dog " * 5).strip()
-    assert len(body) > layers.MAX_UNIT_CONTENT
-    units = layers.validate_value_markers({"value_markers": [_unit(content=body)]})
-    assert len(units[0]["content"]) <= layers.MAX_UNIT_CONTENT
-    assert units[0]["content"].startswith("the quick brown fox")
-    assert not units[0]["content"].endswith(" ")
+def test_a_relation_may_point_at_an_existing_page(layers):
+    unit = _unit(relations=[{"type": "updates", "ref": "knowledge/experiences/page.md"}])
+    assert layers.validate_value_markers({"value_markers": [unit]})[0]["relations"] == [
+        {"type": "updates", "ref": "knowledge/experiences/page.md"}]
 
 
-def test_a_unit_needs_one_known_category(layers):
-    with pytest.raises(layers.LayerContractError, match="must be one of KNOWLEDGE"):
-        layers.validate_value_markers({"value_markers": [_unit(category="OTHER")]})
-
-
-def test_a_relation_must_target_a_unit_in_the_same_window(layers):
-    unit = _unit(relations=[{"type": "caused_by", "ref": "k9"}])
-    with pytest.raises(layers.LayerContractError, match="not in this window"):
-        layers.validate_value_markers({"value_markers": [unit]})
+def test_an_unknown_relation_type_is_refused(layers):
+    with pytest.raises(layers.LayerContractError, match="must be one of"):
+        layers.validate_value_markers(
+            {"value_markers": [_unit(relations=[{"type": "invented", "ref": "k2"}])]})
 
 
 def test_objects_must_be_typed(layers):
@@ -85,10 +78,11 @@ def test_objects_must_be_typed(layers):
         layers.validate_value_markers({"value_markers": [_unit(objects=["Docker"])]})
 
 
-def test_units_merge_on_category_org_and_topic(layers):
-    previous = [_unit(content="old evidence")]
-    merged = layers.validate_value_markers({"value_markers": [_unit(content="new evidence")]}, previous=previous)
-    assert len(merged) == 1 and merged[0]["content"] == "new evidence"
+def test_units_merge_on_info_type_and_topic(layers):
+    previous = [_unit(why="old evidence")]
+    merged = layers.validate_value_markers(
+        {"value_markers": [_unit(why="new evidence")]}, previous=previous)
+    assert len(merged) == 1 and merged[0]["why"] == "new evidence"
 
 
 def test_a_review_cannot_prune(layers):
@@ -148,8 +142,8 @@ def test_the_b3_core_states_the_caps_it_is_given(layers, plugin_package):
     core = layers.load_core("b3_window_summary")
     summary = plugin_package.window_summary
     assert "$" not in core
-    assert f"at most {summary.MAX_OBJECTIVE_CHARS} characters" in core
-    assert f"at most {summary.MAX_STATE_ITEMS} items each" in core
+    assert f"{summary.MAX_GOAL_CHARS} characters per line" in core
+    assert "no item cap" in core
     assert f"at most {summary.MAX_TOTAL_CHARS} characters" in core
     priorities = ", ".join(summary.PRIORITIES[:-1]) + " or " + summary.PRIORITIES[-1]
     kinds = ", ".join(summary.REFERENCE_KINDS[:-1]) + " or " + summary.REFERENCE_KINDS[-1]

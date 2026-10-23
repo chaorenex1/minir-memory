@@ -1,6 +1,6 @@
 # 窗口生命周期与注入面草稿
 
-状态：草稿，未实现，不含代码改动。
+状态：已实现（2026-10-23，T1-T7）。
 
 依据：工作树当前状态的只读核对（HEAD `5a2e1a2`，另有 7 个已修改未提交文件）。行号以本次核对为准。
 
@@ -181,7 +181,7 @@ previous = 本会话 window_to_ts 最大的 base_refreshes 行（无则空）
 ### 4.5 24h 收尾
 
 - 现在的 `session_summary.py` 输出 5 个标题（`session_summary.py:33-35`），与上一步的 8 字段不是一套。
-- 改为同一 8 字段模板的 `final` 形态，键保持 `session_summary:<session>:final`（`__init__.py:1431-1436`）。handoff 的角色从"4 标题摘要"改为"校准 pass"，输出同一模板（`handoff.py:22`）。
+- 改为自带模板的终稿（`templates/session_summary.md`），键保持 `session_summary:<session>:final`（`__init__.py:1431-1436`）。压缩期那次调用改由 B3 校准最新一次窗口总结（`compress_pass.py`），不再有 handoff pass。
 
 ## 5. 模板与解析器
 
@@ -252,7 +252,7 @@ previous = 本会话 window_to_ts 最大的 base_refreshes 行（无则空）
 | `plugin/minir/layers.py` | 244-245、336-343 | 不新增 md 校验；value_markers 仍按 JSON 校验 |
 | `plugin/minir/window_summary.py` | 22、92-96 | 不新增 `parse` / `render`；caps 只作提示词写作目标 |
 | `plugin/minir/context_engine.py` | `compress` 226-290 | 摘要来源改为 window_summary 校准 |
-| `plugin/minir/handoff.py` | 22、72-82 | 输出改为 8 字段校准结果 |
+| `plugin/minir/compress_pass.py` | 1-100 | 压缩期 B3 校准最新窗口总结；清洗不校验 |
 | `plugin/minir/session_summary.py` | 33-35 | 五标题改为同一模板 |
 | `plugin/minir/agents/b2_ai_card.md` | 27、33-38 | 六字段定义，禁止复述任务账本 |
 | `plugin/minir/agents/b3_window_summary.md` | 2、22-47 | previous_summary 只取本会话最新行；objective 改为完整目标列表（无编号）；MERGE 不再删 objective |

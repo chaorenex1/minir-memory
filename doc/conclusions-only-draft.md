@@ -297,7 +297,7 @@ created_at, updated_at
   ```
 
 - `index` 由 `store.next_session_summary_index(session_id)` 计算：`COUNT(*) WHERE kind='session_summary' AND session_id=?` + 1，就是**本会话**的第几次压缩。`session_id` 取自 `compress()` 当前的 host 会话，作为参数传给 `save_conclusion`，不拼进 key。
-- `status=active` 从写入起生效：不再有 pending 两阶段。`promote_summary_run`（`store.py:825-834`）与 `context_engine.py:189` 的调用删除；`expire_pending_handoffs` 只保留 legacy `handoff` 清理。
+- `status=active` 从写入起生效：不再有 pending 两阶段。`promote_summary_run`（`store.py:825-834`）与 `context_engine.py:189` 的调用删除；legacy `handoff` 清理移到 `_repair_rows`，随每次 open 幂等执行。
 - 载体消息仍带 `#<run_id>` 标记，用于折叠；`run_id` 只进 `evidence`，不再进 key。
 - 与 base 6 条完全无关：不共享 key、不共享 `conclusions_published_at` 守卫、不依赖先后顺序。
 

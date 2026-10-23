@@ -65,13 +65,16 @@ class LayerCounter:
     turns: int = 0
     last_trigger_turn: int = 0
     last_trigger_ts: float = 0.0
+    #: The dialectic layer is armed by the session's first base trigger. Until then it neither
+    #: counts nor schedules: its cadence is relative to the base layer, not to session start.
+    armed: bool = True
 
     def due(self) -> bool:
         """True when a full interval has accumulated since this layer's last trigger."""
         return self.turns - self.last_trigger_turn >= self.interval
 
     def as_dict(self) -> dict[str, Any]:
-        return {"turns": self.turns, "interval": self.interval,
+        return {"turns": self.turns, "interval": self.interval, "armed": self.armed,
                 "last_trigger_turn": self.last_trigger_turn, "last_trigger_ts": self.last_trigger_ts}
 
 
@@ -183,6 +186,7 @@ class TurnTracker:
                         counter.turns = previous.turns
                         counter.last_trigger_turn = previous.last_trigger_turn
                         counter.last_trigger_ts = previous.last_trigger_ts
+                        counter.armed = previous.armed
             return target
 
     # -- counting -------------------------------------------------------------
@@ -200,10 +204,18 @@ class TurnTracker:
             except (TypeError, ValueError):
                 host_turn = 0
             state.last_turn_number = max(state.last_turn_number, host_turn)
-            for counter in state.layers.values():
+            # A layer armed by the other layer's trigger on this same turn starts counting from
+            # the next turn: the arming turn is already inside the base window.
+            armed_at_start = {name: state.layers[name].armed for name in state.layers}
+            triggers: list[Trigger] = []
+            for name in (BASE_LAYER, DIALECTIC_LAYER):
+                counter = state.layers.get(name)
+                if counter is None or not armed_at_start.get(name, True):
+                    continue
                 counter.turns = max(counter.turns + 1, host_turn)
-            return [self._fire(state, counter, stamp) for counter in state.layers.values()
-                    if counter.due()]
+                if counter.due():
+                    triggers.append(self._fire(state, counter, stamp))
+            return triggers
 
     def tail(self, session_id: str, *, now: Optional[float] = None, close: bool = False) -> list[Trigger]:
         """Flush every layer's un-reasoned tail, e.g. at a session boundary.
@@ -247,6 +259,8 @@ class TurnTracker:
             counter = (state.layers.get(layer) if state is not None else None)
             if counter is not None:
                 counter.last_trigger_ts = max(counter.last_trigger_ts, float(ts))
+                if layer == BASE_LAYER:
+                    self._arm_dialectic(state)
 
     def snapshot(self, session_id: str) -> Optional[dict[str, Any]]:
         """Counting state for *session_id* (``None`` when the session was never opened)."""
@@ -297,7 +311,8 @@ class TurnTracker:
         stamp = time.time() if now is None else now
         state = SessionCounter(
             session_id=session_id, mode=str(mode or self._default_mode), started_at=stamp,
-            layers={name: LayerCounter(layer=name, interval=interval, last_trigger_ts=stamp)
+            layers={name: LayerCounter(layer=name, interval=interval, last_trigger_ts=stamp,
+                                       armed=(name == BASE_LAYER))
                     for name, interval in ((BASE_LAYER, self._base_interval),
                                            (DIALECTIC_LAYER, self._dialectic_interval))},
         )
@@ -316,6 +331,22 @@ class TurnTracker:
         self._sessions.pop(ordered[0][0], None)
 
     @staticmethod
+    def _arm_dialectic(state: SessionCounter) -> None:
+        """Start the dialectic cadence at the base trigger that armed it.
+
+        Called once, from the first base trigger (periodic or boundary). Setting both the count
+        and the watermark makes the first dialectic window start *after* that base turn, not at
+        session start.
+        """
+        base = state.layers.get(BASE_LAYER)
+        dialectic = state.layers.get(DIALECTIC_LAYER)
+        if base is None or dialectic is None or dialectic.armed:
+            return
+        dialectic.armed = True
+        dialectic.turns = base.turns
+        dialectic.last_trigger_turn = base.turns
+
+    @staticmethod
     def _fire(state: SessionCounter, counter: LayerCounter, now: float) -> Trigger:
         """Build the trigger a due counter owes, and move its watermark onto it."""
         edge = max(float(now), counter.last_trigger_ts + WINDOW_EPSILON)
@@ -323,6 +354,8 @@ class TurnTracker:
                           from_ts=counter.last_trigger_ts, to_ts=edge, turns=counter.turns)
         counter.last_trigger_turn = counter.turns
         counter.last_trigger_ts = edge
+        if counter.layer == BASE_LAYER:
+            TurnTracker._arm_dialectic(state)
         return trigger
 
 

@@ -131,7 +131,7 @@ def format_row(row: dict[str, Any], *, include_tool_results: bool = False,
     return f"{label} {text}".rstrip()
 
 
-def render_digest(buffer: Any, platform: str, layer: str, session_id: str, *,
+def render_digest(buffer: Any, profile: str, layer: str, session_id: str, *,
                   roles: Iterable[str] = ("user", "assistant"),
                   include_tool_results: bool = False, tool_result_chars: int = 400,
                   include_reasoning: bool = False,
@@ -142,7 +142,7 @@ def render_digest(buffer: Any, platform: str, layer: str, session_id: str, *,
     wanted = {str(role) for role in roles}
     if include_reasoning:
         wanted.add("reasoning")
-    result = buffer.read_events(platform, layer, session_id, since=since, until=until,
+    result = buffer.read_events(profile, layer, session_id, since=since, until=until,
                                 turn=turn, step=step, kinds=("msg", "gap"))
     rows = [row for row in result.get("rows") or ()
             if str(row.get("role") or "") in wanted or row.get("kind") == "gap"]
@@ -183,13 +183,13 @@ def render_digest(buffer: Any, platform: str, layer: str, session_id: str, *,
     return "\n".join(kept + [" · ".join(parts)])
 
 
-def digest_block(pass_name: str, buffer: Any, platform: str, layer: str,
+def digest_block(pass_name: str, buffer: Any, profile: str, layer: str,
                  session_id: str, **overrides: Any) -> str:
     """The pass's block body, budget line included; ``""`` when the projection is empty."""
     settings = dict(PRESETS.get(pass_name) or {})
     settings.update({key: value for key, value in overrides.items() if value is not None})
     settings.setdefault("max_chars", DIGEST_MAX_CHARS)
-    text = render_digest(buffer, platform, layer, session_id, **settings)
+    text = render_digest(buffer, profile, layer, session_id, **settings)
     if not text:
         return ""
     return f"Transcript budget: {settings.get('max_chars', DIGEST_MAX_CHARS)} characters.\n{text}"

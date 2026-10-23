@@ -58,6 +58,38 @@ def test_register_captures_provider(plugin_package):
     assert ctx.hooks
 
 
+def test_register_publishes_the_bundled_data_layout_skill(plugin_package):
+    """The data-layout skill ships with the plugin, so it must resolve as ``minir:data-layout``."""
+
+    class FakeContext:
+        def __init__(self):
+            self.provider = None
+            self.skills = []
+
+        def register_memory_provider(self, provider):
+            self.provider = provider
+
+        def register_hook(self, name, callback):
+            pass
+
+        def register_tool(self, **kwargs):
+            pass
+
+        def register_skill(self, name, path, description="", frontmatter=None):
+            self.skills.append((name, Path(path), description))
+
+    ctx = FakeContext()
+    plugin_package.register(ctx)
+
+    assert [name for name, _path, _description in ctx.skills] == ["data-layout"]
+    _name, path, description = ctx.skills[0]
+    assert path.is_file() and path.name == "SKILL.md"
+    assert description.startswith("Use when")
+    text = path.read_text(encoding="utf-8")
+    for token in ("memory.db", "sessions/<profile>", "knowledge/<org>", "user/preference.md"):
+        assert token in text, token
+
+
 def test_discovery_markers_present(plugin_package):
     """``plugins/memory`` discovery heuristically scans __init__.py for these markers."""
     source = (PLUGIN_ROOT / "__init__.py").read_text(encoding="utf-8-sig")[:8192]

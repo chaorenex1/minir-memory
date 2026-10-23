@@ -629,6 +629,23 @@ def test_legacy_session_chunk_summary_kind_is_renamed(plugin_package, tmp_path):
         reopened.close()
 
 
+def test_a_pending_legacy_handoff_row_expires_on_reopen(plugin_package, tmp_path):
+    path = tmp_path / "mem" / "memory.db"
+    first = plugin_package.store.MinirStore(path)
+    try:
+        first.save_conclusion("handoff", "old calibration", key="handoff:s1:1",
+                              session_id="s1", subject="session", status="pending")
+    finally:
+        first.close()
+
+    reopened = plugin_package.store.MinirStore(path)
+    try:
+        row = reopened.get_conclusion("handoff", "handoff:s1:1")
+        assert row is not None and row["status"] == "expired"
+    finally:
+        reopened.close()
+
+
 def test_base_refresh_fts_indexes_six_fields_and_short_cjk_queries(store):
     _refresh(store, from_ts=0.0, to_ts=10.0, summary="deploy 插件",
              peer="喜欢工具", markers="- [tool] pytest")

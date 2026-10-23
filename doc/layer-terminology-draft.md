@@ -57,7 +57,7 @@
 | 部分 | part | 节内的具名正文。`layers.PART_NAMES`：`user_self_representation`、`user_preferences`、`ai_self_representation`、`ai_identity`、`window_summary`。 | `layers.PART_NAMES` |
 | 主体 | subject | 被建模的对象。用户为 `user:{user_id}`，代理为 `agent:{profile}:{identity}`。 | `worker.user_subject`、`worker.dialectic_subject` |
 | 作用域 | scope | 结论的召回范围：`session`（本会话）、`user`（跨会话用户）、`agent`（跨会话代理）。 | `store._ARTIFACT_SECTIONS` |
-| 种类 | kind | 结论行的分类键：`base.user_card`、`base.ai_card`、`base.window_summary`、`base.value_markers`、`dialectic.review`、`session_summary`、`window_summary`（压缩链）、`handoff`、`note`。 | `store._ARTIFACT_SECTIONS`、`store.put_conclusion` |
+| 种类 | kind | 结论行的分类键：`base.user_card`、`base.ai_card`、`base.window_summary`、`base.value_markers`、`dialectic.review`、`session_summary`、`window_summary`（压缩链）、`note`。 | `store._ARTIFACT_SECTIONS`、`store.put_conclusion` |
 | 结论 | conclusion | `conclusions` 表一行，可独立检索。产物按节拆成结论，不是一个整文档。 | `store` docstring |
 | 笔记 | note | `notes` 表一行：`minir_remember` 的显式记忆，或宿主内建记忆工具镜像。不是 transcript。 | `store._SCHEMA` |
 | 基线 | baseline | 一次刷新开始时的 durable 内容，来源三选一。 | `worker._merge_base_cards` |
@@ -96,10 +96,10 @@
 | 标记 | `value_marker` | `value_markers` 数组的一条；中文叫标记，代码里仍写 unit。 | `layers.validate_value_markers` |
 | 标记 id | `id` | 窗口内唯一；重复即失败。 | `layers.validate_value_markers` |
 | 语义分类 | `category` | `KNOWLEDGE`、`VALUE`、`INTENT`、`METHOD`、`GOVERNANCE`，每条标记恰好一个。 | `layers.CATEGORIES` |
-| 组织类型 | `org` | `entities`、`trajectories`、`experiences`、`tools`、`projects`，每条标记恰好一个。 | `layers.ORGS` |
+| 组织类型 | `org` | `entities`、`trajectories`、`experiences`、`events`、`tools`、`projects`，每条标记恰好一个；单次发生且无可复用教训归 `events`，带教训的归 `experiences`。 | `layers.ORGS` |
 | 认识状态 | `epistemic` | `fact`、`inference`、`hypothesis`、`prediction`；只有 `KNOWLEDGE` 携带。 | `layers.EPISTEMIC` |
 | 主题 | `topic` | 标记的业务身份之一，2–40 字符。 | `layers.MAX_UNIT_TOPIC` |
-| 关系 | `relations` | 最多 3 条，类型为 `supersedes`、`caused_by`、`part_of`、`contradicts`。 | `layers.RELATION_TYPES` |
+| 关系 | `relations` | 最多 3 条，类型为 `supersedes`、`caused_by`、`part_of`、`contradicts`、`updates`、`instance_of`。 | `layers.RELATION_TYPES` |
 | 关联对象 | `objects` | 最多 5 个，形如 `tools:Docker`、`projects:minir-memory`。 | `layers.MAX_UNIT_OBJECTS` |
 
 ### 3.1 列名与旧名对照
@@ -185,9 +185,9 @@
 | --- | --- | --- | --- |
 | 空闲窗口 | `knowledge_idle_hours` | 默认 24 小时；期间再次输入则取消本次收尾。 | `extraction.IDLE_SECONDS` |
 | 收尾行 | `session_extractions` | 每个会话一行，记录 due_at、状态、标记快照、页数、摘要长度。 | `store._SCHEMA` |
-| 任务交接 | Task Handoff、`session_handoff` | 压缩或会话收尾时生成的审计记录，四个标题：Goal、Current State、Next Steps、Critical Context。 | `handoff.py` |
-| 会话摘要 | `session_summary` | 最终 durable 摘要，五个标题：Session Goal、Work Done、Decisions、Durable Knowledge、Open Threads。 | `session_summary.HEADINGS` |
-| 交接优先 | handoff first | 摘要 agent 的用户消息第一块就是 Task Handoff。 | `session_summary.build_prompt` |
+| 会话记录 | session record | 压缩期 B3 校准出的最新窗口总结，键 `session_summary:<n>`；终稿与召回的第一输入。 | `compress_pass.py`、`store.latest_compression_summary` |
+| 会话摘要 | `session_summary` | 最终 durable 摘要，自带模板：Request、Outcome、Decisions、Constraints、Verified Facts、Lessons、Open Threads、References。 | `session_summary.TEMPLATE_PATH` |
+| 记录优先 | record first | 摘要 agent 的用户消息第一块是会话记录，缺则最新 base 窗口摘要。 | `__init__._session_record` |
 | 用量 | token usage | 每轮最终 token 用量，随收尾行保存。 | `store.session_usage` |
 
 ## 8. 压缩
@@ -237,7 +237,7 @@
 | `user_preferences` | `user_preference` | 前者是会话卡正文（复数）；后者是全局文件的 part 名（单数）。 |
 | `window_summary` | `session_summary` | 前者是 base 每个窗口的任务状态；后者是会话空闲后的最终摘要。 |
 | `window_summary` | `session_chunk_summary` | 旧名，已迁移；文档不再区分两者。 |
-| Task Handoff | Session Summary | 交接是压缩或收尾时生成的审计记录，四个标题；摘要是会话收尾的最终记录，五个标题。 |
+| 压缩记录 | 终稿 | 前者是压缩期 B3 校准出的最新窗口总结，八节；后者是会话空闲后的最终记录，自带八节（Request/Outcome/Decisions/Constraints/Verified Facts/Lessons/Open Threads/References）。 |
 | 标记 `value_marker` | 笔记 note | 标记是 `value_markers` 的一条知识单元；笔记是 `notes` 表的一行。两者都进 FTS，但生命周期不同。 |
 | `value_markers` | 显式标记 | 前者随 base 刷新合并；后者由 `minir_remember` 写入，按 type 删除。 |
 | dialectic review | card_review | 前者校订一份 base 产物，轮次驱动；后者合并多会话到全局文件，墙钟驱动。 |

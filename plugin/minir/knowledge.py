@@ -528,6 +528,8 @@ def write_unit(unit: Any, *, language: str = "en", budget: int = DEFAULT_BUDGET,
 def _write_unit(unit: Any, *, root: Path, language: str, budget: int,
                 render: Optional[RenderFn]) -> dict[str, Any]:
     category, org, topic = _identity(unit)
+    if org == "events" and category == "KNOWLEDGE":
+        unit = {**unit, "epistemic": "fact"}  # an occurrence is observed, never inferred
     existing = _find_existing(root, category, org, topic)
     existing_meta = read_front_matter(existing) if existing else {}
     stored_revisions = _revisions(existing_meta) if existing else 0

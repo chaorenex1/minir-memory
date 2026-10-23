@@ -53,15 +53,22 @@ def _summary_json():
     return json.dumps({"window_summary": _summary_section()})
 
 
+def _base_pass_json(*, summary: str | None = None, markers=None) -> str:
+    """B1's orchestration reply: the user card plus both child artifacts."""
+    marker = {"id": "k1", "info_type": "experience", "topic": "pytest verification",
+              "why": "a later build needs the verify command", "relations": [],
+              "render_plan": "write the experiences page",
+              "anchor": {"from_ts": 0.0, "to_ts": 1.0, "message_ids": []}, "objects": []}
+    return json.dumps({**json.loads(_base_user_json()),
+                       "window_summary": _summary_section() if summary is None else summary,
+                       "value_markers": [marker] if markers is None else markers})
+
+
 def _base_reply(prompt):
     """Which base pass the worker is running, picked by the block its message carries."""
-    if "baseline_user_card" in prompt:
-        return _base_user_json()
-    if "baseline_ai_card" in prompt or "plugin_yaml" in prompt:
-        return _base_ai_json()
-    if "previous_value_markers" in prompt or "Previous knowledge value markers" in prompt:
-        return json.dumps({"value_markers": []})
-    return _summary_json()
+    if "<window_template>" in prompt:
+        return _base_pass_json()
+    return _base_ai_json()
 
 
 def _dialectic_json(*, changed=False, fields=None, peer=None):
@@ -92,8 +99,9 @@ def test_notes_survive_a_new_instance(plugin_package, make_provider):
 
     second = make_provider({})  # same tmp home -> same db file
     block = second.prefetch("SQLite store")
-    assert "SQLite" in block
-    assert block.startswith("## Minir recall")
+    assert block == "", "prefetch injects layer state only, never explicit recall"
+    found = json.loads(second.handle_tool_call("minir_search", {"query": "SQLite store"}))
+    assert found["count"] >= 1, "the note is still reachable through minir_search"
 
 
 def test_no_conversation_content_is_persisted_anywhere(plugin_package, make_provider, monkeypatch):
@@ -217,44 +225,62 @@ def test_reasoning_can_be_enabled_by_env(make_provider, monkeypatch):
     assert provider._worker.enabled is True
 
 
-def test_prefetch_limit_can_be_set_by_env(make_provider, monkeypatch):
-    monkeypatch.setenv("MINIR_PREFETCH_LIMIT", "2")
-    provider = make_provider({"prefetch_limit": 9})
-    for index in range(5):
-        provider._store.save_conclusion("note", f"deployment checklist entry {index}")
-    payload = json.loads(provider.handle_tool_call("minir_search", {"query": "deployment checklist"}))
-    assert len(payload["results"]) == 2
-
-
-def test_queue_prefetch_feeds_next_prefetch(provider):
-    provider.handle_tool_call("minir_remember", {"type": "tools", "content": "User deploys via Docker Desktop"})
-    provider.queue_prefetch("Docker Desktop")
-    thread = provider._prefetch_thread
-    if thread is not None:
-        thread.join(timeout=5.0)
-    block = provider.prefetch("Docker Desktop")
-    assert "Docker Desktop" in block
-    status = provider.recall_status()
-    assert status is not None and status.count >= 1
-
-
-def test_prefetch_falls_back_to_inline_search(provider):
-    """No queued result (first turn): prefetch still recalls, bounded and inline."""
-    provider.handle_tool_call("minir_remember", {"type": "entities", "content": "staging cluster lives in eu-west"})
-    block = provider.prefetch("staging cluster")
-    assert "eu-west" in block
-
-
 def test_prefetch_on_empty_store_is_blank(provider):
     assert provider.prefetch("nothing was ever stored") == ""
     assert provider.recall_status() is None
 
 
-def test_prefetch_never_returns_stale_recall(provider):
-    provider.handle_tool_call("minir_remember", {"type": "experiences", "content": "remembered once"})
-    assert provider.prefetch("remembered") != ""
-    assert provider.prefetch("totally unrelated empty query") == ""
-    assert provider.recall_status() is None
+def _save_base_row(provider, *, session: str = "", ai_self: str = "", summary: str = "",
+                   to_ts: float = 1.0) -> None:
+    """One live ``base_refreshes`` row; the columns are JSON strings, as the worker writes them."""
+    provider._store.add_base_refresh(
+        session or provider._session_id, "user:default",
+        window_from_ts=to_ts - 1.0, window_to_ts=to_ts, window_from_turn=1, window_to_turn=1,
+        user_representation="", user_peer_card="",
+        ai_self_representation=json.dumps(ai_self), ai_identity_card="",
+        window_summary=json.dumps(summary))
+
+
+def test_prefetch_injects_the_live_base_columns(provider):
+    _save_base_row(provider, ai_self="- direct\n- terse",
+                   summary="## Window Summary\n\n### Objective\n- ship prefetch\n\n"
+                           "### Current State\n#### Done\n- read the row")
+    block = provider.prefetch("unrelated query")
+    assert block.startswith("## Minir layer state")
+    assert "### AI self representation" in block and "- terse" in block
+    assert "### Window summary" in block and "- ship prefetch" in block
+    assert "## Minir recall" not in block and "[knowledge" not in block
+
+
+def test_prefetch_reads_only_this_sessions_window(provider):
+    _save_base_row(provider, session="other", ai_self="other stance",
+                   summary="### Objective\n- other goal", to_ts=9.0)
+    assert provider.prefetch("x") == "", "another session's live row is never injected"
+    _save_base_row(provider, ai_self="mine here", summary="### Objective\n- my goal", to_ts=2.0)
+    block = provider.prefetch("x")
+    assert "mine here" in block and "my goal" in block and "other goal" not in block
+
+
+def test_the_window_budget_keeps_the_goal_ledger(provider):
+    goals = "\n".join(f"- goal {index}" for index in range(40))
+    decisions = "\n".join(f"- decision {index} " + "d" * 120 for index in range(20))
+    _save_base_row(provider, summary="\n\n".join([
+        "## Window Summary", f"### Objective\n{goals}",
+        "### Current State\n#### Done\n#### Doing\n- goal 1\n#### Todo",
+        f"### Decisions\n{decisions}", "### Constraints", "### Verified Facts",
+        "### Open Issues", "### Next Actions", "### References"]))
+    block = provider.prefetch("x")
+    assert "- goal 39" in block
+    assert "[summary truncated]" in block
+    assert "decision 19" not in block
+    assert len(block.split("### AI self representation")[0]) < 2200
+
+
+def test_the_ai_self_cap_is_400(provider):
+    _save_base_row(provider, ai_self="a" * 900)
+    block = provider.prefetch("x")
+    body = block.split("### AI self representation\n", 1)[1]
+    assert len(body) == 400
 
 
 def test_tools_roundtrip(provider):
@@ -279,18 +305,6 @@ def test_tools_roundtrip(provider):
     assert "notes" not in stats and "markers" not in stats and "db_path" in stats
     assert len(stats["targets"]) == 5, "one row per consistency target"
     assert stats["conclusions_by_kind"] == {}, "every row of this session is gone"
-
-
-def test_prefetch_kind_filter_survives_derived_crowding(provider):
-    provider.handle_tool_call(
-        "minir_remember", {"type": "tools", "content": "zebraword note"})
-    for index in range(25):
-        provider._store.save_conclusion(
-            "base.user_peer_card", f"zebraword zebraword zebraword derived {index}",
-            key=f"goal:{index}", subject="user:default")
-    block = provider.prefetch("zebraword")
-    assert "zebraword note" in block
-    assert "zebraword zebraword" not in block
 
 
 def test_search_identifies_every_row_by_kind_and_conclusions_id(provider):
@@ -393,7 +407,6 @@ def test_on_memory_write_mirrors_and_removes(provider):
 def test_on_session_switch_rebinds_and_reset_clears_cache(provider):
     provider.handle_tool_call(
         "minir_remember", {"type": "experiences", "content": "switch test fact"})
-    provider.queue_prefetch("switch test")
     provider.on_session_switch("session-2")
     assert provider._session_id == "session-2"
     provider.on_session_switch("session-3", reset=True)
@@ -417,15 +430,6 @@ def test_search_results_are_excerpted(provider):
     assert all(len(row["text"]) <= 601 for row in payload["results"])
 
 
-def test_recall_block_is_bounded(make_provider):
-    provider = make_provider({"prefetch_limit": 20})
-    for index in range(10):
-        provider._store.save_conclusion("note", f"bounded note {index} " + "y" * 400)
-    block = provider.prefetch("bounded")
-    assert "more results truncated" in block
-    assert len(block) < 2600
-
-
 # -- turn counting (base / dialectic layers) ----------------------------------
 
 def _jobs(provider):
@@ -440,14 +444,10 @@ def test_turn_start_queues_both_layers_on_their_own_cadence(make_provider):
         provider.on_turn_start(turn, f"message {turn}")
     jobs = provider._store.pending_jobs()
     assert [(job["layer"], job["turns"], job["session_id"]) for job in jobs] == [
-        ("dialectic", 2, "session-test"),
         ("base", 3, "session-test"),
-        ("dialectic", 4, "session-test"),
+        ("dialectic", 5, "session-test"),
         ("base", 6, "session-test"),
-        ("dialectic", 6, "session-test"),
     ]
-    tie = [job for job in jobs if job["turns"] == 6]
-    assert [job["layer"] for job in tie] == ["base", "dialectic"], "same-turn base first"
     assert all(job["status"] == "pending" and job["from_ts"] <= job["to_ts"] for job in jobs)
 
 
@@ -462,7 +462,7 @@ def test_new_session_ordering_keeps_the_tail(plugin_package, make_provider):
     plugin_package._on_session_finalize(session_id="session-test")   # frozen first
     provider.on_session_end([])                              # ... tail arrives after
     plugin_package._on_session_reset(session_id="session-next", old_session_id="session-test")
-    assert _jobs(provider) == [("dialectic", 3), ("base", 4), ("dialectic", 4)]
+    assert _jobs(provider) == [("base", 4), ("dialectic", 4)]
 
 
 def test_session_end_flushes_the_tail_once(make_provider):
@@ -472,7 +472,7 @@ def test_session_end_flushes_the_tail_once(make_provider):
     provider._transcript.add_turn("session-test", "tail", "noted")
     provider.on_session_end([])
     provider.on_session_end([])  # a second boundary hook must not re-queue the window
-    assert _jobs(provider) == [("dialectic", 3), ("base", 4), ("dialectic", 4)]
+    assert _jobs(provider) == [("base", 4), ("dialectic", 4)]
 
 
 def test_session_end_on_a_multiple_queues_no_extra_job(make_provider):
@@ -482,8 +482,9 @@ def test_session_end_on_a_multiple_queues_no_extra_job(make_provider):
         provider.on_turn_start(turn, "m")
     provider._transcript.add_turn("session-test", "tail", "noted")
     provider.on_session_end([])
-    # The dialectic job comes from its own turn-3 tick; the boundary only owes base turn 3.
-    assert _jobs(provider) == [("dialectic", 3), ("base", 3)]
+    # No review before the first base trigger in the *cadence*; the boundary still queues the
+    # dependent review of the base window it just flushed.
+    assert _jobs(provider) == [("base", 3), ("dialectic", 3)]
 
 
 def test_pre_compress_without_reasoning_does_not_queue_a_job(make_provider):
@@ -492,11 +493,11 @@ def test_pre_compress_without_reasoning_does_not_queue_a_job(make_provider):
         provider.on_turn_start(turn, "m")
     provider._transcript.add_turn("session-test", "tail", "noted")
     assert provider.on_pre_compress([]) == ""
-    # The turn-2 dialectic job came from its own cadence; pre-compression queues nothing new.
-    assert _jobs(provider) == [("dialectic", 2)], "no worker means no layer refresh job"
+    # No base trigger yet, so the review cadence has not started; pre-compression queues nothing.
+    assert _jobs(provider) == [], "no worker means no layer refresh job"
     for turn in (4, 5):
         provider.on_turn_start(turn, "m")
-    assert _jobs(provider) == [("dialectic", 2), ("dialectic", 4)]
+    assert _jobs(provider) == []
 
 
 def test_pre_compress_pauses_scheduling_and_resets_both_layers(plugin_package, make_provider,
@@ -554,7 +555,7 @@ def test_session_reset_flushes_old_tail_and_opens_new_session(plugin_package, ma
     provider.on_session_switch("session-next", parent_session_id="session-test", reset=True)
     # The plugin hook fires after the provider switch for the same boundary: still one job.
     plugin_package._on_session_reset(session_id="session-next", old_session_id="session-test")
-    assert _jobs(provider) == [("dialectic", 3), ("base", 4), ("dialectic", 4)]
+    assert _jobs(provider) == [("base", 4), ("dialectic", 4)]
     state = plugin_package.turn_counter.TRACKER.snapshot("session-next")
     assert (state["mode"], state["layers"]["base"]["turns"]) == ("coding", 0)
     assert plugin_package.turn_counter.TRACKER.tick("session-test", 5, now=1.0) == []
@@ -570,7 +571,7 @@ def test_branch_inherits_parent_counters(make_provider):
         provider.on_turn_start(turn, "m")
     jobs = provider._store.pending_jobs()
     assert [(job["layer"], job["turns"]) for job in jobs] == [
-        ("base", 3), ("dialectic", 3), ("base", 6), ("dialectic", 6)]
+        ("base", 3), ("base", 6), ("dialectic", 6)]
     base_jobs = [job for job in jobs if job["layer"] == "base"]
     assert base_jobs[0]["to_ts"] == base_jobs[1]["from_ts"]  # the branch continues the window
 
@@ -585,9 +586,9 @@ def test_layer_intervals_can_be_set_by_env(make_provider, monkeypatch):
     monkeypatch.setenv("MINIR_BASE_INTERVAL", "2")
     monkeypatch.setenv("MINIR_DIALECTIC_INTERVAL", "1")
     provider = make_provider({"base_interval": 99, "dialectic_interval": 99})
-    for turn in (1, 2):
+    for turn in (1, 2, 3, 4):
         provider.on_turn_start(turn, "m")
-    assert _jobs(provider) == [("dialectic", 1), ("base", 2), ("dialectic", 2)]
+    assert _jobs(provider) == [("base", 2), ("dialectic", 3), ("base", 4), ("dialectic", 4)]
 
 
 def test_layer_settings_come_from_config_yaml(plugin_package, monkeypatch, tmp_path):
@@ -610,9 +611,9 @@ def test_layer_settings_come_from_config_yaml(plugin_package, monkeypatch, tmp_p
         tracker = plugin_package.turn_counter.TRACKER
         assert (tracker.base_interval, tracker.dialectic_interval) == (4, 2)
         assert tracker.snapshot("session-test")["mode"] == "from-config"
-        for turn in range(1, 5):
-            provider.on_turn_start(turn, "m")  # base interval 4
-        assert _jobs(provider) == [("dialectic", 2), ("base", 4), ("dialectic", 4)]
+        for turn in range(1, 7):
+            provider.on_turn_start(turn, "m")  # base interval 4, then the review every 2
+        assert _jobs(provider) == [("base", 4), ("dialectic", 6)]
     finally:
         provider.shutdown()
 
@@ -632,11 +633,11 @@ def test_subagent_session_start_does_not_disturb_the_bound_session(plugin_packag
 
 
 def test_stats_report_layer_counters_and_jobs(provider):
-    for turn in range(1, 21):
+    for turn in range(1, 25):
         provider.on_turn_start(turn, "m")
     stats = json.loads(provider.handle_tool_call("minir_stats", {}))
-    assert (stats["jobs"], stats["pending_jobs"]) == (2, 2)
-    assert stats["layers"]["layers"]["dialectic"]["turns"] == 20
+    assert (stats["jobs"], stats["pending_jobs"]) == (1, 1)
+    assert stats["layers"]["layers"]["dialectic"]["turns"] == 24
     assert stats["layers"]["layers"]["base"]["interval"] == 24
     assert stats["reasoning_enabled"] is False  # the test bootstrap disables the model calls
     assert stats["artifacts"] == []
@@ -653,15 +654,13 @@ def test_a_boundary_drains_content_the_cadence_already_flushed(plugin_package, m
     for job in provider._store.pending_jobs():
         provider._store.complete_job(job["id"], job["to_ts"])
     provider._transcript.add_turn("session-test", "deploy on Windows", "noted")
-    assert plugin_package.turn_counter.TRACKER.tail("session-test") == []
-
     provider.on_session_end([])
     jobs = provider._store.pending_jobs()
     assert [job["layer"] for job in jobs] == ["base", "dialectic"], \
         "both layers owe the turn the cadence counted before it existed"
     # The queued window starts at the content watermark and reaches forward, so the next drain
     # actually sees the turn the cadence had already counted.
-    for job in jobs:
+    for job in provider._store.pending_jobs():
         covered = provider._transcript.window("session-test", job["from_ts"], time.time() + 1)
         assert [row["content"] for row in covered] == ["deploy on Windows", "noted"]
 
@@ -670,30 +669,23 @@ def test_a_boundary_is_quiet_while_a_queued_job_still_owns_the_content(plugin_pa
     provider = make_provider({"base_interval": 1, "dialectic_interval": 1})
     provider.on_turn_start(1, "m")
     provider._transcript.add_turn("session-test", "deploy on Windows", "noted")
-    before = len(provider._store.pending_jobs())
+    before = [(job["layer"], job["turns"]) for job in provider._store.pending_jobs()]
     provider.on_session_end([])
-    # The two tick jobs are still queued; they read to ``now`` when they run, so the boundary
-    # must not add a third one for the same turns.
-    assert len(provider._store.pending_jobs()) == before
+    # The two tick jobs are still queued; the boundary adds the dependent review of that base
+    # window but must not add a second base job for the same turns.
+    after = [(job["layer"], job["turns"]) for job in provider._store.pending_jobs()]
+    assert [row for row in after if row[0] == "base"] == [row for row in before if row[0] == "base"]
+    assert [row for row in after if row[0] == "dialectic"] == [row for row in before if row[0] == "dialectic"] + \
+        [("dialectic", 1)]
 
 
-def test_prefetch_injects_only_the_dialectic_artifact(provider):
-    provider._store.put_layer_state("base", "user:default",
-                                    "## Session Summary\n- s\n\n## User Representation\n- [fact] f\n\n"
-                                    "## User Peer Card\n- works on Windows\n\n"
-                                    "## AI Self Representation\n- direct\n\n"
-                                    "## AI Identity Card\n- terse\n\n"
-                                    "## Value Markers\n- [tool] pytest")
+def test_prefetch_ignores_the_dialectic_artifact(provider):
     provider._store.put_layer_state("dialectic", "agent:default:minir",
-                                    "## Base Revision\n- user_peer_card: works on Windows")
+                                    "## Base Revision\n- old advice")
+    _save_base_row(provider, ai_self="live ai", summary="### Objective\n- live goal")
     block = provider.prefetch("nothing matches this query")
-    assert block.startswith("## Minir layer state")
-    assert "### Agent model (v1)" in block
-    assert "### User model" not in block
-    assert "works on Windows" in block
-    assert "## User Peer Card" not in block
-    status = provider.recall_status()
-    assert status is not None and status.count == 1, "only the current review is injected"
+    assert "live ai" in block and "live goal" in block
+    assert "old advice" not in block
 
 
 def test_an_oversized_message_cannot_empty_or_own_the_budget(plugin_package):
@@ -754,7 +746,7 @@ def test_sync_turn_prefers_the_host_supplied_author(plugin_package, make_provide
 
 
 def test_layer_reasoning_runs_end_to_end(plugin_package, make_provider, monkeypatch):
-    """Reasoning enabled: a turn ends, both layers publish, and prefetch carries only the agent one."""
+    """Reasoning enabled: a turn ends, both layers publish, and prefetch carries the two columns."""
     monkeypatch.setenv("MINIR_REASONING_ENABLED", "true")
     monkeypatch.setattr(plugin_package.worker, "call_model", lambda task, system, prompt, **kw: (
         _dialectic_json(peer=["no emoji"], changed=True, fields=["user_preferences"])
@@ -771,8 +763,8 @@ def test_layer_reasoning_runs_end_to_end(plugin_package, make_provider, monkeypa
     subjects = sorted({state["subject"] for state in provider._store.all_layer_states()})
     assert subjects == ["agent:default:Masía", "user:default"]
     block = provider.prefetch("q")
-    assert "user_preferences" in block, "the dialectic publishes a revision note, not advice"
-    assert "wants evidence" not in block, "base cards are search-only"
+    assert "### AI self representation" in block and "### Window summary" in block
+    assert "wants evidence" not in block, "cards other than the two columns are search-only"
 
 
 def test_reasoning_disabled_never_calls_the_model(plugin_package, make_provider, monkeypatch):
@@ -784,7 +776,7 @@ def test_reasoning_disabled_never_calls_the_model(plugin_package, make_provider,
     provider.on_turn_start(1, "m")
     provider.sync_turn("deploy on Windows", "noted")
     provider.on_session_end([])
-    assert len(provider._store.pending_jobs()) == 2  # base + review queued, never drained
+    assert [job["layer"] for job in provider._store.pending_jobs()] == ["base"]  # never drained
     assert provider._store.all_layer_states() == []
 
 
@@ -1022,80 +1014,18 @@ def test_boundary_queues_a_state_db_tail_after_the_buffer_was_lost(
         ("base", "session-test"), ("dialectic", "session-test")}
 
 
-def test_prefetch_does_not_inject_another_sessions_review_or_summary(provider):
-    provider._store.put_layer_state(
-        "base", "user:default",
-        "## Session Summary\n- old session secret\n\n## User Representation\n- [goal] old goal\n\n"
-        "## User Peer Card\n- durable trait\n\n## AI Self Representation\n- old stance\n\n"
-        "## AI Identity Card\n- durable identity\n\n## Value Markers\n- [tool] durable tool",
-        session_id="other-session")
-    provider._store.put_layer_state(
-        "dialectic", "agent:default:minir",
-        "## Adviser Review\n- old advice\n\n## Constraints\n- durable constraint\n\n"
-        "## Preferences\n- durable preference\n\n## Second Brain\n- [project] durable project",
-        session_id="other-session")
-    block = provider.prefetch("durable")
-    assert block == "", "another session's review and base cards are not injectable"
-    assert "durable constraint" not in block and "durable project" not in block
-
-
-def test_prefetch_never_injects_durable_base_cards_from_fts(provider):
+def test_another_sessions_window_is_not_injected_and_search_still_sees_cards(provider):
+    _save_base_row(provider, session="other-session", ai_self="other session stance",
+                   summary="### Objective\n- old session secret", to_ts=9.0)
+    assert provider.prefetch("durable") == "", "another session's window is not injectable"
     provider._store.save_conclusion("base.user_peer_card", "durable peer card secret",
                                     key="user:default", subject="user:default")
-    provider._store.save_conclusion("base.ai_identity_card", "durable identity card secret",
-                                    key="agent:default:minir", subject="agent:default:minir")
-    provider._store.save_conclusion("note", "durable peer card note")
-
     block = provider.prefetch("durable peer card secret")
-    assert "durable peer card note" in block
-    assert "durable peer card secret" not in block
-    assert "durable identity card secret" not in block
-
-    provider.queue_prefetch("durable peer card secret")
-    thread = provider._prefetch_thread
-    if thread is not None:
-        thread.join(timeout=5.0)
-    cached = provider.prefetch("durable peer card secret")
-    assert "durable peer card note" in cached
-    assert "durable peer card secret" not in cached
-    assert "durable identity card secret" not in cached
-
+    assert "durable peer card secret" not in block, "only the live two columns are injected"
     payload = json.loads(provider.handle_tool_call(
         "minir_search", {"query": "durable peer card secret"}))
     kinds = {row["kind"] for row in payload["results"]}
-    assert {"base.user_peer_card", "base.ai_identity_card"} <= kinds, \
-        "explicit minir_search still exposes the durable cards"
-
-
-def test_prefetch_does_not_inject_any_base_artifact(provider):
-    session = provider._session_id
-    provider._store.save_conclusion("base.user_representation", "zebraword engineer",
-                                    key="user:default", subject="user:default")
-    provider._store.save_conclusion("base.user_peer_card", "zebraword durable preference",
-                                    key="user:default", subject="user:default")
-    provider._store.save_conclusion("base.ai_self_representation", "zebraword ai stance",
-                                    key="agent:default:minir", subject="agent:default:minir")
-    provider._store.save_conclusion("base.window_summary", "zebraword projection",
-                                    key=f"session:{session}:user:default", session_id=session)
-    provider._store.save_conclusion("base.value_markers", "- [tool] zebraword tool",
-                                    key=f"session:{session}:user:default", session_id=session)
-    provider.handle_tool_call(
-        "minir_remember", {"type": "experiences", "content": "zebraword note"})
-
-    block = provider.prefetch("zebraword")
-    assert "zebraword note" in block
-    assert "zebraword engineer" not in block
-    assert "zebraword durable preference" not in block
-    assert "zebraword ai stance" not in block
-    assert "zebraword tool" not in block
-    assert "## Window Summary" not in block
-
-    payload = json.loads(provider.handle_tool_call("minir_search", {"query": "zebraword"}))
-    kinds = {row["kind"] for row in payload["results"]}
-    assert {"base.user_representation", "base.user_peer_card",
-            "base.value_markers"} <= kinds, "minir_search still exposes the base conclusions"
-    assert "base.ai_self_representation" not in kinds, (
-        "the AI self representation is session-bound and must not leak into a durable search")
+    assert "base.user_peer_card" in kinds, "minir_search still exposes the durable cards"
 
 
 def test_system_prompt_block_gates_adviser_sections(plugin_package, make_provider):
@@ -1129,6 +1059,34 @@ def test_system_prompt_block_gates_adviser_sections(plugin_package, make_provide
     disabled_block = disabled.system_prompt_block()
     assert "# Advisers" not in disabled_block
     assert "## adviser_consult" not in disabled_block
+
+
+def test_system_prompt_block_includes_the_global_user_preference(
+        plugin_package, make_provider, tmp_path):
+    provider = make_provider()
+    assert "# User Preferences" not in provider.system_prompt_block()
+
+    card = tmp_path / "minir-memory" / "user" / "preference.md"
+    card.parent.mkdir(parents=True, exist_ok=True)
+    card.write_text("---\nschema: minir-card/1\n---\n\n- 回复用中文\n- 先给结论\n",
+                    encoding="utf-8")
+
+    block = provider.system_prompt_block()
+    assert "# User Preferences" in block
+    assert "回复用中文" in block
+    assert block.index("# Minir Memory") < block.index("# User Preferences")
+
+
+def test_an_oversized_user_preference_is_capped(plugin_package, make_provider, tmp_path):
+    provider = make_provider()
+    card = tmp_path / "minir-memory" / "user" / "preference.md"
+    card.parent.mkdir(parents=True, exist_ok=True)
+    card.write_text("x" * (plugin_package._MAX_PREFERENCE_CHARS + 500), encoding="utf-8")
+
+    block = provider.system_prompt_block()
+    section = block.split("# User Preferences", 1)[1].split("# Craft Rules", 1)[0]
+    assert section.count("x") == plugin_package._MAX_PREFERENCE_CHARS
+    assert "truncated" in section
 
 
 # -- conclusions only: type filter, todo surface, final-answer injection -------

@@ -2,10 +2,10 @@
 
 The engine no longer maintains a progressive carrier chain. It waits for the host's compression
 boundary, folds the unprotected middle of the window into one **assistant summary message**, and
-returns ``head + notice + summary + tail``. The summary is produced by a real adviser agent run
-that audits the base layer's prepared chunk and the base revision note against history up to the
-window end; raw transcript text stays in the host's ``state.db`` and is never copied into this
-provider's store.
+returns ``head + notice + summary + tail``. The summary is one B3 calibration of the latest window
+summary: the previous base summary plus the turns since that window, so compression and the base
+refresh share one shape contract. Raw transcript text stays in the host's ``state.db`` and is
+never copied into this provider's store.
 
 ``on_pre_compress`` (provider side) pauses the periodic layer scheduler, runs the base and
 dependent dialectic jobs synchronously, resets both counters, and then calls ``compress()``.
@@ -23,7 +23,7 @@ from typing import Any, Iterable, Optional
 
 from agent.context_engine import ContextEngine
 
-from . import cadence, handoff
+from . import cadence, compress_pass, history, layers, window_summary
 from .store import MinirStore
 
 logger = logging.getLogger(__name__)
@@ -40,7 +40,6 @@ NOTICE_TEXT = (
     "minir_hermes_session_search to recover exact details.")
 
 _MAX_FOLD_MESSAGES = 24
-_MAX_SUMMARY_CHARS = 8_000
 _ELIDED_TOOL_MARKER = "[tool result elided by minir · recoverable from the session store]"
 _TERM_RE = re.compile(r"[\w-]{3,}", re.UNICODE)
 _STOPWORDS = frozenset("""
@@ -144,8 +143,6 @@ class MinirContextEngine(ContextEngine):
         self._lock = threading.RLock()
         self._store: Optional[MinirStore] = None
         self._store_checked = False
-        self._summary_enabled = (cadence.configured_handoff("")
-                                 and cadence.configured_reasoning(""))
         self.compression_count = 0
 
     @property
@@ -159,8 +156,6 @@ class MinirContextEngine(ContextEngine):
             self._session_id = str(session_id or "")
         if kwargs.get("hermes_home"):
             self._hermes_home = str(kwargs["hermes_home"])
-        self._summary_enabled = (cadence.configured_handoff(self._hermes_home)
-                                 and cadence.configured_reasoning(self._hermes_home))
 
     def on_session_end(self, session_id: str, messages: list[dict[str, Any]]) -> None:
         self.on_session_reset()
@@ -229,8 +224,9 @@ class MinirContextEngine(ContextEngine):
     ) -> list[dict[str, Any]]:
         """Fold the middle into one audited assistant summary and return head/notice/summary/tail.
 
-        The summary agent runs synchronously; when it fails or times out the prepared chunk and
-        review are used as the summary so the window still shrinks. Never raises.
+        The summary is one B3 calibration of the latest base window summary; when it fails or
+        times out that previous summary is folded instead, and an empty template when there is
+        none. Never raises.
         """
         store = self._memory_store()
         session = self._session_id
@@ -247,24 +243,34 @@ class MinirContextEngine(ContextEngine):
                     if not self.is_summary_message(message)]
             tail = [message for message in messages[end:]
                     if not self.is_summary_message(message)]
-            chunk, review, previous = self._prepared_inputs(store, session)
-            previous_message = self._previous_summary(messages)
-            if previous_message is not None:
-                # The previous summary may still be pending (its carrier was never promoted),
-                # so the store cannot be the only source for the agent's continuity.
-                previous = self._summary_body(previous_message) or previous
+            base = store.latest_base_refresh(session) if store is not None and session else None
+            columns = layers.artifact_from_columns(base)
+            # The calibration baseline is the base layer's own window summary: the window it
+            # covers is what this pass extends, and the fold is not a second source of truth.
+            previous = str(columns.get("window_summary") or "").strip()
             summary = ""
-            if self._summary_enabled:
-                summary = handoff.summarize_agent(
-                    chunk, review, previous=previous, session_id=session,
-                    before=time.time(), focus_topic=focus_topic or "",
-                    memory_context=memory_context or "")
+            # ``reasoning_enabled: false`` promises a provider with no model calls; the fold then
+            # reuses the base window summary instead of spending one.
+            if store is not None and session and cadence.configured_reasoning():
+                summary = compress_pass.summarize(
+                    session_id=session, previous=previous,
+                    from_ts=float((base or {}).get("window_to_ts") or 0.0),
+                    to_ts=time.time(),
+                    # The loader may pass only ``hermes_home``; the host store path is derivable
+                    # from it, and an empty state_db would leave B3 without the window.
+                    state_db=(self._state_db_override
+                              or str(history.state_db_path(self._hermes_home) or "")),
+                    user_card=layers.render_user_card(
+                        str(columns.get("user_self_representation") or ""),
+                        str(columns.get("user_preferences") or "")) if base else "",
+                    ai_card=layers.render_ai_card(
+                        str(columns.get("ai_self_representation") or ""),
+                        str(columns.get("ai_identity") or "")) if base else "")
             if not summary:
-                summary = self._fallback_summary(chunk, review, previous)
-            summary = summary[:_MAX_SUMMARY_CHARS].rstrip()
+                summary = previous or window_summary.empty_summary()
+            summary = summary[:compress_pass.MAX_CHARS].rstrip()
             run_id = uuid.uuid4().hex[:12]
             if store is not None and session:
-                store.expire_pending_handoffs(session, before=time.time() - 3_600)
                 # The index is this session's compression count, not the run id: the row is
                 # active from the start, so no later pass has to promote it.
                 store.save_conclusion(
@@ -321,20 +327,6 @@ class MinirContextEngine(ContextEngine):
         return _is_summary_message(message)
 
     @staticmethod
-    def _previous_summary(messages: Iterable[dict[str, Any]]) -> Optional[dict[str, Any]]:
-        previous: Optional[dict[str, Any]] = None
-        for message in messages or ():
-            if _is_summary_message(message):
-                previous = message
-        return previous
-
-    @staticmethod
-    def _summary_body(message: Any) -> str:
-        text = _text_of(message)
-        newline = text.find("\n")
-        return text[newline + 1:].strip() if newline >= 0 else ""
-
-    @staticmethod
     def has_summary_marker(messages: Iterable[dict[str, Any]]) -> bool:
         return any(_is_summary_message(message) for message in messages or ())
 
@@ -354,26 +346,6 @@ class MinirContextEngine(ContextEngine):
         while index < len(head) and head[index].get("role") == "system":
             index += 1
         return [*head[:index], {"role": "system", "content": NOTICE_TEXT}, *head[index:]]
-
-    @staticmethod
-    def _prepared_inputs(store: Optional[MinirStore], session: str) -> tuple[str, str, str]:
-        if store is None or not session:
-            return "", "", ""
-        chunks = store.chunk_summaries(session)
-        chunk = str(chunks[-1].get("content") or "").strip() if chunks else ""
-        review_row = store.newest_conclusion("dialectic.review", session_id=session)
-        previous_row = store.newest_conclusion("session_summary", session_id=session)
-        return (chunk,
-                str((review_row or {}).get("content") or "").strip(),
-                str((previous_row or {}).get("content") or "").strip())
-
-    @staticmethod
-    def _fallback_summary(chunk: str, review: str, previous: str) -> str:
-        for candidate in (chunk, review, previous):
-            if candidate.strip():
-                return candidate.strip()
-        return ("## Goal\n- N/A\n\n## Current State\n- N/A\n\n"
-                "## Next Steps\n- N/A\n\n## Critical Context\n- No summary was generated.")
 
     # -- status ---------------------------------------------------------------
 

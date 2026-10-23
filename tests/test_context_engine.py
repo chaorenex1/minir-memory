@@ -10,15 +10,21 @@ import pytest
 
 SESSION = "session-ctx"
 
-HANDOFF = """# Task Handoff
-## Goal
+WINDOW_SUMMARY = """## Window Summary
+### Objective
 - ship the context engine
-## Current State
+### Current State
+#### Done
 - compression is synchronous
-## Next Steps
+#### Doing
 - verify the summary
-## Critical Context
-- no secrets"""
+#### Todo
+### Decisions
+### Constraints
+### Verified Facts
+### Open Issues
+### Next Actions
+### References"""
 
 
 def _msg(role, text, uid=""):
@@ -166,10 +172,29 @@ def test_has_content_to_compress_reports_honestly(plugin_package):
 
 # -- compression --------------------------------------------------------------
 
-def _compression_env(monkeypatch, plugin_package):
+def _compression_env(monkeypatch, plugin_package, body=WINDOW_SUMMARY):
+    """Stub the compression-time B3 call; returns the kwargs it was given."""
     monkeypatch.setenv("MINIR_REASONING_ENABLED", "true")
-    monkeypatch.setattr(plugin_package.handoff, "summarize_agent",
-                        lambda *a, **k: HANDOFF)
+    seen: list[dict] = []
+
+    def fake_summarize(**kwargs):
+        seen.append(dict(kwargs))
+        return body
+
+    monkeypatch.setattr(plugin_package.compress_pass, "summarize", fake_summarize)
+    return seen
+
+
+def _seed_base(store, summary=WINDOW_SUMMARY, to_ts=1.0):
+    """One published base window: the calibration baseline compression reads."""
+    store.add_base_refresh(
+        SESSION, "user:default", window_from_ts=0.0, window_to_ts=to_ts,
+        window_from_turn=0, window_to_turn=1,
+        user_representation=json.dumps("## Self\n\n- Occupation: engineer"),
+        user_peer_card=json.dumps("prefers terse answers"),
+        ai_self_representation=json.dumps("## AI\n\n- local memory plugin"),
+        ai_identity_card=json.dumps("steady"),
+        window_summary=json.dumps(summary))
 
 
 def test_compress_returns_head_notice_assistant_summary_and_tail(
@@ -186,7 +211,7 @@ def test_compress_returns_head_notice_assistant_summary_and_tail(
     summaries = [m for m in result
                  if plugin_package.context_engine.SUMMARY_MARKER in m["content"]]
     assert len(summaries) == 1 and summaries[0]["role"] == "assistant"
-    assert HANDOFF in summaries[0]["content"]
+    assert WINDOW_SUMMARY in summaries[0]["content"]
     assert result[-1] == original[-1], "the tail is unmodified"
     assert "recover:" not in summaries[0]["content"], "no folded uid list"
 
@@ -200,7 +225,7 @@ def test_compress_writes_an_active_summary_indexed_per_session(
     first = store.get_conclusion("session_summary", "session_summary:1")
     assert first is not None, "the summary is active from the start, with no pending phase"
     assert first["status"] == "active" and first["session_id"] == SESSION
-    assert HANDOFF in first["content"]
+    assert WINDOW_SUMMARY in first["content"]
 
     # The marker still releases the compression gate; nothing promotes the row any more.
     engine.on_turn_complete(result)
@@ -222,16 +247,14 @@ def test_the_notice_is_added_only_once(plugin_package, tmp_path, state_db, monke
 
 def test_a_second_compression_keeps_exactly_one_summary(
         plugin_package, tmp_path, state_db, monkeypatch):
-    seen: list[str] = []
-    monkeypatch.setenv("MINIR_REASONING_ENABLED", "true")
-    monkeypatch.setattr(plugin_package.handoff, "summarize_agent",
-                        lambda chunk, review, **kwargs: (
-                            seen.append(str(kwargs.get("previous") or "")) or HANDOFF))
+    seen = _compression_env(monkeypatch, plugin_package)
     engine = _engine(plugin_package, hermes_home=tmp_path, state_db=state_db)
+    _seed_base(engine._memory_store(), to_ts=100.0)
     once = engine.compress(_conversation(40))
     twice = engine.compress(once)
-    assert "ship the context engine" in seen[-1], \
-        "the previous assistant summary must feed the next summary agent"
+    assert seen[-1]["previous"] == WINDOW_SUMMARY, \
+        "the base window summary is the calibration baseline"
+    assert seen[-1]["from_ts"] == 100.0, "the window starts where the base window ended"
     assert twice != once, "the second compression must actually fold"
     assert sum(1 for m in twice
                if plugin_package.context_engine.SUMMARY_MARKER in m["content"]) == 1, \
@@ -240,27 +263,76 @@ def test_a_second_compression_keeps_exactly_one_summary(
                if plugin_package.context_engine.NOTICE_MARKER in m["content"]) == 1
 
 
-def test_summary_agent_failure_falls_back_to_the_prepared_chunk(
+def test_a_failed_calibration_folds_the_previous_window_summary(
         plugin_package, tmp_path, state_db, monkeypatch):
-    monkeypatch.setenv("MINIR_REASONING_ENABLED", "true")
-    monkeypatch.setattr(plugin_package.handoff, "summarize_agent", lambda *a, **k: "")
+    _compression_env(monkeypatch, plugin_package, body="")
     engine = _engine(plugin_package, hermes_home=tmp_path, state_db=state_db)
-    store = engine._memory_store()
-    store.add_chunk_summary(SESSION, 1.0, "prepared chunk fact")
+    _seed_base(engine._memory_store(), summary="PREVIOUS BASE FACT", to_ts=1.0)
     result = engine.compress(_conversation(12))
     summary = next(m for m in result
                    if plugin_package.context_engine.SUMMARY_MARKER in m["content"])
-    assert "prepared chunk fact" in summary["content"]
+    assert "PREVIOUS BASE FACT" in summary["content"]
 
 
-def test_reasoning_disabled_skips_the_summary_agent(
+def test_a_failed_calibration_without_a_base_window_folds_the_empty_template(
         plugin_package, tmp_path, state_db, monkeypatch):
-    monkeypatch.setenv("MINIR_REASONING_ENABLED", "false")
-    monkeypatch.setattr(plugin_package.handoff, "summarize_agent",
-                        lambda *a, **k: (_ for _ in ()).throw(AssertionError("agent called")))
+    _compression_env(monkeypatch, plugin_package, body="")
     engine = _engine(plugin_package, hermes_home=tmp_path, state_db=state_db)
     result = engine.compress(_conversation(12))
-    assert any(plugin_package.context_engine.SUMMARY_MARKER in m["content"] for m in result)
+    summary = next(m for m in result
+                   if plugin_package.context_engine.SUMMARY_MARKER in m["content"])
+    assert "## Window Summary" in summary["content"]
+    assert any(plugin_package.context_engine.NOTICE_MARKER in m["content"] for m in result)
+
+
+def test_reasoning_disabled_keeps_the_fold_model_free(
+        plugin_package, tmp_path, state_db, monkeypatch):
+    monkeypatch.setenv("MINIR_REASONING_ENABLED", "false")
+    monkeypatch.setattr(plugin_package.compress_pass, "summarize",
+                        lambda **kwargs: (_ for _ in ()).throw(AssertionError("model called")))
+    engine = _engine(plugin_package, hermes_home=tmp_path, state_db=state_db)
+    _seed_base(engine._memory_store(), summary="BASE ONLY", to_ts=1.0)
+
+    result = engine.compress(_conversation(12))
+
+    summary = next(m for m in result
+                   if plugin_package.context_engine.SUMMARY_MARKER in m["content"])
+    assert "BASE ONLY" in summary["content"]
+
+
+def test_compression_does_not_read_the_chunk_chain(
+        plugin_package, tmp_path, state_db, monkeypatch):
+    _compression_env(monkeypatch, plugin_package, body="CALIBRATED BODY")
+    engine = _engine(plugin_package, hermes_home=tmp_path, state_db=state_db)
+    store = engine._memory_store()
+    assert store.chunk_summaries(SESSION) == []
+    result = engine.compress(_conversation(12))
+    summary = next(m for m in result
+                   if plugin_package.context_engine.SUMMARY_MARKER in m["content"])
+    assert "CALIBRATED BODY" in summary["content"]
+
+
+def test_a_reply_missing_a_section_is_still_folded(
+        plugin_package, tmp_path, state_db, monkeypatch):
+    _compression_env(monkeypatch, plugin_package, body="### Objective\n- only one section")
+    engine = _engine(plugin_package, hermes_home=tmp_path, state_db=state_db)
+    result = engine.compress(_conversation(12))
+    summary = next(m for m in result
+                   if plugin_package.context_engine.SUMMARY_MARKER in m["content"])
+    assert "only one section" in summary["content"]
+
+
+def test_the_fold_is_stored_as_this_sessions_compression_record(
+        plugin_package, tmp_path, state_db, monkeypatch):
+    _compression_env(monkeypatch, plugin_package, body="STORED BODY")
+    engine = _engine(plugin_package, hermes_home=tmp_path, state_db=state_db)
+    result = engine.compress(_conversation(12))
+    summary = next(m for m in result
+                   if plugin_package.context_engine.SUMMARY_MARKER in m["content"])
+    row = engine._memory_store().latest_compression_summary(SESSION)
+    assert row is not None and row["status"] == "active"
+    assert row["key"] == "session_summary:1"
+    assert summary["content"].endswith("STORED BODY")
 
 
 def test_compress_clears_the_compression_gate(plugin_package, tmp_path, state_db, monkeypatch):
@@ -272,27 +344,65 @@ def test_compress_clears_the_compression_gate(plugin_package, tmp_path, state_db
     assert store.compression_gate_active(SESSION) is False
 
 
-def test_summary_agent_prompt_bounds_history_and_includes_flags(plugin_package, monkeypatch):
-    captured: dict[str, str] = {}
+def test_the_compression_pass_runs_b3_with_the_window_template(plugin_package, monkeypatch):
+    captured: dict = {}
 
     class Result:
-        answer = HANDOFF
+        answer = "### Objective\n- ship"
 
-    monkeypatch.setattr(plugin_package.adviser, "load_config",
-                        lambda: {"model": "", "provider": "", "toolsets": []})
     monkeypatch.setattr(plugin_package.agent_loop, "run",
-                        lambda prompt, **kwargs: captured.update(prompt=prompt, **kwargs) or Result())
+                        lambda prompt, **kwargs: captured.update(prompt=prompt, **kwargs)
+                        or Result())
 
-    result = plugin_package.handoff.summarize_agent(
-        "prepared chunk", "prepared review", session_id=SESSION, before=123.0, timeout=5)
-    assert result == HANDOFF
-    prompt = captured["prompt"]
-    assert "before=123.000000" in prompt
-    assert "include_inactive=True" in prompt and "include_compacted=True" in prompt
-    assert "prepared chunk" in prompt and "prepared review" in prompt
-    assert plugin_package.adviser.session_search.TOOLSET in captured["toolsets"]
-    assert "TEMPLATE:" in captured["system_message"] and "Task Handoff" in captured["system_message"], \
-        "MINIR_SUMMARY_TEMPLATE / prompts/session_handoff.md must reach the agent"
+    text = plugin_package.compress_pass.summarize(
+        session_id=SESSION, previous="OLD SUMMARY", from_ts=10.0, to_ts=20.0)
+
+    assert text == "### Objective\n- ship"
+    assert captured["layer"] == "window_summary"
+    assert "toolsets" not in captured, "the calibration pass gets no tools"
+    system = captured["system_message"]
+    assert "You close one base refresh" in system, "B3's own core must lead the prompt"
+    assert "TEMPLATE:" in system and "## Window Summary" in system
+    assert "10.000000 to 20.000000" in captured["prompt"]
+    assert "OLD SUMMARY" in captured["prompt"]
+
+
+def test_the_engine_finds_the_host_store_from_hermes_home(
+        plugin_package, tmp_path, monkeypatch):
+    """The loader may pass only hermes_home; the window transcript still has a source."""
+    connection = sqlite3.connect(str(tmp_path / "state.db"))
+    connection.executescript(
+        "CREATE TABLE messages (id INTEGER PRIMARY KEY, session_id TEXT, role TEXT,"
+        " content TEXT, timestamp INTEGER);")
+    connection.commit()
+    connection.close()
+    seen: dict = {}
+    monkeypatch.setenv("MINIR_REASONING_ENABLED", "true")
+    monkeypatch.setattr(plugin_package.compress_pass, "summarize",
+                        lambda **kwargs: seen.update(kwargs) or "BODY")
+    engine = _engine(plugin_package, hermes_home=tmp_path)
+    _seed_base(engine._memory_store(), to_ts=1.0)
+
+    engine.compress(_conversation(12))
+
+    assert seen["state_db"] == str(tmp_path / "state.db")
+
+
+def test_the_window_digest_starts_at_the_base_window_edge(plugin_package, state_db):
+    connection = sqlite3.connect(str(state_db))
+    connection.executemany(
+        "INSERT INTO messages (session_id, role, content, timestamp) VALUES (?, ?, ?, ?)",
+        [(SESSION, "user", "before the window", 5),
+         (SESSION, "user", "inside the window", 15),
+         (SESSION, "assistant", "after the window", 25)])
+    connection.commit()
+    connection.close()
+
+    text = plugin_package.compress_pass.transcript_text(state_db, SESSION, 10.0, 20.0)
+
+    assert "inside the window" in text
+    assert "before the window" not in text and "after the window" not in text
+    assert "[user]" in text
 
 
 def test_compress_fails_open(plugin_package):
@@ -329,3 +439,20 @@ def test_session_reset_clears_state_and_gate(plugin_package, tmp_path, state_db)
     engine.on_session_reset()
     assert engine._session_id == "" and engine.compression_count == 0
     assert store.compression_gate_active(SESSION) is False
+
+
+def test_compress_never_rewrites_the_base_window(plugin_package, tmp_path, state_db, monkeypatch):
+    _compression_env(monkeypatch, plugin_package)
+    engine = _engine(plugin_package, hermes_home=tmp_path, state_db=state_db)
+    store = engine._memory_store()
+    store.add_base_refresh(
+        SESSION, "user:default", window_from_ts=0.0, window_to_ts=1.0,
+        window_from_turn=1, window_to_turn=1, user_representation="", user_peer_card="",
+        ai_self_representation=json.dumps("ai"), ai_identity_card="",
+        window_summary=json.dumps("### Objective\n- keep me"))
+    before = store.latest_base_refresh(SESSION)
+    engine.compress(_conversation(12))
+    after = store.latest_base_refresh(SESSION)
+    assert (after["id"], after["window_summary"], after["is_latest"]) == \
+        (before["id"], before["window_summary"], before["is_latest"])
+    assert store.newest_conclusion("session_summary", session_id=SESSION) is not None

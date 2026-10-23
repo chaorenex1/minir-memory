@@ -38,7 +38,7 @@ RESERVED_LABELS: frozenset[str] = frozenset({
     "provider_memory_context",
     "rulers",
     "self_audit_correction",
-    "session_handoff",
+    "session_record",
     "session_summary",
     "soul_constraints",
     "target_stats",

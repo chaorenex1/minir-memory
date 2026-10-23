@@ -7,7 +7,7 @@ and grow into a real provider.
 It keeps explicit value markers and every derived conclusion in a per-profile SQLite database,
 recalls them through an FTS5 trigram index (CJK-safe, with a token-scan fallback), and exposes
 seven tools (`minir_search`, `minir_kb_search`, `minir_remember`, `minir_forget`, `minir_todo`,
-`minir_stats`, `minir_agents`). On top of that it runs
+`minir_stats`, `minir_agents`) and one local counter (`minir_content_valid`). On top of that it runs
 two **independent** reasoning layers: the base layer builds the user/AI cards every 24 turns, the
 dialectic reviews them every 8 turns against its own evidence window, and corrects the newest base
 artifact (a pre-overwrite snapshot and an FTS index are kept). The review publishes a short
@@ -20,7 +20,7 @@ permanent, one event per line).
 
 A fourth pass closes the loop after a conversation goes quiet: `on_session_end` records every
 turn's final token usage, captures the session's value markers and arms a 24-hour timer. Typing in
-the session again cancels it; otherwise a **session-summary agent** (the Task Handoff is its first
+the session again cancels it; otherwise a **session-summary agent** (the calibrated window summary is its first
 user prompt input) and a **knowledge-extraction agent** turn the session into a durable summary
 and knowledge pages. The seven tools are also registered as the `minir` toolset, so every agent
 this plugin runs can use the store and the knowledge search directly; the same toolset carries the
@@ -78,12 +78,13 @@ when no `state.db` exists are inherited jobs expired.
 The same directory also ships a **context engine** for audited summary compression: at 95% of the
 configured threshold the provider pauses periodic scheduling, refreshes the base and dialectic
 layers synchronously, and the engine replaces the unprotected middle of the window with one
-assistant `session_summary` produced by a tool-using adviser agent. The summary is stored and
-FTS-indexed; the head and tail stay verbatim.
+assistant `session_summary`. That summary is one B3 calibration of the newest base window summary:
+B3 gets the previous summary plus the turns since that window's end, so compression and the base
+refresh share one shape contract. The summary is stored and FTS-indexed; the head and tail stay
+verbatim.
 
 No external binaries, stdlib only. Layer calls go through the host's auxiliary client, so there is
-no key to configure; set `reasoning_enabled: false` to keep the provider a pure note store, and
-`handoff_enabled: false` to keep compression off the summary model.
+no key to configure; set `reasoning_enabled: false` to keep the provider a pure note store.
 
 ```
 pyproject.toml         package metadata, pytest config, pip entry point
@@ -103,7 +104,7 @@ plugin/minir/          the deployable plugin directory (copy this to plugins/min
   tools.py             the minir toolset: store tools + agent transcript search; file/skills grant
   agent_history.py     minir_aiagent_search: the caller's own layer stream, layer from contextvar
   minir_agents.py      run one named custom agent and flush its transcript under sessions/
-  session_summary.py   end-of-session summary agent (hand-off is its first user prompt input)
+  session_summary.py   end-of-session summary agent (its own template; the compression record is input)
   extraction.py        idle-timer due-row runner + knowledge-page extraction agent
   file_guard.py        pre-tool-call scope for the plugin agents' file tools
   scheduler.py         one clock for turn and time tasks, with a per-task ledger and logs
@@ -113,18 +114,20 @@ plugin/minir/          the deployable plugin directory (copy this to plugins/min
   rules.py             rule-file loader: validation, override, cache, prompt assembly
   rules/               one file per contract (contract + review checks), read at call time
   window_summary.py    the summary section: template asset, prompt caps, type check
-  templates/           the fixed Window Summary shape the model fills
-  handoff.py           Task Handoff template, summary-agent prompt + validation
-  cadence.py           config/store-path helpers shared by the provider and the engine
+  templates/           the Window Summary and Session Summary shapes the model fills
+  skills/              bundled read-only skills, registered as minir:<name> (data-layout)
+  compress_pass.py     compression's one B3 calibration of the newest window summary
+  content_valid.py     minir_content_valid: the local character/token counter
+  cadence.py           store-path helper shared by the provider and the engine
   context_engine.py    audited summary compression (context.engine: minir)
-  agent_loop.py        one-shot in-process AIAgent runs — sync + async (Feishu-shaped)
+  agent_loop.py        one-shot in-process AIAgent runs — sync + async + the bounded run (Feishu-shaped)
   adviser.py           auxiliary routes: task registration (adviser + three layer routes) + host session search
   adviser_prompts.py   adviser prompt loader: prompts/adviser sections + rule bodies
   adviser_mode.py      the only advice producer: event ring, review, guard, delivery channels
   host_bridge.py       optional bridge to hermes_cli.plugin_runtime (steer / continuation)
   host-patches/        git patch series for the host control surface + manifest.json
   session_search.py    read-only multi-shape search over the host's session store (state.db)
-  prompts/             operator handoff template + prompts/adviser prompt sections
+  prompts/adviser/     the adviser prompt sections read at run time
 tests/                 pytest suite: contract, store, transcript, provider, counting, worker, engine
 scripts/install.py               copy the plugin + apply/verify the host patch series
 scripts/install_host_patches.py  apply/check/revert the series on a hermes-agent checkout
@@ -147,10 +150,9 @@ Hermes loads memory providers by **name**, one at a time:
 | `name` (property) | always | must equal the plugin directory name and `memory.provider` |
 | `is_available()` | before activation | config/deps checks only — no network |
 | `initialize(session_id, **kwargs)` | once at agent startup | `kwargs` include `hermes_home` (profile-scoped), `platform`, `agent_context`, `agent_identity`, `user_id` |
-| `system_prompt_block()` | prompt assembly | **static** text only; dynamic recall goes through `prefetch()` |
-| `queue_prefetch(query)` | after each turn, background worker | do the I/O here |
-| `prefetch(query, session_id=)` | before each LLM request, **critical path** | consume the queued result; must stay fast |
-| `recall_status()` | after `prefetch()` | drives the `🧠 Provider — recalled N memories` indicator; must reflect only the last prefetch |
+| `system_prompt_block()` | prompt assembly | **static** text only; dynamic layer state goes through `prefetch()` |
+| `prefetch(query, session_id=)` | before each LLM request, **critical path** | injects the live AI self + window summary and the todo list; one indexed read, no model call |
+| `recall_status()` | after `prefetch()` | drives the provider indicator; counts injected bullets and todo items from the last prefetch |
 | `sync_turn(user, assistant, **kw)` | after each turn, background worker | hands the turn to the layer worker (in memory); `messages`, `turn_author` are optional kwargs |
 | `get_tool_schemas()` / `handle_tool_call()` | tool dispatch | handlers **must return a JSON string** |
 | `shutdown()` | teardown | idempotent |
@@ -201,7 +203,7 @@ process-wide active provider, since the host can construct the plugin twice.
 
 ## Tools
 
-The provider exposes seven tools; every response is a JSON string (errors are `{"error": ...}`).
+The provider exposes eight tools; every response is a JSON string (errors are `{"error": ...}`).
 The same schemas are registered as the `minir` **registry toolset**, so the plugin's own agents can
 be granted them explicitly (see "The `minir` toolset" below).
 
@@ -214,6 +216,7 @@ be granted them explicitly (see "The `minir` toolset" below).
 | `minir_todo` | `todos` (required) | Replaces this session's todo list, at most two levels deep (`parent` names a top-level id) and 256 items. It is stored as one row (`kind="todo"`), rendered as a markdown table into the final answer, and carried by every prefetch block for the session. An empty list deletes the row. |
 | `minir_stats` | none | Store counts (with `conclusions_by_kind` for this session), layer counters, the scheduler ledger, published artifacts, buffered messages, in-memory tool metrics, the session's token usage and its newest turn rows, and the database path. |
 | `minir_agents` | `agent_name` (required), `user_prompts` (required), `skill_name`, `model`, `system_prompts`, `context_files`, `project_dir`, `tool_sets`, `skip_memory`, `skip_context_files`, `skip_background_review`, `load_soul_identity` | Runs a named in-process agent; omitting `tool_sets` grants every host tool. `model` is `provider:model`. The system prompt is the first prompt file found under `HERMES_HOME` (see "Custom agents"); `system_prompts` is the last fallback, and `system_prompt_source` reports which one won. The full run is flushed to `sessions/<agent_name>/<layer_session_id>.jsonl`. |
+| `minir_content_valid` | `content` (required), `limit` (required), `mode` | Local deterministic length check. `mode="string"` (default) counts Unicode code points; `mode="token"` applies `rules.estimate_tokens` (CJK one token per character, otherwise four characters per token, plus a 10% margin). Returns `{ok, mode, unit, measured, limit, over, remaining}` and, in token mode, `estimator`. It never truncates, rewrites or stores, and it answers before the provider is initialized. |
 
 Explicit markers are separate from the base layer's automatic value markers: the worker keeps
 merging its own five-key inventory per refresh, while a remembered marker is a session-bound,
@@ -231,10 +234,10 @@ main-agent surface):
 
 ## The `minir` toolset
 
-The seven tools have two delivery paths. The memory-provider surface (`get_tool_schemas`)
+The eight tools have two delivery paths. The memory-provider surface (`get_tool_schemas`)
 injects them into a main agent that has the host's `memory` toolset enabled. For the plugin's own
-agents — the adviser, the layer worker, the hand-off and session-summary agents, the idle
-extraction — the same schemas are registered through the plugin context under a registry toolset
+agents — the adviser, the layer worker, the session-summary and knowledge-extraction agents — the
+same schemas are registered through the plugin context under a registry toolset
 named `minir`, together with `minir_hermes_session_search` and `minir_aiagent_search`. That
 toolset also carries the host's `file` toolset and `skills`, so a plugin agent grants all three
 with:
@@ -307,12 +310,12 @@ event). Four things happen there beyond the layer drain:
 4. **The due run.** The unified scheduler's `session_extraction` time task
    (`ExtractionScheduler.tick`) claims due rows atomically, so a timer armed in one process is
    honoured after a restart. For each due session it runs the
-   **session summary agent** — the Task Handoff from `handoff.summarize_agent` is the first
-   evidence block of its user message, and it writes `## Session Goal`, `## Work Done`,
-   `## Decisions`, `## Durable Knowledge` and `## Open Threads` — then the **knowledge extraction
-   agent**, which turns the summary, hand-off and markers into knowledge pages written through
-   `knowledge.write_unit` (the same front-matter, atomic write and token budget as the base
-   layer's value markers).
+   **session summary agent** — the session's newest compression record (`session_summary:<n>`) is
+   the first evidence block of its user message, and it writes its own template
+   (`templates/session_summary.md`: `### Request`, `### Outcome`, `### Decisions`,
+   `### Constraints`, `### Verified Facts`, `### Lessons`, `### Open Threads`, `### References`) —
+   then the **knowledge extraction agent**, which reads each marker's anchor, writes the page body
+   from the session slice, and saves it through `knowledge.write_unit`.
 
 `session_extraction_enabled` (default `true`) and `knowledge_idle_hours` (default `24`; `0` fires
 on the next tick) control it. Both need `reasoning_enabled: true`; with reasoning off the provider
@@ -347,17 +350,16 @@ drains it from the host's `state.db` (plus the uncommitted buffer), calls the au
 publishes into `layer_state`/`conclusions`. Each base refresh also appends one structured row to
 `base_refreshes` (session, time window, actual turn range, the six outputs, `is_latest`); one base
 window has one job.
-`prefetch()` injects only the newest base revision note (`## Base Revision`, bounded to 1200 chars)
-ahead of recall. Recall covers explicit memory only — the current session's markers plus durable
-markers, and the session's todo list; every derived artifact (the six base conclusions, the review
-note, chunks
-and summaries) stays explicit-recall through `minir_search`. Another session's rows are reachable
-only through `minir_search(scope="all")`, never by automatic injection. Advice has one producer
+`prefetch()` injects the live base row's `ai_self_representation` (≤400 chars) and
+`window_summary` (≤2000 chars; Objective and Current State are kept whole and only the other six
+sections are truncated), plus the session's todo list. It injects neither knowledge page paths nor
+explicit recall: `minir_kb_search` and `minir_search` are the retrieval surfaces. Another session's
+rows are reachable only through `minir_search(scope="all")`, never by automatic injection. Advice has one producer
 (the live reviewer); the dialectic layer writes no advice at all.
 
 | Layer | Models | Artifact sections | Subject key |
 | --- | --- | --- | --- |
-| base | this profile's user: window + previous cards, three staged JSON passes on `auxiliary.minir_dialectic` | `## User Card`, `## AI Card`, `## Window Summary`, `## Value Markers` | `user:<id>` |
+| base | this profile's user: B1 writes the user card, starts B3 (summary) and B4 (markers) through `minir_agents`, then B2 writes the AI card on `auxiliary.minir_dialectic` | `## User Card`, `## AI Card`, `## Window Summary`, `## Value Markers` | `user:<id>` |
 | dialectic | the live base artifact + its own evidence window; reviews drift and replaces whole parts | `## Base Revision` only (cards stay on the base layer, no advice) | `agent:<profile>:<identity>` |
 
 The review's **evidence** window starts at its own watermark and ends at the live edge; the base
@@ -373,36 +375,43 @@ It returns one review object:
 empty `prunings`. A listed part is replaced in full, so a review cannot half-update a card. The
 pass count is adaptive: short windows get one synthesis, longer ones add a self-audit and a
 reconcile, capped by `dialectic_depth`. A failed or malformed pass falls back to the last valid
-one. `layer_state.version` counts refreshes; the newest review note is what `prefetch` injects.
+one. `layer_state.version` counts refreshes; `prefetch` reads the live base row's two columns, and
+the newest review note stays searchable.
 
-A base refresh runs **four ordered passes** on the `auxiliary.minir_dialectic` route. Each system prompt is
+A base refresh is **one orchestration pass (B1), two child agents (B3, B4), then one AI-card pass
+(B2)** on the `auxiliary.minir_dialectic` route. Each system prompt is
 built at call time from the pass's core asset under `plugin/minir/agents/`, the rule texts that
 pass reads and the output contract; the
-rule files in `plugin/minir/rules/*.md` are passed as text (`rules.rule_text`), untransformed, and
-B3 receives the section template while B4 receives the two marker rules in its user message. An
+rule files in `plugin/minir/rules/*.md` are passed as text (`rules.rule_text`), untransformed. An
 operator override under `$HERMES_HOME/minir-memory/rules/` replaces a packaged file and falls back
-with a warning when it is unreadable. Each pass returns **one JSON object** whose card values are
-markdown bodies (no code fence, no front-matter); the worker validates it against the same rules
-the reviewer reads, and only a validated object is rendered into the artifact. The
-`minir` toolset is attached on this route, and the tool hint carries the window bounds: a pass
-may call `minir_hermes_session_search` with `after`/`before` for evidence inside `(from_ts, to_ts]`, but
+with a warning when it is unreadable. The worker writes the window digest and the previous markers
+to scratch files and gives B1 their paths; B1 calls `minir_agents` for B3 (`tool_sets` file +
+session_search) and B4 (file + minir + session_search), copying B3's markdown verbatim and B4's
+JSON array. A failed child leaves its key empty; the worker retries that one child once and fails
+the refresh if the summary still cannot be produced. B2 runs last, so the six `ai_self` fields see
+this window's ledger. Each pass returns **one JSON object** whose card values are markdown bodies
+(no code fence, no front-matter); the worker validates it against the same rules the reviewer
+reads, and only a validated object is rendered into the artifact. The `minir` toolset is attached
+on this route, and the tool hint carries the window bounds: a pass may call
+`minir_hermes_session_search` with `after`/`before` for evidence inside `(from_ts, to_ts]`, but
 must not read later turns. The first user message is the only allowed outside-window evidence, and
 only on the first refresh.
 
-1. **user card** — the previous user card + this window (+ the first user message as intent anchor
-   on bootstrap) → `{"user_self_representation": "<markdown>", "user_preferences": "<markdown>"}`;
-2. **AI card** — the user card just derived + the previous AI card + operator identity/preference
-   files + `plugin.yaml` + this window → `{"ai_self_representation": "<markdown>", "ai_identity": "<markdown>"}`.
-   Identity claims come from the operator files or the manifest; there is no field contract and no
-   verbatim check, and a fact neither source declares is left out;
-3. **window summary** — the two cards + this window → `{"window_summary": "<the section>"}`. The
-   value is one markdown section following `templates/window_summary.md`; the prompt states the
-   caps and `window_summary.validate` only checks that the value is a string;
-4. **value markers** — this window + the recorded value markers → `{"value_markers": [...]}`. Markers carry one
-   primary category (`KNOWLEDGE`, `VALUE`, `INTENT`, `METHOD`, `GOVERNANCE`), one primary org
-   (`entities`, `trajectories`, `experiences`, `tools`, `projects`), a stable `topic`, and
-   `epistemic` for `KNOWLEDGE` only. At most 16 value markers per window, 160 characters each; a marker
-   merges with an existing one when category, org and topic all match.
+1. **B1 user card** — the previous user card + this window (+ the first user message as intent
+   anchor on bootstrap) → `{"user_self_representation", "user_preferences", "window_summary",
+   "value_markers"}`, where the last two are the children's answers copied verbatim;
+2. **B3 window summary** — the window digest + the previous summary of *this session* → the
+   eight-section markdown. `objective` is the complete goal ledger (one goal per line, no ids, no
+   status); `Current State` groups those goals under Done/Doing/Todo. The prompt is the only
+   enforcement: `window_summary.validate` checks that the value is a string;
+3. **B4 value markers** — the digest + the previous markers + the marker rules →
+   `{"value_markers": [...]}`. Each marker is `{id, info_type, topic, why, relations, render_plan,
+   anchor, objects}`: an index and a render plan, never a page body. `anchor` is required; the
+   `knowledge_render` pass reads that slice and writes the page;
+4. **B2 AI card** — B1's user card + this window's summary + the previous AI card + operator
+   identity/preference files + `plugin.yaml` → `{"ai_self_representation", "ai_identity"}`. The
+   identity is written first; the six AI-self fields (positioning, current task, current goal,
+   1-3 state facts, state, uncertainty) cite the summary's goal lines instead of restating them.
 
 The baseline order is **global card files -> newest row for the subject -> preset**. The four
 files under `$HERMES_HOME/minir-memory/` (see below) are the durable state once they exist; the
@@ -580,37 +589,37 @@ It runs on the `minir_card_view` route with no tools (files and evidence are inl
 
 ### Knowledge pages
 
-Pass 4 value markers also feed a file layer: one page per `(category, org, topic)` under
-`$HERMES_HOME/minir-memory/knowledge/<org>/<CATEGORY>-<slug>.md`. The filename is stable for a
+B4's value markers feed a file layer: one page per `(category, org, topic)` under
+`$HERMES_HOME/minir-memory/knowledge/<org>/<CATEGORY>-<slug>.md`. The orgs are `entities`,
+`trajectories`, `experiences`, `events`, `tools` and `projects`; a single dated occurrence with no
+reusable lesson files under `events`, and the lesson it did leave would file under `experiences`.
+The filename is stable for a
 topic (CJK preserved, separators stripped, collisions hashed); a rewrite bumps `revisions` in the
 front-matter, an older `time` never overwrites a newer page, and the per-file
 `knowledge_token_budget` (2000 by default) rejects an over-long page, keeping the old one and
-writing `_failed/<CATEGORY>-<slug>.json`. The `KnowledgePipeline` consumer is a daemon thread with
-a bounded queue (512, oldest dropped with a counter); a failed marker never propagates into a base
-job. `agents/knowledge_render.md` is the page renderer's agent contract: the idle-session extraction
+writing `_failed/<CATEGORY>-<slug>.json`. A failed page never propagates into a base job.
+`agents/knowledge_render.md` is the page renderer's agent contract: the idle-session extraction
 pass runs it, with `rules/markers-category.md` and `rules/markers-org.md` appended to its system
-prompt, to write pages from a finished session. The marker-to-page write path still renders a body
-from the unit itself and calls a `render` callable only when a caller supplies one.
+prompt, to write pages from a finished session. A marker supplies the page's classification, its
+`render_plan` and the `anchor` slice to re-read; the body always comes from the session, never from
+the marker.
 
-Retrieval is by **path, never by content**: `prefetch()` asks the profile's managed `rg` (found
-through `<HERMES_HOME>/tools/facts.json`, `PATH` as fallback) which pages mention a query term,
-then scores only those front-matters (objects 2x, word overlap 1x, recency 0.5x), selects at most
-6 paths within 700 characters and injects them as `[knowledge — retrieve on demand] ... [end
-knowledge]`. Without ripgrep the selection scans the org folders instead of going blind. Paths
-selected in the last three turns are skipped. The model opens a page with its file tool when the
-hint is relevant, or calls `minir_kb_search` to search the directory's text when the hint is not
-enough.
+Retrieval is explicit: `minir_kb_search` searches the page text with the profile's managed `rg`
+(found through `<HERMES_HOME>/tools/facts.json`, `PATH` as fallback), preferring body lines, and
+the model opens a page with its file tool. `prefetch()` does not inject page paths; the profile's
+`knowledge.select_paths` scorer still backs the adviser's seed index.
 
 ### The transcript event store
 
 Completed host turns and every layer pass are appended to
-`$HERMES_HOME/minir-memory/sessions/<platform>/<layer>/<session_id>.jsonl`: one JSON object per
+`$HERMES_HOME/minir-memory/sessions/<profile>/<layer>/<session_id>.jsonl`: one JSON object per
 line, one line per event, never rewritten, compressed or deleted. Host streams use the `host`
 layer; base, dialectic, card_review, adviser and `minir_agents` runs use their own layer
-directory, partitioned by the `platform` the host passed to `initialize`. Parts rotate at 2000
-lines (`<session_id>.partN.jsonl`) and reads continue across them by `seq`.
+directory, partitioned by the profile `initialize` resolved. Parts rotate at 2000 lines
+(`<session_id>.partN.jsonl`) and reads continue across them by `seq`. The adviser's reasoning
+trail is raw text in `sessions/<profile>/reasoning/<session_id>.log`.
 
-Each row carries `v`, `seq`, `ts`/`iso`, `platform`/`layer`/`session_id`, `turn`/`step`, `role`
+Each row carries `v`, `seq`, `ts`/`iso`, `profile`/`layer`/`session_id`, `turn`/`step`, `role`
 (`user`/`system`/`assistant`/`tool`/`reasoning`), `kind` (`msg`/`aux`/`run_start`/`run_end`/`gap`/
 `marker`), `run_id`, `redacted`, and the role's own fields (`text`, `tool_calls`, `usage`,
 `tool_call_id`, `result`, `fp`, ...). Bodies are full: the 4000-character cut and whitespace
@@ -705,7 +714,8 @@ stable across windows and leaves the evidence replaceable.
 ## The adviser auxiliary (optional agent loop)
 
 `adviser.py` owns the plugin's auxiliary routes, and the loop they feed runs a **real agent loop**
-(its own LLM and tools) rather than a one-shot completion. The base layer's four passes and the
+(its own LLM and tools) rather than a one-shot completion. The base refresh (B1 + its B3/B4
+children + B2) and the
 independent review share `auxiliary.minir_dialectic` (`worker._adviser_consult`); the adviser chain
 keeps `auxiliary.adviser`, the card review uses `auxiliary.minir_card_view` and knowledge
 extraction `auxiliary.minir_knowledge`. The loop is not route-specific: it lives in
@@ -757,7 +767,7 @@ off the event loop, and `close()` still happens in the thread that built the age
 message for the worker's internal synchronous path. There is no model-visible consult tool: its
 schema, handler, dynamic registration, prompt section and toolset were deleted. The host session
 search is registered synchronously (`is_async=False`); its handler injects the caller class and
-platform, so a model cannot pick another layer or widen the filter by argument.
+platform, so a model cannot pick another layer or widen the host-session filter by argument.
 
 ```yaml
 auxiliary:
@@ -981,12 +991,12 @@ window has consumed **95% of the configured threshold** (`last_prompt_tokens >=
 1. `on_pre_compress` sets a per-session **compression gate**, queues the base job for the
    unreasoned window, drains the base and review jobs **synchronously** (base first), resets both
    layer counters to the current turn, and leaves the gate in place.
-2. `compress()` reads the prepared chunk and dialectic review, runs a real **summary agent** on
-   the `auxiliary.adviser` route with the `minir` toolset, and produces the final
-   `session_summary`. The agent may call `minir_hermes_session_search` with `before=<window end>`,
-   `include_inactive=True` and `include_compacted=True`; it never reads later turns. Its system
-   prompt is the operator Task Handoff template (`prompts/session_handoff.md`, override with
-   `MINIR_SUMMARY_TEMPLATE`) plus the audit rules.
+2. `compress()` calls B3 once more, with the newest base window summary as its merge baseline and
+   the turns since that window's `window_to_ts` as its digest. The pass runs on the gateway route
+   with no tools, `layer="window_summary"` and a 90-second budget; its system prompt is B3's core
+   plus `templates/window_summary.md`. The reply is cleaned, not validated: a summary missing a
+   section is still folded, and a failed call folds the previous base summary (or the empty
+   template when there is none).
 3. The returned message list is:
 
 ```text
@@ -1044,6 +1054,22 @@ to the prepared chunk/review (or the previous summary) so the window still shrin
 * **Legacy rows** without a `message_uid` are simply not recoverable by id; the engine never fails
   closed on them.
 
+## Data layout
+
+Everything the plugin writes lives under `$HERMES_HOME/minir-memory/`:
+
+    memory.db          SQLite: conclusions + FTS, layer artifacts, jobs, usage, extraction, adviser
+    sessions/          <profile>/<layer>/<session>.jsonl transcripts; .log for the reasoning trail
+    knowledge/         <org>/<CATEGORY>-<slug>.md durable pages
+    user/              operator-written user cards (identity.md, preference.md)
+    agents/<profile>/  the agent's own cards
+    run/               one process lock per live process
+
+Conclusions are searched with `minir_search`, pages with `minir_kb_search`, the host's
+conversation with `minir_hermes_session_search`, and the plugin's own transcripts with
+`minir_aiagent_search`. The bundled `minir:data-layout` skill carries the per-table, per-field
+and per-file reference; load it before inspecting any of these by hand.
+
 ## Install & activate
 
 Clone the repo anywhere, then install the plugin **into a directory whose name equals the
@@ -1095,9 +1121,8 @@ memory:
     dialectic_cadence: 8       # turns per review job; the two layers never share a watermark
     dialectic_depth: 2         # upper bound: 1 synthesize, 2 audit, 3 reconcile (adaptive by window size)
     reasoning_enabled: true    # run the layer reasoning passes (auxiliary model, no key needed)
-    handoff_enabled: true      # let compression call the summary agent
     session_mode: default      # mode stamped on each newly opened session
-    prefetch_limit: 5          # memory items injected per turn
+    prefetch_limit: 5          # cap for one minir_search result set
     content_language: en       # language for card/knowledge prose; field names stay English
     buffer_streams: 20         # transcript streams cached in memory (current session pinned)
     buffer_events_per_stream: 4000  # per-stream cache cap; the JSONL file keeps everything
@@ -1123,7 +1148,7 @@ memory:
 hand-edited config.yaml are equivalent. Most keys also have an env override —
 `MINIR_CONTEXT_CADENCE`, `MINIR_DIALECTIC_CADENCE`, `MINIR_DIALECTIC_DEPTH`,
 `MINIR_BASE_INTERVAL`, `MINIR_DIALECTIC_INTERVAL`, `MINIR_REASONING_ENABLED`,
-`MINIR_HANDOFF_ENABLED`, `MINIR_SESSION_MODE`, `MINIR_PREFETCH_LIMIT`, `MINIR_CONTENT_LANGUAGE`,
+`MINIR_SESSION_MODE`, `MINIR_PREFETCH_LIMIT`, `MINIR_CONTENT_LANGUAGE`,
 `MINIR_CARD_TOKEN_BUDGET`, `MINIR_CARD_REVIEW_DAYS`, `MINIR_KNOWLEDGE_TOKEN_BUDGET`,
 `MINIR_SESSION_EXTRACTION`, `MINIR_KNOWLEDGE_IDLE_HOURS`, `MINIR_BUFFER_STREAMS`,
 `MINIR_BUFFER_EVENTS`, `MINIR_BUFFER_BYTES` — and **the
@@ -1131,7 +1156,8 @@ env var wins** when both are set. Layer intervals, depth, `reasoning_enabled` an
 cache budget are read when a session opens.
 
 Every published conclusion is searchable: the six base conclusions, the tool markers, the
-dialectic review, local compression chunks, and the final `session_summary` of each compression. The index uses
+dialectic review, the compression record written at each fold, and the final `session_summary` of
+the idle close. The index uses
 FTS5 `trigram` so Chinese queries work; if the SQLite build lacks FTS5, `minir_search` falls back
 to a token scan. Dialectic refreshes are a separate audit surface (`search_base_revisions`,
 trigram over the six pre-overwrite fields); pending advices live in `advisories` and are
@@ -1200,12 +1226,10 @@ package is `plugin/minir`, so it is never collected as a test module.
    you a durable, permission-scoped transcript, replace the buffer and make
    `LayerWorker.expire_orphans` re-queue instead of expiring (that is the only reason the jobs
    table has an expiry path at all).
-4. **Rework recall**: `_search` + `_format_block` decide what reaches the prompt. If
-   your backend is remote, never call it from `prefetch()` — queue in `queue_prefetch()`
-   and return the cached block from `prefetch()` (the host bounds `prefetch()` with a
+4. **Rework injection**: `_layer_block` assembles the live AI self + window summary block; keep the
+   read one indexed row and never call a remote backend from `prefetch()` (the host bounds it with a
    timeout and skips a provider whose previous call is still running).
-5. **Retune the layer prompts**: `worker.BASE_SYSTEM_PROMPT` / `DIALECTIC_SYSTEM_PROMPT` and
-   `LAYER_SECTIONS` are the whole semantic contract of a refresh — the section headings are
+5. **Retune the layer prompts**: the agent cores under `agents/` and `worker.LAYER_SECTIONS` are the whole semantic contract of a refresh — the section headings are
    validated, so changing them changes what the worker will accept.
 6. **Add tools**: a schema dict + a branch in `handle_tool_call`. Return
    `json.dumps({...})` on success and `tool_error("...")` on failure.
@@ -1214,7 +1238,7 @@ package is `plugin/minir`, so it is never collected as a test module.
 
 ## Pitfalls this template already handles
 
-* **Threading** — `sync_turn`, `queue_prefetch`, and `prefetch` run on different host
+* **Threading** — `sync_turn` and `prefetch` run on different host
   threads, and the layer worker is a third one; `store.py` shares one connection
   (`check_same_thread=False`) under an RLock with WAL mode, `transcript.py` guards its
   buckets, and the worker claims one job at a time with a single `UPDATE`.
@@ -1234,8 +1258,8 @@ package is `plugin/minir`, so it is never collected as a test module.
   the provider block itself when the plugin does not override `save_config`). That deliberate
   non-override keeps the write atomic and under the host's config lock; every field also carries
   an `env_var` (`MINIR_PREFETCH_LIMIT`, `MINIR_CONTEXT_CADENCE`, `MINIR_DIALECTIC_CADENCE`,
-  `MINIR_DIALECTIC_DEPTH`, `MINIR_REASONING_ENABLED`, `MINIR_HANDOFF_ENABLED`,
-  `MINIR_SESSION_MODE`) and the env var wins over config.yaml. Override
+  `MINIR_DIALECTIC_DEPTH`, `MINIR_REASONING_ENABLED`, `MINIR_SESSION_MODE`) and the env var wins
+  over config.yaml. Override
   `save_config(values, hermes_home)` only if your values need a native format the host cannot
   write.
 * **Everything injected is bounded** — stored conclusions and artifacts are truncated on write

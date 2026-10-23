@@ -10,7 +10,7 @@ The run's full conversation is handed to :class:`~minir.transcript.TranscriptBuf
 before this tool returns, so the answer and the audit file agree. The path follows the buffer's
 aux namespace::
 
-    <HERMES_HOME>/minir-memory/sessions/<platform>/<agent_name>/<layer_session_id>.jsonl
+    <HERMES_HOME>/minir-memory/sessions/<profile>/<agent_name>/<layer_session_id>.jsonl
 
 ``layer_session_id`` is the provider session that called the tool. If the provider has no session
 id (early/manual call), a timestamped name is used instead of a shared ``session.jsonl``.
@@ -32,7 +32,7 @@ from typing import Any, Optional
 
 from tools.registry import tool_error
 
-from . import agent_loop, file_guard
+from . import agent_history, agent_loop, file_guard
 
 logger = logging.getLogger(__name__)
 
@@ -291,6 +291,8 @@ def run(provider: Any, args: dict[str, Any]) -> str:
             history=history or None,
             layer=name,
             history_session=session_id,
+            # The parent is the layer that called the tool; the depth counts this child.
+            meta={"agent": name, "parent": agent_history.current_layer(), "depth": depth + 1},
             # A custom agent is closer to the main agent than to a layer pass: memory, context
             # files and soul on by default, background review fork still off.
             skip_memory=_flag(args, "skip_memory", False),

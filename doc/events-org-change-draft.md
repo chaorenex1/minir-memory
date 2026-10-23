@@ -1,6 +1,6 @@
 # events org 变更草稿
 
-状态：待批准。工作树已回退，代码与规则未改。
+状态：已实现（2026-10-23）。ORGS、markers-org v3、README、术语/规则草稿和 test_knowledge 已同步。
 
 ## 1. 目标
 
@@ -19,10 +19,12 @@
 | --- | --- | --- |
 | `plugin/minir/layers.py` | ORGS | 加 `"events"`：`("entities", "trajectories", "experiences", "events", "tools", "projects")` |
 | `plugin/minir/rules/markers-org.md` | 头部与 CONTRACT | version 2→3；ORGS 加 events 定义；SELECTION 加 events 一步；EXAMPLES 加 events 例；OBJECTS 的 "five orgs" 改为 "orgs"；REVIEW CHECKS 加 events/experiences 误分检查 |
-| `README.md` | 403 附近 | org 列表加 `events` |
+| `plugin/minir/extraction.py` | `validate_pages` | `events` + `KNOWLEDGE` 强制 `epistemic = "fact"` |
+| `plugin/minir/knowledge.py` | `_write_unit` | 同上，直接写页也强制 fact |
+| `README.md` | Knowledge pages 节 | org 列表加 `events` |
 | `doc/layer-terminology-draft.md` | org 行 | 加 `events` |
 | `doc/rule-files-draft.md` | ORGS / SELECTION / EXAMPLES | 加 events 定义、选择顺序与示例 |
-| `tests/test_knowledge.py` | 写页测试附近 | 新增 `test_events_org_is_a_valid_knowledge_page`：写一页 `org="events"` 的 KNOWLEDGE 页，断言落在 `events/` 且 front-matter 的 org 正确 |
+| `tests/test_knowledge.py` | 写页测试附近 | 新增 `test_events_org_is_a_valid_knowledge_page`（写页落在 `events/`、front-matter org 正确、kb_search 可见）与 `test_events_pages_are_facts`（`validate_pages` 强制 fact） |
 
 ## 4. 自动生效的路径
 
@@ -49,7 +51,7 @@
 - 风险：文档里旧的"五个 org"说法漏改。已列在上表。
 - 回退：撤销 ORGS 一行、rules 回 version 2、文档列表回退、删除新增测试；无数据迁移，因为现有知识目录没有 events 子目录。
 
-## 8. 批准前需要确认
+## 8. 已定
 
-- 是否只在规则层新增，还是同时允许 `knowledge_render` 默认产出 events 页。
-- `events` 页的 `epistemic` 是否固定 `fact`（当前草稿按 fact）。
+- knowledge_render 遵循 markers-org 选择 org，可产出 events 页；没有第二份白名单。
+- events 页的 `epistemic` 固定 `fact`：`extraction.validate_pages` 与 `knowledge._write_unit` 都强制。

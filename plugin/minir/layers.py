@@ -30,9 +30,10 @@ USER_PARTS: tuple[str, ...] = ("user_self_representation", "user_preferences")
 AI_PARTS: tuple[str, ...] = ("ai_self_representation", "ai_identity")
 
 CATEGORIES: tuple[str, ...] = ("KNOWLEDGE", "VALUE", "INTENT", "METHOD", "GOVERNANCE")
-ORGS: tuple[str, ...] = ("entities", "trajectories", "experiences", "tools", "projects")
+ORGS: tuple[str, ...] = ("entities", "trajectories", "experiences", "events", "tools", "projects")
 EPISTEMIC: tuple[str, ...] = ("fact", "inference", "hypothesis", "prediction")
-RELATION_TYPES: tuple[str, ...] = ("supersedes", "caused_by", "part_of", "contradicts")
+RELATION_TYPES: tuple[str, ...] = ("supersedes", "caused_by", "part_of", "contradicts",
+                                   "updates", "instance_of")
 PART_NAMES: tuple[str, ...] = (
     "user_self_representation", "user_preferences",
     "ai_self_representation", "ai_identity", "window_summary",
@@ -48,6 +49,7 @@ _PRESET_OCCUPATION = {"zh": "软件开发工程师", "en": "Software Development
 
 MAX_UNITS = 16
 MAX_UNIT_CONTENT = 160
+MAX_UNIT_WHY = 160
 MAX_UNIT_TOPIC = 40
 MAX_UNIT_RELATIONS = 3
 MAX_UNIT_OBJECTS = 5
@@ -74,6 +76,7 @@ def prompt_vars() -> dict[str, Any]:
     """The values an agent prompt may interpolate: each cap comes from the code that owns it."""
     return {
         "MAX_UNITS": MAX_UNITS, "MAX_UNIT_CONTENT": MAX_UNIT_CONTENT,
+        "MAX_UNIT_WHY": MAX_UNIT_WHY,
         "MAX_UNIT_TOPIC": MAX_UNIT_TOPIC, "MAX_UNIT_RELATIONS": MAX_UNIT_RELATIONS,
         "MAX_UNIT_OBJECTS": MAX_UNIT_OBJECTS,
         **summary_template.PROMPT_VARS,
@@ -103,10 +106,12 @@ OUTPUT_B1 = """OUTPUT
 Return exactly one JSON object:
 {
   "user_self_representation": "<markdown body>",
-  "user_preferences": "<markdown body>"
+  "user_preferences": "<markdown body>",
+  "window_summary": "<the B3 child's markdown, copied verbatim>",
+  "value_markers": [<the B4 child's marker objects, copied verbatim>]
 }
-Both values are markdown text, not objects: the body as you want it in the file. An empty string is
-a valid empty card. No code fence, no extra keys.
+The card values are markdown text, not objects; an empty string is a valid empty card. A failed
+child leaves its key as "" or []. No code fence, no extra keys.
 """
 
 OUTPUT_B2 = """OUTPUT
@@ -236,6 +241,19 @@ def validate_user_card(value: Any) -> dict[str, str]:
     return {part: validate_card_body(data[part], f"user_card.{part}") for part in USER_PARTS}
 
 
+def validate_base_pass(value: Any) -> dict[str, Any]:
+    """B1's reply: the user card plus the two child artifacts, each validated by its own owner."""
+    data = _keys(value, "base_pass",
+                 ("user_self_representation", "user_preferences", "window_summary",
+                  "value_markers"))
+    card = validate_user_card({
+        "user_self_representation": data["user_self_representation"],
+        "user_preferences": data["user_preferences"]})
+    summary = validate_summary_pass({"window_summary": data["window_summary"]})["window_summary"]
+    markers = validate_value_markers({"value_markers": data["value_markers"]})
+    return {**card, "window_summary": summary, "value_markers": markers}
+
+
 def validate_ai_card(value: Any) -> dict[str, str]:
     data = _keys(value, "ai_card", AI_PARTS)
     return {part: validate_card_body(data[part], f"ai_card.{part}") for part in AI_PARTS}
@@ -250,7 +268,12 @@ def validate_ai_identity(value: Any) -> str:
 
 
 def validate_value_markers(value: Any, *, previous: Any = None) -> list[dict[str, Any]]:
-    """The value markers: one primary category, one primary org, one stable topic each."""
+    """B4's markers: an index and a render plan, never the knowledge body.
+
+    Each marker carries ``info_type`` (a short label, replacing category+epistemic), a stable
+    ``topic``, ``why`` it lasts, its ``relations``, the ``render_plan``, the required ``anchor``
+    and the ``objects`` used for retrieval. Page classification stays with ``knowledge_render``.
+    """
     data = _keys(value, "value_markers", ("value_markers",))
     value_markers = data["value_markers"]
     if not isinstance(value_markers, list):
@@ -261,30 +284,19 @@ def validate_value_markers(value: Any, *, previous: Any = None) -> list[dict[str
     seen_ids: set[str] = set()
     for index, entry in enumerate(value_markers):
         path = f"value_markers[{index}]"
-        data_unit = _keys(entry, path, ("id", "org", "category", "topic", "content", "time",
-                                        "relations", "objects"),
-                          optional=("epistemic",))
+        data_unit = _keys(entry, path, ("id", "info_type", "topic", "why", "relations",
+                                        "render_plan", "anchor", "objects"))
         unit_id = _string(data_unit["id"], f"{path}.id", 40, allow_empty=False)
         if unit_id in seen_ids:
             _fail(f"{path}.id", f"duplicate unit id {unit_id!r} in one window")
         seen_ids.add(unit_id)
-        if data_unit["org"] not in ORGS:
-            _fail(f"{path}.org", f"must be one of {', '.join(ORGS)}")
-        category = data_unit["category"]
-        if category not in CATEGORIES:
-            _fail(f"{path}.category", f"must be one of {', '.join(CATEGORIES)}")
-        epistemic = data_unit.get("epistemic")
-        if category == "KNOWLEDGE":
-            if epistemic not in EPISTEMIC:
-                _fail(f"{path}.epistemic",
-                      f"KNOWLEDGE requires one of {', '.join(EPISTEMIC)}")
-        else:
-            # A non-KNOWLEDGE marker is not a knowledge claim. Drop the stray value instead of
-            # failing the window: the field is meaningless there, not evidence of a bad pass.
-            epistemic = ""
+        info_type = _string(data_unit["info_type"], f"{path}.info_type", MAX_UNIT_TOPIC,
+                            allow_empty=False)
         topic = _string(data_unit["topic"], f"{path}.topic", MAX_UNIT_TOPIC, allow_empty=False)
         if len(topic) < 2:
             _fail(f"{path}.topic", "must be at least 2 characters")
+        why = _clamped(data_unit["why"], f"{path}.why", MAX_UNIT_WHY)
+        render_plan = _clamped(data_unit["render_plan"], f"{path}.render_plan", MAX_UNIT_WHY)
         relations = data_unit["relations"]
         if not isinstance(relations, list) or len(relations) > MAX_UNIT_RELATIONS:
             _fail(f"{path}.relations", f"must be an array of at most {MAX_UNIT_RELATIONS}")
@@ -294,10 +306,9 @@ def validate_value_markers(value: Any, *, previous: Any = None) -> list[dict[str
             rel = _keys(relation, rel_path, ("type", "ref"))
             if rel["type"] not in RELATION_TYPES:
                 _fail(f"{rel_path}.type", f"must be one of {', '.join(RELATION_TYPES)}")
-            ref = _string(rel["ref"], f"{rel_path}.ref", 40, allow_empty=False)
-            if ref not in {unit["id"] for unit in value_markers if isinstance(unit, dict)}:
-                _fail(f"{rel_path}.ref", f"references {ref!r}, which is not in this window")
-            clean_relations.append({"type": rel["type"], "ref": ref})
+            clean_relations.append({
+                "type": rel["type"],
+                "ref": _string(rel["ref"], f"{rel_path}.ref", 200, allow_empty=False)})
         objects = data_unit["objects"]
         if not isinstance(objects, list) or len(objects) > MAX_UNIT_OBJECTS:
             _fail(f"{path}.objects", f"must be an array of at most {MAX_UNIT_OBJECTS}")
@@ -310,26 +321,35 @@ def validate_value_markers(value: Any, *, previous: Any = None) -> list[dict[str
             if kind not in ORGS:
                 _fail(f"{path}.objects[{obj_index}]", f"unknown object type {kind!r}")
             clean_objects.append(text)
+        anchor = data_unit["anchor"]
+        if not isinstance(anchor, dict):
+            _fail(f"{path}.anchor", "is required and must be an object")
+        try:
+            anchor_from = float(anchor["from_ts"])
+            anchor_to = float(anchor["to_ts"])
+        except (KeyError, TypeError, ValueError):
+            _fail(f"{path}.anchor", "needs numeric from_ts and to_ts")
+        message_ids = anchor.get("message_ids") or []
+        if not isinstance(message_ids, list) or len(message_ids) > 50:
+            _fail(f"{path}.anchor.message_ids", "must be an array of at most 50 ids")
         cleaned.append({
-            "id": unit_id, "org": data_unit["org"], "category": category,
-            "epistemic": epistemic if category == "KNOWLEDGE" else "",
-            "topic": topic,
-            "content": _clamped(data_unit["content"], f"{path}.content", MAX_UNIT_CONTENT),
-            "time": _string(data_unit["time"], f"{path}.time", 40),
-            "relations": clean_relations, "objects": clean_objects,
+            "id": unit_id, "info_type": info_type, "topic": topic, "why": why,
+            "relations": clean_relations, "render_plan": render_plan,
+            "anchor": {"from_ts": anchor_from, "to_ts": anchor_to,
+                       "message_ids": [str(item)[:100] for item in message_ids]},
+            "objects": clean_objects,
         })
     return _merge_units(cleaned, previous)
 
 
 def _merge_units(value_markers: list[dict[str, Any]], previous: Any) -> list[dict[str, Any]]:
-    """Same category + org + topic is one unit: new evidence replaces the old body, time, links."""
-    merged: dict[tuple[str, str, str], dict[str, Any]] = {}
+    """Same ``info_type`` + ``topic`` is one unit: new evidence replaces the old plan."""
+    merged: dict[tuple[str, str], dict[str, Any]] = {}
     for unit in previous or []:
-        if isinstance(unit, dict):
-            key = (str(unit.get("category")), str(unit.get("org")), str(unit.get("topic")))
-            merged[key] = unit
+        if isinstance(unit, dict) and unit.get("info_type"):
+            merged[(str(unit.get("info_type")), str(unit.get("topic")))] = unit
     for unit in value_markers:
-        merged[(unit["category"], unit["org"], unit["topic"])] = unit
+        merged[(unit["info_type"], unit["topic"])] = unit
     return list(merged.values())
 
 
@@ -463,8 +483,10 @@ def _section(title: str, text: str) -> str:
 def render_markers(value_markers: list[dict[str, Any]]) -> str:
     lines: list[str] = []
     for unit in value_markers:
-        tag = f"{unit['category']}:{unit['epistemic']}" if unit["epistemic"] else unit["category"]
-        lines.append(f"- [{tag}/{unit['org']}] {unit['topic']} — {unit['content']}")
+        anchor = unit.get("anchor") or {}
+        where = f"{anchor.get('from_ts')}–{anchor.get('to_ts')}"
+        lines.append(f"- [{unit['info_type']}] {unit['topic']} — {unit['why']} "
+                     f"(anchor {where})")
     heading = "## Value Markers"
     return heading + ("\n" + "\n".join(lines) if lines else "")
 

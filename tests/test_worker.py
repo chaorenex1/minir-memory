@@ -7,7 +7,9 @@ persists no conversation content.
 from __future__ import annotations
 
 import json
+import re
 import time
+from pathlib import Path
 
 import pytest
 
@@ -109,9 +111,11 @@ def _blank_identity() -> str:
 
 
 def _units():
-    return [{"id": "k1", "org": "tools", "category": "KNOWLEDGE", "epistemic": "fact",
-             "topic": "pytest verification", "content": "pytest is the project's verify command.",
-             "time": "2026-10-21", "relations": [], "objects": []}]
+    return [{"id": "k1", "info_type": "experience", "topic": "pytest verification",
+             "why": "a later build needs the project's verify command",
+             "relations": [], "render_plan": "write the experiences page for pytest",
+             "anchor": {"from_ts": 0.0, "to_ts": 1.0, "message_ids": []},
+             "objects": []}]
 
 
 def _user_json(*, user_self_representation: str | None = None,
@@ -171,13 +175,7 @@ def worker(plugin_package, store, transcript):
         calls.append({"task": task, "system": system, "prompt": prompt})
         if "dialectic reviewer" in system:
             return _dialectic_json()
-        if "baseline_user_card" in prompt:
-            return _user_json()
-        if "baseline_ai_card" in prompt or "plugin_yaml" in prompt:
-            return _ai_json()
-        if "<markers-category>" in prompt:
-            return _units_json()
-        return _summary_json()
+        return _reply_for(prompt)
 
     instance = plugin_package.worker.LayerWorker(
         store, transcript, complete=complete)
@@ -185,14 +183,24 @@ def worker(plugin_package, store, transcript):
     return instance
 
 
+def _base_pass_json(*, user_self_representation: str | None = None,
+                    user_preferences: str | None = None, summary: str | None = None,
+                    value_markers=None) -> str:
+    """B1's orchestration reply: the user card plus both child artifacts."""
+    return json.dumps({
+        "user_self_representation": _user_self() if user_self_representation is None else user_self_representation,
+        "user_preferences": _user_prefs() if user_preferences is None else user_preferences,
+        "window_summary": _section() if summary is None else summary,
+        "value_markers": _units() if value_markers is None else value_markers,
+    })
+
+
 def _reply_for(prompt):
     """The pass the worker is running, picked by a block only that pass carries."""
-    if "<markers-category>" in prompt:
-        return _units_json()
+    if "<baseline_ai_card>" in prompt:
+        return _ai_json()
     if "<window_template>" in prompt:
-        return _summary_json()
-    if "baseline_user_card" in prompt:
-        return _user_json()
+        return _base_pass_json()
     return _ai_json()
 
 
@@ -208,13 +216,13 @@ def _dispatch(store, transcript, session, layer, from_ts, to_ts, turns=0):
 def test_the_base_passes_read_a_transcript_digest(worker, store, transcript):
     """The prompt's window is the pass's own projection, with a coverage line."""
     transcript.add(SESSION, "user", "deploy it", created_at=time.time() - 1)
-    transcript.append_event("host", SESSION, "user", text="deploy it", platform="cli")
-    transcript.append_event("host", SESSION, "assistant", text="done", platform="cli")
+    transcript.append_event("host", SESSION, "user", text="deploy it", profile="default")
+    transcript.append_event("host", SESSION, "assistant", text="done", profile="default")
     _dispatch(store, transcript, SESSION, BASE, 0.0, time.time() + 1)
 
     assert worker.run_once() == 1
     prompts = [call["prompt"] for call in worker.calls]
-    assert len(prompts) == 4
+    assert len(prompts) == 2, "B1 then B2"
     assert all("[coverage]" in prompt for prompt in prompts)
     assert "[user t1] deploy it" in prompts[0]
     assert "Transcript budget:" in prompts[0]
@@ -240,9 +248,9 @@ def test_content_is_never_reasoned_over_twice(store, transcript, worker):
     transcript.add(SESSION, "user", "second window", created_at=150.0)
     _dispatch(store, transcript, SESSION, BASE, 100.0, 140.0)
     assert worker.run_once() == 2
-    assert len(worker.calls) == 8, "four staged passes per base refresh"
+    assert len(worker.calls) == 4, "B1 and B2 per base refresh"
     first = worker.calls[0]["prompt"]
-    second = worker.calls[4]["prompt"]
+    second = worker.calls[2]["prompt"]
     assert "first window" in first and "second window" not in first
     assert "second window" in second and "first window" not in second
 
@@ -271,11 +279,11 @@ def test_a_window_already_drained_is_skipped(store, transcript, worker):
     transcript.add(SESSION, "user", "already seen", created_at=10.0)
     first = _dispatch(store, transcript, SESSION, BASE, 0.0, 20.0)
     worker.run_once()
-    assert len(worker.calls) == 4, "one staged refresh = four passes"
+    assert len(worker.calls) == 2, "B1 (with its children) and B2"
     assert _dispatch(store, transcript, SESSION, BASE, 0.0, 20.0) == first, \
         "one base window has one job"
     assert worker.run_once() == 0
-    assert len(worker.calls) == 4, "no second model call for content already reasoned over"
+    assert len(worker.calls) == 2, "no second model call for content already reasoned over"
     assert store.last_processed_ts(BASE, SESSION) >= 10.0
 
 
@@ -347,10 +355,10 @@ def test_merge_bumps_the_version_and_feeds_the_previous_artifact_forward(store, 
     second = store.layer_state(BASE, "user:default")
 
     assert (first["version"], second["version"]) == (1, 2)
-    assert "- Communication: direct" in worker.calls[4]["prompt"], \
+    assert "- Communication: direct" in worker.calls[2]["prompt"], \
         "the merge pass must see the durable previous card"
-    assert "## Window Summary" not in worker.calls[4]["prompt"], \
-        "the card pass does not carry the summary section"
+    assert "<previous_summary>" in worker.calls[2]["prompt"], \
+        "B3's baseline is this session's previous summary"
 
 
 def test_an_unchanged_review_replaces_the_note_without_advice(plugin_package, store, transcript):
@@ -443,11 +451,13 @@ def test_an_empty_peer_card_is_a_valid_sparse_result(plugin_package, store, tran
     """A short window legitimately yields no peer-card text; the JSON contract still holds."""
     def complete(task, system, prompt, **kwargs):
         if "baseline_user_card" in prompt:
-            return _user_json(user_self_representation="", user_preferences="")
+            return _base_pass_json(user_self_representation="", user_preferences="",
+                                   summary=_empty_summary(), value_markers=[])
         return _reply_for(prompt)
 
     instance = plugin_package.worker.LayerWorker(
         store, transcript, complete=complete)
+    instance._retry_base_child = lambda *args, **kwargs: []  # an empty marker array is valid
     transcript.add(SESSION, "user", "ship it", created_at=10.0)
     _dispatch(store, transcript, SESSION, BASE, 0.0, 20.0)
 
@@ -537,26 +547,17 @@ def test_prompt_inputs_are_labeled_and_cannot_close_their_own_block(plugin_packa
         assert f"<{label}>" in ai_prompt
     assert neutralized(ai_tag) in ai_prompt
 
-    summary_tag = worker.transcript_prompt.BLOCK_NAMES["window_summary"]
-    summary_prompt = worker._base_summary_prompt(
-        "user:default", SESSION, user_card, ai_card, injection(summary_tag),
+    window_tag = worker.transcript_prompt.BLOCK_NAMES["base_user"]
+    orchestration_prompt = worker._base_user_prompt(
+        "user:default", SESSION, user_card, injection(window_tag), False,
         from_ts=0.0, to_ts=1.0, previous_summary=_section(),
-        window_template=plugin_package.window_summary.load_template())
-    for label in ("window_template", "user_card", "ai_card", "previous_summary",
-                  summary_tag):
-        assert f"<{label}>" in summary_prompt
-    assert neutralized(summary_tag) in summary_prompt
-
-    markers_tag = worker.transcript_prompt.BLOCK_NAMES["value_markers"]
-    units_prompt = worker._base_value_markers_prompt(
-        "user:default", SESSION, injection(markers_tag), from_ts=0.0, to_ts=1.0,
-        previous_value_markers=_units(), markers_category="CATEGORY RULE TEXT",
-        markers_org="ORG RULE TEXT")
-    for label in ("markers-category", "markers-org", "previous_value_markers",
-                  markers_tag):
-        assert f"<{label}>" in units_prompt
-    assert "CATEGORY RULE TEXT" in units_prompt and "ORG RULE TEXT" in units_prompt
-    assert neutralized(markers_tag) in units_prompt
+        window_template=plugin_package.window_summary.load_template(),
+        markers_category="CATEGORY RULE TEXT", markers_org="ORG RULE TEXT")
+    for label in ("window_template", "previous_summary", "baseline_user_card",
+                  "markers_category", "markers_org", window_tag):
+        assert f"<{label}>" in orchestration_prompt
+    assert "CATEGORY RULE TEXT" in orchestration_prompt and "ORG RULE TEXT" in orchestration_prompt
+    assert neutralized(window_tag) in orchestration_prompt
 
     dialectic_tag = worker.transcript_prompt.BLOCK_NAMES["dialectic"]
     dialectic_prompt = worker._dialectic_prompt(
@@ -596,10 +597,11 @@ def _full_artifact(plugin_package):
     layers = plugin_package.layers
     budget = plugin_package.worker._MAX_STATE_CHARS
     summary = _section(objective="x" * 120, constraints=["y" * 100] * 3)
-    value_markers = [{"id": f"k{index}", "org": "experiences", "category": "KNOWLEDGE",
-              "epistemic": "fact", "topic": "t" * 40, "content": "c" * 160,
-              "time": "2026-10-21", "relations": [], "objects": []}
-             for index in range(16)]
+    value_markers = [{"id": f"k{index}", "info_type": "experience", "topic": "t" * 40,
+                      "why": "w" * 100, "relations": [], "render_plan": "p" * 40,
+                      "anchor": {"from_ts": 0.0, "to_ts": 1.0, "message_ids": []},
+                      "objects": []}
+                     for index in range(16)]
     bodies = {part: f"## {part.replace('_', ' ').title()}\n\n- seed: {'s' * 40}"
               for part in ("user_self_representation", "user_preferences", "ai_self_representation", "ai_identity")}
     content = layers.render_artifact(**bodies, summary=summary, value_markers=value_markers)
@@ -871,7 +873,7 @@ def test_base_prompt_feeds_the_previous_summary_as_markdown(store, transcript, w
     transcript.add(SESSION, "user", "new delta", created_at=25.0)
     _dispatch(store, transcript, SESSION, BASE, 0.0, 30.0)
     assert worker.run_once() == 1
-    prompt = worker.calls[2]["prompt"]
+    prompt = worker.calls[0]["prompt"]
     assert "## Window Summary" in prompt and "OLD PROJECTION" in prompt
     assert '"current_state"' not in prompt, "the previous summary is text now, not a JSON object"
 
@@ -932,7 +934,7 @@ def test_base_refresh_persists_the_six_fields_and_window_metadata(store, transcr
 
 
 def test_first_refresh_bootstraps_and_later_refreshes_merge(plugin_package, store, transcript,
-                                                            monkeypatch):
+                                                            monkeypatch, tmp_path):
     calls: list[str] = []
 
     monkeypatch.setattr(plugin_package.session_search, "query", lambda args, **kwargs: {
@@ -943,7 +945,8 @@ def test_first_refresh_bootstraps_and_later_refreshes_merge(plugin_package, stor
         return _reply_for(prompt)
 
     instance = plugin_package.worker.LayerWorker(
-        store, transcript, complete=complete, state_db="test-state.db")
+        store, transcript, complete=complete, state_db="test-state.db",
+        hermes_home=str(tmp_path))
     transcript.add(SESSION, "user", "first turn", created_at=10.0)
     _dispatch(store, transcript, SESSION, BASE, 0.0, 20.0)
     assert instance.run_once() == 1
@@ -958,7 +961,7 @@ def test_first_refresh_bootstraps_and_later_refreshes_merge(plugin_package, stor
     transcript.add(SESSION, "user", "second turn", created_at=30.0)
     _dispatch(store, transcript, SESSION, BASE, 20.0, 40.0)
     assert instance.run_once() == 1
-    second = calls[4]
+    second = calls[2]
     assert "subsequent base refresh (merge the baseline)" in second
     assert "Baseline user card:" in second
     assert "- Communication: direct" in second
@@ -967,25 +970,26 @@ def test_first_refresh_bootstraps_and_later_refreshes_merge(plugin_package, stor
     assert "Session: session-1" in second
     assert "anchor: build the memory plugin" not in second, \
         "the first-message anchor belongs to the first refresh only"
-    assert "Previous value markers:" in calls[7]
-    assert "pytest verification" in calls[7], \
-        "the marker inventory carries the previous window's value_markers forward"
+    markers_path = re.search(r"<previous_markers_path>\n(.*?)\n</previous_markers_path>",
+                             second)
+    assert markers_path, "B1 must receive the previous markers file path"
+    assert "pytest verification" in Path(markers_path.group(1)).read_text(encoding="utf-8")
 
 
-def test_the_summary_and_units_passes_get_their_landed_cores(store, transcript, worker,
-                                                             plugin_package):
-    """B3 and B4 read their role, caps and boundaries from ``agents/``."""
+def test_the_orchestrator_and_children_have_their_landed_cores(store, transcript, worker,
+                                                               plugin_package):
+    """B1/B2 read their cores from ``agents/``; B3/B4 remain packaged child definitions."""
     transcript.add(SESSION, "user", "ship the plugin", created_at=10.0)
     _dispatch(store, transcript, SESSION, BASE, 0.0, 20.0)
     assert worker.run_once() == 1
-    summary_opening = _core_opening(plugin_package.layers, "b3_window_summary")
-    units_opening = _core_opening(plugin_package.layers, "b4_value_markers")
     systems = [call["system"] for call in worker.calls]
-    assert len(systems) == 4, "one system prompt per base pass"
-    assert summary_opening in systems[2]
-    assert units_opening in systems[3]
-    assert all(summary_opening not in system for system in systems[:2] + systems[3:])
-    assert all(units_opening not in system for system in systems[:3])
+    assert len(systems) == 2, "B1 then B2"
+    assert _core_opening(plugin_package.layers, "b1_user_card") in systems[0]
+    assert _core_opening(plugin_package.layers, "b2_ai_card") in systems[1]
+    assert "minir_agents" in systems[0], "B1's core must describe the child calls"
+    for name in ("b3_window_summary", "b4_value_markers"):
+        core = plugin_package.layers.load_core(name)
+        assert "ROLE" in core and "$" not in core
 
 
 def test_a_broken_window_template_fails_the_job_without_a_format_retry(
@@ -1024,23 +1028,22 @@ def test_base_refresh_runs_on_the_dialectic_route_with_the_plugin_toolset(
     transcript.add(SESSION, "user", "grounded by session search", created_at=10.0)
     _dispatch(store, transcript, SESSION, BASE, 0.0, 20.0)
     assert instance.run_once() == 1
-    assert len(requests) == 4, "user cards, AI cards, the summary, then the value_markers"
+    assert len(requests) == 2, "B1 (with its children) then B2"
     assert set(route_keys) == {plugin_package.adviser.DIALECTIC_TASK}, \
         "every base pass reads the one route base shares with the dialectic"
     for request in requests:
         assert request["provider"] == "deepseek"
         assert request["model"] == "deepseek-v4-flash"
         assert "file" in request["toolsets"] and "minir" in request["toolsets"]
-    assert "You maintain the user card" in requests[0]["system_message"]
-    assert "You maintain the AI card" in requests[1]["system_message"]
-    assert "You close one base refresh" in requests[2]["system_message"]
-    for request in requests:
-        assert "minir_hermes_session_search" in request["system_message"]
+    systems = ["\n\n".join(request["system_message"]) for request in requests]
+    assert "You close one base refresh" in systems[0]
+    assert "You maintain the AI card" in systems[1]
+    for request, system in zip(requests, systems):
+        assert "minir_hermes_session_search" in system
         assert "Session: session-1" in request["message"]
-        assert "JSON object" in request["system_message"]
-    assert '"user_self_representation"' in requests[0]["system_message"]
-    assert '"window_summary"' in requests[2]["system_message"]
-    assert '"value_markers"' in requests[3]["system_message"]
+        assert "JSON object" in system
+    assert '"user_self_representation"' in systems[0]
+    assert '"window_summary"' in systems[0]
     assert store.latest_base_refresh(SESSION, "user:default") is not None
 
 
@@ -1075,15 +1078,13 @@ def test_sparse_window_completes_without_publishing_an_artifact(
     """A valid JSON reply with every body empty is a sparse window, not a failed pass."""
     def complete(task, system, prompt, **kwargs):
         if "baseline_user_card" in prompt:
-            return _user_json(user_self_representation="", user_preferences="")
-        if "baseline_ai_card" in prompt or "plugin_yaml" in prompt:
-            return _ai_json(ai_self_representation="", ai_identity=_blank_identity())
-        if "previous_value_markers" in prompt or "Previous knowledge value markers" in prompt:
-            return json.dumps({"value_markers": []})
-        return json.dumps({"window_summary": _empty_summary()})
+            return _base_pass_json(user_self_representation="", user_preferences="",
+                                   summary=_empty_summary(), value_markers=[])
+        return _ai_json(ai_self_representation="", ai_identity=_blank_identity())
 
     instance = plugin_package.worker.LayerWorker(
         store, transcript, complete=complete)
+    instance._retry_base_child = lambda *args, **kwargs: []
     transcript.add(SESSION, "user", "Reply with exactly: POST_COMMIT_OK", created_at=10.0)
     _dispatch(store, transcript, SESSION, BASE, 0.0, 20.0)
 
@@ -1146,7 +1147,7 @@ def test_a_base_job_does_not_queue_the_review(plugin_package, store, transcript)
     _dispatch(store, transcript, SESSION, BASE, 0.0, 20.0)
     instance = plugin_package.worker.LayerWorker(store, transcript, complete=complete)
     assert instance.run_once() == 1
-    assert calls == [plugin_package.worker.DIALECTIC_TASK] * 4
+    assert calls == [plugin_package.worker.DIALECTIC_TASK] * 2
     assert store.pending_jobs() == [], "no review was queued by the base job"
 
     _dispatch(store, transcript, SESSION, DIALECTIC, 0.0, 20.0)
@@ -1190,7 +1191,7 @@ def test_dialectic_revision_snapshots_the_old_base_and_applies_the_change(
             return _dialectic_json(user_preferences=terse, changed=True,
                                    fields=["user_preferences"])
         if "baseline_user_card" in prompt:
-            return _user_json(user_preferences=direct)
+            return _base_pass_json(user_preferences=direct)
         return _reply_for(prompt)
 
     transcript.add(SESSION, "user", "ship it", created_at=10.0)
@@ -1235,7 +1236,7 @@ def test_a_listed_empty_part_is_refused(plugin_package, store, transcript):
             return _dialectic_json(user_preferences="", changed=True,
                                    fields=["user_preferences"])
         if "baseline_user_card" in prompt:
-            return _user_json(user_preferences=_user_prefs())
+            return _base_pass_json(user_preferences=_user_prefs())
         return _reply_for(prompt)
 
     transcript.add(SESSION, "user", "ship it", created_at=10.0)
@@ -1255,7 +1256,7 @@ def test_an_empty_part_outside_a_listed_change_is_ignored(plugin_package, store,
         if "dialectic reviewer" in system:
             return _dialectic_json(user_preferences="")  # empty, but base_changed omits it
         if "baseline_user_card" in prompt:
-            return _user_json(user_preferences=_user_prefs())
+            return _base_pass_json(user_preferences=_user_prefs())
         return _reply_for(prompt)
 
     transcript.add(SESSION, "user", "ship it", created_at=10.0)
@@ -1392,11 +1393,11 @@ def test_dialectic_route_appends_the_plugin_toolset_explicitly(
     instance = plugin_package.worker.LayerWorker(store, transcript)
     assert instance.run_once() == 2
 
-    assert len(requests) == 5, "four base passes then one dialectic pass"
+    assert len(requests) == 3, "B1, B2, then the dialectic pass"
     assert set(route_keys) == {plugin_package.adviser.DIALECTIC_TASK}
     dialectic = requests[-1]
     assert "minir" in dialectic["toolsets"]
-    assert "dialectic reviewer" in dialectic["system_message"]
+    assert "dialectic reviewer" in "\n\n".join(dialectic["system_message"])
     assert "Base artifact for this window" in dialectic["message"]
 
 
@@ -1458,12 +1459,10 @@ def test_an_unchanged_identity_source_keeps_the_previous_identity(
         if "dialectic reviewer" in system:
             return _dialectic_json()
         if "baseline_user_card" in prompt:
-            return _user_json()
+            return _base_pass_json()
         if "baseline_ai_card" in prompt or "plugin_yaml" in prompt:
             return json.dumps({"ai_self_representation": _ai_self(), "ai_identity": replies["identity"]})
-        if "<markers-category>" in prompt:
-            return _units_json()
-        return _summary_json()
+        return _reply_for(prompt)
 
     transcript.add(SESSION, "user", "ship it", created_at=10.0)
     _dispatch(store, transcript, SESSION, BASE, 0.0, 20.0)
@@ -1515,14 +1514,10 @@ def test_changed_sources_refresh_the_identity_on_an_empty_window(
 
     def complete(task, system, prompt, **kwargs):
         calls.append(prompt)
-        if "baseline_user_card" in prompt:
-            return _user_json()
-        if "plugin_yaml" in prompt:
-            return json.dumps({"ai_self_representation": _ai_self(),
-                               "ai_identity": _identity(persona="new operator text")})
-        if "<markers-category>" in prompt:
-            return _units_json()
-        return _summary_json()
+        if "<window_template>" in prompt:
+            return _base_pass_json()
+        return json.dumps({"ai_self_representation": _ai_self(),
+                           "ai_identity": _identity(persona="new operator text")})
 
     transcript.add(SESSION, "user", "ship it", created_at=10.0)
     _dispatch(store, transcript, SESSION, BASE, 0.0, 20.0)
@@ -1541,7 +1536,7 @@ def test_changed_sources_refresh_the_identity_on_an_empty_window(
     identity = json.loads(latest["ai_identity_card"])
     assert identity == _identity(persona="new operator text")
     assert json.loads(latest["user_representation"]) == before, "the user card is inherited"
-    assert not any("baseline_user_card" in prompt for prompt in calls[-2:]), \
+    assert not any("<window_template>" in prompt for prompt in calls[-1:]), \
         "an identity-only refresh must not re-run the user pass"
 
 
@@ -1617,7 +1612,7 @@ def test_an_empty_part_echo_is_not_a_revision(plugin_package, store, transcript)
             return _dialectic_json(user_preferences="", changed=True,
                                    fields=["user_preferences"])
         if "baseline_user_card" in prompt:
-            return _user_json(user_preferences="")
+            return _base_pass_json(user_preferences="")
         return _reply_for(prompt)
 
     transcript.add(SESSION, "user", "ship it", created_at=10.0)
@@ -1627,3 +1622,81 @@ def test_an_empty_part_echo_is_not_a_revision(plugin_package, store, transcript)
     assert instance.run_once() == 2
     assert json.loads(store.latest_base_refresh(SESSION, "user:default")["user_peer_card"]) == ""
     assert store.base_revisions(SESSION, "user:default") == []
+
+
+def test_a_failed_child_is_retried_alone(plugin_package, store, transcript):
+    """B1 returns the other three keys; only the empty child is re-run, once."""
+    retried: list[str] = []
+    retry_prompts: list[str] = []
+
+    def complete(task, system, prompt, **kwargs):
+        if "<window_template>" in prompt:
+            return _base_pass_json(summary="", value_markers=_units())  # B3 failed
+        return _ai_json()
+
+    def retry(name, prompt, *args, **kwargs):
+        retried.append(name)
+        retry_prompts.append(prompt)
+        return _section()
+
+    instance = plugin_package.worker.LayerWorker(store, transcript, complete=complete)
+    instance._retry_base_child = retry
+    transcript.add(SESSION, "user", "ship it", created_at=10.0)
+    _dispatch(store, transcript, SESSION, BASE, 0.0, 20.0)
+
+    assert instance.run_once() == 1
+    assert retried == ["b3_window_summary"], "only the failed child is re-run"
+    assert "<window_template>" in retry_prompts[0]
+    assert "### Objective" in retry_prompts[0]
+    row = store.latest_base_refresh(SESSION, "user:default")
+    assert json.loads(row["window_summary"]).startswith("## Window Summary")
+    assert json.loads(row["value_markers"])["value_markers"][0]["info_type"] == "experience"
+
+
+def test_base_passes_name_themselves_in_the_run_meta(plugin_package, store, transcript):
+    """B1 and B2 each carry their own agent label; a stubbed route keeps its two arguments."""
+    labels: list[tuple[str, str]] = []
+    instance = plugin_package.worker.LayerWorker(store, transcript)
+
+    def validated(system, prompt, validator, *, label, agent=""):
+        labels.append((label, agent))
+        if label == "base user pass":
+            return {"user_self_representation": _user_self(), "user_preferences": _user_prefs(),
+                    "window_summary": _section(), "value_markers": _units()}
+        return {"ai_self_representation": _ai_self(), "ai_identity": _identity()}
+
+    def route(system, prompt, layer, tool_hint, agent=""):
+        assert agent == "b1_user_card"
+        return _base_pass_json()
+
+    instance._consult_validated = validated
+    instance._adviser_consult = route
+    assert instance._consult_pass("system", "prompt", "b1_user_card") == _base_pass_json()
+
+    transcript.add(SESSION, "user", "ship it", created_at=10.0)
+    _dispatch(store, transcript, SESSION, BASE, 0.0, 20.0)
+    assert instance.run_once() == 1
+    assert labels == [("base user pass", "b1_user_card"),
+                      ("base AI pass", "b2_ai_card")]
+
+
+def test_the_summary_baseline_is_session_scoped(plugin_package, store, transcript):
+    """A new session starts empty: the previous session's window must not feed B3."""
+    prompts: list[str] = []
+
+    def complete(task, system, prompt, **kwargs):
+        if "<window_template>" in prompt:
+            prompts.append(prompt)
+        return _reply_for(prompt)
+
+    instance = plugin_package.worker.LayerWorker(store, transcript, complete=complete)
+    for session, text, from_ts, to_ts in (
+            ("s-one", "first goal", 0.0, 20.0),
+            ("s-two", "other session", 0.0, 20.0),
+            ("s-one", "more of the first", 20.0, 40.0)):
+        transcript.add(session, "user", text, created_at=from_ts + 10.0)
+        _dispatch(store, transcript, session, "base", from_ts, to_ts)
+        assert instance.run_once() == 1
+
+    assert "<previous_summary>" not in prompts[1], "another session's window leaked in"
+    assert "<previous_summary>" in prompts[2] and "Ship the plugin" in prompts[2]

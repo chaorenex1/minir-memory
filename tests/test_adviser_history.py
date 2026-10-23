@@ -63,7 +63,7 @@ def test_reviewer_runs_read_only_and_records_the_run(plugin_package, make_provid
     assert _review(provider) is True
     assert seen.get("read_only") is True
 
-    files = list((tmp_path / "minir-memory" / "sessions" / "cli" / "adviser").glob("*.jsonl"))
+    files = list((tmp_path / "minir-memory" / "sessions" / "default" / "adviser").glob("*.jsonl"))
     assert len(files) == 1
     rows = [json.loads(line) for line in files[0].read_text(encoding="utf-8").splitlines()]
     messages = [row for row in rows if row["kind"] == "msg" and row["role"] != "system"]
@@ -87,7 +87,7 @@ def test_a_second_review_appends_to_the_same_adviser_history(plugin_package, mak
     _event(provider, "two")
     assert _review(provider) is True
 
-    path = next((tmp_path / "minir-memory" / "sessions" / "cli" / "adviser").glob("*.jsonl"))
+    path = next((tmp_path / "minir-memory" / "sessions" / "default" / "adviser").glob("*.jsonl"))
     rows = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
     messages = [row for row in rows if row["kind"] == "msg" and row["role"] != "system"]
     # Two runs, two message pairs each: the file is the adviser's conversation, not one review.

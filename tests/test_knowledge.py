@@ -80,6 +80,27 @@ def test_different_topics_produce_two_files(knowledge, tmp_path):
     assert len(list((tmp_path / "experiences").glob("*.md"))) == 1
 
 
+def test_events_org_is_a_valid_knowledge_page(plugin_package, knowledge, tmp_path):
+    layers = importlib.import_module(f"{plugin_package.__name__}.layers")
+    page = knowledge.write_unit(
+        _unit(id="k3", org="events", category="KNOWLEDGE", epistemic="hypothesis",
+              topic="2026-10-23 发布无事故",
+              content="the release v0.9 went out at 18:40 with no incident."), root=tmp_path)
+    assert "events" in layers.ORGS
+    assert page["path"].parent.name == "events"
+    meta = knowledge.read_front_matter(page["path"])
+    assert (meta["org"], meta["epistemic"]) == ("events", "fact")
+    rows = knowledge.search_pages("release", tmp_path, org="events")
+    assert [row["org"] for row in rows["results"]] == ["events"]
+
+
+def test_events_pages_are_facts(plugin_package):
+    pages = plugin_package.extraction.validate_pages([{
+        "category": "KNOWLEDGE", "org": "events", "topic": "release v0.9",
+        "content": "the release went out at 18:40.", "epistemic": "hypothesis"}])
+    assert pages[0]["epistemic"] == "fact"
+
+
 def test_slug_collisions_keep_both_topics_in_separate_files(knowledge, tmp_path):
     knowledge.write_unit(_unit(topic="a/b"), root=tmp_path)
     knowledge.write_unit(_unit(id="k2", topic="a:b"), root=tmp_path)

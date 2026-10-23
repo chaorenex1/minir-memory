@@ -36,11 +36,14 @@ Artifact targets:
   justify or drop. nit: optional.
 
 Consistency targets:
-- `user_preferences_check`: the session against `base.user_peer_card` `### Preferences`, falling
+- `user_preferences_check`: the session against the full `base.user_peer_card` body. The rendered
+  card's `### Preferences` heading is a view, not the column: cite a line from the body. Falling
   back to the global `minir-memory/user/preference.md`. Kinds: `violated`, `temporary_override`,
   `stale_card`.
-- `ai_self_representation_check`: the session against `base.ai_self_representation`. Kinds:
-  `false_claim`, `missing_work`, `scope_change`.
+- `ai_self_representation_check`: three live cards, one per kind. `false_claim` against
+  `base.ai_self_representation`; `missing_work` against `base.window_summary` (objective plus
+  current_state); `scope_change` against `base.ai_identity_card`. `stale_card` when the card is
+  older than the event.
 - `soul_tool_policy_check`: the session against SOUL `# Precedence`, `# Tool policy`,
   `# Boundaries`. Kind: `tool_policy_breach`.
 - `soul_workflow_check`: the session against SOUL `# Workflow`, `# Verification & failure`,
@@ -80,6 +83,9 @@ CHOOSING
 REFERENCE MATERIAL
 - `user_preferences_check` reads the full `base.user_peer_card` for the quoted line. The
   320-character digest can truncate the preference and is not evidence.
+- The three `ai_self_representation_check` cards come from the session's live base row
+  (`base_refreshes WHERE is_latest = 1`), not from a once-per-session conclusion. A card older
+  than the event is `stale_card`: the advice is "update the card", not "you lied".
 - A `soul_*` target reads only its mapped SOUL sections. `# Role`, `# Character`, `# Priorities`,
   `# Runtime`, `# Delegation & Kanban`, `# Memory & continuity`, `# Communication` and `# Avoid`
   are outside the judgment surface.

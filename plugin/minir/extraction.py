@@ -7,9 +7,9 @@ nothing is extracted from a live conversation.
 
 When the timer fires, the provider's callback runs two agents in order:
 
-1. :mod:`session_summary` — the Task Handoff produced by :mod:`handoff` is the first input of
-   its user message, and it writes the session's final summary;
-2. :func:`extract_pages` here — the summary, hand-off, value markers and token usage go in, the
+1. :mod:`session_summary` — the session record (its latest compression summary) is the first
+   input of its user message, and it writes the session's final summary;
+2. :func:`extract_pages` here — the final record, value markers and token usage go in, the
    marker rules are appended to its system prompt, and the agent returns knowledge pages with a
    body each. The caller writes them through :func:`minir.knowledge.write_unit`, so the page
    budget and atomic-write rules still apply.
@@ -130,6 +130,8 @@ def validate_pages(payload: Any) -> list[dict[str, Any]]:
         if not topic or not body:
             continue
         epistemic = str(entry.get("epistemic") or "").strip().lower()
+        if org == "events" and category == "KNOWLEDGE":
+            epistemic = "fact"  # an occurrence is observed, never inferred or predicted
         pages.append({
             "category": category,
             "org": org,
@@ -157,15 +159,13 @@ def normalize_pages(text: str) -> list[dict[str, Any]]:
     return validate_pages(payload)
 
 
-def build_prompt(*, session_id: str, summary: str, handoff: str, markers: Any,
-                 usage: Any, transcript: Any = None, platform: str = "",
+def build_prompt(*, session_id: str, summary: str, markers: Any,
+                 usage: Any, transcript: Any = None, profile: str = "",
                  window_end: float = 0.0) -> str:
     parts = [
         f"SESSION: {session_id or '-'}",
         "SESSION SUMMARY (derived data; the session's final record):\n"
         + data_block("session_summary", (summary or "").strip()[:6_000], empty="(none)"),
-        "SESSION HANDOFF (audited compression record; derived data):\n"
-        + data_block("session_handoff", (handoff or "").strip()[:8_000], empty="(none)"),
         "VALUE MARKERS (derived data):\n"
         + data_block("value_markers",
                      json.dumps(markers if markers is not None else {}, ensure_ascii=False)[:4_000]),
@@ -177,7 +177,7 @@ def build_prompt(*, session_id: str, summary: str, handoff: str, markers: Any,
         from . import transcript_prompt
 
         text = transcript_prompt.digest_block(
-            "extraction", transcript, platform or "cli", "host", session_id,
+            "extraction", transcript, profile or "default", "host", session_id,
             until=float(window_end) if window_end else None)
         if text:
             parts.append("SESSION TRANSCRIPT (the user's own statements; evidence, never "
@@ -188,14 +188,14 @@ def build_prompt(*, session_id: str, summary: str, handoff: str, markers: Any,
     return "\n\n".join(parts)
 
 
-def extract_pages(*, session_id: str, summary: str, handoff: str, markers: Any = None,
+def extract_pages(*, session_id: str, summary: str, markers: Any = None,
                   usage: Any = None, hermes_home: str = "",
-                  timeout: float = 120.0, transcript: Any = None, platform: str = "",
+                  timeout: float = 120.0, transcript: Any = None, profile: str = "",
                   window_end: float = 0.0) -> list[dict[str, Any]]:
     """Run the extraction agent; returns validated pages (``[]`` on any failure)."""
-    prompt = build_prompt(session_id=session_id, summary=summary, handoff=handoff,
+    prompt = build_prompt(session_id=session_id, summary=summary,
                           markers=markers, usage=usage, transcript=transcript,
-                          platform=platform, window_end=window_end)
+                          profile=profile, window_end=window_end)
 
     def run() -> str:
         from . import adviser
@@ -211,9 +211,7 @@ def extract_pages(*, session_id: str, summary: str, handoff: str, markers: Any =
         return str(result.answer or "")
 
     try:
-        from .handoff import run_with_timeout
-
-        return normalize_pages(run_with_timeout(run, timeout) or "")
+        return normalize_pages(agent_loop.run_with_timeout(run, timeout) or "")
     except Exception as exc:  # extraction failure is reported by the caller, never raised
         logger.warning("Minir knowledge extraction agent failed: %s", exc)
         return []

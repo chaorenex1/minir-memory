@@ -49,7 +49,7 @@ def test_a_custom_agent_defaults_to_all_tools_and_the_host_knobs(provider, fake_
     assert kwargs["project_dir"], "a custom agent gets the cwd's project root by default"
 
     path = Path(data["transcript_path"])
-    assert path == (tmp_path / "minir-memory" / "sessions" / "cli" / "researcher"
+    assert path == (tmp_path / "minir-memory" / "sessions" / "default" / "researcher"
                     / "session-test.jsonl")
     assert data["transcript_written"] is True
     stored = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
@@ -58,6 +58,16 @@ def test_a_custom_agent_defaults_to_all_tools_and_the_host_knobs(provider, fake_
     assert [row["role"] for row in stored
             if row["kind"] == "msg" and row["role"] != "system"] == ["user", "assistant"]
     assert kwargs["layer"] == "researcher" and kwargs["history_session"] == "session-test"
+    assert kwargs["meta"] == {"agent": "researcher", "parent": "", "depth": 1}
+
+
+def test_the_child_run_meta_names_the_calling_layer(provider, fake_run, plugin_package):
+    tokens = plugin_package.agent_history.layer_context("base", "session-test")
+    try:
+        _payload(provider, agent_name="b3_window_summary", user_prompts="Write the summary.")
+    finally:
+        plugin_package.agent_history.reset_layer(tokens)
+    assert fake_run[0][1]["meta"] == {"agent": "b3_window_summary", "parent": "base", "depth": 1}
 
 
 def test_explicit_tool_sets_are_forwarded_without_the_plugin_appending(provider, fake_run):

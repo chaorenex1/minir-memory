@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import contextvars
 import sys
 import threading
 import types
@@ -179,14 +180,29 @@ def test_system_message_is_forwarded_to_the_turn(loop, host):
     loop.run("q", system_message="  be blunt  ")
 
     (agent,) = FakeAgent.instances
-    assert agent.system_message == "be blunt"
+    assert agent.system_message.startswith("be blunt\n\n[run-meta]")
+    assert "route_source: gateway" in agent.system_message
+    assert "model: gateway-model" in agent.system_message
+
+
+def test_system_segments_join_and_meta_records_the_explicit_route(loop, host):
+    loop.run("q", system_message=["rule one", " ", "rule two"], layer="base",
+             provider="custom:siliconflow", model="Qwen/Qwen3.5-4B",
+             meta={"agent": "b1", "parent": "top", "depth": 0})
+
+    (agent,) = FakeAgent.instances
+    assert agent.system_message.startswith("rule one\n\nrule two\n\n[run-meta]")
+    assert "provider: openrouter" in agent.system_message  # the pinned route, not the request
+    assert "model: Qwen/Qwen3.5-4B" in agent.system_message
+    assert "route_source: explicit" in agent.system_message
+    assert "pinned-key" not in agent.system_message and "api_key" not in agent.system_message
 
 
 def test_no_system_message_means_the_host_default(loop, host):
     loop.run("q")
 
     (agent,) = FakeAgent.instances
-    assert agent.system_message is None
+    assert agent.system_message is None, "metadata alone never creates a system prompt"
 
 
 def test_only_the_intended_constructor_kwargs_are_passed(loop, host):
@@ -405,3 +421,29 @@ def test_apply_read_only_is_idempotent_without_mutating_tools(loop):
                                   valid_tool_names={"read_file"})
     assert loop.apply_read_only(agent) == []
     assert agent.tools == [{"function": {"name": "read_file"}}]
+
+
+# -- the bounded run ----------------------------------------------------------
+
+def test_the_bounded_run_keeps_the_callers_context(loop):
+    scope = contextvars.ContextVar("minir_test_scope", default="")
+    seen: dict = {}
+
+    def _run() -> str:
+        seen["scope"] = scope.get()
+        return "ok"
+
+    token = scope.set("profile-a")
+    try:
+        assert loop.run_with_timeout(_run, 2.0) == "ok"
+    finally:
+        scope.reset(token)
+    assert seen["scope"] == "profile-a"
+
+
+def test_a_failure_in_the_bounded_run_reaches_the_caller(loop):
+    def _run() -> str:
+        raise ValueError("route down")
+
+    with pytest.raises(ValueError, match="route down"):
+        loop.run_with_timeout(_run, 2.0)
