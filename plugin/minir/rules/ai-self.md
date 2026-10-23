@@ -17,7 +17,8 @@ COVER
 - How it presents itself for this task (executor, reviewer, pair).
 - The problem being solved now, not the project it belongs to.
 - The result this task should reach.
-- Facts this window proved, each readable without the window.
+- The 1-3 facts this window proved that bear directly on the current state; the full fact list
+  stays in the window summary. Each line stays readable without the window.
 - Hypotheses still to check. "Not read yet" is a next step, not an unknown.
 - Its current state, in the window's own terms: idle, executing, reasoning, reviewing, blocked,
   done.
@@ -25,6 +26,7 @@ COVER
 
 DISTINCTIONS
 - Only what the window proves counts as known; an inference stays pending until checked.
+- Pick facts that change the state, not the most complete set. The summary keeps the full list.
 - An uncertainty names a cause; "may be risky" is not an entry.
 - The state follows the window's last evidence: finished work is done, not executing.
 
@@ -34,6 +36,7 @@ BOUNDARIES
 
 ## REVIEW CHECKS
 - The stated state contradicts the window (work finished but still executing).
+- The window summary's fact list was restated instead of the state-relevant subset.
 - An inference was written as a known fact.
 - A session observation was carried into the identity card.
 - An uncertainty is an empty hedge with no cause.

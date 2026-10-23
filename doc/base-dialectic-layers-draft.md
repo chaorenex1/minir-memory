@@ -263,7 +263,7 @@
 
 `ai_self.state` 取固定枚举 `idle|executing|reasoning|reviewing|blocked|done`，对应需求里的待命、执行、推理、审查、阻塞、完成；自由文本会让状态无法聚合。
 
-窗口摘要：8 个键都必须存在；`current_state` 用 `{done, doing, todo}`，`decisions` 用 `[{decision, reason}]`，`verified_facts` 用 `[{fact, evidence}]`，`next_actions` 用 `[{action, priority}]`，`references` 用 `[{kind, ref}]`。空列表合法，`objective` 首轮可空字符串；禁止用 `N/A`、`未知`、`待补充` 占位。
+窗口摘要的字段与上限以 `doc/window-summary-template-draft.md` 为准：markdown 单一形态，`objective` 是目标集合，`current_state` 把每个目标 id 分到 done/doing/todo 之一。
 
 字段边界（防止同一句话写两处）：
 
@@ -526,7 +526,7 @@ Identity 卡来源（已定：模型输出 + FILE 工具）：
 | AI 自我表示 6 字段 × 80 | 480 |
 | AI 身份卡：7 个配置字段 × 30 | 210 |
 | AI 身份卡：6 个内容字段 × 100 | 600 |
-| 窗口摘要 8 字段 × 110 | 880 |
+| 窗口摘要其余六节 × 110 | 880 |
 | markers 16 × 180（含 topic） | 2880 |
 | identity `_sources` 路径 | 120 |
 | 合计 | 约 6210 |
@@ -539,7 +539,7 @@ Identity 卡来源（已定：模型输出 + FILE 工具）：
 
 建议先量一次真实字符分布再定，不拍脑袋；默认倾向 1 + markers 上限 8。
 
-无论选哪个，上限都由校验器执行：产物超出上限即该次刷新失败、保留上一份产物并重试一次，不靠渲染层截断。40 个字段静默截断会变成「模型漏写」的假象，比失败更难查。
+无论选哪个，窗口摘要的上限都只是提示词目标，不靠校验器执行；超预算由 B3 压缩措辞、不删目标。markers 仍按 JSON 校验。40 个字段静默截断会变成「模型漏写」的假象，所以提示词要写清"宁短不删"。
 
 其他预算风险：
 

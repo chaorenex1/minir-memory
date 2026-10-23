@@ -67,6 +67,16 @@ _MAX_CONTENT = 12000  # stored text is truncated to this many chars
 _MAX_TERMS = 8       # query tokens considered per search
 _MAX_SCAN = 200      # candidate rows fetched per table before scoring
 
+#: Bumped whenever ``_migrate`` changes the shape of the file. A database already at this
+#: version skips the migration write path on open, so a second process does not rewrite the
+#: schema while the first one is writing.
+_SCHEMA_VERSION = 4
+
+#: Requeue budget for a job whose owning process died mid-run. A death is not a failed attempt
+#: (the window is still readable), so the row goes back to ``pending`` with ``attempts``
+#: untouched; this counter only stops a job that kills every process that claims it.
+_MAX_RECLAIMS = 3
+
 #: The five value-marker kinds the base layer merges; ``minir_remember``/``minir_forget`` and
 #: the marker evidence paths use this vocabulary so search and deletion stay type-safe.
 _MARKER_KINDS: tuple[str, ...] = (
@@ -90,6 +100,7 @@ CREATE TABLE IF NOT EXISTS jobs (
     status TEXT NOT NULL DEFAULT 'pending',
     created_at REAL NOT NULL,
     attempts INTEGER NOT NULL DEFAULT 0,
+    reclaims INTEGER NOT NULL DEFAULT 0,
     claimed_at REAL,
     finished_at REAL,
     error TEXT NOT NULL DEFAULT '',
@@ -310,7 +321,9 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_base_revisions_latest
 _ADDED_COLUMNS: dict[str, tuple[tuple[str, str], ...]] = {
     "jobs": (("attempts", "INTEGER NOT NULL DEFAULT 0"), ("claimed_at", "REAL"),
              ("finished_at", "REAL"), ("error", "TEXT NOT NULL DEFAULT ''"),
-             ("processed_ts", "REAL")),
+             ("processed_ts", "REAL"),
+             # Process deaths the row survived; ``fail_job`` spends it as extra attempts.
+             ("reclaims", "INTEGER NOT NULL DEFAULT 0")),
     "layer_state": (("session_id", "TEXT NOT NULL DEFAULT ''"),),
     "base_refreshes": (("value_markers", "TEXT NOT NULL DEFAULT ''"),
                        # Set once per session when the six calibrated conclusions were
@@ -471,6 +484,25 @@ def _terms(query: str) -> list[str]:
     return seen
 
 
+def _execute_script(conn: sqlite3.Connection, script: str) -> None:
+    """Run a multi-statement script without ``executescript``'s implicit COMMIT.
+
+    ``executescript`` commits any open transaction before it runs, which would release the
+    migration lock halfway through ``_migrate``. Statements run one complete ``;``-terminated
+    chunk at a time; ``sqlite3.complete_statement`` is what knows a trigger body's inner
+    semicolons are not terminators.
+    """
+    buffer = ""
+    for line in script.splitlines(keepends=True):
+        buffer += line
+        if sqlite3.complete_statement(buffer):
+            if buffer.strip():
+                conn.execute(buffer)
+            buffer = ""
+    if buffer.strip():
+        conn.execute(buffer)
+
+
 class MinirStore:
     """Thread-safe SQLite store.
 
@@ -486,17 +518,87 @@ class MinirStore:
         self._fts = False
         self._base_fts = False
         self._base_revisions_fts = False
-        self._conn = sqlite3.connect(str(self.path), check_same_thread=False, timeout=5.0)
+        # The driver's timeout is the busy handler: another process (a CLI session, a subagent)
+        # may hold the write lock for seconds while it migrates. Five seconds turned that into
+        # the ``database is locked`` failures in the host log; thirty gives it room to finish.
+        self._conn = sqlite3.connect(str(self.path), check_same_thread=False, timeout=30.0)
         self._conn.row_factory = sqlite3.Row
         with self._lock:
             self._conn.execute("PRAGMA journal_mode=WAL")
             self._conn.executescript(_SCHEMA)
-            self._migrate()
+            self._migrate_once()
+            self._repair_rows()
             self._ensure_fts()
             self._ensure_base_refreshes_fts()
             self._ensure_base_revisions_fts()
             self._backfill_conclusions()
             self._conn.commit()
+
+    def _migrate_once(self) -> None:
+        """Run ``_migrate`` only for a file older than this build (caller holds the lock).
+
+        ``PRAGMA user_version`` is the guard: without it every open re-ran the DDL — table
+        rebuilds, ``ALTER``/``DROP COLUMN`` and the FTS recreate that follows — so a second
+        process starting while the first was writing held the lock long enough to fail the
+        first one's writes. Row-level repairs are deliberately *not* here: ``_repair_rows``
+        runs them on every open because they are cheap and a crash can leave one behind. The
+        migration runs inside ``BEGIN IMMEDIATE`` so two processes cannot migrate the same file
+        concurrently, and the version is written in the same transaction as the shape it
+        describes.
+        """
+        version = int(self._conn.execute("PRAGMA user_version").fetchone()[0])
+        if version >= _SCHEMA_VERSION:
+            return
+        self._conn.execute("BEGIN IMMEDIATE")
+        try:
+            self._migrate()
+            self._conn.execute(f"PRAGMA user_version = {int(_SCHEMA_VERSION)}")
+            self._conn.commit()
+        except BaseException:
+            self._conn.rollback()
+            raise
+
+    def _repair_rows(self) -> None:
+        """Data repairs that are cheap enough to run on every open (caller holds the lock).
+
+        These are not schema changes: a row can carry a kind, a part name, a ``latest`` flag or
+        a staged request that this release reads differently, and a crash between releases can
+        leave any of them behind. They are single-table UPDATEs, so they cost milliseconds even
+        while another process waits; the DDL that used to sit beside them is what held the write
+        lock for seconds and is now behind ``_migrate_once``.
+        """
+        # One kind for the compression chain. Ignore a collision with a row already migrated.
+        self._conn.execute(
+            "UPDATE OR IGNORE conclusions SET kind = 'window_summary' "
+            "WHERE kind = 'session_chunk_summary'")
+        # Old snapshots recorded the parts by their pre-rename keys.
+        self._conn.execute(
+            "UPDATE dialectic_refreshes SET changed_fields = "
+            "REPLACE(REPLACE(REPLACE(changed_fields, "
+            "'\"user_self\"', '\"user_self_representation\"'), "
+            "'\"ai_self\"', '\"ai_self_representation\"'), "
+            "'\"session_chunk_summary\"', '\"window_summary\"') "
+            "WHERE changed_fields LIKE '%\"user_self\"%' "
+            "OR changed_fields LIKE '%\"ai_self\"%' "
+            "OR changed_fields LIKE '%\"session_chunk_summary\"%'")
+        # The rolling base Session Summary is a projection of the chunk chain now; an older
+        # independent conclusion must not compete with it in FTS recall.
+        self._conn.execute(
+            "UPDATE conclusions SET status = 'superseded' WHERE kind = 'base.session_summary'")
+        # A request staged by a process that died was never confirmed delivered: make it
+        # pending again so the next request can carry it.
+        self._conn.execute(
+            "UPDATE advisories SET status = 'pending', request_id = '' WHERE status = 'staged'")
+        # An older release flagged the row written last. Restore the invariant now that
+        # ``is_latest`` means the greatest window: clear, then promote one row per subject.
+        self._conn.execute("UPDATE base_refreshes SET is_latest = 0")
+        self._conn.execute(
+            "UPDATE base_refreshes SET is_latest = 1 WHERE id IN ("
+            "SELECT b.id FROM base_refreshes AS b WHERE b.id = ("
+            "SELECT x.id FROM base_refreshes AS x "
+            "WHERE x.session_id = b.session_id AND x.subject = b.subject "
+            "ORDER BY x.window_to_ts DESC, x.window_from_ts DESC, x.id DESC LIMIT 1))")
+        self._conn.commit()
 
     def _migrate(self) -> None:
         """Bring a pre-existing database to this schema (idempotent; caller holds the lock).
@@ -524,24 +626,9 @@ class MinirStore:
                     f"UPDATE {table} SET window_summary = session_chunk_summary "
                     "WHERE (window_summary IS NULL OR window_summary = '') "
                     "AND session_chunk_summary IS NOT NULL AND session_chunk_summary <> ''")
-        # One kind for the compression chain. Ignore a collision with a row already migrated.
-        self._conn.execute(
-            "UPDATE OR IGNORE conclusions SET kind = 'window_summary' "
-            "WHERE kind = 'session_chunk_summary'")
-        # Old snapshots and changed_fields lists named the parts by their pre-rename keys.
-        self._conn.execute(
-            "UPDATE dialectic_refreshes SET changed_fields = "
-            "REPLACE(REPLACE(REPLACE(changed_fields, "
-            "'\"user_self\"', '\"user_self_representation\"'), "
-            "'\"ai_self\"', '\"ai_self_representation\"'), "
-            "'\"session_chunk_summary\"', '\"window_summary\"') "
-            "WHERE changed_fields LIKE '%\"user_self\"%' "
-            "OR changed_fields LIKE '%\"ai_self\"%' "
-            "OR changed_fields LIKE '%\"session_chunk_summary\"%'")
-        # The rolling base Session Summary is a projection of the chunk chain now; an older
-        # independent conclusion must not compete with it in FTS recall.
-        self._conn.execute(
-            "UPDATE conclusions SET status = 'superseded' WHERE kind = 'base.session_summary'")
+        # One kind for the compression chain, the part names a snapshot recorded, and the
+        # superseded rolling summary are *data* repairs; ``_repair_rows`` owns them so they run
+        # on every open instead of only when the shape changes.
         for table, columns in _ADDED_COLUMNS.items():
             present = {row["name"] for row in self._conn.execute(f"PRAGMA table_info({table})")}
             for name, declaration in columns:
@@ -560,20 +647,8 @@ class MinirStore:
             for trigger in ("conclusions_ai", "conclusions_ad", "conclusions_au"):
                 self._conn.execute(f"DROP TRIGGER IF EXISTS {trigger}")
             self._conn.execute("DROP TABLE IF EXISTS conclusions_fts")
-        # After the ALTER loop: an old ``advisories`` table has no ``request_id`` yet. A request
-        # staged by a process that died was never confirmed delivered; make it pending again so
-        # the next request can carry it.
-        self._conn.execute(
-            "UPDATE advisories SET status = 'pending', request_id = '' WHERE status = 'staged'")
-        # An older release flagged the row written last. Restore the invariant now that
-        # ``is_latest`` means the greatest window: clear, then promote one row per subject.
-        self._conn.execute("UPDATE base_refreshes SET is_latest = 0")
-        self._conn.execute(
-            "UPDATE base_refreshes SET is_latest = 1 WHERE id IN ("
-            "SELECT b.id FROM base_refreshes AS b WHERE b.id = ("
-            "SELECT x.id FROM base_refreshes AS x "
-            "WHERE x.session_id = b.session_id AND x.subject = b.subject "
-            "ORDER BY x.window_to_ts DESC, x.window_from_ts DESC, x.id DESC LIMIT 1))")
+        # ``is_latest`` normalization and staged-request recovery are data repairs too; see
+        # ``_repair_rows`` (every open, not only on a shape change).
 
     def _migrate_dialectic_refreshes(self) -> None:
         """Rename ``base_revisions`` and drop its dead ``advices`` column (idempotent).
@@ -593,7 +668,7 @@ class MinirStore:
             else:
                 self._conn.execute(
                     "ALTER TABLE base_revisions RENAME TO dialectic_refreshes")
-        self._conn.executescript(_DIALECTIC_REFRESHES_SCHEMA)
+        _execute_script(self._conn, _DIALECTIC_REFRESHES_SCHEMA)
         present = {row["name"] for row in self._conn.execute(
             "PRAGMA table_info(dialectic_refreshes)")}
         if "advices" not in present:
@@ -608,7 +683,7 @@ class MinirStore:
                     "changed_fields, source_job_id, is_latest, created_at")
             self._conn.execute(
                 "ALTER TABLE dialectic_refreshes RENAME TO dialectic_refreshes_old")
-            self._conn.executescript(_DIALECTIC_REFRESHES_SCHEMA)
+            _execute_script(self._conn, _DIALECTIC_REFRESHES_SCHEMA)
             self._conn.execute(
                 f"INSERT INTO dialectic_refreshes ({kept}) "
                 f"SELECT {kept} FROM dialectic_refreshes_old")
@@ -1117,15 +1192,20 @@ class MinirStore:
         A re-queued job keeps its window — the content watermark never moved, so the retry
         reads the same turns. A job that exhausts its attempts stays ``failed`` and the *next*
         job of that layer/session re-covers the same content, so an error cannot lose it.
+        ``attempts`` counts claims, but a process death is not the job's failure: each reclaim
+        buys one more attempt, up to the reclaim budget ``reclaim_open_jobs`` enforces.
         ``closed`` means the provider was torn down mid-drain; the row is left ``running`` for
         the next process to reclaim.
         """
         with self._lock:
             if self._conn is None:
                 return "closed"
-            row = self._conn.execute("SELECT attempts FROM jobs WHERE id = ?", (int(job_id),)).fetchone()
+            row = self._conn.execute(
+                "SELECT attempts, reclaims FROM jobs WHERE id = ?", (int(job_id),)).fetchone()
             attempts = int(row["attempts"]) if row is not None else max_attempts
-            status = "pending" if attempts < max(1, int(max_attempts)) else "failed"
+            reclaims = int(row["reclaims"]) if row is not None else 0
+            deadline = max(1, int(max_attempts)) + reclaims
+            status = "pending" if attempts < deadline else "failed"
             self._conn.execute(
                 "UPDATE jobs SET status = ?, error = ?, finished_at = ? WHERE id = ?",
                 (status, error[:500], time.time(), int(job_id)),
@@ -1151,24 +1231,30 @@ class MinirStore:
             self._conn.commit()
             return int(cur.rowcount)
 
-    def reclaim_open_jobs(self, *, before: float, max_attempts: int = 2) -> int:
+    def reclaim_open_jobs(self, *, before: float, max_reclaims: int = _MAX_RECLAIMS) -> int:
         """Re-queue jobs a dead process left ``running``; returns the count.
 
         A claimed job's owner is a thread in one process: if that process ended, nothing will
         ever finish the row. Unlike ``expire_open_jobs`` this is safe when host history exists
-        — the window is still readable — so the next drain retries it (and marks it failed once
-        its attempts are spent). Jobs claimed by *this* process (``claimed_at >= before``) and
-        jobs that were merely queued are left alone.
+        — the window is still readable — so the row goes back to ``pending`` with ``attempts``
+        untouched (the death was not the job's failure, and charging it was what turned 27
+        reclaims into ``abandoned`` job failures). ``reclaims`` records the death instead and
+        ``max_reclaims`` bounds it, so a job that kills every process that claims it cannot
+        loop forever. Jobs claimed by *this* process (``claimed_at >= before``) and jobs that
+        were merely queued are left alone.
         """
+        cap = max(1, int(max_reclaims))
         with self._lock:
             cur = self._conn.execute(
-                "UPDATE jobs SET status = CASE WHEN attempts < ? THEN 'pending' ELSE 'failed' END,"
+                "UPDATE jobs SET status = CASE WHEN reclaims < ? THEN 'pending' "
+                "ELSE 'failed' END,"
                 " claimed_at = NULL,"
-                " error = CASE WHEN attempts < ? THEN '' ELSE 'abandoned: the process that claimed it ended' END,"
-                " finished_at = CASE WHEN attempts < ? THEN NULL ELSE ? END"
+                " reclaims = reclaims + 1,"
+                " error = CASE WHEN reclaims < ? THEN '' "
+                "ELSE 'abandoned: the process that claimed it ended' END,"
+                " finished_at = CASE WHEN reclaims < ? THEN NULL ELSE ? END"
                 " WHERE status = 'running' AND COALESCE(claimed_at, created_at) < ?",
-                (max(1, int(max_attempts)), max(1, int(max_attempts)),
-                 max(1, int(max_attempts)), time.time(), float(before)),
+                (cap, cap, cap, time.time(), float(before)),
             )
             self._conn.commit()
             return int(cur.rowcount)

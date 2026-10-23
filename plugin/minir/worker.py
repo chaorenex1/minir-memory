@@ -129,8 +129,14 @@ _PART_COLUMNS: dict[str, str] = {
 }
 
 def call_model(task: str, system: str, prompt: str, *, timeout: float = _MODEL_TIMEOUT,
-               max_tokens: int = _MODEL_MAX_TOKENS) -> str:
+               max_tokens: int = _MODEL_MAX_TOKENS,
+               response_format: Optional[dict] = None) -> str:
     """One auxiliary LLM completion; returns the text or ``""`` (never raises).
+
+    ``response_format`` is the provider's structured-output switch (``{"type": "json_object"}``
+    or a ``json_schema`` envelope). It travels as ``extra_body`` because the auxiliary client
+    passes that form through on every wire and strips it when a provider rejects the field, so
+    the call degrades to plain text instead of failing.
 
     Lazy import: the host module is absent in a bare checkout, and the shim test suite stubs
     this function instead.
@@ -140,7 +146,9 @@ def call_model(task: str, system: str, prompt: str, *, timeout: float = _MODEL_T
 
         response = call_llm(task=task, messages=[{"role": "system", "content": system},
                                                 {"role": "user", "content": prompt}],
-                            temperature=0, max_tokens=max_tokens, timeout=timeout)
+                            temperature=0, max_tokens=max_tokens, timeout=timeout,
+                            extra_body=({"response_format": response_format}
+                                        if response_format else None))
     except Exception as exc:
         logger.debug("Minir layer model call failed: %s", exc)
         return ""
@@ -967,14 +975,15 @@ class LayerWorker:
             logger.debug("Minir orphan expiry failed: %s", exc)
             return 0
 
-    def reclaim_orphans(self, *, before: float, max_attempts: int = _MAX_ATTEMPTS) -> int:
+    def reclaim_orphans(self, *, before: float) -> int:
         """Re-queue jobs a previous process claimed but never finished.
 
         The window is still readable from host history, so the retry is meaningful (unlike
-        ``expire_orphans``, which is for processes whose content only lived in memory).
+        ``expire_orphans``, which is for processes whose content only lived in memory). The
+        store owns the budget: a death is charged to ``reclaims``, not to ``attempts``.
         """
         try:
-            return self._store.reclaim_open_jobs(before=before, max_attempts=max_attempts)
+            return self._store.reclaim_open_jobs(before=before)
         except Exception as exc:
             logger.debug("Minir orphan reclaim failed: %s", exc)
             return 0

@@ -253,17 +253,56 @@ def test_expire_closes_only_jobs_from_before_the_process(store):
 def test_reclaim_requeues_running_jobs_left_by_a_previous_process(store):
     job = store.record_job("base", "s1", 0.0, 10.0)
     store.claim_jobs(limit=1)
-    assert store.reclaim_open_jobs(before=time.time() - 1.0, max_attempts=2) == 0, \
+    assert store.reclaim_open_jobs(before=time.time() - 1.0) == 0, \
         "a job claimed by this process must be left running"
     cutoff = time.time() + 0.001  # a later process starts
-    assert store.reclaim_open_jobs(before=cutoff, max_attempts=2) == 1
-    row = store._conn.execute("SELECT status, attempts, claimed_at, error FROM jobs WHERE id = ?",
-                              (job,)).fetchone()
-    assert (row["status"], row["attempts"], row["claimed_at"], row["error"]) == ("pending", 1, None, "")
-    store.claim_jobs(limit=1)  # second claim: attempts now 2
-    assert store.reclaim_open_jobs(before=time.time() + 0.001, max_attempts=2) == 1
+    assert store.reclaim_open_jobs(before=cutoff) == 1
+    row = store._conn.execute(
+        "SELECT status, attempts, reclaims, claimed_at, error FROM jobs WHERE id = ?",
+        (job,)).fetchone()
+    assert (row["status"], row["attempts"], row["reclaims"], row["claimed_at"],
+            row["error"]) == ("pending", 1, 1, None, ""), \
+        "a process death is charged to reclaims, not to the job's attempts"
+    # Two more deaths still requeue the job; the fourth closes it.
+    for expected in (2, 3):
+        store.claim_jobs(limit=1)
+        assert store.reclaim_open_jobs(before=time.time() + 0.001) == 1
+        row = store._conn.execute(
+            "SELECT status, attempts, reclaims FROM jobs WHERE id = ?", (job,)).fetchone()
+        assert (row["status"], row["attempts"], row["reclaims"]) == ("pending", expected, expected)
+    store.claim_jobs(limit=1)
+    assert store.reclaim_open_jobs(before=time.time() + 0.001) == 1
     row = store._conn.execute("SELECT status, error FROM jobs WHERE id = ?", (job,)).fetchone()
     assert row["status"] == "failed" and "process" in row["error"]
+
+
+def test_a_reclaim_does_not_spend_the_failure_budget(store):
+    """One death buys an attempt: the job still gets its two real failures afterwards."""
+    job = store.record_job("base", "s1", 0.0, 10.0)
+    store.claim_jobs(limit=1)
+    assert store.reclaim_open_jobs(before=time.time() + 0.001) == 1
+    for expected in ("pending", "failed"):
+        store.claim_jobs(limit=1)
+        assert store.fail_job(job, "LayerMergeError: boom") == expected
+
+
+def test_open_sets_a_busy_timeout_and_skips_a_current_schema(plugin_package, tmp_path, monkeypatch):
+    path = tmp_path / "v" / "memory.db"
+    first = plugin_package.store.MinirStore(path)
+    version = first._conn.execute("PRAGMA user_version").fetchone()[0]
+    assert version == plugin_package.store._SCHEMA_VERSION
+    assert first._conn.execute("PRAGMA busy_timeout").fetchone()[0] == 30000
+    first.close()
+
+    migrations: list[int] = []
+    monkeypatch.setattr(plugin_package.store.MinirStore, "_migrate",
+                        lambda self: migrations.append(1))
+    again = plugin_package.store.MinirStore(path)
+    try:
+        assert migrations == [], "a file at the current version is not migrated again"
+        assert again._conn.execute("PRAGMA user_version").fetchone()[0] == version
+    finally:
+        again.close()
 
 
 def test_migration_drops_a_legacy_transcript_table(plugin_package, tmp_path):

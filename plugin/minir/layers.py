@@ -190,6 +190,27 @@ def _strings(value: Any, path: str, limit: int, max_items: int) -> list[str]:
             for index, item in enumerate(value)]
 
 
+def _clamped(value: Any, path: str, limit: int) -> str:
+    """One free-text field capped at *limit*: an over-long answer is trimmed, not fatal.
+
+    The size limit exists to bound storage and prompt cost, so a model that overshoots by a
+    few characters loses that tail instead of the whole pass (a rejected window costs two more
+    model calls and drops the evidence it already merged).
+    """
+    if not isinstance(value, str):
+        _fail(path, "must be a string")
+    flat = " ".join(value.split()).strip()
+    if not flat:
+        _fail(path, "must not be empty")
+    if summary_template.is_placeholder(flat):
+        _fail(path, f"placeholder value {flat!r} is not allowed")
+    if len(flat) <= limit:
+        return flat
+    cut = flat[:limit]
+    space = cut.rfind(" ")
+    return (cut[:space] if space >= limit // 2 else cut).rstrip(" ,;:.-·")
+
+
 def validate_card_body(value: Any, path: str, limit: int = CARD_TEXT_LIMIT) -> str:
     """One card body: markdown text, empty allowed, framed by the size limit only."""
     if not isinstance(value, str):
@@ -257,8 +278,10 @@ def validate_value_markers(value: Any, *, previous: Any = None) -> list[dict[str
             if epistemic not in EPISTEMIC:
                 _fail(f"{path}.epistemic",
                       f"KNOWLEDGE requires one of {', '.join(EPISTEMIC)}")
-        elif epistemic is not None:
-            _fail(f"{path}.epistemic", "only KNOWLEDGE carries an epistemic value")
+        else:
+            # A non-KNOWLEDGE marker is not a knowledge claim. Drop the stray value instead of
+            # failing the window: the field is meaningless there, not evidence of a bad pass.
+            epistemic = ""
         topic = _string(data_unit["topic"], f"{path}.topic", MAX_UNIT_TOPIC, allow_empty=False)
         if len(topic) < 2:
             _fail(f"{path}.topic", "must be at least 2 characters")
@@ -291,8 +314,7 @@ def validate_value_markers(value: Any, *, previous: Any = None) -> list[dict[str
             "id": unit_id, "org": data_unit["org"], "category": category,
             "epistemic": epistemic if category == "KNOWLEDGE" else "",
             "topic": topic,
-            "content": _string(data_unit["content"], f"{path}.content", MAX_UNIT_CONTENT,
-                               allow_empty=False),
+            "content": _clamped(data_unit["content"], f"{path}.content", MAX_UNIT_CONTENT),
             "time": _string(data_unit["time"], f"{path}.time", 40),
             "relations": clean_relations, "objects": clean_objects,
         })

@@ -50,9 +50,23 @@ def test_a_knowledge_unit_needs_an_epistemic_value(layers):
         layers.validate_value_markers({"value_markers": [unit]})
 
 
-def test_a_non_knowledge_unit_must_not_carry_an_epistemic_value(layers):
-    with pytest.raises(layers.LayerContractError, match="only KNOWLEDGE"):
-        layers.validate_value_markers({"value_markers": [_unit(category="METHOD", epistemic="fact")]})
+def test_a_non_knowledge_unit_drops_a_stray_epistemic_value(layers):
+    """The field is meaningless on a non-KNOWLEDGE marker, so it is dropped, not fatal."""
+    units = layers.validate_value_markers(
+        {"value_markers": [_unit(category="METHOD", epistemic="fact")]})
+    assert units[0]["category"] == "METHOD"
+    assert units[0]["epistemic"] == ""
+
+
+def test_an_over_long_marker_body_is_clamped_not_rejected(layers):
+    """The cap bounds storage and prompt cost: a 174-character body loses its tail, not the
+    whole window (a rejected pass costs two more model calls and the evidence it merged)."""
+    body = ("the quick brown fox jumps over the lazy dog " * 5).strip()
+    assert len(body) > layers.MAX_UNIT_CONTENT
+    units = layers.validate_value_markers({"value_markers": [_unit(content=body)]})
+    assert len(units[0]["content"]) <= layers.MAX_UNIT_CONTENT
+    assert units[0]["content"].startswith("the quick brown fox")
+    assert not units[0]["content"].endswith(" ")
 
 
 def test_a_unit_needs_one_known_category(layers):
