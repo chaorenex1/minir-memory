@@ -55,7 +55,9 @@ def test_a_dimension_change_queues_a_resumable_migration(plugin_package, store, 
     assert index._meta("pending_dim") == "4"
 
     monkeypatch.delenv("SILICONFLOW_API_KEY", raising=False)
-    assert index.migrate()["status"] == "running"  # no key: the cursor stays put
+    stalled = index.migrate()  # no key: the cursor stays put and the reason is reported
+    assert stalled["status"] == "degraded"
+    assert "SILICONFLOW_API_KEY" in stalled["reason"]
     assert index._meta("migration_cursor") == "0"
 
     index.embed = lambda text, dim=None: [0.5] * int(dim or index.dim)
@@ -70,6 +72,36 @@ def test_a_dimension_change_queues_a_resumable_migration(plugin_package, store, 
     assert conn.execute("SELECT COUNT(*) FROM sqlite_master WHERE name = 'conclusions_vec'"
                         ).fetchone()[0] == 0
     assert index.ensure_table() is True
+
+
+def test_a_blank_conclusion_is_skipped_instead_of_pinning_the_migration(plugin_package, store):
+    """A row with no text can never embed; retrying it kept the cursor on one id for ever."""
+    vector_mod = importlib.import_module(f"{plugin_package.__name__}.vector")
+    sqlite_vec = pytest.importorskip("sqlite_vec")
+    index = vector_mod.VectorIndex(store, {"dim": 4, "model": "new-model"})
+    assert index.available() is True  # loads vec0 on this connection
+    index.embed = lambda text, dim=None: [0.5] * int(dim or index.dim)
+    conn = store._conn
+    conn.execute("CREATE TABLE IF NOT EXISTS vector_meta (key TEXT PRIMARY KEY, "
+                 "value TEXT NOT NULL)")
+    conn.execute("CREATE VIRTUAL TABLE IF NOT EXISTS conclusions_vec USING vec0("
+                 "conclusion_id INTEGER PRIMARY KEY, embedding FLOAT[2])")
+    conn.execute("INSERT INTO vector_meta VALUES ('dim', '2')")
+    conn.execute("INSERT INTO vector_meta VALUES ('table', 'conclusions_vec')")
+    conn.commit()
+    assert index.ensure_table() is False  # the dim/model change queues a migration
+    conn.execute("INSERT INTO conclusions (kind, key, content, created_at, updated_at) "
+                 "VALUES ('note', 'blank', '   ', 1, 1)")
+    conn.commit()
+    store.save_conclusion("note", "docker prune removes images", key="real", session_id="s1")
+
+    result = index.migrate(batch=10)
+    assert result["status"] == "done"
+    assert result["skipped"] == 1 and result["done"] == 1
+    assert index._meta("migration_cursor") != "0"
+    table = index._meta("table")
+    assert table and table != "conclusions_vec"
+    assert conn.execute("SELECT COUNT(*) FROM %s" % table).fetchone()[0] == 1
 
 
 class _Response:

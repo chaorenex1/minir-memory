@@ -45,6 +45,9 @@ class VectorIndex:
         self._ready = False
         self._cache: dict[tuple[str, int], list[float]] = {}
         self._warned_key = False
+        #: Why the last ``embed`` returned None. Migrate reports it instead of spinning as
+        #: "running" forever on a provider that is not answering.
+        self._last_error = "not attempted"
         self._queue: "queue.Queue[tuple[int, str]]" = queue.Queue(maxsize=256)
         self._thread: Optional[threading.Thread] = None
         self._stopping = False
@@ -159,6 +162,7 @@ class VectorIndex:
         expected = max(1, int(dim or self.dim))
         flat = " ".join(str(text or "").split())
         if not flat:
+            self._last_error = "empty text"
             return None
         cached = self._cache.get((flat, expected))
         if cached is not None:
@@ -168,6 +172,8 @@ class VectorIndex:
             if not self._warned_key:
                 logger.warning("minir vector: no API key configured, bm25 only")
                 self._warned_key = True
+            self._last_error = "no API key (env %s is empty)" % (
+                str(self.settings.get("key_env") or "?"))
             return None
         body = json.dumps({"model": self.settings.get("model"), "input": flat}).encode("utf-8")
         request = urllib.request.Request(
@@ -180,10 +186,13 @@ class VectorIndex:
             vector = payload["data"][0]["embedding"]
         except Exception as exc:
             logger.warning("minir vector: embedding failed, bm25 only: %s", exc)
+            self._last_error = "%s: %s" % (type(exc).__name__, exc)
             return None
         if not isinstance(vector, list) or len(vector) != expected:
             logger.warning("minir vector: embedding dimension %s != %s; refused",
                            len(vector) if isinstance(vector, list) else "?", expected)
+            self._last_error = "dimension %s != %s" % (
+                len(vector) if isinstance(vector, list) else "?", expected)
             return None
         values = [float(item) for item in vector]
         if len(self._cache) >= 128:
@@ -286,11 +295,23 @@ class VectorIndex:
             logger.warning("minir vector: migration read failed: %s", exc)
             return {"status": "failed", "done": 0}
         written = 0
+        skipped = 0
+        stalled = ""
         for row in rows:
             conclusion_id, content = int(row[0]), str(row[1] or "")
+            if not content.strip():
+                # A blank conclusion cannot be embedded, so retrying it would pin the cursor for
+                # ever (this is what kept the migration at one row). Advance past it instead:
+                # there is no text to search, and the row keeps its place in the store.
+                cursor = conclusion_id
+                skipped += 1
+                continue
             vector = self.embed(content, dim=target_dim)
             if vector is None:
-                break  # retry the same row next tick; the old vectors are still in place
+                # Retry the same row next tick; the old vectors stay in place. Report why, so a
+                # provider that never answers shows up as degraded instead of "running".
+                stalled = self._last_error or "embedding unavailable"
+                break
             try:
                 import sqlite_vec
                 with conn:
@@ -299,17 +320,17 @@ class VectorIndex:
                         % table, (conclusion_id, sqlite_vec.serialize_float32(vector)))
             except Exception as exc:
                 logger.warning("minir vector: migration write failed: %s", exc)
-                return {"status": "failed", "done": written}
+                return {"status": "failed", "done": written, "skipped": skipped}
             cursor = conclusion_id
             written += 1
         with conn:
             self._set_meta(conn, "migration_cursor", cursor)
-        if written < len(rows):
-            return {"status": "running", "done": written}  # a row failed to embed; retry it
+        if stalled:
+            return {"status": "degraded", "done": written, "skipped": skipped, "reason": stalled}
         if len(rows) < size:
             self._finish_migration(conn, target_dim, table)
-            return {"status": "done", "done": written}
-        return {"status": "running", "done": written}
+            return {"status": "done", "done": written, "skipped": skipped}
+        return {"status": "running", "done": written, "skipped": skipped}
 
     def _finish_migration(self, conn: Any, dim: int, table: str) -> None:
         old = self._table()

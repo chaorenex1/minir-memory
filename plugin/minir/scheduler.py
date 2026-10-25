@@ -36,6 +36,10 @@ TIME = "time"
 DEFAULT_TICK_SECONDS = 1.0
 _MAX_DETAIL = 240
 
+#: Return-value statuses that mean "the task ran but its subsystem is not working". Recorded as
+#: the ``degraded`` outcome so a task cannot report ok while it is silently doing nothing.
+_DEGRADED_STATES = frozenset({"degraded", "failed", "unavailable"})
+
 
 def _describe(result: Any) -> str:
     """Short, log-safe rendering of a task's return value (empty means "nothing happened")."""
@@ -226,6 +230,15 @@ class Scheduler:
         if result is False:
             self._record(task, trigger, "retry", detail, elapsed)
             logger.warning("Minir scheduler: task=%s trigger=%s outcome=retry detail=%s ms=%.1f",
+                           task.name, trigger, detail or "-", elapsed)
+            return
+        # A task that reports its own degradation must not read as ok: a vector migration
+        # spinning on an unreachable provider returned {"status": "running", "done": 0} every
+        # five minutes and looked healthy for hours.
+        state = str(result.get("status") or "") if isinstance(result, Mapping) else ""
+        if state in _DEGRADED_STATES:
+            self._record(task, trigger, "degraded", detail, elapsed)
+            logger.warning("Minir scheduler: task=%s trigger=%s outcome=degraded detail=%s ms=%.1f",
                            task.name, trigger, detail or "-", elapsed)
             return
         self._record(task, trigger, "ok", detail, elapsed)
