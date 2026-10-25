@@ -95,11 +95,14 @@ def test_a_card_claim_and_an_unclaimed_preference_stop_at_concern(claims, plugin
         {"severity": "blocker", "target": "tool_choice", "text": "one", "claim": card["id"]},
         {"severity": "blocker", "target": "user_preferences_check", "text": "two"}]})
 
-    notes = mode.parse_review(answer, severity_floor="nit", max_advices=3, active_claims=[card])
+    dropped: dict[str, int] = {}
+    notes = mode.parse_review(answer, severity_floor="nit", max_advices=3, active_claims=[card],
+                              dropped=dropped)
     capped = claims.apply_ceiling(notes, [card])
 
     assert [note["severity"] for note in capped] == ["concern", "concern"]
     assert capped[0]["claim_text"] == "be terse"
+    assert dropped == {}, "a delivered preference note is not a dropped note"
 
 
 def test_a_duplicate_claim_id_is_an_error_not_an_overwrite(claims):
@@ -144,3 +147,16 @@ def test_parse_review_drops_an_unselected_claim(plugin_package):
     parsed = mode.parse_review(answer, active_claims=[{"id": "c1"}], dropped=dropped)
     assert [note["content"] for note in parsed] == ["keep"]
     assert dropped["unselected_claim"] == 1
+
+
+def test_parse_review_drops_a_delivered_note_that_names_no_claim(plugin_package):
+    """The review prompt must ask for `claim`: without it every note dies here."""
+    mode = plugin_package.adviser_mode
+    answer = json.dumps({"action": "advise", "advices": [
+        {"severity": "concern", "target": "tool_choice", "text": "no claim named"}]})
+    dropped: dict[str, int] = {}
+
+    parsed = mode.parse_review(answer, active_claims=[{"id": "c1"}], dropped=dropped)
+
+    assert parsed == []
+    assert dropped == {"unclaimed": 1}

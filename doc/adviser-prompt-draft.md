@@ -209,8 +209,12 @@ or
 {"action":"advise","advices":[{"severity":"nit|concern|blocker",
  "target":"one token from ADVICE TARGETS",
  "text":"...","decision":"...","evidence":["..."],
- "candidate_id": 12}]}
+ "claim":"<id copied from ACTIVE CLAIMS>","candidate_id": 12}]}
 
+- claim is required whenever ACTIVE CLAIMS lists ids: copy one of those ids verbatim, the one the
+  finding rests on, and judge only claims in that list. An advice without it is dropped as
+  unclaimed; an id that is not in the list is dropped as unselected. Neither ever reaches the
+  agent. Only a user_preferences_check note may stand without a claim.
 - candidate_id is optional; include it when the advice came from a candidate.
 - If you merge several candidates, cite their ids in evidence.
 - Write text and decision in the user's language; keep JSON keys, severity, and target tokens
@@ -598,7 +602,7 @@ craft block 与 SOUL 的分工：
    `store.pending_advisories(session, limit=candidate_limit, source="dialectic")`，作为 `<candidate_advices>` 数据块加入 `_prompt()`。`consult()` 若读取候选，必须只读：不调用 consume/stage/deliver，不改变 status，也不写 `adviser_mode` 行。
 5. **提示词**：`_review_brief(cfg)` 加入 `MODE_REVIEW` 的候选项与 `ADVICE GRADING`；`CORE` 保持共享；REVIEW 输出要求 `text`/`decision` 跟随用户语言。
 6. **动态 system block**：`ADVICE_TARGETS` 扩为 `(name, definition, usage)` 并覆盖 11 个；新增 `ADVICE_SEVERITIES`、`advice_handling_section()`、`advice_nit_report_section()`、`advice_language_line()`；`system_prompt_block()` 按 §2.1.1 的顺序与门控拼接，不手写重复表。
-7. **解析**：`parse_review` 接受可选 `candidate_id`（以及合并时的 evidence `candidate:<id>`），保留到 ledger 行；候选的 memory target 提升时重映射为 action target 或 `general`。
+7. **解析**：`parse_review` 接受可选 `candidate_id`（以及合并时的 evidence `candidate:<id>`），保留到 ledger 行；候选的 memory target 提升时重映射为 action target 或 `general`。`claims` 开启时每条建议必须带 `claim`（取自本轮 active claims）：缺失计 `unclaimed` 并丢弃，不在列表内计 `unselected_claim` 并丢弃；唯一例外是 `user_preferences_check`，无 claim 也放行且不计入 `notes_dropped`。
 8. **ledger**：新增 consume 语义（例如 `status='consumed'` + `review_id`）。只在 `_finish_safe` 成功发布 `silent`/`advised` 后执行；模型错误、解析失败、session ended、任何 dropped 路径都保持 pending，**不要在 `finally` 里无条件标记**。
 9. **投递**：`handle_llm_request` 仍只读 `source='adviser_mode'`；不要恢复 dialectic 的直接投递。
 10. **测试**：

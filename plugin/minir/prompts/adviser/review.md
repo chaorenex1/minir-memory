@@ -37,8 +37,12 @@ or
 {"action":"advise","advices":[{"severity":"nit|concern|blocker",
  "target":"one token from ADVICE TARGETS",
  "text":"...","decision":"...","evidence":["..."],
- "candidate_id": 12}]}
+ "claim":"<id copied from ACTIVE CLAIMS>","candidate_id": 12}]}
 
+- claim is required whenever ACTIVE CLAIMS lists ids: copy one of those ids verbatim, the one the
+  finding rests on, and judge only claims in that list. An advice without it is dropped as
+  unclaimed; an id that is not in the list is dropped as unselected. Neither ever reaches the
+  agent. Only a user_preferences_check note may stand without a claim.
 - candidate_id is optional; include it when the advice came from a candidate.
 - deferred: true holds this note for the end-of-turn aggregate instead of a mid-turn channel.
   Use it when the note matters but not before the turn finishes; never defer a blocker.

@@ -623,6 +623,17 @@ def test_review_prompt_carries_artifact_advice(plugin_package):
     assert "changes the artifact" in brief
 
 
+def test_review_contract_names_the_claim_field_the_parser_requires(plugin_package):
+    """parse_review drops a delivered note with no `claim` while claims are active, so the
+    packaged contract has to name the field; otherwise the reviewer writes valid prose the
+    parser silently discards."""
+    brief = plugin_package.adviser_mode._review_brief({})
+    flat = " ".join(brief.split())
+
+    assert '"claim":"<id copied from ACTIVE CLAIMS>"' in flat
+    assert "dropped as unclaimed" in flat
+
+
 def test_review_brief_appends_both_rule_files(plugin_package):
     brief = plugin_package.adviser_mode._review_brief({})
     assert "PARALLEL RULES" in brief, "advice_target rule body is missing"
