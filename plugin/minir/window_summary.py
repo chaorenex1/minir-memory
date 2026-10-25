@@ -16,6 +16,9 @@ from typing import Any
 TEMPLATE_VERSION = 1
 TEMPLATE_PATH = Path(__file__).resolve().parent / "templates" / "window_summary.md"
 
+#: The section heading ``layers.is_artifact`` requires before the field headings.
+SECTION_HEADING = "## Window Summary"
+
 #: The eight sections a summary must carry, in template order. Compression and the 24h final
 #: summary validate against this same list so one shape covers the window, its snapshots and the
 #: session's last record.
@@ -109,6 +112,18 @@ def validate_nonempty(text: Any) -> str:
     if value and is_empty(value):
         _fail("window_summary", "must carry at least one non-heading line")
     return value
+
+
+def missing_section_heading(text: Any) -> bool:
+    """True when the section heading the merge matches is absent from a summary.
+
+    ``layers.is_artifact`` matches ``## Window Summary`` verbatim, so a model that translates it
+    ("## 窗口摘要") produces a summary the merge can only reject after every child pass ran.
+    Checking at the pass boundary turns that into the format error it is and lets the pass retry
+    the child. The eight field headings are the template's content shape, not a merge condition,
+    so they are not checked here: a section the model left thin costs quality, not the window.
+    """
+    return SECTION_HEADING not in {line.strip() for line in str(text or "").splitlines()}
 
 
 def empty_summary() -> str:

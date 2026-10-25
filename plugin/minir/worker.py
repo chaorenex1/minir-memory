@@ -993,10 +993,20 @@ class LayerWorker:
             layers.validate_base_pass, label="base user pass", agent="b1_user_card")
         summary = base["window_summary"]
         value_markers = base["value_markers"]
-        if not summary.strip():
-            logger.warning("Minir base refresh %s: b3 child failed; retrying once", subject)
+        # An empty summary is a failed child; a translated section heading is a format failure.
+        # Both are retried here, before b2 runs and before the merge can only report
+        # "invalid artifact".
+        heading_missing = summary_template.missing_section_heading(summary)
+        if heading_missing:
+            logger.warning("Minir base refresh %s: b3 child returned %s; retrying once", subject,
+                           "an empty summary" if not summary.strip()
+                           else "a translated '## Window Summary' heading")
             retry_parts = [
                 "Write the window summary for the window in the supplied digest.",
+                "Keep the template's headings exactly as written, in order: the section heading "
+                "is '## Window Summary' and the field headings are '### Objective', "
+                "'### Current State', and so on. Never translate a heading, even when the body "
+                "is written in another language.",
                 _language_block(self._language),
                 data_block("window_template", summary_template.load_template()),
             ]
@@ -1005,6 +1015,7 @@ class LayerWorker:
             summary = self._retry_base_child(
                 "b3_window_summary", "\n\n".join(retry_parts),
                 [window_path], session, ["file", "session_search"])
+            heading_missing = summary_template.missing_section_heading(summary)
         page_writes = [dict(item) for item in base.get("page_writes") or []
                        if isinstance(item, dict)]
         if not value_markers:
@@ -1016,6 +1027,10 @@ class LayerWorker:
             page_writes.extend(retry_writes)
         if not summary.strip():
             raise LayerMergeError("base summary child failed after one retry")
+        if heading_missing:
+            raise LayerMergeError(
+                "base summary is missing the '## Window Summary' heading after one retry "
+                "(the model translated it); the merge cannot place the section")
         for item in page_writes:
             logger.info("Minir page write %s %s: %s", item.get("status"),
                         item.get("path") or item.get("topic"),

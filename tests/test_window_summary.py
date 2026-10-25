@@ -12,6 +12,16 @@ def summary(plugin_package):
     return importlib.reload(plugin_package.window_summary)
 
 
+def test_a_translated_section_heading_is_reported_before_the_merge(summary):
+    """The merge matches '## Window Summary' verbatim; a localized heading must fail here."""
+    translated = "## 窗口摘要\n\n### Objective\nRestart docker\n"
+    assert summary.missing_section_heading(translated) is True
+    assert summary.missing_section_heading("") is True
+    assert summary.missing_section_heading(_filled()) is False
+    # A heading that only appears inside a sentence is not a heading.
+    assert summary.missing_section_heading("see ## Window Summary above") is True
+
+
 def _filled() -> str:
     """One section with content under every heading, in the shape the template fixes."""
     return "\n\n".join([
