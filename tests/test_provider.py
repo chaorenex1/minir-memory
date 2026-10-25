@@ -226,6 +226,81 @@ def test_reasoning_can_be_enabled_by_env(make_provider, monkeypatch):
     assert provider._worker.enabled is True
 
 
+def test_an_unknown_remember_mode_is_an_error(provider):
+    payload = json.loads(provider.handle_tool_call("minir_remember", {
+        "type": "note", "content": "docker prune", "remember_mode": "page"}))
+
+    assert "error" in payload
+
+
+def test_session_extraction_writes_a_page_and_leaves_the_note_row_alone(
+        plugin_package, make_provider, monkeypatch):
+    provider = make_provider({})
+    session = provider._session_id
+    stored = json.loads(provider.handle_tool_call("minir_remember", {
+        "type": "note", "content": "prefer pytest over unittest" * 3}))
+    note_id = int(stored["conclusions_id"])
+    before = dict(provider._store.conclusion_by_id(note_id))
+    before_versions = provider._store._conn.execute(
+        "SELECT COUNT(*) FROM conclusion_versions WHERE conclusion_id = ?",
+        (note_id,)).fetchone()[0]
+    page = {"path": "tools/METHOD-pytest-tips.md", "category": "METHOD", "org": "tools",
+            "topic": "pytest tips", "summary": "prefer pytest",
+            "content": "1. run pytest -q.\n2. keep tests short.",
+            "time": "2026-10-25", "objects": [], "relations": []}
+    monkeypatch.setattr(plugin_package.session_summary, "summarize_agent",
+                        lambda **kwargs: "")
+    monkeypatch.setattr(plugin_package.extraction, "extract_pages", lambda **kwargs: [page])
+
+    result = provider._run_session_extraction(
+        {"session_id": session, "markers": "{}", "window_to_ts": 0.0})
+
+    after = dict(provider._store.conclusion_by_id(note_id))
+    assert result["pages"] == 1
+    assert (provider._knowledge.root / "tools" / "METHOD-pytest-tips.md").is_file()
+    assert after["content"] == before["content"] and after["version"] == before["version"]
+    assert provider._store._conn.execute(
+        "SELECT COUNT(*) FROM conclusion_versions WHERE conclusion_id = ?",
+        (note_id,)).fetchone()[0] == before_versions
+
+
+def test_remember_without_a_category_needs_a_numbered_procedure(make_provider):
+    provider = make_provider({})
+    prose = json.loads(provider.handle_tool_call("minir_remember", {
+        "type": "tools", "remember_mode": "knowledge", "summary": "daemon restart",
+        "content": "The daemon restarted cleanly.\nNo image was lost.\nThe cache stayed warm."}))
+    assert "error" in prose
+
+    steps = json.loads(provider.handle_tool_call("minir_remember", {
+        "type": "tools", "remember_mode": "knowledge", "summary": "docker prune procedure",
+        "topic": "docker prune procedure",
+        "content": "1. pull the image.\n2. prune the dangling layers.\n3. restart the daemon."}))
+    assert (steps["category"], steps["queued"]) == ("METHOD", True)
+
+
+def test_the_same_remember_twice_writes_one_page(make_provider):
+    provider = make_provider({})
+    args = {"type": "tools", "remember_mode": "knowledge", "category": "METHOD",
+            "topic": "docker prune", "summary": "prune",
+            "content": "1. stop the daemon.\n2. prune the images.\n3. restart it."}
+
+    first = json.loads(provider.handle_tool_call("minir_remember", args))
+    second = json.loads(provider.handle_tool_call("minir_remember", args))
+    provider._knowledge.stop()
+
+    assert first["queued"] is True and second["queued"] is True
+    assert len(list((provider._knowledge.root / "tools").glob("*.md"))) == 1
+
+
+def test_history_maintenance_runs_with_reasoning_off(make_provider):
+    provider = make_provider({"reasoning_enabled": False})
+
+    inventory = json.loads(provider.handle_tool_call("minir_stats", {}))["scheduler"]
+
+    assert "conclusion_history_maintenance" in inventory
+    assert "card_review" not in inventory
+
+
 def test_prefetch_on_empty_store_is_blank(provider):
     assert provider.prefetch("nothing was ever stored") == ""
     assert provider.recall_status() is None
@@ -350,7 +425,8 @@ def test_tool_argument_validation(provider):
 def test_kb_search_answers_from_the_knowledge_directory(provider, plugin_package):
     root = plugin_package.knowledge.knowledge_dir(provider._hermes_home)
     plugin_package.knowledge.write_unit(
-        {"id": "u1", "org": "tools", "category": "METHOD", "topic": "Docker prune",
+        {"id": "u1", "path": "tools/METHOD-Docker-prune.md", "org": "tools",
+         "category": "METHOD", "topic": "Docker prune",
          "content": "docker system prune -af", "time": "2026-10-21", "relations": [],
          "objects": ["tools:Docker"]}, root=root)
     if plugin_package.knowledge.rgtool.find(provider._hermes_home) is None:
@@ -1086,6 +1162,25 @@ def test_system_prompt_block_includes_the_global_user_preference(
     assert "# User Preferences" in block
     assert "回复用中文" in block
     assert block.index("# Minir Memory") < block.index("# User Preferences")
+
+
+def test_an_empty_identity_card_adds_no_block(plugin_package, make_provider):
+    provider = make_provider({})
+    home = Path(provider._hermes_home)
+    path = plugin_package.card_review.card_paths(str(home), "default")[
+        plugin_package.card_review.USER_PREFERENCE]
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("## Style\n- terse\n", encoding="utf-8")
+
+    block = provider._cards_prompt_block()
+
+    assert "# User Preferences" in block and "# User Identity" not in block
+
+
+def test_both_cards_empty_returns_empty_block(make_provider):
+    provider = make_provider({})
+
+    assert provider._cards_prompt_block() == ""
 
 
 def test_system_prompt_injects_the_user_identity_card(plugin_package, make_provider, tmp_path):

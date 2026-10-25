@@ -446,6 +446,21 @@ def test_a_failed_window_is_recovered_by_the_next_job(plugin_package, store, tra
     assert store.layer_state(BASE, "user:default")["content"].startswith("## User Card")
 
 
+def test_a_b4_retry_returns_the_writes_it_made(plugin_package, store, transcript):
+    """The retry answer has two halves; dropping page_writes loses the only write record."""
+    answer = json.dumps({
+        "value_markers": [{"path": "tools/METHOD-x.md", "topic": "x"}],
+        "page_writes": [{"path": "tools/METHOD-x.md", "status": "created", "error": ""}]})
+    instance = plugin_package.worker.LayerWorker(
+        store, transcript, complete=lambda *args, **kwargs: "{}")
+    instance._base_child = lambda *args, **kwargs: answer
+
+    markers, writes = instance._retry_markers_child("prompt", [], SESSION)
+
+    assert [marker["path"] for marker in markers] == ["tools/METHOD-x.md"]
+    assert writes == [{"path": "tools/METHOD-x.md", "status": "created", "error": ""}]
+
+
 def test_an_empty_peer_card_is_a_valid_sparse_result(plugin_package, store, transcript):
     """A short window legitimately yields no peer-card text; the JSON contract still holds."""
     def complete(task, system, prompt, **kwargs):
@@ -456,7 +471,7 @@ def test_an_empty_peer_card_is_a_valid_sparse_result(plugin_package, store, tran
 
     instance = plugin_package.worker.LayerWorker(
         store, transcript, complete=complete)
-    instance._retry_base_child = lambda *args, **kwargs: []  # an empty marker array is valid
+    instance._retry_markers_child = lambda *args, **kwargs: ([], [])  # empty markers are valid
     transcript.add(SESSION, "user", "ship it", created_at=10.0)
     _dispatch(store, transcript, SESSION, BASE, 0.0, 20.0)
 
@@ -513,6 +528,42 @@ def test_evidence_keeps_the_newest_messages_when_over_budget(store, transcript, 
     assert "newest message" in prompt and "…earlier messages omitted" in prompt
 
 
+def test_the_ai_card_prompt_separates_soul_review_and_manifest(plugin_package):
+    worker = plugin_package.worker
+    prompt = worker._base_ai_prompt(
+        "agent:default:minir", SESSION,
+        {"user_self_representation": _user_self(), "user_preferences": _user_prefs()},
+        {"ai_self_representation": _ai_self(), "ai_identity": _identity()},
+        "evidence line", identity="review identity body", preference="review preference body",
+        preference_source="review", plugin_yaml="name: minir", soul_identity="operator soul body",
+        first=False)
+
+    assert "## Operator declarations (SOUL, trusted)" in prompt and "<soul_identity>" in prompt
+    assert "<review_identity>" in prompt and "Prior review identity" in prompt
+    assert "## Manifest (facts)" in prompt and "<plugin_yaml>" in prompt
+    assert prompt.index("<soul_identity>") < prompt.index("<review_identity>")
+    assert "Operator-authored identity" not in prompt  # a review card is not an operator one
+
+
+def test_a_review_sourced_card_is_not_labelled_operator(plugin_package):
+    worker = plugin_package.worker
+    card = {"user_self_representation": _user_self(), "user_preferences": _user_prefs()}
+    ai_card = {"ai_self_representation": _ai_self(), "ai_identity": _identity()}
+
+    review = worker._base_ai_prompt("agent:default:minir", SESSION, card, ai_card, "",
+                                    identity="review body", preference="review prefs",
+                                    identity_source="review", preference_source="review",
+                                    first=False)
+    operator = worker._base_ai_prompt("agent:default:minir", SESSION, card, ai_card, "",
+                                      identity="operator body", preference="operator prefs",
+                                      identity_source="operator_edit",
+                                      preference_source="operator_edit", first=False)
+
+    assert "Operator-authored" not in review and "<review_identity>" in review
+    assert "Operator-authored identity (trusted)" in operator
+    assert "<operator_identity>" in operator and "<operator_preferences>" in operator
+
+
 def test_prompt_inputs_are_labeled_and_cannot_close_their_own_block(plugin_package):
     worker = plugin_package.worker
     user_card = {"user_self_representation": _user_self(), "user_preferences": _user_prefs()}
@@ -565,10 +616,19 @@ def test_prompt_inputs_are_labeled_and_cannot_close_their_own_block(plugin_packa
         "agent:default:minir", "old review", "base artifact", injection(dialectic_tag),
         session=SESSION, from_ts=0.0, to_ts=1.0, identity="identity",
         preference="preference", chunks="chunk one")
-    for label in ("previous_review", "base_artifact", "operator_identity",
-                  "operator_preferences", "chunk_summaries", dialectic_tag):
+    for label in ("previous_review", "base_artifact", "review_identity",
+                  "review_preferences", "chunk_summaries", dialectic_tag):
         assert f"<{label}>" in dialectic_prompt
+    assert "Operator-authored" not in dialectic_prompt
+    assert "Prior review identity (review rank" in dialectic_prompt
     assert neutralized(dialectic_tag) in dialectic_prompt
+
+    declared = worker._dialectic_prompt(
+        "agent:default:minir", "", "base", "", identity="I am the operator",
+        preference="prefer evidence", identity_source="operator_edit",
+        preference_source="operator_edit")
+    assert "<operator_identity>" in declared and "<operator_preferences>" in declared
+    assert "Operator-authored identity (trusted)" in declared
 
 
 def test_prompt_budget_trims_only_the_window_and_keeps_structure(plugin_package):
@@ -1045,6 +1105,8 @@ def test_base_refresh_runs_on_the_dialectic_route_with_the_plugin_toolset(
         assert "JSON object" in system
     assert '"user_self_representation"' in systems[0]
     assert '"window_summary"' in systems[0]
+    assert "How this assistant is required to work in this profile." in systems[1], (
+        "B2 must carry the ai-preferences rule")
     assert store.latest_base_refresh(SESSION, "user:default") is not None
 
 
@@ -1252,12 +1314,12 @@ def test_an_empty_part_outside_a_listed_change_is_ignored(plugin_package, store,
 
 def test_a_sparse_base_window_is_reviewed_without_inventing_cards(plugin_package, store,
                                                                   transcript):
-    """A base row with an empty summary and identity must review cleanly when echoed."""
-    _seed_base_refresh(store, summary=_empty_summary(), identity=_blank_identity())
+    """A base row with a sparse summary and no identity must review cleanly when echoed."""
+    sparse = _section() + "\n- read the window; nothing durable happened\n"
+    _seed_base_refresh(store, summary=sparse, identity=_blank_identity())
 
     def complete(task, system, prompt, **kwargs):
-        return _dialectic_json(summary=_empty_summary(), ai_identity=_blank_identity(),
-                               changed=False)
+        return _dialectic_json(summary=sparse, ai_identity=_blank_identity(), changed=False)
 
     instance = plugin_package.worker.LayerWorker(store, transcript, complete=complete)
     transcript.add(SESSION, "user", "review this", created_at=10.0)
@@ -1377,7 +1439,10 @@ def test_dialectic_route_appends_the_plugin_toolset_explicitly(
     assert set(route_keys) == {plugin_package.adviser.DIALECTIC_TASK}
     dialectic = requests[-1]
     assert "minir" in dialectic["toolsets"]
-    assert "dialectic reviewer" in "\n\n".join(dialectic["system_message"])
+    dialectic_system = "\n\n".join(dialectic["system_message"])
+    assert "dialectic reviewer" in dialectic_system
+    assert "How this assistant is required to work in this profile." in dialectic_system, (
+        "the dialectic must carry the ai-preferences rule")
     assert "Base artifact for this window" in dialectic["message"]
 
 

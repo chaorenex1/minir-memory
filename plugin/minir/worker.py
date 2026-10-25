@@ -498,9 +498,26 @@ def _base_user_prompt(subject: str, session: str, baseline: dict[str, Any], evid
         block=transcript_prompt.BLOCK_NAMES["base_user"])
 
 
+def _identity_prompt_block(what: str, body: str, source: str) -> str:
+    """A card block whose trust line comes from the file's recorded source, not the caller.
+
+    ``what`` is ``identity`` or ``preference``; the block tag follows the same rule, so all three
+    prompts that carry these files present them identically.
+    """
+    tag = "identity" if what == "identity" else "preferences"
+    if str(source or "").strip() == "operator_edit":
+        return ("## Operator-authored %s (trusted)\n"
+                "The operator edited this file; it overrides every card below.\n" % what
+                + data_block("operator_" + tag, body))
+    return ("## Prior review %s (review rank, may be revised)\n"
+            "A review wrote this; it is not an operator declaration.\n" % what
+            + data_block("review_" + tag, body))
+
+
 def _base_ai_prompt(subject: str, session: str, user_card: dict[str, Any],
                     previous: dict[str, Any], evidence: str, *,
-                    identity: str = "", preference: str = "", plugin_yaml: str = "",
+                    identity: str = "", preference: str = "",
+                    identity_source: str = "", preference_source: str = "", plugin_yaml: str = "",
                     soul_identity: str = "",
                     window_summary: str = "", first: bool, from_ts: float = 0.0,
                     to_ts: float = 0.0, language: str = "en") -> str:
@@ -522,13 +539,9 @@ def _base_ai_prompt(subject: str, session: str, user_card: dict[str, Any],
                      "These override every card below.\n"
                      + data_block("soul_identity", soul_identity))
     if identity.strip():
-        parts.append("## Prior review card (review rank, may be revised)\n"
-                     "A review wrote this; it is not an operator declaration.\n"
-                     + data_block("review_identity", identity))
+        parts.append(_identity_prompt_block("identity", identity, identity_source))
     if preference.strip():
-        parts.append("## Prior review preference (review rank, may be revised)\n"
-                     "A review wrote this; it is not an operator declaration.\n"
-                     + data_block("review_preferences", preference))
+        parts.append(_identity_prompt_block("preference", preference, preference_source))
     if plugin_yaml.strip():
         parts.append("## Manifest (facts)\nOnly deployment facts; never transcribe a version or "
                      "lifecycle block into the card.\n"
@@ -544,7 +557,8 @@ _MAX_DIALECTIC_PROMPT_CHARS = 24_000
 
 def _dialectic_prompt(subject: str, previous: str, base_content: str, evidence: str, *,
                       session: str = "", from_ts: float = 0.0, to_ts: float = 0.0,
-                      identity: str = "", preference: str = "", chunks: str = "",
+                      identity: str = "", preference: str = "",
+                      identity_source: str = "", preference_source: str = "", chunks: str = "",
                       cold: bool = False, language: str = "en") -> str:
     """User message for the dialectic review: base artifact + history + window."""
     parts = [
@@ -560,11 +574,9 @@ def _dialectic_prompt(subject: str, previous: str, base_content: str, evidence: 
         if base_content.strip() else "Base artifact for this window: none",
     ]
     if identity.strip():
-        parts.append("Operator-authored AI identity (trusted):\n"
-                     + data_block("operator_identity", identity))
+        parts.append(_identity_prompt_block("identity", identity, identity_source))
     if preference.strip():
-        parts.append("Operator-authored AI preferences (trusted):\n"
-                     + data_block("operator_preferences", preference))
+        parts.append(_identity_prompt_block("preference", preference, preference_source))
     if chunks.strip():
         parts.append("LOCAL CHUNK SUMMARIES (canonical chain, oldest first; derived drafts):\n"
                      + data_block("chunk_summaries", chunks[:3_000]))
@@ -629,6 +641,7 @@ class LayerWorker:
 
     def __init__(self, store: MinirStore, transcript: TranscriptBuffer, *, enabled: bool = True,
                  agent_identity: str = "", user_id: str = "", state_db: str = "",
+                 identity_source: str = "", preference_source: str = "",
                  profile: str = "", identity: str = "", preference: str = "", depth: int = 2,
                  content_language: str = "en", hermes_home: str = "",
                  complete: Optional[Callable[..., str]] = None,
@@ -643,6 +656,8 @@ class LayerWorker:
         self._state_db = str(state_db or "")
         self._identity = str(identity or "")
         self._preference = str(preference or "")
+        self._identity_source = str(identity_source or "")
+        self._preference_source = str(preference_source or "")
         self._language = str(content_language or "en")
         self._hermes_home = str(hermes_home or "")
         self._plugin_yaml = _read_plugin_yaml()
@@ -920,6 +935,20 @@ class LayerWorker:
             logger.warning("Minir %s child retry failed its contract: %s", name, exc)
             return "" if name == "b3_window_summary" else []
 
+    def _retry_markers_child(self, user_prompt: str, context_files: list[str],
+                             session: str) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+        """Retry B4 once and keep both halves of its answer: markers and the writes it made."""
+        answer = self._base_child("b4_value_markers", user_prompt, context_files, session,
+                                  ["file", "minir", "session_search"])
+        try:
+            payload = json.loads(answer)
+        except (TypeError, ValueError) as exc:
+            logger.warning("Minir b4 child retry failed its contract: %s", exc)
+            return [], []
+        writes = payload.get("page_writes") if isinstance(payload, dict) else None
+        return (layers.coerce_value_markers(payload),
+                [dict(item) for item in (writes or []) if isinstance(item, dict)])
+
     def _merge_base_cards(self, subject: str, evidence: str, baseline: dict[str, Any], *,
                           session: str = "", first: bool = False,
                           first_message: str = "", from_ts: float = 0.0,
@@ -975,32 +1004,37 @@ class LayerWorker:
             summary = self._retry_base_child(
                 "b3_window_summary", "\n\n".join(retry_parts),
                 [window_path], session, ["file", "session_search"])
+        page_writes = [dict(item) for item in base.get("page_writes") or []
+                       if isinstance(item, dict)]
         if not value_markers:
             logger.warning("Minir base refresh %s: b4 child failed; retrying once", subject)
-            value_markers = self._retry_base_child(
-                "b4_value_markers",
+            value_markers, retry_writes = self._retry_markers_child(
                 "Record this window's value markers.\n\n" + markers_category + "\n\n"
                 + markers_org,
-                [window_path, markers_path], session, ["file", "minir", "session_search"])
+                [window_path, markers_path], session)
+            page_writes.extend(retry_writes)
         if not summary.strip():
             raise LayerMergeError("base summary child failed after one retry")
-        for item in base.get("page_writes") or []:
-            if isinstance(item, dict):
-                logger.info("Minir page write %s %s: %s", item.get("status"),
-                            item.get("topic"), item.get("path") or item.get("error") or "")
+        for item in page_writes:
+            logger.info("Minir page write %s %s: %s", item.get("status"),
+                        item.get("path") or item.get("topic"),
+                        item.get("error") or "")
 
         ai_baseline = {}
         if _has_content(baseline.get("ai_self_representation")) or _has_content(baseline.get("ai_identity")):
             ai_baseline = {"ai_self_representation": baseline.get("ai_self_representation") or {},
                            "ai_identity": baseline.get("ai_identity") or {}}
         ai_system = self._system(layers.load_core("b2_ai_card"), layers.OUTPUT_B2,
-                                 [self._rule("ai-self"), self._rule("ai-identity")])
+                                  [self._rule("ai-self"), self._rule("ai-identity"),
+                                   self._rule("ai-preferences")])
         user_card = {"user_self_representation": base["user_self_representation"],
                      "user_preferences": base["user_preferences"]}
         ai_card = self._consult_validated(
             ai_system,
             _base_ai_prompt(subject, session, user_card, ai_baseline, ai_evidence,
                             identity=self._identity, preference=self._preference,
+                            identity_source=self._identity_source,
+                            preference_source=self._preference_source,
                             plugin_yaml=self._plugin_yaml, soul_identity=self._soul_identity,
                             window_summary=summary, first=first,
                             from_ts=from_ts, to_ts=to_ts, language=self._language),
@@ -1083,7 +1117,9 @@ class LayerWorker:
 
     @staticmethod
     def _window_key(job: Mapping[str, Any]) -> str:
-        return "%s:%d" % (job.get("session_id") or "", int(float(job.get("from_ts") or 0)))
+        # Full precision: two windows can start inside the same second, and a truncated key would
+        # make them one row in layer_failures.
+        return "%s:%.6f" % (job.get("session_id") or "", float(job.get("from_ts") or 0))
 
     def _record_base_failure(self, job: Mapping[str, Any], exc: BaseException) -> None:
         self._store.record_layer_failure(
@@ -1100,8 +1136,8 @@ class LayerWorker:
         session = str(job.get("session_id") or "")
         row = self._store.latest_base_refresh(session) if session else None
         if row is not None and float(row.get("window_to_ts") or 0) >= float(job.get("to_ts") or 0):
-            self._store.resolve_layer_failure("base", self.user_subject(),
-                                              self._window_key(job))
+            self._store.resolve_layer_failures_through(
+                "base", self.user_subject(), float(job.get("to_ts") or 0))
 
     def run_once(self, *, session_id: str = "") -> int:
         """Process up to ``_MAX_JOBS_PER_RUN`` jobs oldest-first; returns how many ran.
@@ -1364,11 +1400,14 @@ class LayerWorker:
         ai_baseline = {"ai_self_representation": baseline.get("ai_self_representation") or {},
                        "ai_identity": baseline.get("ai_identity") or {}}
         system = self._system(layers.load_core("b2_ai_card"), layers.OUTPUT_B2,
-                              [self._rule("ai-self"), self._rule("ai-identity")])
+                              [self._rule("ai-self"), self._rule("ai-identity"),
+                               self._rule("ai-preferences")])
         ai_card = self._consult_validated(
             system,
             _base_ai_prompt(self.user_subject(), "", user_card, ai_baseline, "",
                             identity=self._identity, preference=self._preference,
+                            identity_source=self._identity_source,
+                            preference_source=self._preference_source,
                             plugin_yaml=self._plugin_yaml, soul_identity=self._soul_identity,
                             first=False, language=self._language),
             lambda value: layers.validate_ai_card(value),
@@ -1492,7 +1531,8 @@ class LayerWorker:
         # (``add_chunk_summary`` is idempotent by session + from_ts and returns 0 when the
         # chain is already superseded). If it cannot be updated, do not claim it changed.
         if "window_summary" in changed_parts:
-            body = summary_template.validate(corrected["window_summary"]).split("\n", 1)[1].strip()
+            body = summary_template.validate_nonempty(
+                corrected["window_summary"]).split("\n", 1)[1].strip()
             chunk_version = self._store.add_chunk_summary(
                 session, float(base_row["window_from_ts"]), body)
             if not chunk_version:
@@ -1546,10 +1586,13 @@ class LayerWorker:
         system = self._system(
             layers.load_core("dialectic"), layers.OUTPUT_DIALECTIC,
             [self._rule("user-self"), self._rule("user-preferences"),
-             self._rule("ai-self"), self._rule("ai-identity")])
+             self._rule("ai-self"), self._rule("ai-identity"),
+             self._rule("ai-preferences")])
         prompt = _dialectic_prompt(
             subject, prior, base_content, evidence, identity=self._identity,
-            preference=self._preference, chunks=chunks, cold=cold, language=self._language,
+            preference=self._preference, identity_source=self._identity_source,
+            preference_source=self._preference_source, chunks=chunks, cold=cold,
+            language=self._language,
             session=session, from_ts=from_ts, to_ts=to_ts)
         draft = self._dialectic_consult(system, prompt)
         candidates = [draft]

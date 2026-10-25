@@ -28,7 +28,7 @@ def _provider(make_provider, **overrides):
     cfg = {
         "enabled": True, "mode": "watch", "cadence": 99, "severity_floor": "concern",
         "max_reviews_per_turn": 4, "max_advices": 3, "max_chars": 900,
-        "host_steer": True, "host_continue": False,
+        "host_steer": True, "host_continue": False, "claims": "off",
     }
     cfg.update(overrides)
     return make_provider({"adviser_mode": cfg})

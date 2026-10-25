@@ -32,7 +32,8 @@ def _fake_run(answer_for):
 def _provider(make_provider, **overrides):
     cfg = {"enabled": True, "mode": "watch", "cadence": 99, "severity_floor": "concern",
            "max_reviews_per_turn": 4, "max_advices": 3, "max_chars": 900,
-           "block_tools": True, "verify_continue": False}
+           "block_tools": True, "verify_continue": False,
+           "claims": "off"}  # these tests carry no claim pool; claiming is tested elsewhere
     cfg.update(overrides)
     return make_provider({"adviser_mode": cfg})
 

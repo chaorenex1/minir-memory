@@ -95,8 +95,8 @@ _DEFAULTS: dict[str, Any] = {
     "max_reviews_per_turn": 6,
     # -- claims (P0-P3) -------------------------------------------------------
     # off: today's behaviour. shadow: select and store only. on: inject the offer.
-    "claims": "off",
-    "claim_gate": False,          # P3: deterministic operator gate before a mutating tool
+    "claims": "on",
+    "claim_gate": True,           # P3: deterministic operator gate before a mutating tool
     "max_advices": MAX_ADVICES,
     "max_chars": MAX_BLOCK_CHARS,
     "toolsets": [TOOLSET],
@@ -1600,7 +1600,7 @@ class AdviserMode:
             out.append(note)
         return out, counts
 
-    def _select_claims(self, events: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    def _select_claims(self, events: list[dict[str, Any]], session: str = "") -> list[dict[str, Any]]:
         """P0: select 0-3 claims for this step; shadow mode stores without injecting."""
         cfg = self._cfg()
         mode = str(cfg.get("claims") or "off").strip().lower()
@@ -1622,8 +1622,15 @@ class AdviserMode:
         if not home:
             return []
         profile = str(getattr(self._provider, "_profile", "default") or "default")
+        base = None
+        if session:
+            try:
+                row = getattr(self._provider, "_store", None).latest_base_refresh(session)
+                base = dict(row) if row is not None else None
+            except Exception as exc:
+                logger.debug("adviser mode: base row read failed: %s", exc)
         try:
-            pool = claims_mod.soul_claims(home) + claims_mod.card_claims(home, profile)
+            pool = claims_mod.soul_claims(home) + claims_mod.card_claims(home, profile, base)
         except Exception as exc:
             logger.debug("adviser mode: claim read failed: %s", exc)
             return []
@@ -1634,6 +1641,11 @@ class AdviserMode:
                     query, knowledge.knowledge_dir(home), limit=3))
             except Exception as exc:
                 logger.debug("adviser mode: knowledge claims failed: %s", exc)
+        try:
+            pool = claims_mod.unique(pool)
+        except ValueError as exc:
+            logger.warning("adviser mode: claim pool has duplicate ids: %s", exc)
+            return []
         return claims_mod.select(turn, pool, limit=3)
 
     def _prompt(self, session: str, turn_id: str, trigger: str,
@@ -1840,7 +1852,7 @@ class AdviserMode:
         review_id = store.start_adviser_review(
             session, turn_id, trigger, from_seq, to_seq, adviser=name)
         started = time.time()
-        selected = self._select_claims(fresh)
+        selected = self._select_claims(fresh, session)
         claims_mode = str(cfg.get("claims") or "off").strip().lower()
         active = (selected if claims_mode == "on" else [])
         if claims_mode != "off":
@@ -1892,16 +1904,19 @@ class AdviserMode:
             parsed = parse_review(
                 result.answer, severity_floor=str(cfg["severity_floor"]),
                 max_advices=int(cfg["max_notes_per_update"]), dropped=refused,
-                active_claims=active or None)
+                # claims=off keeps the pre-claim behaviour: no pool means no claim filtering.
+                # With claims on, an empty pool is a real answer and citing an unselected id
+                # is dropped, never silently accepted.
+                active_claims=active if claims_mode == "on" else None)
             parsed = claims_mod.apply_ceiling(parsed, active)
             # Strip invalid citations before the guard so the fingerprint describes the text
             # that will actually be delivered.
             parsed, ref_counts = self._validate_knowledge_refs(parsed)
-            coverage = parse_coverage(result.answer)
-            if active:
-                coverage.update(claims_mod.parse_coverage(
-                    result.answer, [str(claim.get("id") or "") for claim in active]))
-            store.set_adviser_review_claims(review_id, selected, coverage)
+            coverage = parse_coverage(result.answer)  # target coverage keeps its own column
+            claim_coverage = (claims_mod.parse_coverage(
+                result.answer, [str(claim.get("id") or "") for claim in active])
+                if active else {})
+            store.set_adviser_review_claims(review_id, selected, claim_coverage)
             if self._cfg().get("soul_targets_enabled") and not self._soul_block():
                 for target in CONSISTENCY_TARGETS:
                     if target.startswith("soul_"):
@@ -1913,7 +1928,10 @@ class AdviserMode:
                 kept = []
                 for note in parsed:
                     claim_id = str(note.get("claim") or "")
-                    if claim_id and store.mark_claim_repeated(session, claim_id):
+                    if claim_id and store.repeat_claim(
+                            session, claim_id, text=str(note.get("text") or ""),
+                            severity=str(note.get("severity") or "nit"),
+                            target=str(note.get("target") or "")):
                         refused["repeated_claim"] = int(
                             refused.get("repeated_claim") or 0) + 1
                         continue
@@ -2489,24 +2507,12 @@ class AdviserMode:
             return (f"adviser_only mode: {tool_name} is a mutating tool. "
                     "Propose the exact change for the user to apply instead.")
         cfg = self._cfg()
-        if cfg.get("claim_gate"):
-            home = str(self._hermes_home() or "")
-            turn = {"tool": tool, "args": json.dumps(args, ensure_ascii=False)
-                    if not isinstance(args, str) else args}
-            try:
-                pool = (claims_mod.soul_claims(home)
-                        + claims_mod.card_claims(
-                            home, str(getattr(self._provider, "_profile", "default"))))
-            except Exception as exc:
-                logger.debug("adviser mode: claim gate read failed: %s", exc)
-                pool = []
-            for claim in pool:
-                if claim.authority == "operator" and claim.test \
-                        and claims_mod.matches(claim.test, turn):
-                    logger.info("adviser mode: operator claim %s refused %s",
-                                claim.id, tool_name)
-                    return (f"operator claim {claim.id}: {claim.text}\n"
-                            "Fix the action or explain why the claim does not apply.")
+        claim = self._claim_gate_claim(session, tool_name, args) if cfg.get("claim_gate") else None
+        if claim is not None:
+            self._record_claim_gate(session, tool_name, claim, target="claim_gate")
+            logger.info("adviser mode: operator claim %s refused %s", claim.id, tool_name)
+            return (f"operator claim {claim.id}: {claim.text}\n"
+                    "Fix the action or explain why the claim does not apply.")
         if not cfg.get("block_tools"):
             return None
         store = self._store()
@@ -2537,6 +2543,71 @@ class AdviserMode:
         logger.info("adviser mode: blocker refused %s (session=%s)", tool_name, session)
         return (f"adviser blocker - {note}\n"
                 "Address this before retrying the tool, or explain why it does not apply.")
+
+    def _claim_gate_claim(self, session: str, tool_name: str, args: Any) -> Optional[Any]:
+        """The operator claim this step violates, judged synchronously from tool and args.
+
+        Only operator-authority claims gate; a card claim or a base-fallback row can advise but
+        never stop a tool, and a claim without a predicate is not a gate.
+        """
+        home = str(self._hermes_home() or "")
+        turn = {"tool": str(tool_name or "").lower(),
+                "args": args if isinstance(args, str) else json.dumps(args, ensure_ascii=False)}
+        try:
+            base = None
+            store = self._store()
+            row = store.latest_base_refresh(session) if store is not None else None
+            base = dict(row) if row is not None else None
+            pool = (claims_mod.soul_claims(home)
+                    + claims_mod.card_claims(
+                        home, str(getattr(self._provider, "_profile", "default")), base))
+            pool = claims_mod.unique(pool)
+        except Exception as exc:
+            logger.debug("adviser mode: claim gate read failed: %s", exc)
+            return None
+        for claim in pool:
+            if claim.authority == "operator" and claim.test \
+                    and claims_mod.matches(claim.test, turn):
+                return claim
+        return None
+
+    def _record_claim_gate(self, session: str, tool_name: str, claim: Any, *,
+                           target: str) -> None:
+        """A deterministic refusal is an advice: the ledger must show why the tool stopped."""
+        store = self._store()
+        if store is None:
+            return
+        try:
+            ids = store.add_advisories(session, [{
+                "severity": "blocker", "target": str(target),
+                "content": f"{target}: operator claim {claim.id} refused {tool_name}: {claim.text}",
+                "claim": claim.id,
+                "evidence": [{"src": claim.id, "tool": str(tool_name)}],
+            }], source=SOURCE)
+            if ids:
+                # The pre-gate already refused this call, so it is delivered; a late gate could
+                # not stop anything, so it stays pending and surfaces in the next update.
+                if str(target) == "claim_gate":
+                    store.mark_advisories_injected(ids)
+                store.mark_advisory_outcome(ids[0], "blocked")
+        except Exception:
+            logger.debug("adviser mode: claim gate ledger failed", exc_info=True)
+
+    def late_blocker(self, session_id: str, tool_name: str, args: Any = None) -> Optional[str]:
+        """A mutating tool that already ran: record the refusal the pre-hook could not deliver."""
+        session = self._primary(session_id)
+        if not session or not self.policy_active(session):
+            return None
+        if str(tool_name or "").lower() not in _MUTATING_TOOLS:
+            return None
+        if not self._cfg().get("claim_gate"):
+            return None
+        claim = self._claim_gate_claim(session, tool_name, args)
+        if claim is None:
+            return None
+        self._record_claim_gate(session, tool_name, claim, target="late_blocker")
+        logger.info("adviser mode: late blocker for %s (session=%s)", tool_name, session)
+        return (f"operator claim {claim.id} applied after the fact: {claim.text}")
 
     def verify_continue(self, session_id: str, changed_paths: Any = None) -> Optional[dict[str, str]]:
         """``pre_verify``: a live blocker keeps a code-editing turn going exactly once."""
@@ -2789,6 +2860,8 @@ class AdviserMode:
                        {"error", "failed", "failure", "timeout"})
         self.record_tool(session, tool_name, turn_id=turn_id, status=status,
                          args=args, result=result, error=error_message or kwargs.get("error"))
+        if not errored:
+            self.late_blocker(session, tool_name, args)
         self._flush_reasoning(session)
         if str(tool_name or "").lower() == "plan_mode":
             self._note_plan_mode(session, args, result)

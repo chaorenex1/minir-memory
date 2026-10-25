@@ -21,7 +21,8 @@ SUMMARY = "\n".join([
 
 
 def _page():
-    return {"category": "KNOWLEDGE", "org": "tools", "topic": "SQLite FTS5 trigram",
+    return {"path": "tools/KNOWLEDGE-SQLite-FTS5-trigram.md",
+            "category": "KNOWLEDGE", "org": "tools", "topic": "SQLite FTS5 trigram",
             "content": "Trigram tokenization makes FTS5 recall CJK substrings.",
             "epistemic": "fact", "objects": ["SQLite"], "relations": [],
             "summary": "use the trigram tokenizer for CJK recall"}

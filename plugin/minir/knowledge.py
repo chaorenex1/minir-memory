@@ -37,11 +37,11 @@ import tempfile
 import threading
 import unicodedata
 from datetime import datetime, timezone
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any, Callable, Iterable, Mapping, Optional, Sequence
 
 from . import rgtool
-from .layers import CATEGORIES, EPISTEMIC, ORGS
+from .layers import CATEGORIES, EPISTEMIC, ORGS, RELATION_TYPES
 from .rules import estimate_tokens
 
 logger = logging.getLogger(__name__)
@@ -54,7 +54,7 @@ SLUG_MAX = 60
 DEFAULT_BUDGET = 2000
 DEFAULT_LIMIT = 6
 DEFAULT_MAX_CHARS = 700
-DEFAULT_SEARCH_LIMIT = 5
+DEFAULT_SEARCH_LIMIT = 8
 MATCH_PREVIEW = 240
 MAX_BLOCK_CHARS = 700
 QUEUE_MAX = 512
@@ -102,8 +102,8 @@ def slugify(topic: Any, *, limit: int = SLUG_MAX) -> str:
     than transliterated, so a topic can never escape its org directory. Runs of punctuation
     collapse to one hyphen, the result is capped at ``limit`` characters (the default 60 keeps
     Windows below its path-component ceiling) and a reserved device name is prefixed with ``_``.
-    Two topics that normalize to the same slug are still two identities; the collision is
-    resolved by :func:`_new_path`, never by merging the topics.
+    Two topics that normalize to the same slug are the same page path, so the second one is a
+    revision of the first rather than a second file.
     """
     text = unicodedata.normalize("NFKC", str(topic or "")).strip()
     chars: list[str] = []
@@ -151,22 +151,6 @@ def knowledge_dir(hermes_home: Any = "") -> Path:
 
 def _topic_key(topic: Any) -> str:
     return " ".join(str(topic or "").split()).casefold()
-
-
-def _identity(unit: Mapping[str, Any]) -> tuple[str, str, str]:
-    """Validate the three identity fields against the layer contract's vocabularies."""
-    if not isinstance(unit, Mapping):
-        raise KnowledgeError("unit must be a mapping")
-    category = str(unit.get("category") or "").strip().upper()
-    org = str(unit.get("org") or "").strip()
-    topic = " ".join(str(unit.get("topic") or "").split())
-    if category not in CATEGORIES:
-        raise KnowledgeError(f"unknown category {category!r}")
-    if org not in ORGS:
-        raise KnowledgeError(f"unknown org {org!r}")
-    if not topic:
-        raise KnowledgeError("unit topic is empty")
-    return category, org, topic
 
 
 # -- front-matter ------------------------------------------------------------------------------
@@ -356,65 +340,44 @@ def _revisions(meta: Mapping[str, Any]) -> int:
 # -- paths -------------------------------------------------------------------------------------
 
 
-def _meta_matches(meta: Mapping[str, Any], category: str, org: str, topic: str) -> bool:
-    return (str(meta.get("category") or "").strip().upper() == category
-            and str(meta.get("org") or "").strip() == org
-            and _topic_key(meta.get("topic")) == _topic_key(topic))
+def normalize_path(path: Any) -> str:
+    """A page identity: ``<org>/<CATEGORY>-<slug>.md`` under the knowledge root.
 
-
-def _find_existing(root: Path, category: str, org: str, topic: str) -> Optional[Path]:
-    """The page already holding this identity, by front-matter — not by guessed filename alone.
-
-    Front-matter is the authority: a page whose name happens to match but whose ``topic`` differs
-    is another topic's page, and a page written under a collision suffix is still found by its
-    identity. This is also what makes ``Docker`` and ``docker`` one identity on case-sensitive
-    filesystems.
+    The relative path is the only identity a page has. Front-matter ``(category, org, topic)``
+    is metadata: rendered, indexed and declared to the edge builder, but it never decides which
+    file a unit belongs to.
     """
-    folder = Path(root) / org
-    if not folder.is_dir():
-        return None
-    expected = folder / render_filename(category, topic)
-    if expected.exists():
-        meta = read_front_matter(expected)
-        if meta and _meta_matches(meta, category, org, topic):
-            return expected
-    prefix = f"{category.casefold()}-"
-    try:
-        candidates = sorted(folder.glob("*.md"))
-    except OSError:
-        return None
-    for path in candidates:
-        if path == expected or not path.name.casefold().startswith(prefix):
-            continue
-        meta = read_front_matter(path)
-        if meta and _meta_matches(meta, category, org, topic):
-            return path
-    return None
+    raw = str(path or "").strip()
+    if not raw:
+        raise KnowledgeError("page path is required")
+    if "\\" in raw or ":" in raw or raw.startswith("/"):
+        raise KnowledgeError(f"page path must be a relative POSIX path, got {raw!r}")
+    parts = PurePosixPath(raw).parts
+    if len(parts) != 2 or any(part in {"", ".", ".."} for part in parts):
+        raise KnowledgeError(f"page path must be <org>/<CATEGORY>-<slug>.md, got {raw!r}")
+    org, name = parts
+    if org not in ORGS:
+        raise KnowledgeError(f"page path org must be one of: {', '.join(ORGS)}; got {org!r}")
+    if not name.endswith(".md"):
+        raise KnowledgeError(f"page path must end in .md, got {raw!r}")
+    category, sep, slug = name[:-3].partition("-")
+    if not sep or category.upper() not in CATEGORIES or not slug:
+        raise KnowledgeError(f"page file must be <CATEGORY>-<slug>.md, got {name!r}")
+    return f"{org}/{name}"
 
 
-def _occupied(folder: Path, name: str) -> bool:
-    if (folder / name).exists():
-        return True
-    if not folder.is_dir():
-        return False
-    target = name.casefold()
-    return any(path.name.casefold() == target for path in folder.glob("*.md"))
+def resolve_path(org: Any, category: Any, topic: Any) -> str:
+    """The canonical path for a unit that has no page yet; the writer never guesses one."""
+    org_text = str(org or "").strip()
+    category_text = str(category or "").strip().upper()
+    if org_text not in ORGS:
+        raise KnowledgeError(f"org must be one of: {', '.join(ORGS)}; got {org_text!r}")
+    if category_text not in CATEGORIES:
+        raise KnowledgeError(f"unknown category {category!r}")
+    if not str(topic or "").strip():
+        raise KnowledgeError("topic is required to resolve a page path")
+    return normalize_path(f"{org_text}/{render_filename(category_text, topic)}")
 
-
-def _new_path(root: Path, category: str, org: str, topic: str) -> Path:
-    """The target for a new identity; a slug collision gets a deterministic hash suffix."""
-    folder = Path(root) / org
-    base = render_filename(category, topic)
-    if not _occupied(folder, base):
-        return folder / base
-    digest = hashlib.sha1(_topic_key(topic).encode("utf-8")).hexdigest()[:8]
-    stem = base[:-len(".md")]
-    candidate = folder / f"{stem}-{digest}.md"
-    counter = 2
-    while _occupied(folder, candidate.name):
-        candidate = folder / f"{stem}-{digest}-{counter}.md"
-        counter += 1
-    return candidate
 
 
 # -- rendering and writing ---------------------------------------------------------------------
@@ -503,19 +466,40 @@ def _atomic_write(path: Path, text: str) -> None:
         raise
 
 
-def _write_failure(root: Optional[Path], unit: Mapping[str, Any], error: str) -> Optional[Path]:
-    """Record a failed write beside the pages, never in place of one."""
+def _write_failure(root: Optional[Path], unit: Mapping[str, Any], error: str, *,
+                   op: str = "write", path: str = "") -> Optional[Path]:
+    """Record a failed write beside the pages, never in place of one.
+
+    The record names the version it could not write: op, relative path, the file's current
+    sha256 and body line count. Without those a later reader cannot tell which version failed.
+    """
     if root is None:
         return None
     try:
+        rel = str(path or "").strip()
+        try:
+            rel = normalize_path(unit.get("path"))
+        except KnowledgeError:
+            pass
+        target = Path(root) / Path(rel) if rel else None
+        sha = ""
+        lines = 0
+        if target is not None and target.is_file():
+            raw = target.read_bytes()
+            sha = hashlib.sha256(raw).hexdigest()
+            lines = len(raw.decode("utf-8", "replace").splitlines())
         category = str(unit.get("category") or "UNIT").strip().upper()
         if category not in CATEGORIES:
             category = "UNIT"
         topic = str(unit.get("topic") or "").strip()
-        path = Path(root) / FAILED_DIRNAME / f"{category}-{slugify(topic) if topic else 'unit'}.json"
-        payload = {"schema": SCHEMA, "failed_at": _now(), "error": str(error), "unit": dict(unit)}
-        _atomic_write(path, json.dumps(payload, ensure_ascii=False, indent=2) + "\n")
-        return path
+        stem = slugify(topic) if topic else (
+            rel.rsplit("/", 1)[-1][:-3].partition("-")[2] if rel.endswith(".md") else "unit")
+        path_out = Path(root) / FAILED_DIRNAME / f"{category}-{stem or 'unit'}.json"
+        payload = {"schema": SCHEMA, "failed_at": _now(), "op": str(op or "write"),
+                   "path": rel, "sha256": sha, "lines": lines, "error": str(error),
+                   "unit": dict(unit)}
+        _atomic_write(path_out, json.dumps(payload, ensure_ascii=False, indent=2) + "\n")
+        return path_out
     except Exception:  # a failure record must never replace the failure's return value
         logger.warning("minir knowledge: cannot write failure record", exc_info=True)
         return None
@@ -525,15 +509,17 @@ def write_unit(unit: Any, *, language: str = "en", budget: int = DEFAULT_BUDGET,
                root: Any = None, render: Optional[RenderFn] = None) -> dict[str, Any]:
     """Create or atomically rewrite one knowledge page; never raises for a unit-level problem.
 
-    Returns ``{"status", "path", "revisions", "error"}`` where status is one of ``created``,
-    ``updated``, ``unchanged``, ``stale`` or ``failed``. A failed write keeps the previous file
-    exactly as it was and records the error plus the original unit under ``_failed/``.
+    ``unit["path"]`` is the page identity (relative to the knowledge root); a unit without a
+    valid one is a failure, not a new page. Returns ``{"status", "path", "revisions", "error"}``
+    where status is one of ``created``, ``updated``, ``unchanged``, ``stale`` or ``failed``, and
+    ``path`` is the relative path. A failed write keeps the previous file exactly as it was and
+    records the error plus the original unit under ``_failed/``.
     """
     root_path: Optional[Path]
     try:
         root_path = Path(root) if root is not None else knowledge_dir()
     except Exception as exc:
-        return {"status": "failed", "path": None, "revisions": 0, "error": str(exc)}
+        return {"status": "failed", "path": "", "revisions": 0, "error": str(exc)}
     try:
         return _write_unit(unit, root=root_path, language=language, budget=budget, render=render)
     except Exception as exc:
@@ -541,38 +527,166 @@ def write_unit(unit: Any, *, language: str = "en", budget: int = DEFAULT_BUDGET,
         _write_failure(root_path, unit if isinstance(unit, Mapping) else {}, error)
         logger.warning("minir knowledge: write failed for %r: %s",
                        unit.get("topic") if isinstance(unit, Mapping) else unit, error)
-        existing = None
-        try:
-            category, org, topic = _identity(unit)
-            existing = _find_existing(root_path, category, org, topic)
-        except Exception:
-            pass
-        return {"status": "failed", "path": existing, "revisions": 0, "error": error}
+        rel = ""
+        if isinstance(unit, Mapping):
+            try:
+                rel = normalize_path(unit.get("path"))
+            except Exception:
+                rel = str(unit.get("path") or "")
+        return {"status": "failed", "path": rel, "revisions": 0, "error": error}
+
+
+def _is_date(value: Any) -> bool:
+    try:
+        datetime.strptime(str(value or "").strip(), "%Y-%m-%d")
+        return True
+    except ValueError:
+        return False
+
+
+def page_edges(rel_path: Any, meta: Mapping[str, Any]) -> list[dict[str, Any]]:
+    """The edges a page declares: every object is ``instance_of``, every relation its own type.
+
+    The page file is the source; this function never invents an edge the front matter does not
+    state. A declared target without a matching conclusion stays in the table and is dropped by
+    the expansion join and the maintenance sweep, so a dangling edge is visible, not silent.
+    """
+    path = normalize_path(rel_path)
+    edges: list[dict[str, Any]] = []
+    for entry in meta.get("objects") or []:
+        kind, sep, key = str(entry).partition(":")
+        if sep and kind.strip() and key.strip():
+            edges.append({"src": ("page", path), "rel": "instance_of",
+                          "dst": (kind.strip(), key.strip())})
+    for entry in meta.get("relations") or []:
+        if not isinstance(entry, Mapping):
+            continue
+        relation = str(entry.get("type") or "").strip().lower()
+        kind, sep, key = str(entry.get("ref") or "").partition(":")
+        if relation in RELATION_TYPES and sep and kind.strip() and key.strip():
+            edges.append({"src": ("page", path), "rel": relation,
+                          "dst": (kind.strip(), key.strip())})
+    return edges
+
+
+def derived_edges(root: Any = None) -> list[dict[str, Any]]:
+    """Every page-declared edge under the knowledge root, sorted for a stable rebuild."""
+    base = Path(root) if root is not None else knowledge_dir()
+    edges: list[dict[str, Any]] = []
+    for org in ORGS:
+        folder = base / org
+        if not folder.is_dir():
+            continue
+        for path in sorted(folder.glob("*.md")):
+            meta = read_front_matter(path)
+            if meta:
+                edges.extend(page_edges(f"{org}/{path.name}", meta))
+    return edges
+
+
+def page_topics(root: Any = None) -> list[dict[str, str]]:
+    """Every page's declared topic, for the offline merge-candidate pass."""
+    base = Path(root) if root is not None else knowledge_dir()
+    topics: list[dict[str, str]] = []
+    for org in ORGS:
+        folder = base / org
+        if not folder.is_dir():
+            continue
+        for path in sorted(folder.glob("*.md")):
+            meta = read_front_matter(path)
+            topic = " ".join(str(meta.get("topic") or "").split())
+            if topic:
+                topics.append({"path": f"{org}/{path.name}", "topic": topic})
+    return topics
+
+
+def _validate_org_shape(org: str, unit: Mapping[str, Any]) -> None:
+    """The org's shape contract, as far as a writer can check it without reading meaning.
+
+    The rules file decides the org; these are the structural minimums a wrong choice fails. They
+    are shapes, not proof: a projects unit that lists three lines can still miss its goal, and
+    that stays a review finding rather than a write gate.
+    """
+    lines = [line for line in str(unit.get("content") or "").splitlines() if line.strip()]
+    if org == "events":
+        if not _is_date(unit.get("time")):
+            raise KnowledgeError("an events unit needs a dated time (YYYY-MM-DD)")
+        if not [item for item in unit.get("objects") or [] if str(item).strip()]:
+            raise KnowledgeError("an events unit needs at least one object")
+        if len(lines) < 2:
+            raise KnowledgeError("an events unit needs the action and its result")
+    if org == "projects":
+        if len(lines) < 3:
+            raise KnowledgeError(
+                "a projects unit needs a goal, a deliverable and a current state (3 lines)")
+
+
+def run_value_markers(units: Iterable[Any], *, root: Any = None, language: str = "en",
+                      budget: int = DEFAULT_BUDGET, session_id: str = "", source: str = "",
+                      render: Optional[RenderFn] = None) -> list[dict[str, Any]]:
+    """The single writer for every source: window refresh, note extraction, remember queue.
+
+    Each result carries the unit's ``topic``/``path`` beside the write status, so ``page_writes``
+    and ``_failed`` describe exactly the attempts that happened, retries included. Running the
+    same units twice is a no-op through the stored content hash, so a retry cannot duplicate a
+    page.
+    """
+    results: list[dict[str, Any]] = []
+    for raw in list(units or ()):
+        if not isinstance(raw, Mapping):
+            results.append({"topic": "", "path": "", "status": "failed", "revisions": 0,
+                            "error": "unit must be an object"})
+            continue
+        unit = dict(raw)
+        unit.setdefault("source_session", str(session_id or ""))
+        if source:
+            unit.setdefault("source_artifact", str(source))
+        result = write_unit(unit, language=language, budget=budget, root=root, render=render)
+        results.append({
+            "topic": " ".join(str(unit.get("topic") or "").split()),
+            "path": str(result.get("path") or unit.get("path") or ""),
+            "status": str(result.get("status") or "failed"),
+            "revisions": int(result.get("revisions") or 0),
+            "error": str(result.get("error") or ""),
+        })
+    return results
 
 
 def _write_unit(unit: Any, *, root: Path, language: str, budget: int,
                 render: Optional[RenderFn]) -> dict[str, Any]:
-    category, org, topic = _identity(unit)
+    if not isinstance(unit, Mapping):
+        raise KnowledgeError("unit must be an object")
+    rel = normalize_path(unit.get("path"))
+    org, name = rel.split("/", 1)
+    category, _sep, slug = name[:-3].partition("-")
+    category = category.upper()
+    topic = " ".join(str(unit.get("topic") or "").split())
+    if not topic:
+        raise KnowledgeError("unit topic is empty")
+    if slugify(topic) != slug:
+        raise KnowledgeError(f"topic {topic!r} does not match page path {rel!r}")
     if org == "events" and category == "KNOWLEDGE":
         unit = {**unit, "epistemic": "fact"}  # an occurrence is observed, never inferred
-    existing = _find_existing(root, category, org, topic)
+    _validate_org_shape(org, unit)
+    target = Path(root) / Path(rel)
+    existing = target if target.is_file() else None
     existing_meta = read_front_matter(existing) if existing else {}
     stored_revisions = _revisions(existing_meta) if existing else 0
 
     if existing and _is_stale(unit.get("time"), existing_meta.get("time")):
-        return {"status": "stale", "path": existing, "revisions": stored_revisions, "error": ""}
+        return {"status": "stale", "path": rel, "revisions": stored_revisions, "error": ""}
 
     fingerprint = _unit_fingerprint(unit)
     stored_hash = str(existing_meta.get("content_hash") or "") if existing else ""
     if existing and stored_hash == fingerprint:
-        return {"status": "unchanged", "path": existing,
+        return {"status": "unchanged", "path": rel,
                 "revisions": stored_revisions, "error": ""}
 
     body = _body_for(unit, render, language)
     if existing and not stored_hash:
         # A page written before fingerprints existed: the body is the only evidence of change.
         if _read_document(existing)[1].strip() == body.strip():
-            return {"status": "unchanged", "path": existing,
+            return {"status": "unchanged", "path": rel,
                     "revisions": stored_revisions, "error": ""}
     revisions = stored_revisions + 1 if existing else 1
     updated_at = _now()
@@ -591,9 +705,8 @@ def _write_unit(unit: Any, *, root: Path, language: str, budget: int,
                 f"page exceeds the {limit}-token budget even after dropping evidence lines")
         body, text = trimmed, compose(trimmed)
 
-    target = existing or _new_path(root, category, org, topic)
     _atomic_write(target, text)
-    return {"status": "updated" if existing else "created", "path": target,
+    return {"status": "updated" if existing else "created", "path": rel,
             "revisions": revisions, "error": ""}
 
 
@@ -605,18 +718,11 @@ ARCHIVE_DIRNAME = "_archive"
 
 def _page_target(root: Path, path: Any) -> tuple[Path, str, str, str, str]:
     """A page path -> (absolute, relative, org, category, slug); reject anything else."""
-    rel_text = str(path or "").strip().replace("\\", "/").lstrip("/")
-    rel = Path(rel_text)
-    if len(rel.parts) != 2 or rel.parts[0] not in ORGS:
-        raise KnowledgeError(f"page path must be <org>/<CATEGORY>-<slug>.md, got {rel_text!r}")
-    name = rel.parts[1]
-    if not name.endswith(".md"):
-        raise KnowledgeError(f"page path must end in .md, got {rel_text!r}")
-    category, sep, slug = name[:-3].partition("-")
-    category = category.upper()
-    if not sep or category not in CATEGORIES or not slug:
-        raise KnowledgeError(f"page file must be <CATEGORY>-<slug>.md, got {name!r}")
-    return Path(root) / rel, rel.as_posix(), rel.parts[0], category, slug
+    rel_text = normalize_path(path)
+    rel = PurePosixPath(rel_text)
+    org, name = rel.parts
+    category, _sep, slug = name[:-3].partition("-")
+    return Path(root) / Path(rel_text), rel_text, org, category.upper(), slug
 
 
 def _body_lines(body: str) -> list[str]:
@@ -901,6 +1007,7 @@ def _create_page(root: Path, target: Path, rel: str, org: str, category: str, sl
         return _edit_failure(root, category, topic, "create", rel,
                             f"KNOWLEDGE requires epistemic in {', '.join(EPISTEMIC)}")
     unit = {
+        "path": rel,
         "category": category, "org": org, "topic": topic, "summary": summary,
         "epistemic": epistemic if category == "KNOWLEDGE" else "",
         "time": str(header.get("time") or ""),
@@ -910,7 +1017,7 @@ def _create_page(root: Path, target: Path, rel: str, org: str, category: str, sl
     }
     result = write_unit(unit, language=language, budget=budget, root=root)
     status = str(result.get("status") or "failed")
-    written = Path(result.get("path") or target)
+    written = Path(root) / Path(rel)
     if status not in ("created", "updated", "unchanged"):
         return _edit_failure(root, category, topic, "create", rel,
                              str(result.get("error") or status))
@@ -1247,11 +1354,13 @@ class KnowledgePipeline:
 
     def __init__(self, hermes_home: Any = "", *, root: Any = None, language: str = "en",
                  budget: int = DEFAULT_BUDGET, render: Optional[RenderFn] = None,
-                 queue_size: int = QUEUE_MAX, autostart: bool = True):
+                 queue_size: int = QUEUE_MAX, autostart: bool = True,
+                 on_written: Optional[Callable[[str], None]] = None):
         self.root = Path(root) if root is not None else knowledge_dir(hermes_home)
         self.language = str(language or "en")
         self.budget = max(1, int(budget))
         self.render = render
+        self.on_written = on_written
         self._queue: "queue.Queue[Any]" = queue.Queue(maxsize=max(1, int(queue_size)))
         self._lock = threading.Lock()
         self._state_lock = threading.Lock()
@@ -1340,9 +1449,9 @@ class KnowledgePipeline:
         return enqueued
 
     def _needs_write(self, unit: Mapping[str, Any]) -> bool:
-        category, org, topic = _identity(unit)
-        existing = _find_existing(self.root, category, org, topic)
-        if existing is None:
+        rel = normalize_path(unit.get("path"))
+        existing = self.root / Path(rel)
+        if not existing.is_file():
             return True
         meta = read_front_matter(existing)
         stored = str(meta.get("content_hash") or "")
@@ -1385,11 +1494,17 @@ class KnowledgePipeline:
             try:
                 if item is _STOP:
                     return
-                result = write_unit(item, language=self.language, budget=self.budget,
-                                    root=self.root, render=self.render)
+                result = run_value_markers(
+                    [item], language=self.language, budget=self.budget,
+                    root=self.root, render=self.render)[0]
                 with self._lock:
                     status = str(result.get("status") or "failed")
                     self._counts[status] = self._counts.get(status, 0) + 1
+                if status in {"created", "updated"} and self.on_written is not None:
+                    try:
+                        self.on_written(str(result.get("path") or ""))
+                    except Exception:
+                        logger.warning("minir knowledge: edge hook failed", exc_info=True)
             except Exception:
                 with self._lock:
                     self._errors += 1

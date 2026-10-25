@@ -366,12 +366,9 @@ def build_prompt(store: Any, hermes_home: str, profile: str, since: float, *, sc
     current = []
     for part in parts_for_scope:
         path = paths[part]
-        try:
-            text = path.read_text(encoding="utf-8-sig")
-        except (OSError, UnicodeError):
-            text = ""
-        if text.strip():
-            current.append(f"--- {path.name} ({PART_SCOPE[part]}/{PART_NAME[part]}) ---\n{text}")
+        meta, body = read_card(path)  # identity input is the body; front matter is metadata
+        if body.strip():
+            current.append(f"--- {path.name} ({PART_SCOPE[part]}/{PART_NAME[part]}) ---\n{body}")
     rows = store.base_refreshes_since(since, per_session=1, max_sessions=_MAX_SESSIONS)
     blocks: list[str] = []
     size = 0
@@ -540,13 +537,19 @@ class CardReviewScheduler:
                                     json.dumps(state, ensure_ascii=False))
 
     def ensure_anchor(self, now: Optional[float] = None) -> float:
-        """Start the clock without claiming a review ran; a missing card still runs immediately."""
+        """Start the clock without claiming a review ran.
+
+        A state without ``started_at`` is either fresh or a legacy anchor whose ``last_success_at``
+        no run in this build can prove, so both restart from here: the first attempt is due within
+        a day, and only a successful review starts the full period.
+        """
         now = time.time() if now is None else float(now)
         state = self._state()
-        if "started_at" not in state and "last_success_at" not in state:
-            state = {"started_at": now, "attempts": 0, "next_attempt_at": now + self._period}
-            self._save(state)
-        return float(state.get("started_at") or state.get("last_success_at") or now)
+        if "started_at" not in state:
+            first_attempt = now + min(self._period, 86_400.0)
+            self._save({"started_at": now, "attempts": 0, "next_attempt_at": first_attempt})
+            return now
+        return float(state.get("started_at") or now)
 
     def due(self, now: Optional[float] = None) -> bool:
         now = time.time() if now is None else float(now)

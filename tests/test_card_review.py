@@ -272,7 +272,7 @@ def test_a_missing_body_fails_the_review(cards, store, tmp_path):
                           complete=complete, since=0.0, plugin_yaml=PLUGIN_YAML)
 
 
-def test_the_scheduler_waits_three_days_and_advances_only_on_success(cards, plugin_package,
+def test_a_successful_review_starts_the_three_day_period(cards, plugin_package,
                                                                      store):
     module = plugin_package.card_review
     calls: list[float] = []
@@ -286,8 +286,9 @@ def test_the_scheduler_waits_three_days_and_advances_only_on_success(cards, plug
     now = time.time()
     assert scheduler.ensure_anchor(now) == now
     assert "last_success_at" not in scheduler._state(), "an anchor is not a successful review"
-    assert scheduler.due(now + 86400) is False
-    assert scheduler.tick(now + 86400) is False
+    assert scheduler.due(now + 3600) is False
+    assert scheduler.tick(now + 3600) is False
+    assert scheduler.due(now + 86_400) is True  # the first attempt lands within a day
     assert scheduler.due(now + 3 * 86400 + 1) is True
 
     def failing(since):
@@ -301,6 +302,7 @@ def test_the_scheduler_waits_three_days_and_advances_only_on_success(cards, plug
     assert state["attempts"] == 1
     assert state["next_attempt_at"] == pytest.approx(now + 3 * 86400 + 1 + 1800, abs=5)
     assert broken.due(now + 3 * 86400 + 1000) is False
+
 
     healthy = module.CardReviewScheduler(store, run, subject="user:default",
                                          period=3 * 86400, files_present=lambda: True)
@@ -322,3 +324,62 @@ def test_a_missing_card_runs_the_first_review_immediately(cards, plugin_package,
     scheduler.ensure_anchor(now)
     assert scheduler.due(now) is True
     assert scheduler.tick(now) is True
+
+
+def test_front_matter_never_reaches_the_identity_input(plugin_package, store,
+                                                                tmp_path):
+    review = plugin_package.card_review
+    home = tmp_path / "home"
+    path = review.card_paths(str(home), "default")[review.USER_SELF]
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("---\nsource: operator_edit\nreviewer: masia\nevidence: [1]\n---\n\n"
+                    "## Roles\n- operator\n", encoding="utf-8")
+
+    _system, prompt = review.build_prompt(
+        store, str(home), "default", 0.0, scope=review.USER_SELF, plugin_yaml="name: minir")
+
+    assert "## Roles" in prompt
+    for marker in ("source:", "reviewer:", "evidence:"):
+        assert marker not in prompt
+    rendered = review.render_card(review.USER_SELF, "## Roles\n- operator\n",
+                                  {"source": "review", "evidence": []})
+    assert rendered.count("\n---\n") == 1
+
+
+def test_ai_preference_reads_its_own_rule(plugin_package):
+    review = plugin_package.card_review
+    rules = plugin_package.rules
+
+    assert review.CARD_SCOPE_RULES["ai_preference"] == ("ai-preferences",)
+    preference = rules.rule_text("ai-preferences")
+    identity = rules.rule_text("ai-identity")
+    assert "How this assistant is required to work in this profile." in preference
+    assert preference != identity
+
+
+def test_the_two_ai_rules_have_distinct_contracts(plugin_package):
+    rules = plugin_package.rules
+
+    identity = rules.rule_text("ai-identity")
+    preference = rules.rule_text("ai-preferences")
+
+    assert "Who this assistant is in this profile" in identity
+    assert "Who this assistant is in this profile" not in preference
+    assert "How this assistant is required to work in this profile." in preference
+
+
+def test_a_legacy_anchor_is_cleared_and_the_first_review_lands_within_a_day(
+        plugin_package, store):
+    module = plugin_package.card_review
+    scheduler = module.CardReviewScheduler(
+        store, lambda since: [], subject="user:default", period=3 * 86400,
+        files_present=lambda: True)
+    start = 1_000_000.0
+    store.put_layer_state("card_review", "user:default",
+                          json.dumps({"last_success_at": start + 10, "attempts": 0}))
+
+    assert scheduler.ensure_anchor(start + 20) == start + 20
+    state = scheduler._state()
+    assert "last_success_at" not in state and state["started_at"] == start + 20
+    assert scheduler.due(start + 20 + 3600) is False
+    assert scheduler.due(start + 20 + 86_400) is True

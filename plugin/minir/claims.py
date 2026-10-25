@@ -11,7 +11,7 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Iterable, Optional
+from typing import Any, Iterable, Mapping, Optional
 
 from . import card_review, knowledge
 
@@ -82,24 +82,67 @@ def _infer_test(text: str) -> str:
     return ""
 
 
-def card_claims(hermes_home: str, profile: str) -> list[Claim]:
-    """Every non-empty line of the four global cards, with the authority its meta declares."""
+def _relative(path: Path, root: Path) -> str:
+    """A file's POSIX path under its root; the fallback keeps the id unique when it escapes."""
+    try:
+        return path.relative_to(root).as_posix()
+    except ValueError:
+        return path.as_posix()
+
+
+def unique(claims: Iterable[Claim]) -> list[Claim]:
+    """Assert the pool's ids are unique: a duplicate would silently shadow one claim."""
+    seen: set[str] = set()
+    out: list[Claim] = []
+    for claim in claims:
+        if claim.id in seen:
+            raise ValueError(f"duplicate claim id {claim.id!r}")
+        seen.add(claim.id)
+        out.append(claim)
+    return out
+
+
+#: A missing card falls back to the base row that carries the same text (A §P2).
+_CARD_BASE_COLUMNS = {
+    "user_self_representation": "user_representation",
+    "user_preferences": "user_peer_card",
+    "ai_identity": "ai_identity_card",
+    "ai_preference": "ai_self_representation",
+}
+
+
+def card_claims(hermes_home: str, profile: str,
+                base: Optional[Mapping[str, Any]] = None) -> list[Claim]:
+    """Every non-empty line of the four global cards, with the authority its meta declares.
+
+    A card file that is missing or empty falls back to the base row that carries the same text,
+    with ``#base:<line>`` ids so the two sources can never collide.
+    """
     if not str(hermes_home or "").strip():
         return []
+    card_root = Path(str(hermes_home)) / card_review.CARD_DIRNAME
     paths = card_review.card_paths(hermes_home, profile)
     claims: list[Claim] = []
     for part, path in paths.items():
         meta, body = card_review.read_card(path)
-        if not body:
+        fallback = False
+        if not str(body or "").strip() and base:
+            column = _CARD_BASE_COLUMNS.get(part)
+            body = str((base.get(column) if column else "") or "")
+            fallback = bool(str(body).strip())
+        if not str(body or "").strip():
             continue
+        rel = _relative(path, card_root)
         authority = "operator" if str(meta.get("source") or "") == "operator_edit" else "card"
         heading = ""
         for line_no, text in _lines(body):
             if text.startswith("#"):
-                heading = text.lstrip("#").strip() if text.startswith("## ") else heading
+                if text.startswith("##"):
+                    heading = text.lstrip("#").strip()  # ### narrows the section too
                 continue
             claims.append(Claim(
-                id=f"card:{path.name}#{line_no}", text=text,
+                id=(f"card:{rel}#base:{line_no}" if fallback else f"card:{rel}#{line_no}"),
+                text=text,
                 scope=_claim_scope(heading, part), authority=authority,
                 test=_infer_test(text)))
     return claims
@@ -131,7 +174,7 @@ def soul_claims(hermes_home: str) -> list[Claim]:
             text = text[2:].strip()
         if len(text) >= 8:
             claims.append(Claim(
-                id=f"soul:{heading[2:].replace(' ', '-')}#{line_no}", text=text,
+                id=f"soul:SOUL.md#{line_no}", text=text,
                 scope=_claim_scope(heading, "soul"), authority="operator",
                 test=_infer_test(text)))
     return claims
@@ -229,7 +272,12 @@ def select(turn: dict[str, Any], claims: Iterable[Claim], limit: int = 3
 def apply_ceiling(notes: list[dict[str, Any]], claims: Iterable[dict[str, Any]]
                   ) -> list[dict[str, Any]]:
     """Cap each note at the authority of the claim it cites; never raise a severity."""
-    by_id = {str(claim.get("id") or ""): claim for claim in claims or ()}
+    by_id: dict[str, dict[str, Any]] = {}
+    for claim in claims or ():
+        cid = str(claim.get("id") or "")
+        if cid in by_id:
+            raise ValueError(f"duplicate claim id {cid!r}")
+        by_id[cid] = claim
     ceiling = {"operator": "blocker", "card": "concern", "knowledge": "concern",
                "inference": "nit"}
     for note in notes:

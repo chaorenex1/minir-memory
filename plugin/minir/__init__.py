@@ -44,6 +44,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import threading
 import time
 from pathlib import Path
@@ -410,6 +411,7 @@ class MinirMemoryProvider(MemoryProvider):
         db_path = Path(hermes_home) / _STORE_DIRNAME / _DB_FILENAME
         self._store = MinirStore(db_path)
         self._vector = vector.VectorIndex(self._store, self._config.get("vector") or {})
+        self._store.on_conclusion_saved = self._vector.index_async
         try:
             self._vector.ensure_table()
         except Exception as exc:  # a vector table must never block a provider start
@@ -426,7 +428,10 @@ class MinirMemoryProvider(MemoryProvider):
         self._agent_identity = str(kwargs.get("agent_identity") or "")
         self._profile = (host_history.profile_name(self._state_db, self._session_id)
                          or str(kwargs.get("profile") or kwargs.get("profile_name") or "default"))
-        self._identity, self._preference = host_history.load_identity(self._hermes_home, self._profile)
+        (identity_meta, self._identity), (preference_meta, self._preference) = (
+            host_history.load_identity(self._hermes_home, self._profile))
+        self._identity_source = str(identity_meta.get("source") or "")
+        self._preference_source = str(preference_meta.get("source") or "")
         # The transcript streams are profile-scoped: the profile is the partition key for every
         # stream and every agent run. ``bind`` pins this session and, when this is the first
         # process after a clean shutdown, replays the last cache range of each stream.
@@ -441,12 +446,15 @@ class MinirMemoryProvider(MemoryProvider):
         self._knowledge = knowledge.KnowledgePipeline(
             self._hermes_home,
             language=str(self._config.get("content_language") or "en"),
-            budget=self._knowledge_token_budget, autostart=self._reasoning)
+            budget=self._knowledge_token_budget, autostart=self._reasoning,
+            on_written=self._index_page_edges)
         self._worker = LayerWorker(
             self._store, self._transcript, enabled=self._reasoning,
             agent_identity=self._agent_identity, user_id=self._user_id,
             state_db=self._state_db, profile=self._profile,
             identity=self._identity, preference=self._preference,
+            identity_source=self._identity_source,
+            preference_source=self._preference_source,
             depth=self._dialectic_depth,
             content_language=str(self._config.get("content_language") or "en"),
             hermes_home=self._hermes_home,
@@ -473,11 +481,13 @@ class MinirMemoryProvider(MemoryProvider):
         if self._reasoning and self._session_extraction:
             self._scheduler.add_time("session_extraction", extraction.TICK_SECONDS,
                                      self._extraction_scheduler.tick, first_delay=0.0)
+        self._scheduler.add_time("conclusion_history_maintenance", 6 * 3600,
+                                 self._maintain_conclusion_history, first_delay=60.0)
         if self._reasoning:
-            self._scheduler.add_time("conclusion_history_maintenance", 6 * 3600,
-                                     self._maintain_conclusion_history, first_delay=60.0)
             self._scheduler.add_time("vector_backfill", 3600,
                                      self._backfill_vectors, first_delay=120.0)
+            self._scheduler.add_time("vector_dim_migration", 300,
+                                     self._migrate_vectors, first_delay=30.0)
         self._scheduler.start()
         # Configure before opening the session: intervals/mode apply to sessions opened later
         # (an already-running session keeps the cadence it started with).
@@ -712,10 +722,31 @@ class MinirMemoryProvider(MemoryProvider):
                                           glyph=INDICATOR_GLYPH) if block else None)
         return block
 
+    def _index_page_edges(self, rel_path: str) -> None:
+        """A written page owns its edges: derive them from the file and upsert them."""
+        if self._store is None or not str(rel_path or "").strip():
+            return
+        meta = knowledge.read_front_matter(self._knowledge.root / rel_path)
+        self._store.upsert_page_edges(knowledge.page_edges(rel_path, meta))
+
     def _maintain_conclusion_history(self) -> dict[str, int]:
-        """Fold, archive and clean conclusion history; runs on the one scheduler."""
+        """Fold, archive, clean and look for merge candidates; runs on the one scheduler."""
         archive = Path(self._hermes_home) / _STORE_DIRNAME / "conclusion" / "archive"
-        return self._store.maintain_conclusion_history(archive)
+        counts = dict(self._store.maintain_conclusion_history(archive))
+        try:
+            merge = self._store.generate_merge_candidates(
+                page_topics=knowledge.page_topics(self._knowledge.root))
+            counts["merged"] = int(merge.get("merged") or 0)
+            counts["advised"] = int(merge.get("advised") or 0)
+        except Exception as exc:
+            logger.warning("Minir merge candidates failed: %s", exc)
+        return counts
+
+    def _migrate_vectors(self) -> dict[str, Any]:
+        """One resumable migration step; a no-op unless a dim/model change queued one."""
+        if self._vector is None:
+            return {"status": "none"}
+        return self._vector.migrate()
 
     def _backfill_vectors(self) -> int:
         """Index conclusions the vector table does not have yet; a no-op without a key."""
@@ -737,10 +768,12 @@ class MinirMemoryProvider(MemoryProvider):
                  "These windows were never written to memory. Absence of a memory is not "
                  "evidence that the work did not happen."]
         for row in rows:
-            when = time.strftime("%m-%d %H:%M", time.localtime(
+            start = time.strftime("%m-%d %H:%M", time.localtime(
                 float(row.get("window_from_ts") or 0)))
+            end = time.strftime("%m-%d %H:%M", time.localtime(
+                float(row.get("window_to_ts") or 0)))
             error = " ".join(str(row.get("error") or "").split())[:160]
-            lines.append("- %s: base refresh failed (%s)" % (when, error))
+            lines.append("- %s → %s: base refresh failed (%s)" % (start, end, error))
         return "\n".join(lines), len(lines) - 2
 
     def _layer_block(self, session: str) -> tuple[str, int]:
@@ -1428,17 +1461,16 @@ class MinirMemoryProvider(MemoryProvider):
             markers=snapshot, usage=usage, hermes_home=self._hermes_home,
             transcript=self._transcript, profile=self._profile, window_end=window_end)
         written = 0
-        for page in pages:
-            page["source_session"] = session
-            page["source_artifact"] = f"session_extraction:{session}"
-            result = knowledge.write_unit(
-                page, language=str(self._config.get("content_language") or "en"),
-                budget=self._knowledge_token_budget, root=self._knowledge.root)
-            status = str(result.get("status") or "failed")
-            if status in {"created", "updated"}:
+        results = knowledge.run_value_markers(
+            pages, root=self._knowledge.root, session_id=session,
+            source=f"session_extraction:{session}",
+            language=str(self._config.get("content_language") or "en"),
+            budget=self._knowledge_token_budget)
+        for item in results:
+            if item["status"] in {"created", "updated"}:
                 written += 1
             else:
-                logger.debug("Minir extraction page %s: %s", page.get("topic"), status)
+                logger.debug("Minir extraction page %s: %s", item["topic"], item["status"])
         return {"pages": written, "summary_chars": len(summary_text)}
 
     def _flush_boundary(self, session_id: str, *, close: bool = False) -> None:
@@ -1577,6 +1609,8 @@ class MinirMemoryProvider(MemoryProvider):
         self._adviser_mode.session_end(self._session_id)
         self._adviser_mode.stop()  # no review may touch the store after this point
         self._scheduler.stop()     # no scheduled job may touch the store after this point
+        if self._vector is not None:
+            self._vector.stop()    # drain the index queue before the store closes
         if self._knowledge is not None:
             self._knowledge.stop()      # drain queued value markers while the filesystem still exists
         self._transcript.close()        # last writer join: no JSON may be half-written
@@ -1599,13 +1633,25 @@ class MinirMemoryProvider(MemoryProvider):
         """The same schemas the ``minir`` registry toolset registers (one source in tools.py)."""
         return list(plugin_tools.SCHEMAS)
 
+    _STEP_RE = re.compile(r"^[ \t]*\d+[.)]\s+\S")
+
+    @classmethod
+    def _looks_like_method(cls, content: str) -> bool:
+        """A numbered procedure is the only shape allowed to fall back to METHOD."""
+        return sum(1 for line in str(content or "").splitlines()
+                   if cls._STEP_RE.match(line)) >= 2
+
     def _remember_knowledge(self, org: str, content: str, args: dict[str, Any]) -> str:
         """Queue one page unit for the writer; the tool never writes a page itself."""
         if org not in ORGS:
             return tool_error(f"type must be one of: {', '.join(ORGS)}")
         category = str(args.get("category") or "").strip().upper()
         if category not in CATEGORIES:
-            return tool_error(f"category must be one of: {', '.join(CATEGORIES)}")
+            # An omitted category is only recoverable for a numbered procedure; a stated but
+            # unknown one is a caller error, and every other content must name its category.
+            if category or not self._looks_like_method(content):
+                return tool_error(f"category must be one of: {', '.join(CATEGORIES)}")
+            category = "METHOD"
         lines = content.strip("\n").splitlines()
         if len(lines) < 3 or len(lines) > 8:
             return tool_error("knowledge content must be 3..8 lines")
@@ -1618,7 +1664,13 @@ class MinirMemoryProvider(MemoryProvider):
         topic = " ".join(str(args.get("topic") or summary).split())
         if len(topic) < 2:
             return tool_error("topic must be at least 2 characters")
+        try:
+            path = (knowledge.normalize_path(args.get("path")) if str(args.get("path") or "").strip()
+                    else knowledge.resolve_path(org, category, topic))
+        except knowledge.KnowledgeError as exc:
+            return tool_error(str(exc))
         unit = {
+            "path": path,
             "category": category, "org": org, "topic": topic, "summary": summary,
             "epistemic": epistemic if category == "KNOWLEDGE" else "",
             "time": str(args.get("time") or ""), "objects": [], "relations": [],
@@ -1957,34 +2009,14 @@ class MinirMemoryProvider(MemoryProvider):
         except (TypeError, ValueError):
             requested = self._prefetch_limit
         session = session_id or self._session_id
-        rows = self._store.search(query, limit=max(1, min(20, requested)),
-                                  session_id=session, scope=scope, kinds=kinds,
-                                  as_of=as_of, expand=expand,
-                                  include_superseded=include_superseded)
+        ranks: dict[int, int] = {}
         if self._vector is not None and as_of is None:
             ranks = self._vector.recall(query, limit=20)
-            if ranks:
-                by_id = {int(row["conclusions_id"]): row for row in rows}
-                for cid, rank in ranks.items():
-                    row = by_id.get(int(cid))
-                    if row is None:
-                        stored = self._store.conclusion_by_id(int(cid))
-                        if stored is None or str(stored.get("status") or "") != "active":
-                            continue
-                        row = {
-                            "conclusions_id": int(cid), "kind": stored.get("kind") or "",
-                            "key": stored.get("key") or "", "text": stored.get("content") or "",
-                            "when": float(stored.get("updated_at") or 0),
-                            "author": stored.get("subject") or stored.get("kind") or "",
-                            "subject": stored.get("subject") or "",
-                            "session_id": stored.get("session_id") or "",
-                            "score": 0.0, "rank": 0.0,
-                        }
-                        rows.append(row)
-                    row["score"] = float(row.get("score") or 0.0) + 0.7 / (60.0 + rank)
-                rows.sort(key=lambda item: (item.get("score") or 0.0,
-                                            item.get("when") or 0.0), reverse=True)
-        return rows
+        return self._store.search(query, limit=max(1, min(20, requested)),
+                                  session_id=session, scope=scope, kinds=kinds,
+                                  as_of=as_of, expand=expand,
+                                  include_superseded=include_superseded,
+                                  vector_ranks=ranks)
 
 
 def _skill_description(path: Path) -> str:

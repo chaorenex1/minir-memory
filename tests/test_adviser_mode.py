@@ -42,7 +42,51 @@ def _mode_provider(make_provider, *, cadence: int = 2, floor: str = "nit",
     return make_provider({"adviser_mode": {
         "enabled": True, "mode": mode, "cadence": cadence, "severity_floor": floor,
         "max_reviews_per_turn": 4, "max_advices": 3, "max_chars": 900,
+        "claims": "off",  # this file covers scheduling and storage, not the claim pool
     }})
+
+
+def test_shadow_selects_claims_and_on_is_the_only_mode_that_injects(make_provider):
+    provider = make_provider({"adviser_mode": {
+        "enabled": True, "mode": "watch", "cadence": 99, "claims": "shadow"}})
+    home = Path(provider._hermes_home)
+    home.mkdir(parents=True, exist_ok=True)
+    (home / "SOUL.md").write_text("# Boundaries\n- never commit or push without asking\n",
+                                  encoding="utf-8")
+    mode = provider._adviser_mode
+    events = [{"kind": "tool", "tool": "terminal", "args": "git commit -m x"}]
+
+    shadow_selected = mode._select_claims(events, provider._session_id)
+
+    assert shadow_selected and shadow_selected[0]["id"] == "soul:SOUL.md#2"
+
+
+def test_the_operator_gate_records_its_refusal_and_a_late_blocker(plugin_package, make_provider):
+    provider = make_provider({"adviser_mode": {
+        "enabled": True, "mode": "watch", "cadence": 99, "severity_floor": "nit"}})
+    home = Path(provider._hermes_home)
+    home.mkdir(parents=True, exist_ok=True)
+    (home / "SOUL.md").write_text("# Boundaries\n- never commit or push without asking\n",
+                                  encoding="utf-8")
+    mode = provider._adviser_mode
+
+    session = provider._session_id
+    assert "terminal" in plugin_package.adviser_mode._MUTATING_TOOLS
+    gate_claim = mode._claim_gate_claim(session, "terminal", {"command": "git commit -m x"})
+    assert gate_claim is not None and gate_claim.test == "commit_unasked"
+
+    reason = mode.block_reason(session, "terminal", {"command": "git commit -m x"})
+
+    assert reason and "operator claim soul:SOUL.md#2" in reason
+    late = mode.late_blocker(session, "terminal", {"command": "git commit -m x"})
+    assert late and "after the fact" in late
+
+    rows = [dict(row) for row in provider._store._conn.execute(
+        "SELECT target, severity, outcome, status FROM advisories ORDER BY id").fetchall()]
+    assert [(row["target"], row["severity"], row["outcome"]) for row in rows] == [
+        ("claim_gate", "blocker", "blocked"), ("late_blocker", "blocker", "blocked")]
+    assert [row["status"] for row in rows] == ["injected", "pending"], (
+        "a late blocker must still reach the next update")
 
 
 # -- scheduling ---------------------------------------------------------------

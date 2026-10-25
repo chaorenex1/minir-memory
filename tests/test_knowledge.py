@@ -14,6 +14,15 @@ def knowledge(plugin_package):
     return importlib.import_module(f"{plugin_package.__name__}.knowledge")
 
 
+def _page_path(org, category, topic):
+    """The canonical relative path, from the package under test (the writer's own resolver)."""
+    import sys
+
+    package = next(module for name, module in sys.modules.items()
+                   if name.startswith("minir_pkg_"))
+    return package.knowledge.resolve_path(org, category, topic)
+
+
 def _unit(**over):
     unit = {
         "id": "k1", "org": "tools", "category": "METHOD", "topic": "Docker 镜像清理",
@@ -23,6 +32,11 @@ def _unit(**over):
         "anchor": {"from_ts": 0.0, "to_ts": 1e12, "message_ids": []},
     }
     unit.update(over)
+    if "path" not in unit:
+        try:
+            unit["path"] = _page_path(unit["org"], unit["category"], unit["topic"])
+        except Exception:
+            unit["path"] = ""  # the writer records the failure this unit is meant to produce
     return unit
 
 
@@ -54,7 +68,7 @@ def test_same_identity_is_one_file_and_front_matter_counts_revisions(knowledge, 
     assert second["path"] == first["path"]
     assert len(list((tmp_path / "tools").glob("METHOD-*.md"))) == 1
 
-    meta = knowledge.read_front_matter(second["path"])
+    meta = knowledge.read_front_matter(tmp_path / second["path"])
     for key in ("schema", "category", "org", "topic", "epistemic", "time", "revisions",
                 "updated_at"):
         assert key in meta, f"missing front-matter key {key}"
@@ -63,7 +77,7 @@ def test_same_identity_is_one_file_and_front_matter_counts_revisions(knowledge, 
     assert meta["revisions"] == 2 and meta["time"] == "2026-10-22"
     assert meta["epistemic"] == ""
 
-    text = second["path"].read_text(encoding="utf-8")
+    text = (tmp_path / second["path"]).read_text(encoding="utf-8")
     assert text.startswith("---\n")
     assert "# Docker 镜像清理" in text and "docker system prune -af" in text
 
@@ -86,10 +100,10 @@ def test_events_org_is_a_valid_knowledge_page(plugin_package, knowledge, tmp_pat
     page = knowledge.write_unit(
         _unit(id="k3", org="events", category="KNOWLEDGE", epistemic="hypothesis",
               topic="2026-10-23 发布无事故",
-              content="the release v0.9 went out at 18:40 with no incident."), root=tmp_path)
+              content="released v0.9 at 18:40.\nthe publish finished with no incident."), root=tmp_path)
     assert "events" in layers.ORGS
-    assert page["path"].parent.name == "events"
-    meta = knowledge.read_front_matter(page["path"])
+    assert Path(page["path"]).parent.name == "events"
+    meta = knowledge.read_front_matter(tmp_path / page["path"])
     assert (meta["org"], meta["epistemic"]) == ("events", "fact")
     rows = knowledge.search_pages("release", tmp_path, org="events")
     assert [row["org"] for row in rows["results"]] == ["events"]
@@ -102,13 +116,60 @@ def test_events_pages_are_facts(plugin_package):
     assert pages[0]["epistemic"] == "fact"
 
 
-def test_slug_collisions_keep_both_topics_in_separate_files(knowledge, tmp_path):
-    knowledge.write_unit(_unit(topic="a/b"), root=tmp_path)
-    knowledge.write_unit(_unit(id="k2", topic="a:b"), root=tmp_path)
-    pages = sorted((tmp_path / "tools").glob("METHOD-*.md"))
-    assert len(pages) == 2
-    topics = sorted(knowledge.read_front_matter(page)["topic"] for page in pages)
-    assert topics == ["a/b", "a:b"]
+def test_a_slug_collision_is_one_page_whose_metadata_is_refreshed(knowledge, tmp_path):
+    first = knowledge.write_unit(_unit(topic="a/b"), root=tmp_path)
+    second = knowledge.write_unit(_unit(id="k2", topic="a:b", content="the second body"),
+                                  root=tmp_path)
+    assert second["path"] == first["path"] and second["status"] == "updated"
+    assert len(list((tmp_path / "tools").glob("METHOD-*.md"))) == 1
+    assert knowledge.read_front_matter(tmp_path / first["path"])["topic"] == "a:b"
+
+
+def test_path_is_the_page_identity_not_the_metadata(knowledge, tmp_path):
+    first = knowledge.write_unit(_unit(path="tools/METHOD-docker-a.md", topic="docker a"),
+                                 root=tmp_path)
+    other = knowledge.write_unit(_unit(path="tools/METHOD-docker-b.md", topic="docker b"),
+                                 root=tmp_path)
+    assert (first["status"], other["status"]) == ("created", "created")
+    assert first["path"] != other["path"]
+    assert len(list((tmp_path / "tools").glob("METHOD-docker-*.md"))) == 2
+
+    # A page whose front matter disagrees is that one page: the path wins, the metadata follows.
+    legacy = tmp_path / "entities" / "KNOWLEDGE-legacy.md"
+    legacy.parent.mkdir(parents=True)
+    legacy.write_text("---\ncategory: METHOD\norg: tools\ntopic: legacy\n---\n\n# legacy\n\n"
+                      "the old body\n", encoding="utf-8")
+    result = knowledge.write_unit(_unit(path="entities/KNOWLEDGE-legacy.md", topic="legacy"),
+                                  root=tmp_path)
+    assert result["status"] == "updated"
+    assert result["path"] == "entities/KNOWLEDGE-legacy.md"
+    assert not (tmp_path / "tools" / "METHOD-legacy.md").exists()
+    meta = knowledge.read_front_matter(legacy)
+    assert (meta["org"], meta["category"]) == ("entities", "KNOWLEDGE")
+
+
+@pytest.mark.parametrize("path", ["", "tools", "/tools/METHOD-x.md", "tools/../METHOD-x.md",
+                                  "tools\\METHOD-x.md", "C:/tools/METHOD-x.md",
+                                  "nope/METHOD-x.md", "tools/METHOD-x.txt",
+                                  "tools/loose.md"])
+def test_an_invalid_page_path_is_a_failed_write(knowledge, tmp_path, path):
+    result = knowledge.write_unit(_unit(path=path), root=tmp_path)
+    assert result["status"] == "failed"
+    assert list((tmp_path / "_failed").glob("*.json"))
+
+
+def test_a_unit_without_a_path_is_a_failure_not_a_new_page(knowledge, tmp_path):
+    result = knowledge.write_unit(_unit(path=""), root=tmp_path)
+    assert result["status"] == "failed" and "path is required" in result["error"]
+    payload = json.loads((tmp_path / "_failed" / "METHOD-Docker-镜像清理.json")
+                         .read_text(encoding="utf-8"))
+    assert (payload["op"], payload["path"], payload["sha256"]) == ("write", "", "")
+    assert not list((tmp_path / "tools").glob("*.md"))
+
+
+def test_a_topic_that_does_not_match_the_path_is_refused(knowledge, tmp_path):
+    result = knowledge.write_unit(_unit(path="tools/METHOD-docker-a.md"), root=tmp_path)
+    assert result["status"] == "failed" and "does not match" in result["error"]
 
 
 def test_stale_evidence_is_skipped_and_the_page_kept(knowledge, tmp_path):
@@ -117,9 +178,9 @@ def test_stale_evidence_is_skipped_and_the_page_kept(knowledge, tmp_path):
                                  root=tmp_path)
     assert stale["status"] == "stale"
     assert stale["path"] == fresh["path"]
-    text = fresh["path"].read_text(encoding="utf-8")
+    text = (tmp_path / fresh["path"]).read_text(encoding="utf-8")
     assert "fresh fact" in text and "contradicting" not in text
-    assert knowledge.read_front_matter(fresh["path"])["revisions"] == 1
+    assert knowledge.read_front_matter(tmp_path / fresh["path"])["revisions"] == 1
 
 
 def test_over_budget_write_fails_keeps_the_page_and_records_the_unit(knowledge, tmp_path):
@@ -144,7 +205,7 @@ def test_over_budget_retry_drops_the_oldest_evidence_lines(knowledge, tmp_path):
     result = knowledge.write_unit(unit, budget=200, root=tmp_path)
 
     assert result["status"] == "created", result["error"]
-    text = result["path"].read_text(encoding="utf-8")
+    text = (tmp_path / result["path"]).read_text(encoding="utf-8")
     assert "\n- evidence line 0" not in text and "\n- evidence line 7" in text
 
 
@@ -164,7 +225,7 @@ def test_render_callable_supplies_the_body_and_language(knowledge, tmp_path):
     result = knowledge.write_unit(_unit(), language="zh", render=render, root=tmp_path)
     assert result["status"] == "created"
     assert calls == ["zh"]
-    assert "Rendered in zh:" in result["path"].read_text(encoding="utf-8")
+    assert "Rendered in zh:" in (tmp_path / result["path"]).read_text(encoding="utf-8")
 
 
 def test_queue_drops_the_oldest_and_counts_it(knowledge, tmp_path):
@@ -415,3 +476,74 @@ def test_block_never_exceeds_its_cap(knowledge):
     assert block.startswith("[knowledge — retrieve on demand]")
     assert block.endswith("[end knowledge]")
     assert len(block) <= 700
+
+
+def test_an_events_unit_needs_a_date_an_object_and_a_result(knowledge, tmp_path):
+    shape = {"org": "events", "category": "KNOWLEDGE", "topic": "Docker cleanup",
+             "path": "events/KNOWLEDGE-Docker-cleanup.md"}
+
+    undated = knowledge.write_unit(_unit(**shape, time=""), root=tmp_path)
+    assert undated["status"] == "failed" and "dated time" in undated["error"]
+
+    objectless = knowledge.write_unit(_unit(**shape, objects=[]), root=tmp_path)
+    assert objectless["status"] == "failed" and "object" in objectless["error"]
+
+    resultless = knowledge.write_unit(_unit(**shape, content="Pruned the images."), root=tmp_path)
+    assert resultless["status"] == "failed" and "result" in resultless["error"]
+
+
+def test_a_projects_unit_needs_a_goal_a_deliverable_and_a_state(knowledge, tmp_path):
+    result = knowledge.write_unit(
+        _unit(org="projects", category="INTENT", topic="minir", path="projects/INTENT-minir.md",
+              content="Ship the strict alignment."), root=tmp_path)
+    assert result["status"] == "failed" and "3 lines" in result["error"]
+
+
+def test_pages_under_the_archive_folder_are_not_searchable(knowledge, tmp_path):
+    archived = tmp_path / "_archive" / "tools" / "KNOWLEDGE-docker.md"
+    archived.parent.mkdir(parents=True)
+    archived.write_text("---\ncategory: KNOWLEDGE\norg: tools\ntopic: docker prune\n---\n\n"
+                        "# docker prune\n\ndocker prune images\n", encoding="utf-8")
+
+    assert knowledge.search_pages("docker", tmp_path)["count"] == 0
+
+
+def test_a_page_declares_its_edges_and_a_file_rebuild_replaces_them(knowledge, plugin_package,
+                                                                   tmp_path):
+    knowledge.write_unit(_unit(
+        path="tools/METHOD-docker.md", topic="docker",
+        objects=["tools:Docker", "not-a-ref"],
+        relations=[{"type": "derived_from", "ref": "events:release"},
+                   {"type": "nonsense", "ref": "tools:X"}]), root=tmp_path)
+    edges = knowledge.derived_edges(tmp_path)
+    assert {(edge["src"], edge["rel"], edge["dst"]) for edge in edges} == {
+        (("page", "tools/METHOD-docker.md"), "instance_of", ("tools", "Docker")),
+        (("page", "tools/METHOD-docker.md"), "derived_from", ("events", "release"))}
+
+    instance = plugin_package.store.MinirStore(tmp_path / "memory.db")
+    try:
+        assert instance.rebuild_page_edges(edges) == 2
+        assert instance.rebuild_page_edges(edges) == 2  # idempotent, not duplicated
+        assert instance._conn.execute("SELECT COUNT(*) FROM edges").fetchone()[0] == 2
+
+        (tmp_path / "tools" / "METHOD-docker.md").rename(
+            tmp_path / "tools" / "METHOD-docker-moved.md")
+        moved = knowledge.derived_edges(tmp_path)
+        assert {edge["src"][1] for edge in moved} == {"tools/METHOD-docker-moved.md"}
+        instance.rebuild_page_edges(moved)
+        assert instance._conn.execute("SELECT COUNT(*) FROM edges").fetchone()[0] == 2
+    finally:
+        instance.close()
+
+
+def test_run_value_markers_is_the_one_writer_and_is_idempotent(knowledge, tmp_path):
+    units = [_unit(), _unit(id="k2", path="tools/METHOD-docker-prune.md", topic="docker prune")]
+
+    first = knowledge.run_value_markers(units, root=tmp_path, session_id="s1", source="test")
+    second = knowledge.run_value_markers(units, root=tmp_path, session_id="s1", source="test")
+
+    assert [(item["status"], item["topic"]) for item in first] == [
+        ("created", "Docker 镜像清理"), ("created", "docker prune")]
+    assert [item["path"] for item in first] == ["tools/METHOD-Docker-镜像清理.md",
+                                                "tools/METHOD-docker-prune.md"]
+    assert [item["status"] for item in second] == ["unchanged", "unchanged"]

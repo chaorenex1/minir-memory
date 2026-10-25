@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import importlib
 import json
+from pathlib import Path
 
 import pytest
 
@@ -28,7 +29,7 @@ def _review(layers, **over):
                       "user_preferences": layers.empty_user_preferences()},
         "ai_card": {"ai_self_representation": layers.empty_ai_self_representation(),
                     "ai_identity": layers.empty_ai_identity()},
-        "window_summary": "## Window Summary",
+        "window_summary": "## Window Summary\n\n- the review carried one verified line\n",
         "base_changed": {"changed": False, "fields": []},
         "changes": [], "prunings": [],
     }
@@ -149,6 +150,54 @@ def test_the_b3_core_states_the_caps_it_is_given(layers, plugin_package):
     kinds = ", ".join(summary.REFERENCE_KINDS[:-1]) + " or " + summary.REFERENCE_KINDS[-1]
     assert priorities in core, "the priority enum the prompt states is missing"
     assert kinds in core, "the reference-kind enum the prompt states is missing"
+
+
+def test_ai_self_marks_unknown_without_window_evidence(plugin_package):
+    rule = plugin_package.rules.rule_text("ai-self")
+
+    assert "empty Doing produces `unknown`" in rule
+    assert "never `idle`" in rule
+    assert '"idle" when Doing is empty' not in rule
+
+
+def test_a_review_with_both_cards_empty_is_valid(layers):
+    payload = {
+        "user_card": {part: "" for part in layers.USER_PARTS},
+        "ai_card": {part: "" for part in layers.AI_PARTS},
+        "window_summary": "## Window Summary\n\n- nothing durable happened\n",
+        "base_changed": {"changed": False, "fields": []},
+        "changes": [],
+        "prunings": [],
+    }
+
+    reviewed = layers.validate_review(payload)
+
+    assert set(reviewed) == {"user_self_representation", "user_preferences",
+                            "ai_self_representation", "ai_identity", "window_summary",
+                            "changed"}
+    assert reviewed["user_self_representation"] == "" and reviewed["ai_identity"] == ""
+
+
+def test_a_heading_only_summary_is_rejected(layers):
+    payload = {
+        "user_card": {part: "" for part in layers.USER_PARTS},
+        "ai_card": {part: "" for part in layers.AI_PARTS},
+        "window_summary": "## STATE\n\n## GOALS\n",
+        "base_changed": {"changed": False, "fields": []},
+        "changes": [],
+        "prunings": [],
+    }
+
+    with pytest.raises(layers.LayerContractError):
+        layers.validate_review(payload)
+
+
+def test_the_ai_self_rule_never_turns_an_empty_doing_into_idle(plugin_package):
+    rule = (Path(plugin_package.__file__).parent / "rules" / "ai-self.md").read_text("utf-8")
+
+    assert '"idle" when Doing is empty' not in rule
+    assert "empty Doing produces `unknown`" in rule
+    assert "never `idle`" in rule
 
 
 def test_artifact_from_columns_reads_legacy_and_current_marker_keys(layers):

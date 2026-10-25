@@ -289,16 +289,21 @@ def _card_body(text: str) -> str:
     return text.strip()
 
 
-def load_identity(hermes_home: Any, profile: str) -> tuple[str, str]:
-    """Read the review-sourced identity/preference files as bodies; ``("", "")`` when absent."""
+def load_identity(hermes_home: Any, profile: str) -> tuple[tuple[dict[str, Any], str],
+                                                          tuple[dict[str, Any], str]]:
+    """Read the identity/preference files as ``(meta, body)`` pairs; ``({}, "")`` when absent.
+
+    The caller needs the recorded ``source`` to decide whether a card may be presented as an
+    operator declaration, and it must never see the front matter as identity text.
+    """
+    empty: tuple[dict[str, Any], str] = ({}, "")
     if not str(hermes_home or "").strip():
-        return "", ""
+        return empty, empty
+    from . import card_review  # local import keeps this module stdlib-only at load time
+
     identity_path, preference_path = identity_paths(hermes_home, profile)
-    texts: list[str] = []
+    out: list[tuple[dict[str, Any], str]] = []
     for path in (identity_path, preference_path):
-        try:
-            text = path.read_text(encoding="utf-8-sig").strip()
-        except (OSError, UnicodeError):
-            text = ""
-        texts.append(_card_body(text)[:_MAX_IDENTITY_CHARS])
-    return texts[0], texts[1]
+        meta, body = card_review.read_card(path)
+        out.append((dict(meta), str(body or "")[:_MAX_IDENTITY_CHARS]))
+    return out[0], out[1]

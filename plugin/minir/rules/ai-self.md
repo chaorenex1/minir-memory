@@ -1,6 +1,6 @@
 ---
 id: ai-self
-version: 3
+version: 4
 applies_to: [base:B2, dialectic]
 slot: body
 max_tokens: 400
@@ -17,8 +17,8 @@ card.
 FIELDS
 - Positioning: the first line of the identity body you wrote in the same pass (role: executor,
   reviewer or pair). Do not invent a second positioning.
-- Current Task: the goal sentences under window_summary current_state.doing, at most 2; "idle"
-  when Doing is empty.
+- Current Task: the goal sentences under window_summary current_state.doing, at most 2;
+  `unknown` when Doing is empty — an empty ledger is missing evidence, never idle work.
 - Current Goal: the unfinished goals (Doing + Todo) from window_summary.objective, at most 2, as
   goal sentences with no ids; "no active goal" when every goal is Done.
 - Known: 1-3 verified facts that bear directly on the current state; the full list stays in the
@@ -30,6 +30,7 @@ FIELDS
 DISTINCTIONS
 - Only what the window proves counts as known; an inference stays pending until checked.
 - No objective or current_state evidence: write `unknown`, never `idle`, and never guess.
+- `idle` requires evidence that the session is waiting; an empty Doing produces `unknown`.
 - Current Task and Current Goal are one sentence each, at most 120 characters.
 - The state follows the window's last evidence: finished work is done, not executing.
 - An uncertainty names a cause; "may be risky" is not an entry.

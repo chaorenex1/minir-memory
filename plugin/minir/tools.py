@@ -101,7 +101,7 @@ _TOOL_SEARCH = _tool_schema(
 _TOOL_KB_SEARCH = _tool_schema(
     "minir_kb_search",
     "Search the Minir knowledge directory — the pages the knowledge hint points at — and return "
-    "the matching lines with each page's topic, category, summary and absolute path. Read-only "
+    "the matching lines with each page's topic, category, summary and relative path. Read-only "
     "and scoped to that directory, never the rest of the profile. Use it when you need to find "
     "which page covers something before opening a file. The pattern is ripgrep/Rust regex "
     "syntax ('docker (prune|restart)', '\\bindex\\b'); matching is case-insensitive, and org or "

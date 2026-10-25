@@ -50,7 +50,7 @@ def test_save_conclusion_returns_the_row_and_search_hides_note_fields(store):
     results = store.search("Docker Hermes")
     assert results, "content with both terms must be found"
     top = results[0]
-    assert top["kind"] == "entities" and top["conclusions_id"] == row_id and top["score"] >= 2
+    assert top["kind"] == "entities" and top["conclusions_id"] == row_id and top["score"] > 0
     assert set(top) == {"conclusions_id", "kind", "key", "text", "when", "author", "subject",
                         "session_id", "score", "rank"}
 
@@ -788,6 +788,368 @@ def test_layer_failures_upsert_open_and_resolve(store):
     assert [row["window_key"] for row in remaining] == ["s1:30"]
 
 
+def test_layer_failures_close_by_window_range(store):
+    store.record_layer_failure("base", "user:ada", window_key="s1:10", session_id="s1",
+                               window_from_ts=10, window_to_ts=20, error="old")
+    store.record_layer_failure("base", "user:ada", window_key="s1:30", session_id="s1",
+                               window_from_ts=30, window_to_ts=60, error="newer")
+    store.record_layer_failure("knowledge", "user:ada", window_key="s1:10", session_id="s1",
+                               window_from_ts=10, window_to_ts=20, error="other layer")
+
+    assert store.resolve_layer_failures_through("base", "user:ada", 20) == 1
+    assert [row["window_key"] for row in store.open_layer_failures("base", "user:ada")] == ["s1:30"]
+    assert store.resolve_layer_failures_through("base", "user:ada", 60) == 1
+    assert store.open_layer_failures("base", "user:ada") == []
+    assert len(store.open_layer_failures("knowledge", "user:ada")) == 1
+
+
+_ARCHIVE_DDL = (
+    "CREATE TABLE conclusion_versions (original_id INTEGER PRIMARY KEY, "
+    "conclusion_id INTEGER NOT NULL, kind TEXT NOT NULL, key TEXT NOT NULL, "
+    "session_id TEXT NOT NULL DEFAULT '', subject TEXT NOT NULL DEFAULT '', "
+    "content TEXT NOT NULL, evidence TEXT NOT NULL DEFAULT '[]', "
+    "status TEXT NOT NULL DEFAULT 'active', version INTEGER NOT NULL DEFAULT 0, "
+    "valid_from REAL NOT NULL, valid_to REAL, superseded_by INTEGER, "
+    "recorded_at REAL NOT NULL, archived_at REAL NOT NULL)")
+
+
+def test_as_of_attaches_only_the_newest_archive(plugin_package, tmp_path):
+    instance = plugin_package.store.MinirStore(tmp_path / "memory.db")
+    try:
+        instance.save_conclusion("note", "kubernetes restart policy", key="k", session_id="s1")
+        folder = tmp_path / "conclusion" / "archive"
+        folder.mkdir(parents=True)
+        for name, content in (("conclusion_archive_20250101.db", "docker prune old"),
+                              ("conclusion_archive_20260101.db", None)):
+            raw = sqlite3.connect(str(folder / name))
+            try:
+                raw.execute(_ARCHIVE_DDL)
+                if content:
+                    raw.execute(
+                        "INSERT INTO conclusion_versions (original_id, conclusion_id, kind, key,"
+                        " content, version, valid_from, valid_to, recorded_at, archived_at)"
+                        " VALUES (1, 1, 'note', 'd', ?, 0, 1000.0, 2000.0, 1000.0, 3000.0)",
+                        (content,))
+                raw.commit()
+            finally:
+                raw.close()
+
+        assert instance.search("docker", session_id="s1", as_of=1500) == []
+    finally:
+        instance.close()
+
+
+def test_an_archive_conflict_keeps_the_row_in_the_hot_table(plugin_package, tmp_path):
+    path = tmp_path / "memory.db"
+    instance = plugin_package.store.MinirStore(path)
+    try:
+        instance.save_conclusion("note", "docker v0", key="d", session_id="s1")
+        instance.save_conclusion("note", "docker v1", key="d", session_id="s1")
+        row = instance._conn.execute(
+            "SELECT id, valid_from FROM conclusion_versions WHERE content = 'docker v0'"
+        ).fetchone()
+        archive = tmp_path / "conclusion" / "archive"
+        archive.mkdir(parents=True)
+        later = time.time() + 400 * 86_400
+        target = archive / ("conclusion_archive_%s.db" % time.strftime(
+            "%Y%m%d", time.localtime(later)))
+        conn = sqlite3.connect(str(target))
+        try:
+            conn.execute(_ARCHIVE_DDL)
+            conn.execute(
+                "INSERT INTO conclusion_versions (original_id, conclusion_id, kind, key, "
+                "content, version, valid_from, recorded_at, archived_at) "
+                "VALUES (?, ?, 'note', 'd', 'a conflicting body', 0, ?, ?, ?)",
+                (row["id"], row["id"], row["valid_from"], row["valid_from"], later))
+            conn.commit()
+        finally:
+            conn.close()
+
+        counts = instance.maintain_conclusion_history(archive, now=later)
+
+        assert counts["archived"] == 0
+        remaining = {item["content"] for item in instance._conn.execute(
+            "SELECT content FROM conclusion_versions").fetchall()}
+        assert "docker v0" in remaining
+    finally:
+        instance.close()
+
+
+def test_folding_needs_the_age_threshold_and_runs_once(store):
+    for index in range(34):
+        store.save_conclusion("note", f"docker v{index}", key="d", session_id="s1")
+    base = time.time()
+
+    assert store.maintain_conclusion_history(now=base + 179 * 86_400)["folded"] == 0
+    assert store._conn.execute(
+        "SELECT COUNT(*) FROM conclusion_versions WHERE status = 'collapsed'"
+    ).fetchone()[0] == 0
+
+    assert store.maintain_conclusion_history(now=base + 181 * 86_400)["folded"] == 2
+    assert store._conn.execute(
+        "SELECT COUNT(*) FROM conclusion_versions WHERE status = 'collapsed'"
+    ).fetchone()[0] == 1
+    assert store.maintain_conclusion_history(now=base + 181 * 86_400)["folded"] == 0
+
+
+def test_v4_backfill_gives_each_eligible_row_one_open_version(plugin_package, tmp_path):
+    path = tmp_path / "memory.db"
+    instance = plugin_package.store.MinirStore(path)
+    instance.save_conclusion("note", "docker prune", key="n", session_id="s1")
+    instance.save_conclusion("todo", "ship it", key="t", session_id="s1")
+    instance.close()
+    raw = sqlite3.connect(str(path))
+    raw.execute("DROP TABLE conclusion_versions")
+    raw.execute("PRAGMA user_version = 4")
+    raw.commit()
+    raw.close()
+
+    migrated = plugin_package.store.MinirStore(path)
+    try:
+        rows = migrated._conn.execute(
+            "SELECT kind, COUNT(*) AS n, SUM(valid_to IS NULL) AS open FROM "
+            "conclusion_versions GROUP BY kind").fetchall()
+    finally:
+        migrated.close()
+
+    assert [(row["kind"], row["n"], row["open"]) for row in rows] == [("note", 1, 1)]
+
+
+def test_expansion_stops_at_the_fanout_cap(store):
+    store.save_conclusion("note", "docker hub", key="hub", session_id="s1")
+    for index in range(12):
+        # the children must not match the query, or they arrive as lexical hits and prove nothing
+        store.save_conclusion("note", f"container child {index}", key=f"c{index}", session_id="s1")
+        store.link(("note", "hub"), "part_of", ("note", f"c{index}"))
+
+    rows = store.search("docker hub", session_id="s1", expand=1)
+
+    assert 1 <= sum(1 for row in rows if row.get("via")) <= 10
+
+
+def test_as_of_boundaries_pick_the_version_in_force(store):
+    store.save_conclusion("note", "docker v1", key="d", session_id="s1")
+    first = time.time()
+    time.sleep(0.03)
+    store.save_conclusion("note", "docker v2", key="d", session_id="s1")
+    second = time.time()
+    time.sleep(0.03)
+    store.save_conclusion("note", "docker v3", key="d", session_id="s1")
+    third = time.time()
+
+    assert [row["text"] for row in store.search("docker", session_id="s1", as_of=first)] == [
+        "docker v1"]
+    assert [row["text"] for row in store.search("docker", session_id="s1", as_of=second)] == [
+        "docker v2"]
+    assert [row["text"] for row in store.search("docker", session_id="s1", as_of=third)] == [
+        "docker v3"]
+
+
+def test_a_todo_write_creates_no_version_row(store):
+    store.save_conclusion("todo", "ship the release", key="t", session_id="s1")
+    row = store.get_conclusion("todo", "t")
+
+    assert store._conn.execute(
+        "SELECT COUNT(*) FROM conclusion_versions WHERE conclusion_id = ?",
+        (row["id"],)).fetchone()[0] == 0
+
+
+def test_link_refuses_missing_endpoints_and_upserts(store):
+    store.save_conclusion("note", "a", key="a", session_id="s1")
+    store.save_conclusion("note", "b", key="b", session_id="s1")
+
+    assert store.link(("note", "a"), "part_of", ("note", "missing")) is False
+    assert store.link(("note", "a"), "part_of", ("note", "b")) is True
+    assert store.link(("note", "a"), "part_of", ("note", "b")) is True
+
+    assert store._conn.execute(
+        "SELECT COUNT(*) FROM edges WHERE src_key = 'a' AND rel = 'part_of'"
+    ).fetchone()[0] == 1
+
+
+def test_merge_meta_and_unmerge_restore_the_row(store):
+    source = store.save_conclusion("note", "docker prune", key="src", session_id="s1")
+    store.save_conclusion("note", "docker prune images", key="dst", session_id="s1")
+    assert store.merge_into(("note", "src"), ("note", "dst"), score=0.95, now=100.0)
+
+    meta = json.loads(store._conn.execute(
+        "SELECT meta FROM edges WHERE src_key = 'src' AND rel = 'same_as'").fetchone()["meta"])
+    assert (meta["prev_status"], meta["score"], meta["merged_at"]) == ("active", 0.95, 100.0)
+    assert [row["text"] for row in store.search("docker", session_id="s1")] == [
+        "docker prune images"]
+
+    result = store.unmerge("note", "src", "wrong merge", now=200.0)
+    assert result["unmerged"] is True and result["restored_status"] == "active"
+    assert store.get_conclusion("note", "src")["status"] == "active"
+    assert store._conn.execute(
+        "SELECT COUNT(*) FROM edges WHERE src_key = 'src' AND rel = 'same_as'"
+    ).fetchone()[0] == 0
+    latest = store._conn.execute(
+        "SELECT version, valid_to FROM conclusion_versions WHERE conclusion_id = ? "
+        "ORDER BY version DESC LIMIT 1", (source,)).fetchone()
+    assert latest["valid_to"] is None and latest["version"] == 1
+
+    assert store.unmerge("note", "src", "again")["unmerged"] is False
+    with pytest.raises(ValueError):
+        store.unmerge("note", "src", "")
+
+
+def test_alias_chains_resolve_and_a_cycle_is_refused(store):
+    for key in ("a", "b", "c"):
+        store.save_conclusion("note", f"docker {key}", key=key, session_id="s1")
+    assert store.merge_into(("note", "a"), ("note", "b"))
+    assert store.merge_into(("note", "b"), ("note", "c"))
+
+    assert store.resolve_alias("note", "a") == ("note", "c")
+    assert store.resolve_alias("note", "c") == ("note", "c")
+    with pytest.raises(ValueError):
+        store.merge_into(("note", "c"), ("note", "a"))
+
+
+def test_scheduler_runs_keep_the_newest_two_hundred_per_task(store):
+    now = time.time()
+    for _ in range(205):
+        store.record_scheduler_run("card_review", "tick", "ok", "", now - 10, now - 10, 1.0)
+    store.record_scheduler_run("card_review_other", "tick", "ok", "", now - 10, now - 10, 1.0)
+
+    store.maintain_conclusion_history(now=now)
+
+    counts = dict(store._conn.execute(
+        "SELECT task, COUNT(*) FROM scheduler_runs GROUP BY task").fetchall())
+    assert counts == {"card_review": 200, "card_review_other": 1}
+
+
+def test_scheduler_runs_age_out_at_ninety_days(store):
+    now = time.time()
+    store.record_scheduler_run("card_review", "tick", "ok", "", now - 100 * 86_400,
+                               now - 100 * 86_400, 1.0)
+    store.record_scheduler_run("card_review", "tick", "ok", "", now - 80 * 86_400,
+                               now - 80 * 86_400, 1.0)
+
+    store.maintain_conclusion_history(now=now)
+
+    assert len(store.scheduler_runs(limit=10)) == 1
+
+
+def test_page_topics_are_merge_candidates_but_never_auto_merged(store):
+    counts = store.generate_merge_candidates(page_topics=[
+        {"path": "tools/METHOD-docker-prune.md", "topic": "Docker prune image"},
+        {"path": "tools/METHOD-docker-pruning.md", "topic": "Docker prune images"}])
+
+    assert counts == {"merged": 0, "advised": 1}
+    rows = store.pending_advisories("", limit=5)
+    assert any("page tools/METHOD-docker-prune.md" in row["content"] for row in rows)
+
+
+def test_default_search_matches_the_first_golden(store):
+    """A regression lock on the default ``search`` output, created after the strict alignment.
+
+    No pre-change snapshot exists in the repository, so this cannot prove the output matched the
+    old build; it pins what ships from here on: same rows, same order, same RRF scores.
+    """
+    store.save_conclusion("note", "docker system prune removes dangling images", session_id="s1")
+    store.save_conclusion("note", "pytest -q keeps the feedback loop short", session_id="s1")
+    store.save_conclusion("entities", "Docker is the container runtime", key="Docker",
+                          session_id="s1")
+
+    rows = store.search("docker", session_id="s1")
+
+    note = store.search("docker", session_id="s1", kinds=frozenset({"note"}))[0]
+    assert [(row["kind"], row["text"], round(row["score"], 6)) for row in rows] == [
+        ("entities", "Docker is the container runtime", 0.016667),
+        ("note", "docker system prune removes dangling images", 0.016393)]
+    assert note["key"].startswith("note:")
+
+
+def test_rrf_fuses_the_lexical_and_vector_channels(store):
+    store.save_conclusion("note", "docker prune keeps images", key="a", session_id="s1")
+    second = store.save_conclusion("note", "docker prune removes images", key="b", session_id="s1")
+
+    rows = store.search("docker", session_id="s1", vector_ranks={second: 0})
+
+    assert len(rows) == 2
+    # both rows are lexical hits; the vector hit also carries the vector term at rank 0
+    assert sorted(round(row["score"], 6) for row in rows) == sorted(
+        [round(1 / 60, 6), round(1 / 61 + 0.7 / 60, 6)])
+    assert set(rows[0]) == {"conclusions_id", "kind", "key", "text", "when", "author",
+                            "subject", "session_id", "score", "rank"}
+
+
+def test_a_vector_only_hit_is_fused_in_without_a_lexical_rank(store):
+    hit = store.save_conclusion("note", "kubernetes pod restart policy", key="k",
+                                session_id="s1")
+
+    rows = store.search("docker", session_id="s1", vector_ranks={hit: 0})
+
+    assert [row["key"] for row in rows] == ["k"]
+    assert rows[0]["score"] == pytest.approx(0.7 / 60)
+
+
+def test_a_saved_conclusion_reaches_the_index_hook(store):
+    seen: list[tuple[int, str]] = []
+    store.on_conclusion_saved = lambda cid, text: seen.append((cid, text))
+
+    store.save_conclusion("note", "docker prune removes images", key="d", session_id="s1")
+
+    assert seen and seen[0][1] == "docker prune removes images"
+
+
+def test_a_dangling_edge_is_not_expanded(store):
+    parent = store.save_conclusion("note", "the parent", key="parent", session_id="s1")
+    store.save_conclusion("note", "the child", key="child", session_id="s1")
+    assert store.link(("note", "parent"), "part_of", ("note", "child"))
+    assert [row["key"] for row in store.edges_from(("note", "parent"))] == ["child"]
+
+    assert store.forget_conclusion("note", store.get_conclusion("note", "child")["id"])
+
+    assert store.edges_from(("note", "parent")) == []
+    assert store.get_conclusion("note", "parent")["id"] == parent
+
+
+def test_as_of_returns_a_row_after_forget(store):
+    store.save_conclusion("note", "docker system prune clears dangling images", session_id="s1")
+    hit = store.search("docker", session_id="s1")[0]
+    before = time.time()
+    time.sleep(0.03)  # the deletion must land strictly after the as-of instant
+    assert store.forget_conclusion("note", hit["conclusions_id"])
+    assert store.search("docker", session_id="s1") == []
+
+    rows = store.search("docker", session_id="s1", as_of=before)
+
+    assert [row["text"] for row in rows] == ["docker system prune clears dangling images"]
+    assert (rows[0]["version"], rows[0]["version_status"]) == (0, "deleted")
+
+
+def test_include_superseded_reaches_a_superseded_row(store):
+    store.save_conclusion("note", "docker prune current", key="docker", session_id="s1")
+    store.save_conclusion("note", "docker prune retired", key="docker-old", session_id="s1",
+                          status="superseded")
+
+    assert [row["text"] for row in store.search("docker", session_id="s1")] == [
+        "docker prune current"]
+    both = store.search("docker", session_id="s1", include_superseded=True)
+    assert {row["text"] for row in both} == {"docker prune current", "docker prune retired"}
+
+
+def test_as_of_reads_a_version_archived_to_a_file(plugin_package, tmp_path):
+    instance = plugin_package.store.MinirStore(tmp_path / "memory.db")
+    try:
+        instance.save_conclusion("note", "docker prune v1", key="docker", session_id="s1")
+        time.sleep(0.03)
+        stamp = time.time()
+        time.sleep(0.03)  # v2 must be strictly newer than the as-of instant
+        instance.save_conclusion("note", "docker prune v2", key="docker", session_id="s1")
+        archive = tmp_path / "conclusion" / "archive"
+        later = stamp + 200 * 86_400
+        assert instance.maintain_conclusion_history(archive, now=later)["archived"] == 1
+
+        rows = instance.search("docker", session_id="s1", as_of=stamp)
+
+        assert [row["text"] for row in rows] == ["docker prune v1"]
+    finally:
+        instance.close()
+
+
 def test_conclusion_versions_append_and_answer_as_of(store):
     cid = store.save_conclusion("note", "first text", key="k1")
     store.save_conclusion("note", "second text", key="k1")
@@ -854,19 +1216,23 @@ def test_history_maintenance_folds_old_versions_and_archives_them(store, tmp_pat
     archived = store.version_at(cid, old + 10, tmp_path / "archive")
     assert archived and archived.get("archived")
 
-def test_claim_stats_and_repeat_guard_count_the_same_claim(store):
+def test_claim_stats_count_cited_blocked_and_a_separate_repeat_row(store):
     first = store.add_advisories("s1", [{
         "content": "prefer pytest", "severity": "concern", "target": "general",
         "claim": "card:preference.md#3"}], source="adviser_mode")
     store.mark_advisory_outcome(first[0], "blocked")
-    store.add_advisories("s1", [{
-        "content": "prefer pytest again", "severity": "concern", "target": "general",
-        "claim": "card:preference.md#3"}], source="adviser_mode")
-    assert store.mark_claim_repeated("s1", "card:preference.md#3") is True
+
+    repeat_id = store.repeat_claim("s1", "card:preference.md#3", text="prefer pytest again",
+                                   severity="concern", target="general")
+
+    assert repeat_id is not None
+    row = store._conn.execute("SELECT * FROM advisories WHERE id = ?", (repeat_id,)).fetchone()
+    assert (row["outcome"], row["status"], row["claim_id"]) == (
+        "repeated", "dropped", "card:preference.md#3")
     stats = store.claim_stats("s1")
     assert stats[0]["claim_id"] == "card:preference.md#3"
-    assert stats[0]["cited"] == 2 and stats[0]["blocked"] == 1
-    assert stats[0]["repeated"] == 1
+    assert (stats[0]["cited"], stats[0]["blocked"], stats[0]["repeated"]) == (2, 1, 1)
+    assert repeat_id not in [row["id"] for row in store.pending_advisories("s1", limit=10)]
     assert store.claim_stats("other") == []
 
 def test_merge_candidates_auto_merge_and_advise(store):
@@ -885,3 +1251,73 @@ def test_merge_candidates_auto_merge_and_advise(store):
     merge_notes = [row for row in store.pending_advisories("", limit=10)
                    if row["target"] == "merge_candidate"]
     assert merge_notes and "entities:d1" in merge_notes[0]["content"]
+
+
+def test_a_late_blocker_counts_as_blocked_for_its_claim(store):
+    row = store.add_advisories("s1", [{
+        "content": "late_blocker: operator claim soul:SOUL.md#2 refused terminal",
+        "severity": "blocker", "target": "late_blocker", "claim": "soul:SOUL.md#2"}],
+        source="adviser_mode")
+    store.mark_advisory_outcome(row[0], "blocked")
+
+    stats = store.claim_stats("s1")
+
+    assert [(item["claim_id"], item["blocked"]) for item in stats] == [("soul:SOUL.md#2", 1)]
+
+
+def test_claim_coverage_and_target_coverage_are_separate_columns(store):
+    review = store.start_adviser_review("s", "t", "window", 0, 1)
+    store.set_adviser_review_claims(
+        review, [{"id": "card:user/preference.md#2"}],
+        {"card:user/preference.md#2": "clean"})
+    store.finish_adviser_review(review, status="done", coverage='{"general": "clean"}')
+
+    row = store.adviser_reviews("s")[0]
+    assert json.loads(row["claim_coverage"]) == {"card:user/preference.md#2": "clean"}
+    assert json.loads(row["coverage"]) == {"general": "clean"}
+
+
+def _shape(instance):
+    """Every non-FTS table and its columns: what a reader of the database can depend on."""
+    tables = [row[0] for row in instance._conn.execute(
+        "SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%' "
+        "AND name NOT LIKE '%_fts%' ORDER BY name").fetchall()]
+    shape = {name: [column[1] for column in instance._conn.execute(
+        f"PRAGMA table_info({name})").fetchall()] for name in tables}
+    version = instance._conn.execute("PRAGMA user_version").fetchone()[0]
+    return shape, int(version)
+
+
+def test_a_migrated_database_has_the_same_shape_as_a_fresh_one(plugin_package, tmp_path):
+    legacy_path = tmp_path / "legacy" / "memory.db"
+    legacy_path.parent.mkdir(parents=True)
+    legacy = sqlite3.connect(str(legacy_path))
+    try:
+        legacy.executescript(
+            "CREATE TABLE notes (id INTEGER PRIMARY KEY AUTOINCREMENT,"
+            " source TEXT NOT NULL DEFAULT 'tool', content TEXT NOT NULL,"
+            " created_at REAL NOT NULL, session_id TEXT NOT NULL DEFAULT '');"
+            "CREATE TABLE base_revisions (id INTEGER PRIMARY KEY AUTOINCREMENT,"
+            " session_id TEXT NOT NULL DEFAULT '', subject TEXT NOT NULL DEFAULT '',"
+            " base_refresh_id INTEGER NOT NULL DEFAULT 0, window_from_ts REAL NOT NULL,"
+            " window_to_ts REAL NOT NULL, window_from_turn INTEGER, window_to_turn INTEGER,"
+            " user_representation TEXT NOT NULL DEFAULT '',"
+            " user_peer_card TEXT NOT NULL DEFAULT '',"
+            " ai_self_representation TEXT NOT NULL DEFAULT '',"
+            " ai_identity_card TEXT NOT NULL DEFAULT '',"
+            " window_summary TEXT NOT NULL DEFAULT '',"
+            " value_markers TEXT NOT NULL DEFAULT '',"
+            " advices TEXT NOT NULL DEFAULT '[]', changed_fields TEXT NOT NULL DEFAULT '[]',"
+            " source_job_id INTEGER NOT NULL DEFAULT 0,"
+            " is_latest INTEGER NOT NULL DEFAULT 1, created_at REAL NOT NULL);")
+        legacy.commit()
+    finally:
+        legacy.close()
+
+    migrated = plugin_package.store.MinirStore(legacy_path)
+    fresh = plugin_package.store.MinirStore(tmp_path / "fresh" / "memory.db")
+    try:
+        assert _shape(migrated) == _shape(fresh)
+    finally:
+        migrated.close()
+        fresh.close()

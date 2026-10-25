@@ -151,8 +151,12 @@ def test_profile_name_and_identity_files(plugin_package, tmp_path):
     identity.parent.mkdir(parents=True)
     identity.write_text("---\nsource: review\nreviewer: masia\n---\n\nI am Masía.", encoding="utf-8")
     preference.write_text("---\nsource: review\n---\n\nPrefer evidence.", encoding="utf-8")
-    assert plugin_package.history.load_identity(tmp_path, "work") == (
-        "I am Masía.", "Prefer evidence.")
+    (identity_meta, identity_body), (preference_meta, preference_body) = (
+        plugin_package.history.load_identity(tmp_path, "work"))
+
+    assert (identity_body, preference_body) == ("I am Masía.", "Prefer evidence.")
+    assert (identity_meta["source"], identity_meta["reviewer"]) == ("review", "masia")
+    assert preference_meta["source"] == "review"
 
 
 def test_identity_profile_is_sanitised(plugin_package, tmp_path):

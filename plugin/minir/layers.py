@@ -292,24 +292,28 @@ def coerce_value_markers(value: Any, *, previous: Any = None) -> list[dict[str, 
 
 
 def _merge_units(units: list[dict[str, Any]], previous: Any) -> list[dict[str, Any]]:
-    """A unit already carrying a path is identified by it: the newer entry replaces the older one.
+    """A unit is identified by its relative page path: the newer entry replaces the older one.
 
-    A carried entry without a category, an org or a topic cannot be merged, rendered or written,
-    so it is not carried forward. A legacy inventory whose entries still carry all three
-    survives until the one-shot reset in scripts/drop_legacy_markers.py removes it.
+    Path is the only key. Two units whose metadata agrees but whose paths differ are two pages;
+    two units with the same path are one page whatever their metadata says. An entry from the
+    previous artifact that carries no valid path is dropped — its failure was already recorded in
+    the window that produced it — while a path-less entry from this window is carried through
+    once so the writer can record it as a failure instead of losing it silently.
     """
-    merged: dict[object, dict[str, Any]] = {}
-    order: list[object] = []
-    for unit in list(previous or []) + units:
+    from .knowledge import normalize_path  # knowledge imports layers; keep this edge lazy
+
+    carried = list(previous or [])
+    merged: dict[Any, dict[str, Any]] = {}
+    order: list[Any] = []
+    for index, unit in enumerate(carried + units):
         if not isinstance(unit, dict):
             continue
-        path = str(unit.get("path") or "").strip()
-        topic = " ".join(str(unit.get("topic") or "").split())
-        org = str(unit.get("org") or "").strip()
-        category = str(unit.get("category") or "").strip().upper()
-        if not topic or not org or not category:
-            continue
-        key = path or (category, org, topic.casefold())
+        try:
+            key: Any = normalize_path(unit.get("path"))
+        except Exception:
+            if index < len(carried):
+                continue
+            key = ("invalid", index)
         if key not in merged:
             order.append(key)
         merged[key] = unit
@@ -347,7 +351,7 @@ def validate_review(value: Any) -> dict[str, Any]:
     if changed["changed"] and not fields:
         _fail("base_changed", "changed is true but fields is empty")
     try:
-        summary = summary_template.validate(data["window_summary"])
+        summary = summary_template.validate_nonempty(data["window_summary"])
     except WindowSummaryError as exc:
         raise LayerContractError(str(exc)) from exc
     changes = data["changes"]

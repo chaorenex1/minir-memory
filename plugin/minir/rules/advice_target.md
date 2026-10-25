@@ -62,6 +62,9 @@ COVERAGE
 - Every review reports `coverage` for each enabled consistency target: `clean`, `found`, or
   `n/a`. A target you did not inspect is omitted; missing is `unknown`, never `clean`.
 - A malformed coverage map does not fail the review; delivery depends on advice, not coverage.
+- When the prompt lists claims, answer `coverage` for every listed claim id with `clean`,
+  `found`, or `n/a`; the key is the exact id (`card:user/preference.md#2`). A claim you did not
+  test is `n/a`, never `clean`; an omitted claim counts as skipped, not as a pass.
 
 PARALLEL RULES
 - The seven consistency targets are parallel and delivered, not candidate-only. There is no `soul`

@@ -36,6 +36,8 @@ RESERVED_LABELS: frozenset[str] = frozenset({
     "previous_user_cards",
     "previous_value_markers",
     "provider_memory_context",
+    "review_identity",
+    "review_preferences",
     "rulers",
     "self_audit_correction",
     "session_record",

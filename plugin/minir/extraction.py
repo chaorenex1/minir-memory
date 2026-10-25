@@ -28,7 +28,7 @@ import re
 import time
 from typing import Any, Callable, Optional
 
-from . import agent_loop, layers, tools
+from . import agent_loop, knowledge, layers, tools
 from . import rules as layer_rules
 from .prompting import data_block
 
@@ -129,10 +129,16 @@ def validate_pages(payload: Any) -> list[dict[str, Any]]:
             continue
         if not topic or not body:
             continue
+        try:
+            path = (knowledge.normalize_path(entry.get("path")) if str(entry.get("path") or "").strip()
+                    else knowledge.resolve_path(org, category, topic))
+        except knowledge.KnowledgeError:
+            continue
         epistemic = str(entry.get("epistemic") or "").strip().lower()
         if org == "events" and category == "KNOWLEDGE":
             epistemic = "fact"  # an occurrence is observed, never inferred or predicted
         pages.append({
+            "path": path,
             "category": category,
             "org": org,
             "topic": topic,

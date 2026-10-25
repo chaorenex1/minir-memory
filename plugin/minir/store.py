@@ -59,7 +59,7 @@ import threading
 import time
 from uuid import uuid4
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Mapping, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -616,6 +616,9 @@ class MinirStore:
     def __init__(self, db_path: Path | str):
         self.path = Path(db_path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
+        # Set by the provider: called after every conclusion write, inside the store lock, so it
+        # must only enqueue (never embed or wait on the network).
+        self.on_conclusion_saved: Optional[Callable[[int, str], None]] = None
         self._lock = threading.RLock()
         self._fts = False
         self._base_fts = False
@@ -1091,6 +1094,11 @@ class MinirStore:
              evidence or "[]", max(0, int(version)), status, created_at or stamp, stamp))
         row = self._conn.execute(
             "SELECT id, version FROM conclusions WHERE kind = ? AND key = ?", (kind, key)).fetchone()
+        if row is not None and self.on_conclusion_saved is not None:
+            try:
+                self.on_conclusion_saved(int(row["id"]), str(content or ""))
+            except Exception:
+                logger.warning("minir store: conclusion hook failed", exc_info=True)
         if row is not None and _versioned(kind):
             self._conn.execute(
                 "INSERT INTO conclusion_versions (conclusion_id, kind, key, session_id, subject, "
@@ -1179,6 +1187,50 @@ class MinirStore:
                  json.dumps(meta or {}, ensure_ascii=False), stamp, stamp))
             self._conn.commit()
             return True
+
+    def _page_edge_rows(self, edges: Any, stamp: float) -> list[tuple[Any, ...]]:
+        rows: list[tuple[Any, ...]] = []
+        for edge in edges or ():
+            if not isinstance(edge, dict):
+                continue
+            src, dst = edge.get("src") or ("", ""), edge.get("dst") or ("", "")
+            relation = str(edge.get("rel") or "").strip()
+            if not relation or len(src) != 2 or len(dst) != 2:
+                continue
+            if not all(str(part or "").strip() for part in (*src, *dst)):
+                continue
+            rows.append((str(src[0]), str(src[1]), relation, str(dst[0]), str(dst[1]),
+                         float(edge.get("weight") or 1.0),
+                         json.dumps({"source": "page"}, ensure_ascii=False), stamp, stamp))
+        return rows
+
+    def upsert_page_edges(self, edges: Any, *, now: Optional[float] = None) -> int:
+        """Write the edges a page file declares; an unknown target key is kept, not invented."""
+        stamp = float(now if now is not None else time.time())
+        rows = self._page_edge_rows(edges, stamp)
+        if not rows:
+            return 0
+        with self._lock:
+            self._conn.executemany(
+                "INSERT INTO edges (src_kind, src_key, rel, dst_kind, dst_key, weight, meta, "
+                "valid_from, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) "
+                "ON CONFLICT(src_kind, src_key, rel, dst_kind, dst_key) DO UPDATE SET "
+                "weight = excluded.weight, valid_to = NULL", rows)
+            self._conn.commit()
+        return len(rows)
+
+    def rebuild_page_edges(self, edges: Any, *, now: Optional[float] = None) -> int:
+        """Replace every page-sourced edge with the current file-derived set; idempotent."""
+        stamp = float(now if now is not None else time.time())
+        rows = self._page_edge_rows(edges, stamp)
+        with self._lock:
+            self._conn.execute("DELETE FROM edges WHERE src_kind = 'page'")
+            if rows:
+                self._conn.executemany(
+                    "INSERT INTO edges (src_kind, src_key, rel, dst_kind, dst_key, weight, meta, "
+                    "valid_from, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)", rows)
+            self._conn.commit()
+        return len(rows)
 
     def edges_from(self, src: tuple[str, str], *, max_depth: int = 2,
                    limit: int = 50) -> list[dict[str, Any]]:
@@ -1291,7 +1343,8 @@ class MinirStore:
     def generate_merge_candidates(self, *, now: Optional[float] = None,
                                   auto_threshold: float = 0.92,
                                   advise_threshold: float = 0.85,
-                                  limit: int = 300) -> dict[str, int]:
+                                  limit: int = 300,
+                                  page_topics: Any = None) -> dict[str, int]:
         """Compare active subjects by trigram; auto-merge ≥0.92, advise 0.85-0.92.
 
         The pass only changes a row's status through ``merge_into`` (reversible) and never
@@ -1343,6 +1396,27 @@ class MinirStore:
                                   "score": round(score, 4)}],
                 }], source="merge")
                 advised += 1
+        # Pages are never auto-merged: a file redirect has no reversible row to fall back on,
+        # so the top tier is reported for a human instead of applied.
+        pages = [dict(item) for item in (page_topics or ()) if isinstance(item, Mapping)]
+        page_pairs: list[tuple[float, dict[str, Any], dict[str, Any]]] = []
+        for index, left in enumerate(pages):
+            for right in pages[index + 1:]:
+                score = _similarity(left.get("topic"), right.get("topic"))
+                if score >= advise_threshold:
+                    page_pairs.append((score, left, right))
+        page_pairs.sort(key=lambda item: (-item[0], str(item[1].get("path")),
+                                          str(item[2].get("path"))))
+        for score, left, right in page_pairs[:10]:
+            self.add_advisories("", [{
+                "content": "merge_candidate: page %s -> page %s (score %.3f)" % (
+                    left.get("path"), right.get("path"), score),
+                "severity": "concern", "target": "merge_candidate",
+                "evidence": [{"src": ["page", left.get("path")],
+                              "dst": ["page", right.get("path")],
+                              "score": round(score, 4)}],
+            }], source="merge")
+            advised += 1
         return {"merged": merged, "advised": advised}
 
     def record_scheduler_run(self, task: str, trigger: str, outcome: str, detail: str,
@@ -1408,7 +1482,15 @@ class MinirStore:
                 "DELETE FROM edges WHERE NOT EXISTS (SELECT 1 FROM conclusions c "
                 "WHERE c.kind = edges.dst_kind AND c.key = edges.dst_key)")
             dangling = max(0, int(cur.rowcount))
-            self._conn.execute("DELETE FROM scheduler_runs WHERE finished_at < ?", (cutoff,))
+            # Run history is observation with its own, shorter retention than the versions:
+            # 90 days, and at most 200 rows per task however fast the task fires.
+            self._conn.execute("DELETE FROM scheduler_runs WHERE finished_at < ?",
+                               (stamp - 90 * 86_400,))
+            self._conn.execute(
+                "DELETE FROM scheduler_runs WHERE id NOT IN ("
+                "  SELECT id FROM (SELECT id, ROW_NUMBER() OVER ("
+                "    PARTITION BY task ORDER BY id DESC) AS row_no FROM scheduler_runs)"
+                "  WHERE row_no <= 200)")
             self._conn.execute(
                 "DELETE FROM scheduler_runs WHERE id IN (SELECT id FROM ("
                 "SELECT id, ROW_NUMBER() OVER (PARTITION BY task ORDER BY id DESC) AS rn "
@@ -1740,6 +1822,24 @@ class MinirStore:
                 "WHERE layer = ? AND subject = ? AND window_key = ? AND resolved_at IS NULL",
                 (stamp, layer, subject, window_key))
             self._conn.commit()
+
+    def resolve_layer_failures_through(self, layer: str, subject: str, window_to_ts: float,
+                                       now: Optional[float] = None) -> int:
+        """Close every open failure whose window ended at or before a published window.
+
+        A later window that reaches past a failed one proves that gap is covered, so keying the
+        close on the exact window key would leave the row open forever.
+        """
+        stamp = float(now if now is not None else time.time())
+        with self._lock:
+            if self._conn is None:
+                return 0
+            cursor = self._conn.execute(
+                "UPDATE layer_failures SET resolved_at = ? "
+                "WHERE layer = ? AND subject = ? AND window_to_ts <= ? AND resolved_at IS NULL",
+                (stamp, layer, subject, float(window_to_ts)))
+            self._conn.commit()
+            return int(cursor.rowcount or 0)
 
     def open_layer_failures(self, layer: str, subject: str,
                             limit: int = 3) -> list[dict[str, Any]]:
@@ -2421,21 +2521,35 @@ class MinirStore:
                 (str(outcome or ""), int(advisory_id)))
             self._conn.commit()
 
-    def mark_claim_repeated(self, session_id: str, claim_id: str) -> bool:
-        """Mark the newest note citing a claim as repeated; True means suppress this one."""
-        if not session_id or not claim_id:
-            return False
+    def repeat_claim(self, session_id: str, claim_id: str, *, text: str = "",
+                     severity: str = "nit", target: str = "",
+                     now: Optional[float] = None) -> Optional[int]:
+        """Record a second sighting as its own row; the ledger keeps both the repeat and its origin.
+
+        Rewriting the first row lost the fact that the same claim came back, and gave the repeat
+        no identity of its own. The new row carries ``outcome='repeated'``, the suppressed text,
+        and the id of the note it repeats; it is never delivered.
+        """
+        if not str(session_id or "").strip() or not str(claim_id or "").strip():
+            return None
         with self._lock:
-            row = self._conn.execute(
+            previous = self._conn.execute(
                 "SELECT id FROM advisories WHERE session_id = ? AND claim_id = ? "
-                "AND source = 'adviser_mode' ORDER BY id DESC LIMIT 1",
+                "AND source = 'adviser_mode' AND outcome != 'repeated' "
+                "ORDER BY id DESC LIMIT 1",
                 (str(session_id), str(claim_id))).fetchone()
-            if row is None:
-                return False
-            self._conn.execute(
-                "UPDATE advisories SET outcome = 'repeated' WHERE id = ?", (int(row["id"]),))
+            if previous is None:
+                return None
+            stamp = float(now if now is not None else time.time())
+            fingerprint = "repeat:%d:%s:%.6f" % (int(previous["id"]), str(claim_id), stamp)
+            cursor = self._conn.execute(
+                "INSERT INTO advisories (session_id, source, severity, target, content, "
+                "fingerprint, status, created_at, claim_id, outcome) "
+                "VALUES (?, 'adviser_mode', ?, ?, ?, ?, 'dropped', ?, ?, 'repeated')",
+                (str(session_id), str(severity or "nit"), str(target or ""),
+                 str(text or ""), fingerprint, stamp, str(claim_id)))
             self._conn.commit()
-            return True
+            return int(cursor.lastrowid or 0)
 
     def claim_stats(self, session_id: str = "", *, window: float = 30 * 86_400,
                     limit: int = 20) -> list[dict[str, Any]]:
@@ -2767,7 +2881,8 @@ class MinirStore:
     # -- reads ----------------------------------------------------------------
 
     @staticmethod
-    def _visibility_sql(session_id: str, scope: str = "session") -> tuple[str, list[Any]]:
+    def _visibility_sql(session_id: str, scope: str = "session", alias: str = "c"
+                        ) -> tuple[str, list[Any]]:
         """SQL predicate + params for the requested recall scope.
 
         ``scope="session"`` (the default) is the current conversation's view: its own rows plus
@@ -2780,16 +2895,17 @@ class MinirStore:
             return "1=1", []
         durable_kinds = (*_LONG_TERM_KINDS, *CONCLUSION_KINDS)
         marks = ",".join("?" * len(durable_kinds))
-        durable = f"(c.session_id = '' AND c.kind IN ({marks}))"
+        durable = f"({alias}.session_id = '' AND {alias}.kind IN ({marks}))"
         if session_id:
-            return f"(c.session_id = ? OR {durable})", [session_id, *durable_kinds]
+            return f"({alias}.session_id = ? OR {durable})", [session_id, *durable_kinds]
         return durable, list(durable_kinds)
 
     def search(self, query: str, limit: int = 5, *, session_id: str = "",
                scope: str = "session",
                kinds: Optional[frozenset[str]] = None,
                as_of: Optional[float] = None, expand: int = 0,
-               include_superseded: bool = False) -> list[dict[str, Any]]:
+               include_superseded: bool = False,
+               vector_ranks: Optional[Mapping[int, int]] = None) -> list[dict[str, Any]]:
         """Ranked matches across conclusions, scoped to *session_id* or every session.
 
         FTS5 with the trigram tokenizer is the primary index (CJK-safe). A scan over the same
@@ -2820,18 +2936,21 @@ class MinirStore:
                 explicit = explicit - bound
                 if not explicit:
                     return []
-        visibility, visible_params = self._visibility_sql(session_id, scope)
+        # The as-of read never joins the live table: its rows come from the version table, so the
+        # predicate and the kind filter must name that alias too.
+        alias = "v" if as_of is not None else "c"
+        visibility, visible_params = self._visibility_sql(session_id, scope, alias=alias)
         if scope == "all":
             # A generic cross-session query must not surface another conversation's ruler;
             # only an explicit session scope (with its id) may read it.
             marks = ", ".join("?" * len(bound))
-            visibility = f"({visibility} AND c.kind NOT IN ({marks}))"
+            visibility = f"({visibility} AND {alias}.kind NOT IN ({marks}))"
             visible_params = [*visible_params, *bound]
         kinds = explicit
         kind_sql, kind_params = "", []
         if kinds is not None:
             marks = ",".join("?" * len(kinds))
-            kind_sql = f" AND c.kind IN ({marks})"
+            kind_sql = f" AND {alias}.kind IN ({marks})"
             kind_params = list(kinds)
         if as_of is not None:
             return self._search_as_of(
@@ -2892,24 +3011,104 @@ class MinirStore:
         results.sort(key=lambda item: (item["score"], -item["rank"], item["when"],
                                        item["conclusions_id"]), reverse=True)
         results = self._expand_results(results, expand=expand, limit=capped)
-        return results[:capped]
+        return self._fuse(results, vector_ranks=vector_ranks, limit=capped)
+
+    _RRF_K = 60.0
+
+    def _fuse(self, results: list[dict[str, Any]], *,
+              vector_ranks: Optional[Mapping[int, int]], limit: int) -> list[dict[str, Any]]:
+        """RRF over the lexical, expansion and vector channels; a missing channel adds 0.
+
+        ``1/(60+lexical) + 0.5/(60+expand) + 0.7/(60+vector)``; raw scores are not comparable
+        across channels, so nothing is normalized. Vector hits outside the requested scope are
+        dropped, and vector-only rows carry no lexical rank.
+        """
+        lexical: dict[int, int] = {}
+        expanded: dict[int, int] = {}
+        for row in results:
+            cid = int(row["conclusions_id"])
+            channel = expanded if row.get("via") else lexical
+            channel.setdefault(cid, len(channel))
+        vector: dict[int, int] = {}
+        by_id = {int(row["conclusions_id"]): row for row in results}
+        for cid, rank in (vector_ranks or {}).items():
+            row = by_id.get(int(cid))
+            if row is None:
+                stored = self.conclusion_by_id(int(cid))
+                if stored is None or str(stored.get("status") or "") != "active":
+                    continue
+                row = {
+                    "conclusions_id": int(cid), "kind": stored.get("kind") or "",
+                    "key": stored.get("key") or "", "text": stored.get("content") or "",
+                    "when": float(stored.get("updated_at") or 0),
+                    "author": stored.get("subject") or stored.get("kind") or "",
+                    "subject": stored.get("subject") or "",
+                    "session_id": stored.get("session_id") or "",
+                    "rank": 0.0,
+                }
+                results.append(row)
+                by_id[int(cid)] = row
+            vector[int(cid)] = int(rank)
+        for row in results:
+            cid = int(row["conclusions_id"])
+            total = 0.0
+            if cid in lexical:
+                total += 1.0 / (self._RRF_K + float(lexical[cid]))
+            if cid in expanded:
+                total += 0.5 / (self._RRF_K + float(expanded[cid]))
+            if cid in vector:
+                total += 0.7 / (self._RRF_K + float(vector[cid]))
+            row["score"] = total
+        results.sort(key=lambda item: (item.get("score") or 0.0, item.get("when") or 0.0,
+                                       item.get("conclusions_id") or 0), reverse=True)
+        return results[:limit]
+
+    def _archive_files(self) -> list[Path]:
+        """The dated archive files beside the live database; empty when nothing was archived."""
+        folder = Path(self.path).parent / "conclusion" / "archive"
+        if not folder.is_dir():
+            return []
+        return sorted(folder.glob("conclusion_archive_*.db"))
 
     def _search_as_of(self, terms: list[str], *, limit: int, visibility: str,
                       visible_params: list[Any], kind_sql: str, kind_params: list[Any],
                       as_of: float) -> list[dict[str, Any]]:
-        """Rank the version rows in force at *as_of*; the live table is never the answer."""
+        """Rank the version rows in force at *as_of*; the live table is never the answer.
+
+        The newest dated archive is read too, because retention must not turn a recent
+        historical recall into "nothing happened". A row that survived in both is one hit.
+        """
         where = " OR ".join("lower(v.content) LIKE ?" for _ in terms)
         sql = (
-            "SELECT c.id, c.kind, c.key, c.subject, c.session_id, v.content, v.version, "
-            "v.status, v.valid_from, v.valid_to FROM conclusions c "
-            "JOIN conclusion_versions v ON v.conclusion_id = c.id "
+            "SELECT v.conclusion_id AS id, v.kind, v.key, v.subject, v.session_id, v.content, "
+            "v.version, v.status, v.valid_from, v.valid_to FROM conclusion_versions v "
             f"WHERE {visibility}{kind_sql} AND v.valid_from <= ? "
-            "AND (v.valid_to IS NULL OR v.valid_to > ?) "
+            "AND (v.valid_to IS NULL OR v.valid_to > ?) AND v.status != 'collapsed' "
             f"AND ({where}) ORDER BY v.valid_from DESC LIMIT ?")
+        params = [*visible_params, *kind_params, as_of, as_of,
+                  *[f"%{term}%" for term in terms], _MAX_SCAN]
         with self._lock:
-            found = self._conn.execute(
-                sql, [*visible_params, *kind_params, as_of, as_of,
-                      *[f"%{term}%" for term in terms], _MAX_SCAN]).fetchall()
+            found = [dict(row) for row in self._conn.execute(sql, params).fetchall()]
+        seen = {(int(row["id"] or 0), int(row["version"] or 0)) for row in found}
+        # C §4.9: attach at most the newest archive. Older files stay on disk for a manual ATTACH,
+        # and a time before that window answers "nothing" instead of paying for every file.
+        for path in self._archive_files()[-1:]:
+            try:
+                archive = sqlite3.connect(str(path))
+                archive.row_factory = sqlite3.Row
+                try:
+                    extra = archive.execute(sql, params).fetchall()
+                finally:
+                    archive.close()
+            except sqlite3.Error as exc:
+                logger.warning("Minir archive unreadable at %s: %s", path, exc)
+                continue
+            for raw in extra:
+                row = dict(raw)
+                key = (int(row["id"] or 0), int(row["version"] or 0))
+                if key not in seen:
+                    seen.add(key)
+                    found.append(row)
         results: list[dict[str, Any]] = []
         for row in found:
             text = str(row["content"] or "")
@@ -2949,7 +3148,7 @@ class MinirStore:
                     "kind": hop["kind"], "key": hop["key"],
                     "text": hop["content"] or "", "when": 0.0,
                     "author": hop["kind"], "subject": "", "session_id": "",
-                    "score": row["score"] * 0.5, "rank": 0.0,
+                    "rank": 0.0, "expand_rank": len(extra),
                     "via": f"{row['kind']}:{row['key']}",
                 })
         return results + extra
