@@ -6,6 +6,12 @@ license: MIT
 tags:
   - memory
   - template
+# Vector recall loads sqlite-vec inside the host runtime. Hermes strips every interpreter
+# site-packages entry from sys.path at boot and keeps only the PM generation, so a package that
+# exists only in the checkout's dev venv is invisible here: without this declaration the plugin
+# logs "sqlite-vec unavailable, bm25 only" on every start.
+python_dependencies:
+  - sqlite-vec>=0.1.9
 # The provider's own surface (MemoryProvider) is reached through memory.provider;
 # these are the plugin-level hooks register(ctx) subscribes to. The host validator fails
 # the manifest when register() adds a hook that is not declared here.
