@@ -237,7 +237,7 @@ AI 卡的价值在"上下文丢失后仍能约束下一次回答"，不在复述
 - `summary_template` 增加"全空模板"判定：有标题、无正文 → 无效。`validate_summary_pass` 调用它。
 - `rules/ai-self.md` 增加一条：窗口摘要没有 objective/current_state 时写 `unknown`，不写 `idle`，不猜。
 - `prefetch` 的 layer block 在 base 窗口失败时注入一行 `stale: 上一个窗口未摘要`（带 job 时间），不再静默为空。这是 10-24 23:50 已提出的要求。
-  - 落点：base job 最终失败时写 `layer_failures`（marker 稿 §1.3）一行（subject、layer=base、session、window_to、error）；prefetch 的 `## Minir memory gaps` 块按 subject 渲染，新 base 行成功后清掉。不新建 `base_stale`。
+  - 落点：base job 最终失败时写 `layer_failures`（marker 稿 §1.3）一行（subject、layer=base、session、window_to、error）；prefetch 的 `## Minir memory gaps` 块按 subject 渲染，新 base 行成功后清掉，且只清**同一 session** 的行：另一个会话的发布不构成这个窗口被覆盖的证据。不新建 `base_stale`。
 - 失败窗口的覆盖行为先测后改：如果 `since` 不回退，failed 窗口的证据会丢；如果回退，只需要重试上限。
 
 测试：

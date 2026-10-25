@@ -132,6 +132,7 @@ _MAX_TOOL_EXCERPT = 600           # text excerpt returned by the minir_search to
 _MAX_AUTHOR_CACHE = 64            # per-session last-seen author, bounded like the turn counter
 _COMPRESSION_GATE_TTL = 300.0     # seconds a crashed compression may pause periodic scheduling
 _PRE_COMPRESS_TIMEOUT = 120.0     # synchronous base -> dialectic budget before compress()
+_LAYER_DRAIN_SECONDS = 60.0       # background drain cadence when turns stop arriving
 # Final-answer injection. ``transform_llm_output_inject`` queues markdown for the answer the
 # model is finishing; the host hook pops the whole session queue, so one turn cannot inherit the
 # previous turn's block. Known types render in this declaration order, unknown types after them
@@ -475,6 +476,11 @@ class MinirMemoryProvider(MemoryProvider):
         # Everything recurring is registered on one scheduler. A disabled task is simply not
         # registered; the scheduler inventories what it owns when it starts.
         self._scheduler.add_turn("layers", self._run_turn_layers)
+        # A turn is the usual kick, but a session can sit idle with windows already queued (a
+        # long tool call, a conversation resumed in another client): the queue would then wait
+        # for a turn that never comes. The tick only starts a drain; a live one makes it a no-op.
+        self._scheduler.add_time("layer_drain", _LAYER_DRAIN_SECONDS, self._drain_layers_tick,
+                                 due=self._has_queued_layer_jobs, first_delay=45.0)
         if self._reasoning:
             self._card_scheduler.ensure_anchor()
             self._scheduler.add_time("card_review", card_review.TICK_SECONDS,
@@ -1551,6 +1557,15 @@ class MinirMemoryProvider(MemoryProvider):
             logger.info("Minir %s-layer job queued (#%s): session=%s turns=%d window=%s..%s",
                         trigger.layer, job_id, trigger.session_id or "-", trigger.turns,
                         format_when(trigger.from_ts), format_when(trigger.to_ts))
+
+    def _has_queued_layer_jobs(self) -> bool:
+        """Due check for the layer-drain tick: only spawn a drain when the queue has work."""
+        return self._store is not None and self._store.queued_job_count() > 0
+
+    def _drain_layers_tick(self) -> str:
+        """Start a background drain between turns; a drain already running is left alone."""
+        self._kick_worker()
+        return "kicked"
 
     def _kick_worker(self) -> None:
         """Start a background drain unless one is already running (never on the tick path)."""

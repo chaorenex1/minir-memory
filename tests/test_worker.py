@@ -1745,3 +1745,56 @@ def test_the_summary_baseline_is_session_scoped(plugin_package, store, transcrip
 
     assert "<previous_summary>" not in prompts[1], "another session's window leaked in"
     assert "<previous_summary>" in prompts[2] and "Ship the plugin" in prompts[2]
+
+
+# -- the drain's failure policy ----------------------------------------------
+
+
+def test_a_layer_pass_records_its_token_usage(worker, monkeypatch):
+    """Without usage on the run_end rows, a layer's cost cannot be attributed from the record."""
+    captured: dict = {}
+
+    def _record(layer, session, messages, **kwargs):
+        captured.update(kwargs)
+
+    monkeypatch.setattr(worker._transcript, "record_aux", _record)
+
+    class _Result:
+        messages = ({"role": "user", "content": "ship it"},)
+        usage = {"total_tokens": 4321}
+
+    worker._record_aux("b1_user_card", "system prompt", _Result(),
+                       {"model": "m", "provider": "p"}, ["file"])
+    assert captured["usage"] == {"total_tokens": 4321}
+
+
+def test_a_global_drain_continues_past_a_failed_job(store, transcript, worker, monkeypatch):
+    """One broken window must not hold every other session's queue."""
+    broken = _dispatch(store, transcript, "s-one", BASE, 0.0, 10.0)
+    healthy = _dispatch(store, transcript, "s-two", BASE, 0.0, 10.0)
+    original = worker._process
+    seen: list[int] = []
+
+    def _process(job):
+        seen.append(int(job["id"]))
+        if int(job["id"]) == int(broken):
+            raise RuntimeError("assembled an invalid artifact")
+        return original(job)
+
+    monkeypatch.setattr(worker, "_process", _process)
+    assert worker.run_once() == 2
+    assert seen == [int(broken), int(healthy)]
+    assert store.open_layer_failures("base", worker.user_subject(), limit=5)
+
+
+def test_a_scoped_drain_stops_at_the_first_failure(store, transcript, worker, monkeypatch):
+    """The pre-compression drain must not run the same session's review over a failed base."""
+    broken = _dispatch(store, transcript, SESSION, BASE, 0.0, 10.0)
+    review = _dispatch(store, transcript, SESSION, DIALECTIC, 10.0, 20.0)
+
+    monkeypatch.setattr(worker, "_process",
+                        lambda job: (_ for _ in ()).throw(RuntimeError("bad artifact")))
+    assert worker.run_once(session_id=SESSION) == 1
+    assert int(broken) > 0
+    # The review was never claimed: it is still pending, not running and not done.
+    assert review in [job["id"] for job in store.pending_jobs()]

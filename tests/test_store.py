@@ -220,6 +220,16 @@ def test_failure_requeues_then_gives_up_without_moving_the_watermark(store):
     assert store.last_processed_ts("base", "s1") == 0.0, "a failed window stays owed"
 
 
+def test_claim_can_skip_the_ids_a_drain_already_failed(store):
+    """The drain excludes what it just failed instead of retrying it inside the same pass."""
+    first = store.record_job("base", "s1", 0.0, 10.0)
+    second = store.record_job("base", "s2", 0.0, 10.0)
+    claimed = store.claim_jobs(limit=1, exclude_ids=[first])
+    assert [job["id"] for job in claimed] == [second]
+    assert [job["id"] for job in store.pending_jobs()] == [first]
+    assert store.queued_job_count() == 1
+
+
 def test_newer_and_open_job_queries(store):
     first = store.record_job("base", "s1", 0.0, 10.0)
     assert store.has_open_job("base", "s1") is True
@@ -796,11 +806,28 @@ def test_layer_failures_close_by_window_range(store):
     store.record_layer_failure("knowledge", "user:ada", window_key="s1:10", session_id="s1",
                                window_from_ts=10, window_to_ts=20, error="other layer")
 
-    assert store.resolve_layer_failures_through("base", "user:ada", 20) == 1
+    assert store.resolve_layer_failures_through(
+        "base", "user:ada", 20, session_id="s1") == 1
     assert [row["window_key"] for row in store.open_layer_failures("base", "user:ada")] == ["s1:30"]
-    assert store.resolve_layer_failures_through("base", "user:ada", 60) == 1
+    assert store.resolve_layer_failures_through(
+        "base", "user:ada", 60, session_id="s1") == 1
     assert store.open_layer_failures("base", "user:ada") == []
     assert len(store.open_layer_failures("knowledge", "user:ada")) == 1
+
+
+def test_another_sessions_publish_does_not_close_this_sessions_gap(store):
+    """A refresh of s2 proves nothing about s1's window, which is what the sweep used to assume."""
+    store.record_layer_failure("base", "user:ada", window_key="s1:10", session_id="s1",
+                               window_from_ts=10, window_to_ts=20, error="s1 gap")
+    store.record_layer_failure("base", "user:ada", window_key="s2:10", session_id="s2",
+                               window_from_ts=10, window_to_ts=20, error="s2 gap")
+
+    assert store.resolve_layer_failures_through(
+        "base", "user:ada", 999, session_id="s2") == 1
+    remaining = store.open_layer_failures("base", "user:ada")
+    assert [row["session_id"] for row in remaining] == ["s1"]
+    with pytest.raises(ValueError):
+        store.resolve_layer_failures_through("base", "user:ada", 999, session_id="")
 
 
 _ARCHIVE_DDL = (

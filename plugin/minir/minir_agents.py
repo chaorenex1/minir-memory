@@ -320,7 +320,7 @@ def run(provider: Any, args: dict[str, Any]) -> str:
             transcript.record_aux(
                 name, session_id, messages,
                 model=result.model, provider=result.provider, toolsets=result.toolsets,
-                system_message=system_prompt)
+                system_message=system_prompt, usage=getattr(result, "usage", None))
             written = bool(transcript.flush_aux(name, session_id, timeout=10.0)
                            and path is not None and path.exists())
         except Exception as exc:  # the answer is still useful; only the audit trail failed

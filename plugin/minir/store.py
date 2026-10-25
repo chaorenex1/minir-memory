@@ -59,7 +59,7 @@ import threading
 import time
 from uuid import uuid4
 from pathlib import Path
-from typing import Any, Mapping, Optional
+from typing import Any, Iterable, Mapping, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -1702,13 +1702,15 @@ class MinirStore:
             ).fetchall()
         return [dict(row) for row in rows]
 
-    def claim_jobs(self, limit: int = 2, *, session_id: str = "") -> list[dict[str, Any]]:
+    def claim_jobs(self, limit: int = 2, *, session_id: str = "",
+                   exclude_ids: Iterable[int] = ()) -> list[dict[str, Any]]:
         """Mark the oldest *limit* pending jobs ``running`` and return them.
 
         One UPDATE round-trips the claim, so two workers (or a restarted process racing its
         own predecessor) can never process the same row twice. ``attempts`` counts claims.
         A non-empty *session_id* scopes the claim to one session, which is what the
-        pre-compression synchronous drain needs.
+        pre-compression synchronous drain needs. *exclude_ids* lets one drain pass skip the job
+        it just failed instead of retrying it immediately.
 
         Claiming is strictly FIFO *within a session*: a job is only eligible once every
         earlier job of the same session finished. That is what makes a same-turn base and
@@ -1728,6 +1730,10 @@ class MinirStore:
             if session_id:
                 where += " AND session_id = ?"
                 params.append(session_id)
+            skip = [int(item) for item in exclude_ids]
+            if skip:
+                where += " AND id NOT IN (%s)" % ",".join("?" * len(skip))
+                params.extend(skip)
             ids = [row["id"] for row in self._conn.execute(
                 f"SELECT id FROM jobs {where} {order} LIMIT ?",
                 (*params, max(1, min(int(limit), 50))),
@@ -1823,21 +1829,27 @@ class MinirStore:
                 (stamp, layer, subject, window_key))
             self._conn.commit()
 
-    def resolve_layer_failures_through(self, layer: str, subject: str, window_to_ts: float,
-                                       now: Optional[float] = None) -> int:
-        """Close every open failure whose window ended at or before a published window.
+    def resolve_layer_failures_through(self, layer: str, subject: str, window_to_ts: float, *,
+                                       session_id: str, now: Optional[float] = None) -> int:
+        """Close every open failure of *session_id* whose window ended at or before a publish.
 
-        A later window that reaches past a failed one proves that gap is covered, so keying the
-        close on the exact window key would leave the row open forever.
+        A later window *of the same session* that reaches past a failed one proves that gap is
+        covered, so keying the close on the exact window key would leave the row open forever.
+        Another session's publish proves nothing about this stretch of the conversation, so the
+        session is part of the predicate: without it one successful refresh silently closed the
+        gaps of every other session that had ever failed.
         """
+        if not session_id:
+            raise ValueError("resolve_layer_failures_through needs a session_id")
         stamp = float(now if now is not None else time.time())
         with self._lock:
             if self._conn is None:
                 return 0
             cursor = self._conn.execute(
                 "UPDATE layer_failures SET resolved_at = ? "
-                "WHERE layer = ? AND subject = ? AND window_to_ts <= ? AND resolved_at IS NULL",
-                (stamp, layer, subject, float(window_to_ts)))
+                "WHERE layer = ? AND subject = ? AND session_id = ? "
+                "AND window_to_ts <= ? AND resolved_at IS NULL",
+                (stamp, layer, subject, session_id, float(window_to_ts)))
             self._conn.commit()
             return int(cursor.rowcount or 0)
 
@@ -1940,6 +1952,16 @@ class MinirStore:
             row = self._conn.execute(
                 "SELECT COUNT(*) AS n FROM jobs WHERE session_id = ? AND status = 'pending'",
                 (session_id,)).fetchone()
+        return int(row["n"] or 0) if row is not None else 0
+
+    def queued_job_count(self) -> int:
+        """Pending layer jobs across every session; the background drain's due check."""
+        with self._lock:
+            if self._conn is None:
+                return 0
+            row = self._conn.execute(
+                "SELECT COUNT(*) AS n FROM jobs WHERE layer IN ('base', 'dialectic') "
+                "AND status = 'pending'").fetchone()
         return int(row["n"] or 0) if row is not None else 0
 
     def open_job_count(self, session_id: str) -> int:

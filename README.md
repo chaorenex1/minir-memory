@@ -519,6 +519,14 @@ content (the content watermark never moved).
   (`turns - last_trigger_turn >= interval`), not when the count is a multiple: the periodic tick
   and the boundary flushes read the counter from different threads, and a watermark makes every
   trigger idempotent. `last_trigger_turn`/`last_trigger_ts` advance at dispatch time.
+* **The drain** — a kick starts one background pass over the oldest pending job; a 60-second
+  `layer_drain` tick starts a pass too whenever any job is pending, so queued windows do not wait
+  for a turn that may never arrive (a long tool call, a session resumed in another client). Within
+  a pass a session's job still waits for every earlier job of that session (base before review),
+  but the job a pass just failed is excluded from the rest of that pass: one permanently broken
+  window must not hold another session's queue. The synchronous pre-compression drain is the
+  exception — it stops at the first failure, because the same session's review must not read an
+  unpublished base.
 * **Windows are edge-to-edge** — `from_ts` of the next window is `to_ts` of the previous one (the
   first starts at the session's start time), so no turn falls between two windows or is reasoned
   over twice.

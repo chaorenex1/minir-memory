@@ -823,7 +823,8 @@ class LayerWorker:
             self._transcript.record_aux(
                 layer, f"{layer}-{int(time.time() * 1000)}", messages,
                 model=str(cfg.get("model") or ""), provider=str(cfg.get("provider") or ""),
-                toolsets=tuple(toolsets), system_message=system)
+                toolsets=tuple(toolsets), system_message=system,
+                usage=getattr(result, "usage", None))
         except Exception as exc:  # an audit file must never fail a reasoning pass
             logger.debug("Minir aux transcript write failed: %s", exc)
 
@@ -1132,25 +1133,30 @@ class LayerWorker:
 
     def _resolve_base_failure(self, job: Mapping[str, Any]) -> None:
         # A job can finish without publishing (a sparse window); only a row covering its
-        # window proves the memory gap is closed.
+        # window proves the memory gap is closed. The resolve is scoped to this job's session:
+        # another session's publish says nothing about this window.
         session = str(job.get("session_id") or "")
-        row = self._store.latest_base_refresh(session) if session else None
+        if not session:
+            return
+        row = self._store.latest_base_refresh(session)
         if row is not None and float(row.get("window_to_ts") or 0) >= float(job.get("to_ts") or 0):
             self._store.resolve_layer_failures_through(
-                "base", self.user_subject(), float(job.get("to_ts") or 0))
+                "base", self.user_subject(), float(job.get("to_ts") or 0), session_id=session)
 
     def run_once(self, *, session_id: str = "") -> int:
         """Process up to ``_MAX_JOBS_PER_RUN`` jobs oldest-first; returns how many ran.
 
-        Stops at the first failure: a re-queued job would otherwise be retried immediately,
-        burning its remaining attempt against the same broken condition. A non-empty
-        *session_id* scopes the claim to one session for the synchronous pre-compression drain.
+        A failed job is re-queued by the store, so a global drain skips that id for the rest of
+        the pass and continues with the next session: one permanently broken window must not
+        stop every other conversation's queue. A *session-scoped* drain still stops at the first
+        failure, because the same session's next job has to see the published base row.
         """
         if not self._enabled:
             return 0
         processed = 0
+        skipped: set[int] = set()
         while processed < _MAX_JOBS_PER_RUN:
-            jobs = self._store.claim_jobs(limit=1, session_id=session_id)
+            jobs = self._store.claim_jobs(limit=1, session_id=session_id, exclude_ids=skipped)
             if not jobs:
                 break
             job = jobs[0]
@@ -1167,7 +1173,10 @@ class LayerWorker:
                     logger.debug("Minir job #%s failure could not be recorded: %s",
                                  job["id"], record_exc)
                 processed += 1
-                break
+                if session_id:
+                    break
+                skipped.add(int(job["id"]))
+                continue
             else:
                 if str(job.get("layer") or "") == BASE_LAYER:
                     try:
