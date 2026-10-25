@@ -220,6 +220,7 @@ def test_config_schema_fields_are_valid(plugin_package):
 def test_tool_responses_are_json_strings(plugin_package, provider):
     for tool_name, args in (("minir_stats", {}), ("minir_search", {"query": "anything"}),
                             ("minir_kb_search", {"query": "anything"}),
+                            ("minir_kb_write", {"path": "tools/METHOD-x.md", "op": "create"}),
                             ("minir_remember", {"type": "entities", "category": "KNOWLEDGE", "content": "a fact"}),
                             ("minir_forget", {"type": "entities", "note_id": 1})):
         result = provider.handle_tool_call(tool_name, args)

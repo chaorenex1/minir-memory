@@ -361,6 +361,8 @@ class MinirMemoryProvider(MemoryProvider):
         self._hermes_home = ""
         self._state_db = ""
         self._profile = "default"
+        #: Content language for every generated artifact (cards, pages, knowledge writes).
+        self._language = str(self._config.get("content_language") or "en")
         self._identity = ""
         self._preference = ""
         self._worker: Optional[LayerWorker] = None
@@ -445,7 +447,7 @@ class MinirMemoryProvider(MemoryProvider):
         self._transcript.bind(self._session_id, profile=self._profile)
         self._knowledge = knowledge.KnowledgePipeline(
             self._hermes_home,
-            language=str(self._config.get("content_language") or "en"),
+            language=self._language,
             budget=self._knowledge_token_budget, autostart=self._reasoning,
             on_written=self._index_page_edges)
         self._worker = LayerWorker(
@@ -456,7 +458,7 @@ class MinirMemoryProvider(MemoryProvider):
             identity_source=self._identity_source,
             preference_source=self._preference_source,
             depth=self._dialectic_depth,
-            content_language=str(self._config.get("content_language") or "en"),
+            content_language=self._language,
             hermes_home=self._hermes_home,
             on_value_markers=(self._knowledge.enqueue_from_refresh
                       if self._knowledge is not None else None))
@@ -1464,7 +1466,7 @@ class MinirMemoryProvider(MemoryProvider):
         results = knowledge.run_value_markers(
             pages, root=self._knowledge.root, session_id=session,
             source=f"session_extraction:{session}",
-            language=str(self._config.get("content_language") or "en"),
+            language=self._language,
             budget=self._knowledge_token_budget)
         for item in results:
             if item["status"] in {"created", "updated"}:
@@ -1921,7 +1923,7 @@ class MinirMemoryProvider(MemoryProvider):
             self._store, self._hermes_home, self._profile,
             complete=self._worker.review_cards, since=since,
             plugin_yaml=self._worker._plugin_yaml,
-            language=str(self._config.get("content_language") or "en"),
+            language=self._language,
             transcript=self._transcript)
         return revisions
 

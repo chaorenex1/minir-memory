@@ -467,6 +467,22 @@ def test_kb_search_rejects_bad_arguments_and_never_leaves_the_root(provider, plu
     assert "error" in json.loads(provider.handle_tool_call("minir_kb_search", {"query": "x"}))
 
 
+def test_kb_write_creates_a_page_through_the_tool(provider, plugin_package):
+    """The tool path must reach ``edit_page`` with the provider's language, not raise."""
+    body = ("docker system prune -af drops stopped containers\n"
+            "add --volumes to release unused volumes\n"
+            "check free space afterwards")
+    payload = json.loads(provider.handle_tool_call(
+        "minir_kb_write",
+        {"path": "tools/METHOD-Docker-prune.md", "op": "create", "topic": "Docker prune",
+         "summary": "reclaim disk space", "content": body}))
+
+    assert payload["status"] == "created" and payload["verified"] is True, payload
+    assert provider._language == "en"
+    page = plugin_package.knowledge.knowledge_dir(provider._hermes_home) / "tools" / "METHOD-Docker-prune.md"
+    assert page.is_file() and "docker system prune -af" in page.read_text(encoding="utf-8")
+
+
 def test_search_scope_all_crosses_sessions(provider):
     provider.handle_tool_call(
         "minir_remember", {"type": "projects", "content": "cross session fact"})
