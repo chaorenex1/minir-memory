@@ -37,7 +37,7 @@ import os
 import re
 import threading
 import time
-from collections import deque
+from collections import Counter, deque
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Optional
@@ -156,7 +156,7 @@ def _disk_rows(path: Path) -> tuple[list[dict[str, Any]], int]:
 
 
 def _tail_rows(path: Path, count: int) -> list[dict[str, Any]]:
-    """Last *count* parseable rows of one part, newest last, without loading the file."""
+    """Last *count* parseable rows of one part, newest first, without loading the file."""
     try:
         size = path.stat().st_size
     except OSError:
@@ -288,6 +288,12 @@ class TranscriptBuffer:
                 logger.warning("transcript: cannot create persist_dir %s", self._persist_dir,
                                exc_info=True)
             self._process = transcript_process.ProcessLock(self._run_dir)
+            try:
+                removed = transcript_process.prune_stale_locks(self._persist_dir)
+                if removed:
+                    logger.info("transcript: removed %d stale stream lock(s)", removed)
+            except Exception:  # hygiene must never keep a writer from starting
+                logger.debug("transcript: stale lock prune failed", exc_info=True)
             self._thread = threading.Thread(target=self._writer_loop, name="minir-transcript",
                                             daemon=True)
             self._thread.start()
@@ -455,14 +461,29 @@ class TranscriptBuffer:
                             tool_call_id=str(row.get("tool_call_id") or ""),
                             name=str(row.get("name") or ""))
                 for row in normalized]
-            start = 0
+            start = None
             if anchor:
                 start = self._anchor_offset(fingerprints, anchor)
-                if start is None:
-                    self.append_event(layer, session_id, "", kind="gap", dropped=0,
-                                      reason="compaction", profile=profile,
-                                      redacted=redacted)
-                    start = 0
+            if start is None:
+                # The in-memory anchor can be behind a newer writer: match against the tail
+                # actually on disk before calling this a rewritten conversation.
+                disk_anchor = self._disk_anchor(stream)
+                if disk_anchor:
+                    anchor = disk_anchor
+                    start = self._anchor_offset(fingerprints, disk_anchor)
+            dropped = 0
+            if start is None and anchor:
+                # Still no anchor. A whole-history replay would duplicate every message the
+                # file already carries, so rows whose fingerprint the tail still holds are
+                # dropped and the gap records how many.
+                normalized, fingerprints, dropped = self._drop_seen_tail(
+                    stream, normalized, fingerprints)
+                self.append_event(layer, session_id, "", kind="gap", dropped=dropped,
+                                  reason="compaction", profile=profile,
+                                  redacted=redacted)
+                start = 0
+            else:
+                start = int(start or 0)
             appended = 0
             for row in normalized[start:]:
                 appended += self._append_message(stream, row, redacted=redacted,
@@ -487,6 +508,38 @@ class TranscriptBuffer:
                 if fingerprints[index] == anchor[-1]:
                     return index + 1
         return None
+
+    def _disk_anchor(self, stream: "_Stream", size: int = 8, scan: int = 800) -> list[str]:
+        """The newest message fingerprints on disk; the anchor to trust after a lost one."""
+        files = self._parts_for(stream)
+        if not files:
+            return []
+        # _tail_rows is newest-first; an anchor has to read oldest-to-newest.
+        fps = [str(row.get("fp") or "") for row in reversed(_tail_rows(files[-1], scan))
+               if str(row.get("kind") or "") == "msg" and row.get("fp")]
+        return fps[-size:] if fps else []
+
+    def _drop_seen_tail(self, stream: "_Stream",
+                        rows: list[dict[str, Any]], fingerprints: list[str],
+                        scan: int = 800) -> tuple[list[dict[str, Any]], list[str], int]:
+        """Drop incoming rows the newest part already carries (multiset match on ``fp``)."""
+        files = self._parts_for(stream)
+        if not files:
+            return rows, fingerprints, 0
+        seen: Counter[str] = Counter(
+            str(row["fp"]) for row in _tail_rows(files[-1], scan)
+            if str(row.get("kind") or "") == "msg" and row.get("fp"))
+        kept: list[dict[str, Any]] = []
+        kept_fps: list[str] = []
+        dropped = 0
+        for row, fp in zip(rows, fingerprints):
+            if seen[fp] > 0:
+                seen[fp] -= 1
+                dropped += 1
+                continue
+            kept.append(row)
+            kept_fps.append(fp)
+        return kept, kept_fps, dropped
 
     def _append_message(self, stream: _Stream, row: Mapping[str, Any], *, redacted: bool,
                         run_id: str, source: str) -> int:

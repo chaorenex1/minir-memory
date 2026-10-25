@@ -97,6 +97,36 @@ def test_a_lost_anchor_writes_a_gap_then_the_slice(persisted):
     assert "summary of earlier work" in [row.get("text") for row in _rows(buffer)]
 
 
+def test_a_stale_in_memory_anchor_is_recovered_from_disk(persisted):
+    """The anchor in memory can be behind the file; the file's tail is the authority."""
+    make, _root = persisted
+    buffer = make()
+    first = _conversation(1)
+    assert buffer.ingest("host", "s1", first) == 5
+    assert buffer.flush() is True
+    buffer._streams[("default", "host", "s1")].last_seen = {
+        "fp": "gone", "fps": ["gone"], "role": "user", "ts": 0.0}
+    assert buffer.ingest("host", "s1", first) == 0
+    assert len([row for row in _rows(buffer) if row.get("kind") == "msg"]) == 5
+
+
+def test_a_prefix_replay_appends_only_the_rows_the_file_lacks(persisted):
+    """A history that starts inside the file matches no anchor: do not replay it wholesale."""
+    make, _root = persisted
+    buffer = make()
+    first = _conversation(1)
+    buffer.ingest("host", "s1", first)
+    assert buffer.flush() is True
+    buffer._streams[("default", "host", "s1")].last_seen = {
+        "fp": "gone", "fps": ["gone"], "role": "user", "ts": 0.0}
+    replay = first[:3] + [{"role": "user", "content": "turn 2: deploy it"}]
+    assert buffer.ingest("host", "s1", replay) == 1
+    users = [row.get("text") for row in _rows(buffer) if row.get("role") == "user"]
+    assert users == ["turn 1: deploy it", "turn 2: deploy it"]
+    gap = [row for row in _rows(buffer) if row.get("kind") == "gap"]
+    assert gap and gap[-1]["reason"] == "compaction" and gap[-1]["dropped"] == 3
+
+
 def test_a_resumed_process_appends_only_the_new_tail(persisted):
     make, _root = persisted
     first = make()

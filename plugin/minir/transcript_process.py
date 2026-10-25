@@ -140,6 +140,36 @@ def new_stream_lock(path: Path) -> Path:
     return path.with_suffix(path.suffix + ".lock")
 
 
+#: A StreamLock is held for the length of one append (timeout 5s), so a file nobody touched
+#: for this long belongs to a stream that will never be locked again.
+LOCK_MAX_AGE = 24 * 3600.0
+
+
+def prune_stale_locks(directory: Optional[Path], max_age: float = LOCK_MAX_AGE) -> int:
+    """Remove lock files no writer can still hold. Returns how many were deleted.
+
+    Deleting on release was rejected: on POSIX a waiting writer can already hold the inode, and
+    a third writer would then create a fresh file and lock it in parallel. Age bounds the pile-up
+    without touching a live lock.
+    """
+    if directory is None:
+        return 0
+    cutoff = time.time() - max(60.0, float(max_age))
+    removed = 0
+    try:
+        candidates = list(directory.rglob("*.lock"))
+    except OSError:
+        return 0
+    for path in candidates:
+        try:
+            if path.stat().st_mtime < cutoff:
+                path.unlink()
+                removed += 1
+        except OSError:
+            continue
+    return removed
+
+
 class StreamLock:
     """Best-effort exclusive lock over one stream file's seq/append region."""
 
