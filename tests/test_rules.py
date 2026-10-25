@@ -23,8 +23,8 @@ def _packaged_ids(rules) -> list[str]:
 
 def test_the_packaged_rules_load_without_front_matter(rules):
     assert _packaged_ids(rules) == [
-        "advice_judgment", "advice_target", "ai-identity", "ai-self", "markers-category",
-        "markers-org", "user-preferences", "user-self",
+        "advice_judgment", "advice_target", "ai-identity", "ai-preferences", "ai-self",
+        "markers-category", "markers-org", "user-preferences", "user-self",
     ]
     for rule_id in _packaged_ids(rules):
         text = rules.rule_text(rule_id)

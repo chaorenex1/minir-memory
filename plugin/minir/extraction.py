@@ -245,4 +245,12 @@ class ExtractionScheduler:
             completed += 1
             logger.info("Minir extraction done for %s: %s page(s), %s summary chars",
                         session, result.get("pages", 0), result.get("summary_chars", 0))
+        if completed and hasattr(self._store, "generate_merge_candidates"):
+            try:
+                counts = self._store.generate_merge_candidates()
+                if counts.get("merged") or counts.get("advised"):
+                    logger.info("Minir merge candidates: %s auto, %s advised",
+                                counts.get("merged", 0), counts.get("advised", 0))
+            except Exception as exc:  # candidate generation never fails an extraction
+                logger.warning("Minir merge candidate pass failed: %s", exc)
         return completed

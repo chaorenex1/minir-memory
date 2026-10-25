@@ -111,11 +111,10 @@ def _blank_identity() -> str:
 
 
 def _units():
-    return [{"id": "k1", "info_type": "experience", "topic": "pytest verification",
-             "why": "a later build needs the project's verify command",
-             "relations": [], "render_plan": "write the experiences page for pytest",
-             "anchor": {"from_ts": 0.0, "to_ts": 1.0, "message_ids": []},
-             "objects": []}]
+    return [{"id": "k1", "category": "METHOD", "org": "tools", "topic": "pytest verification",
+             "content": "run the project's verify command\nread its exit code",
+             "summary": "verify with pytest", "relations": [], "objects": [],
+             "anchor": {"from_ts": 0.0, "to_ts": 1e12, "message_ids": []}}]
 
 
 def _user_json(*, user_self_representation: str | None = None,
@@ -452,7 +451,7 @@ def test_an_empty_peer_card_is_a_valid_sparse_result(plugin_package, store, tran
     def complete(task, system, prompt, **kwargs):
         if "baseline_user_card" in prompt:
             return _base_pass_json(user_self_representation="", user_preferences="",
-                                   summary=_empty_summary(), value_markers=[])
+                                   summary=_section(), value_markers=[])
         return _reply_for(prompt)
 
     instance = plugin_package.worker.LayerWorker(
@@ -541,10 +540,12 @@ def test_prompt_inputs_are_labeled_and_cannot_close_their_own_block(plugin_packa
     ai_prompt = worker._base_ai_prompt(
         "user:default", SESSION, user_card, ai_card, injection(ai_tag),
         identity="identity", preference="preference", plugin_yaml="name: minir",
-        first=False, from_ts=0.0, to_ts=1.0)
-    for label in ("user_card", "baseline_ai_card", "operator_identity",
-                  "operator_preferences", "plugin_yaml", ai_tag):
+        soul_identity="SOUL DECLARATION", first=False, from_ts=0.0, to_ts=1.0)
+    for label in ("user_card", "baseline_ai_card", "review_identity",
+                  "review_preferences", "plugin_yaml", "soul_identity", ai_tag):
         assert f"<{label}>" in ai_prompt
+    assert "## Operator declarations (SOUL, trusted)" in ai_prompt
+    assert "Operator-authored" not in ai_prompt
     assert neutralized(ai_tag) in ai_prompt
 
     window_tag = worker.transcript_prompt.BLOCK_NAMES["base_user"]
@@ -1073,27 +1074,6 @@ def test_base_ai_pass_repairs_an_echoed_window_instruction(plugin_package, store
     assert "POST_COMMIT_OK" in ai_prompts[1]
 
 
-def test_sparse_window_completes_without_publishing_an_artifact(
-        plugin_package, store, transcript):
-    """A valid JSON reply with every body empty is a sparse window, not a failed pass."""
-    def complete(task, system, prompt, **kwargs):
-        if "baseline_user_card" in prompt:
-            return _base_pass_json(user_self_representation="", user_preferences="",
-                                   summary=_empty_summary(), value_markers=[])
-        return _ai_json(ai_self_representation="", ai_identity=_blank_identity())
-
-    instance = plugin_package.worker.LayerWorker(
-        store, transcript, complete=complete)
-    instance._retry_base_child = lambda *args, **kwargs: []
-    transcript.add(SESSION, "user", "Reply with exactly: POST_COMMIT_OK", created_at=10.0)
-    _dispatch(store, transcript, SESSION, BASE, 0.0, 20.0)
-
-    assert instance.run_once() == 1
-    assert store.pending_jobs() == []
-    assert store.layer_state("base", "user:default") is None, \
-        "nothing durable was found, so no artifact should be published"
-
-
 def test_one_shot_fallback_prompt_does_not_mention_unavailable_tools(store, transcript, worker):
     transcript.add(SESSION, "user", "fallback path", created_at=10.0)
     _dispatch(store, transcript, SESSION, BASE, 0.0, 20.0)
@@ -1422,8 +1402,8 @@ def test_global_card_files_outrank_the_session_baseline(
     """The four review files are the profile's durable baseline once they exist."""
     home = str(tmp_path / "hermes")
     payload = {
-        "user_identity": "## Self\n\n- Occupation: Global Engineer\n- Skills: Rust",
-        "user_preference": "## Preferences\n\n- Communication: whole sentences",
+        "user_self_representation": "## Self\n\n- Occupation: Global Engineer\n- Skills: Rust",
+        "user_preferences": "## Preferences\n\n- Communication: whole sentences",
         "ai_identity": _identity(),
         "ai_preference": "## Preferences\n\n- Persona: careful reviewer",
     }
@@ -1486,8 +1466,8 @@ def test_an_empty_first_window_publishes_the_global_baseline(
     """With card files on disk, the session's first job echoes them without a model call."""
     home = str(tmp_path / "hermes")
     payload = {
-        "user_identity": "## Self\n\n- Occupation: Global Engineer\n- Skills: Rust",
-        "user_preference": "## Preferences\n\n- Communication: whole sentences",
+        "user_self_representation": "## Self\n\n- Occupation: Global Engineer\n- Skills: Rust",
+        "user_preferences": "## Preferences\n\n- Communication: whole sentences",
         "ai_identity": _identity(),
         "ai_preference": "## Preferences\n\n- Persona: careful reviewer",
     }
@@ -1502,7 +1482,7 @@ def test_an_empty_first_window_publishes_the_global_baseline(
         store, transcript, complete=explode, hermes_home=home, profile="default")
     assert instance.run_once() == 1
     latest = store.latest_base_refresh(SESSION, "user:default")
-    assert json.loads(latest["user_representation"]) == payload["user_identity"]
+    assert json.loads(latest["user_representation"]) == payload["user_self_representation"]
     identity = json.loads(latest["ai_identity_card"])
     assert "Name: minir" in identity and "Persona: careful reviewer" in identity
 
@@ -1650,7 +1630,7 @@ def test_a_failed_child_is_retried_alone(plugin_package, store, transcript):
     assert "### Objective" in retry_prompts[0]
     row = store.latest_base_refresh(SESSION, "user:default")
     assert json.loads(row["window_summary"]).startswith("## Window Summary")
-    assert json.loads(row["value_markers"])["value_markers"][0]["info_type"] == "experience"
+    assert json.loads(row["value_markers"])["value_markers"][0]["category"] == "METHOD"
 
 
 def test_base_passes_name_themselves_in_the_run_meta(plugin_package, store, transcript):

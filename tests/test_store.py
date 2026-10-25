@@ -771,3 +771,117 @@ def test_session_bound_kind_needs_a_session_and_never_leaks_into_all(plugin_pack
     assert store.search("ruler", scope="session", session_id="s2") == []
     assert store.search("ruler", scope="session", session_id="s1")[0]["kind"] == \
         "base.ai_self_representation"
+
+
+def test_layer_failures_upsert_open_and_resolve(store):
+    store.record_layer_failure("base", "user:ada", window_key="s1:10", session_id="s1",
+                               window_from_ts=10, window_to_ts=20, error="first", attempts=1)
+    store.record_layer_failure("base", "user:ada", window_key="s1:10", session_id="s1",
+                               window_from_ts=10, window_to_ts=20, error="second", attempts=2)
+    store.record_layer_failure("base", "user:ada", window_key="s1:30", session_id="s1",
+                               window_from_ts=30, window_to_ts=40, error="other")
+    assert len(store.open_layer_failures("base", "user:ada", limit=5)) == 2
+    newest = store.open_layer_failures("base", "user:ada", limit=1)[0]
+    assert newest["window_key"] in {"s1:10", "s1:30"}
+    store.resolve_layer_failure("base", "user:ada", "s1:10")
+    remaining = store.open_layer_failures("base", "user:ada", limit=5)
+    assert [row["window_key"] for row in remaining] == ["s1:30"]
+
+
+def test_conclusion_versions_append_and_answer_as_of(store):
+    cid = store.save_conclusion("note", "first text", key="k1")
+    store.save_conclusion("note", "second text", key="k1")
+    versions = store.conclusion_versions(cid)
+    assert [row["content"] for row in versions] == ["second text", "first text"]
+    assert sum(1 for row in versions if row["valid_to"] is None) == 1
+    assert store.version_at(cid, time.time() + 1)["content"] == "second text"
+    assert store.search("second text", scope="all",
+                        as_of=time.time() + 1)[0]["text"] == "second text"
+    todo = store.save_conclusion("todo", "a task", key="t1")
+    assert store.conclusion_versions(todo) == []
+
+
+def test_edges_expand_only_to_existing_rows_and_merge_is_reversible(store):
+    store.save_conclusion("projects", "project row", key="p1")
+    store.save_conclusion("experiences", "lesson row", key="e1")
+    store.save_conclusion("tools", "tool row", key="t1")
+    assert store.link(("projects", "p1"), "part_of", ("experiences", "e1"))
+    assert store.link(("experiences", "e1"), "instance_of", ("tools", "t1"))
+    assert not store.link(("projects", "p1"), "part_of", ("tools", "missing"))
+    hops = store.edges_from(("projects", "p1"), max_depth=2)
+    assert {(row["kind"], row["key"]) for row in hops} == {("experiences", "e1"),
+                                                           ("tools", "t1")}
+    assert store.merge_into(("experiences", "e1"), ("projects", "p1"))
+    assert store.resolve_alias("experiences", "e1") == ("projects", "p1")
+    assert store.unmerge("experiences", "e1", "wrong merge")["unmerged"] is True
+    assert store.get_conclusion("experiences", "e1")["status"] == "active"
+
+
+def test_scheduler_runs_are_recorded_through_the_store(plugin_package, store):
+    scheduler = plugin_package.scheduler.Scheduler(
+        record=store.record_scheduler_run)
+    calls: list[str] = []
+    scheduler.add_time("probe", 1, lambda: calls.append("run") or True, first_delay=0.0)
+    assert scheduler.tick(now=time.monotonic() + 0.01) == ["probe"]
+    rows = store.scheduler_runs("probe")
+    assert len(rows) == 1 and rows[0]["outcome"] == "ok"
+    assert calls == ["run"]
+
+
+def test_history_maintenance_folds_old_versions_and_archives_them(store, tmp_path):
+    cid = store.save_conclusion("note", "current", key="k1")
+    old = time.time() - 200 * 86400
+    with store._lock:
+        store._conn.executemany(
+            "INSERT INTO conclusion_versions (conclusion_id, kind, key, content, status, "
+            "version, valid_from, valid_to, recorded_at) VALUES (?, 'note', 'k1', ?, "
+            "'active', ?, ?, ?, ?)",
+            [(cid, f"old {index}", index, old + index, old + index + 1, old + index)
+             for index in range(40)])
+        store._conn.commit()
+    result = store.maintain_conclusion_history(tmp_path / "archive", now=time.time())
+    assert result["folded"] > 0 and result["archived"] > 0
+    archive = next((tmp_path / "archive").glob("conclusion_archive_*.db"))
+    connection = sqlite3.connect(str(archive))
+    try:
+        collapsed = connection.execute(
+            "SELECT COUNT(*) FROM conclusion_versions WHERE status = 'collapsed'").fetchone()[0]
+    finally:
+        connection.close()
+    assert collapsed == 1
+    remaining = store.conclusion_versions(cid, limit=100)
+    assert any(row["valid_to"] is None for row in remaining)
+    archived = store.version_at(cid, old + 10, tmp_path / "archive")
+    assert archived and archived.get("archived")
+
+def test_claim_stats_and_repeat_guard_count_the_same_claim(store):
+    first = store.add_advisories("s1", [{
+        "content": "prefer pytest", "severity": "concern", "target": "general",
+        "claim": "card:preference.md#3"}], source="adviser_mode")
+    store.mark_advisory_outcome(first[0], "blocked")
+    store.add_advisories("s1", [{
+        "content": "prefer pytest again", "severity": "concern", "target": "general",
+        "claim": "card:preference.md#3"}], source="adviser_mode")
+    assert store.mark_claim_repeated("s1", "card:preference.md#3") is True
+    stats = store.claim_stats("s1")
+    assert stats[0]["claim_id"] == "card:preference.md#3"
+    assert stats[0]["cited"] == 2 and stats[0]["blocked"] == 1
+    assert stats[0]["repeated"] == 1
+    assert store.claim_stats("other") == []
+
+def test_merge_candidates_auto_merge_and_advise(store):
+    store.save_conclusion("entities", "acme one", key="acme-1", subject="Acme Corp")
+    store.save_conclusion("entities", "acme two", key="acme-2", subject="Acme Corp.")
+    store.save_conclusion("entities", "docker", key="d1", subject="docker")
+    store.save_conclusion("entities", "dockers", key="d2", subject="dockers")
+    counts = store.generate_merge_candidates()
+    assert counts["merged"] >= 1 and counts["advised"] >= 1
+    statuses = {key: store.get_conclusion("entities", key)["status"]
+                for key in ("acme-1", "acme-2")}
+    assert "merged" in statuses.values()
+    merged_key = next(key for key, status in statuses.items() if status == "merged")
+    other = "acme-1" if merged_key == "acme-2" else "acme-2"
+    assert store.resolve_alias("entities", merged_key) == ("entities", other)
+    merge_notes = [row for row in store.pending_advisories("", limit=10)
+                   if row["target"] == "merge_candidate"]
+    assert merge_notes and "entities:d1" in merge_notes[0]["content"]

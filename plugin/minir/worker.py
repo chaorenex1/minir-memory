@@ -60,7 +60,7 @@ import threading
 import time
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any, Callable, Optional, Sequence
+from typing import Any, Callable, Mapping, Optional, Sequence
 
 from . import adviser
 from . import card_review
@@ -501,6 +501,7 @@ def _base_user_prompt(subject: str, session: str, baseline: dict[str, Any], evid
 def _base_ai_prompt(subject: str, session: str, user_card: dict[str, Any],
                     previous: dict[str, Any], evidence: str, *,
                     identity: str = "", preference: str = "", plugin_yaml: str = "",
+                    soul_identity: str = "",
                     window_summary: str = "", first: bool, from_ts: float = 0.0,
                     to_ts: float = 0.0, language: str = "en") -> str:
     """Pass B2: the AI card, grounded in the user card and this window's summary."""
@@ -516,14 +517,21 @@ def _base_ai_prompt(subject: str, session: str, user_card: dict[str, Any],
         + data_block("window_summary", window_summary or "(empty)", empty="(empty)"),
         _json_block("baseline_ai_card", previous) if previous else "Baseline AI card: none",
     ]
+    if soul_identity.strip():
+        parts.append("## Operator declarations (SOUL, trusted)\n"
+                     "These override every card below.\n"
+                     + data_block("soul_identity", soul_identity))
     if identity.strip():
-        parts.append("Operator-authored AI identity (trusted):\n"
-                     + data_block("operator_identity", identity))
+        parts.append("## Prior review card (review rank, may be revised)\n"
+                     "A review wrote this; it is not an operator declaration.\n"
+                     + data_block("review_identity", identity))
     if preference.strip():
-        parts.append("Operator-authored AI preferences (trusted):\n"
-                     + data_block("operator_preferences", preference))
+        parts.append("## Prior review preference (review rank, may be revised)\n"
+                     "A review wrote this; it is not an operator declaration.\n"
+                     + data_block("review_preferences", preference))
     if plugin_yaml.strip():
-        parts.append("Manifest (trusted; the deployment facts this plugin declares):\n"
+        parts.append("## Manifest (facts)\nOnly deployment facts; never transcribe a version or "
+                     "lifecycle block into the card.\n"
                      + data_block("plugin_yaml", plugin_yaml[:8_000]))
     return _compose_prompt(
         parts, evidence,
@@ -576,6 +584,17 @@ def _read_plugin_yaml() -> str:
         return ""
 
 
+def _read_soul_identity(hermes_home: str) -> str:
+    """The operator's SOUL, capped; the trusted declarations B2 may not overwrite."""
+    home = str(hermes_home or "").strip()
+    if not home:
+        return ""
+    try:
+        return (Path(home) / "SOUL.md").read_text(encoding="utf-8-sig").strip()[:4_000]
+    except (OSError, UnicodeError):
+        return ""
+
+
 def chunk_window_start(chunk: dict[str, Any]) -> float:
     """The window start a chunk summary key encodes (``chunk:<sid>:<from_ts>``).
 
@@ -614,7 +633,7 @@ class LayerWorker:
                  content_language: str = "en", hermes_home: str = "",
                  complete: Optional[Callable[..., str]] = None,
                  consult: Optional[Callable[[str, str], str]] = None,
-                 on_value_markers: Optional[Callable[[str, list[dict[str, Any]]], None]] = None):
+                 on_value_markers: Optional[Callable[..., None]] = None):
         self._store = store
         self._transcript = transcript
         self._enabled = bool(enabled)
@@ -627,6 +646,7 @@ class LayerWorker:
         self._language = str(content_language or "en")
         self._hermes_home = str(hermes_home or "")
         self._plugin_yaml = _read_plugin_yaml()
+        self._soul_identity = _read_soul_identity(self._hermes_home)
         self._identity_digest = self._digest_sources()
         self._depth = max(1, min(3, int(depth or 2)))
         self._on_value_markers = on_value_markers
@@ -750,12 +770,12 @@ class LayerWorker:
     def _digest_sources(self) -> str:
         """sha256 over everything the identity card may be grounded in.
 
-        The manifest and the two operator files are the only sources; the profile and agent
-        identity are included because they name the row. The digest decides whether the model
+        The manifest, the operator SOUL, and the two review files are the sources; the profile and
+        agent identity are included because they name the row. The digest decides whether the model
         has to re-derive the identity at all, not what it may say.
         """
-        payload = "\x00".join((self._plugin_yaml, self._identity, self._preference,
-                               self._profile, self._agent_identity))
+        payload = "\x00".join((self._plugin_yaml, self._soul_identity, self._identity,
+                               self._preference, self._profile, self._agent_identity))
         return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
     def _stored_identity_digest(self) -> str:
@@ -895,7 +915,7 @@ class LayerWorker:
         try:
             if name == "b3_window_summary":
                 return layers.validate_summary_pass({"window_summary": answer})["window_summary"]
-            return layers.validate_value_markers(json.loads(answer))
+            return layers.coerce_value_markers(json.loads(answer))
         except (ValueError, layers.LayerContractError) as exc:
             logger.warning("Minir %s child retry failed its contract: %s", name, exc)
             return "" if name == "b3_window_summary" else []
@@ -964,6 +984,10 @@ class LayerWorker:
                 [window_path, markers_path], session, ["file", "minir", "session_search"])
         if not summary.strip():
             raise LayerMergeError("base summary child failed after one retry")
+        for item in base.get("page_writes") or []:
+            if isinstance(item, dict):
+                logger.info("Minir page write %s %s: %s", item.get("status"),
+                            item.get("topic"), item.get("path") or item.get("error") or "")
 
         ai_baseline = {}
         if _has_content(baseline.get("ai_self_representation")) or _has_content(baseline.get("ai_identity")):
@@ -977,7 +1001,8 @@ class LayerWorker:
             ai_system,
             _base_ai_prompt(subject, session, user_card, ai_baseline, ai_evidence,
                             identity=self._identity, preference=self._preference,
-                            plugin_yaml=self._plugin_yaml, window_summary=summary, first=first,
+                            plugin_yaml=self._plugin_yaml, soul_identity=self._soul_identity,
+                            window_summary=summary, first=first,
                             from_ts=from_ts, to_ts=to_ts, language=self._language),
             lambda value: layers.validate_ai_card(value),
             label="base AI pass", agent="b2_ai_card")
@@ -1056,6 +1081,28 @@ class LayerWorker:
 
     # -- the drain ------------------------------------------------------------
 
+    @staticmethod
+    def _window_key(job: Mapping[str, Any]) -> str:
+        return "%s:%d" % (job.get("session_id") or "", int(float(job.get("from_ts") or 0)))
+
+    def _record_base_failure(self, job: Mapping[str, Any], exc: BaseException) -> None:
+        self._store.record_layer_failure(
+            "base", self.user_subject(), window_key=self._window_key(job),
+            session_id=str(job.get("session_id") or ""),
+            window_from_ts=float(job.get("from_ts") or 0),
+            window_to_ts=float(job.get("to_ts") or 0),
+            error="%s: %s" % (type(exc).__name__, exc),
+            attempts=int(job.get("attempts") or 0))
+
+    def _resolve_base_failure(self, job: Mapping[str, Any]) -> None:
+        # A job can finish without publishing (a sparse window); only a row covering its
+        # window proves the memory gap is closed.
+        session = str(job.get("session_id") or "")
+        row = self._store.latest_base_refresh(session) if session else None
+        if row is not None and float(row.get("window_to_ts") or 0) >= float(job.get("to_ts") or 0):
+            self._store.resolve_layer_failure("base", self.user_subject(),
+                                              self._window_key(job))
+
     def run_once(self, *, session_id: str = "") -> int:
         """Process up to ``_MAX_JOBS_PER_RUN`` jobs oldest-first; returns how many ran.
 
@@ -1078,11 +1125,20 @@ class LayerWorker:
                 try:
                     self._store.fail_job(int(job["id"]), f"{type(exc).__name__}: {exc}",
                                          max_attempts=_MAX_ATTEMPTS)
+                    if str(job.get("layer") or "") == BASE_LAYER:
+                        self._record_base_failure(job, exc)
                 except Exception as record_exc:  # a closing store must not kill the drain thread
                     logger.debug("Minir job #%s failure could not be recorded: %s",
                                  job["id"], record_exc)
                 processed += 1
                 break
+            else:
+                if str(job.get("layer") or "") == BASE_LAYER:
+                    try:
+                        self._resolve_base_failure(job)
+                    except Exception as exc:
+                        logger.debug("Minir job #%s failure could not be resolved: %s",
+                                     job["id"], exc)
             processed += 1
         return processed
 
@@ -1185,7 +1241,7 @@ class LayerWorker:
                 pass
         if layer == BASE_LAYER and value_markers and self._on_value_markers is not None:
             try:
-                self._on_value_markers(session, value_markers)
+                self._on_value_markers(session, value_markers, from_ts=start, to_ts=end)
             except Exception as exc:  # the knowledge pipeline must not fail a base job
                 logger.warning("Minir knowledge enqueue failed: %s", exc)
         self._store.complete_job(job_id, end)
@@ -1313,7 +1369,8 @@ class LayerWorker:
             system,
             _base_ai_prompt(self.user_subject(), "", user_card, ai_baseline, "",
                             identity=self._identity, preference=self._preference,
-                            plugin_yaml=self._plugin_yaml, first=False, language=self._language),
+                            plugin_yaml=self._plugin_yaml, soul_identity=self._soul_identity,
+                            first=False, language=self._language),
             lambda value: layers.validate_ai_card(value),
             label="identity refresh")
         identity = ai_card["ai_identity"]

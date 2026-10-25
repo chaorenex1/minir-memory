@@ -39,4 +39,6 @@ BOUNDARIES
 - A permission or prohibition was added that the operator never wrote.
 - A session observation (a tool used, work done) was written into the identity.
 - A review-sourced line is used as if the operator had declared it.
+- A version number, a lifecycle list or a project state that will drift out of date.
+- The same fact appears in the identity and preference bodies.
 - A line describes the task or the user instead of the assistant.

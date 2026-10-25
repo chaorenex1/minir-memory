@@ -29,6 +29,7 @@ FIELDS
 
 DISTINCTIONS
 - Only what the window proves counts as known; an inference stays pending until checked.
+- No objective or current_state evidence: write `unknown`, never `idle`, and never guess.
 - Current Task and Current Goal are one sentence each, at most 120 characters.
 - The state follows the window's last evidence: finished work is done, not executing.
 - An uncertainty names a cause; "may be risky" is not an entry.

@@ -5,9 +5,10 @@ reference implementation of the `MemoryProvider` contract that you can fork, ren
 and grow into a real provider.
 
 It keeps explicit value markers and every derived conclusion in a per-profile SQLite database,
-recalls them through an FTS5 trigram index (CJK-safe, with a token-scan fallback), and exposes
-seven tools (`minir_search`, `minir_kb_search`, `minir_remember`, `minir_forget`, `minir_todo`,
-`minir_stats`, `minir_agents`) and one local counter (`minir_content_valid`). On top of that it runs
+recalls them through an FTS5 trigram index (CJK-safe, with a token-scan fallback) plus an optional
+sqlite-vec index, and exposes ten tools (`minir_search`, `minir_kb_search`, `minir_remember`,
+`minir_forget`, `minir_todo`, `minir_stats`, `minir_agents`, `minir_kb_write`, `minir_link`,
+`minir_unmerge`) and one local counter (`minir_content_valid`). On top of that it runs
 two **independent** reasoning layers: the base layer builds the user/AI cards every 24 turns, the
 dialectic reviews them every 8 turns against its own evidence window, and corrects the newest base
 artifact (a pre-overwrite snapshot and an FTS index are kept). The review publishes a short
@@ -22,7 +23,7 @@ A fourth pass closes the loop after a conversation goes quiet: `on_session_end` 
 turn's final token usage, captures the session's value markers and arms a 24-hour timer. Typing in
 the session again cancels it; otherwise a **session-summary agent** (the calibrated window summary is its first
 user prompt input) and a **knowledge-extraction agent** turn the session into a durable summary
-and knowledge pages. The seven tools are also registered as the `minir` toolset, so every agent
+and knowledge pages. The same tools are also registered as the `minir` toolset, so every agent
 this plugin runs can use the store and the knowledge search directly; the same toolset carries the
 layer-scoped transcript search.
 
@@ -399,17 +400,18 @@ only on the first refresh.
 
 1. **B1 user card** — the previous user card + this window (+ the first user message as intent
    anchor on bootstrap) → `{"user_self_representation", "user_preferences", "window_summary",
-   "value_markers"}`, where the last two are the children's answers copied verbatim;
+   "value_markers", "page_writes"}`, where the last three are the children's answers copied
+   verbatim; `page_writes` is optional;
 2. **B3 window summary** — the window digest + the previous summary of *this session* → the
    eight-section markdown. `objective` is the complete goal ledger (one goal per line, no ids, no
    status); `Current State` groups those goals under Done/Doing/Todo. The prompt is the only
    enforcement: `window_summary.validate` checks that the value is a string;
-3. **B4 value markers** — the digest + the previous markers + the marker rules →
-   `{"value_markers": [...]}`. Each marker is `{id, info_type, topic, why, relations, render_plan,
-   anchor, objects}`: an index and a render plan, never a page body. `anchor` is required; the
-   `knowledge_render` pass reads that slice and writes the page;
-4. **B2 AI card** — B1's user card + this window's summary + the previous AI card + operator
-   identity/preference files + `plugin.yaml` → `{"ai_self_representation", "ai_identity"}`. The
+3. **B4 value markers** — the digest + the previous markers + the marker rules → the units plus
+   the `minir_kb_write` results. Each unit is `{id, category, org, topic, content, summary,
+   epistemic, time, objects, relations, anchor}`. B4 searches, creates or edits each page itself
+   and returns `{"value_markers": [...], "page_writes": [...]}`; `anchor` is required;
+4. **B2 AI card** — B1's user card + this window's summary + the previous AI card + the operator
+   SOUL + the prior review cards + `plugin.yaml` → `{"ai_self_representation", "ai_identity"}`. The
    identity is written first; the six AI-self fields (positioning, current task, current goal,
    1-3 state facts, state, uncertainty) cite the summary's goal lines instead of restating them.
 
@@ -427,7 +429,9 @@ refreshing the same window twice.
 The base row keeps `user_representation` for `user_self_representation`, `user_peer_card` for
 `user_preferences`, the same-named `ai_self_representation` and `ai_identity_card` for `ai_identity`,
 `window_summary` for the summary section, and `value_markers` for
-`{"value_markers": [...]}`. The same data is
+`{"value_markers": [units], "page_writes": [...]}`. A unit is `{id, category, org, topic, content,
+summary, epistemic, time, objects, relations, anchor}`; the marker pass writes the page through
+`minir_kb_write` and reports each write result in `page_writes`. The same data is
 rendered into the four-section artifact, and every column is published once per session as its own
 conclusion (`base.user_representation`, `base.user_peer_card`, `base.ai_self_representation`,
 `base.ai_identity_card`, `base.window_summary`, `base.value_markers`) through
@@ -598,11 +602,9 @@ topic (CJK preserved, separators stripped, collisions hashed); a rewrite bumps `
 front-matter, an older `time` never overwrites a newer page, and the per-file
 `knowledge_token_budget` (2000 by default) rejects an over-long page, keeping the old one and
 writing `_failed/<CATEGORY>-<slug>.json`. A failed page never propagates into a base job.
-`agents/knowledge_render.md` is the page renderer's agent contract: the idle-session extraction
-pass runs it, with `rules/markers-category.md` and `rules/markers-org.md` appended to its system
-prompt, to write pages from a finished session. A marker supplies the page's classification, its
-`render_plan` and the `anchor` slice to re-read; the body always comes from the session, never from
-the marker.
+B4 is the writer: it calls `minir_kb_write`, which addresses the body by line or exact text and
+re-reads the file to verify the edit. `agents/knowledge_render.md` is a legacy renderer contract;
+the value-marker pass no longer delegates page bodies to it.
 
 Retrieval is explicit: `minir_kb_search` searches the page text with the profile's managed `rg`
 (found through `<HERMES_HOME>/tools/facts.json`, `PATH` as fallback), preferring body lines, and
@@ -1274,6 +1276,44 @@ package is `plugin/minir`, so it is never collected as a test module.
   `dialectic_cadence` (alias `dialectic_interval`, default 10) are read when a session opens;
   changing them mid-session only affects sessions opened later, because moving a watermark
   retroactively would re-queue windows that already dispatched.
+
+## Conclusion history, edges and vector recall
+
+Every eligible conclusion (`note` plus the five marker kinds, never `todo`) appends a row to
+`conclusion_versions`: an open interval for the current version and a closed one for the previous.
+`minir_search as_of=<epoch>` ranks the version in force at that instant; `include_superseded`
+widens the live path. A history row is folded after 180 days and more than 32 versions, and closed
+rows older than 180 days move to a dated SQLite archive under
+`$HERMES_HOME/minir-memory/conclusion/archive/`. `forget` closes the open row as `deleted` and keeps
+the history.
+
+`edges` stores directed relations between `(kind, key)` endpoints. `minir_link` refuses a missing
+endpoint; `minir_search expand=1|2` adds 1-2 hop neighbours of the top hits. `merge_into` folds a row
+into a reversible `same_as` alias, and `minir_unmerge(kind, key, reason)` restores the previous
+status and appends a new open version. The idle extraction tick compares active marker subjects by
+trigram: ≥0.92 is auto-merged, 0.85–0.92 writes a `merge_candidate` advisory, below that is ignored.
+
+Vector recall is optional and fail-open: `sqlite-vec` plus an OpenAI-compatible embedding endpoint
+(`memory.minir.vector.*`, default `BAAI/bge-m3` at 1024 dimensions). With no key, no package or a
+failed call, search stays on bm25; a background task indexes missing rows and the table is rebuilt
+when the configured dimension no longer matches it.
+
+`minir_remember` routes on `remember_mode`: `conclusion` (default) writes the conclusions row,
+`knowledge` queues a page unit for the writer, and `card` overlays one global card part through
+`card_review.write_cards` with `source=operator_edit` and a required reason.
+
+## Claim selection (adviser)
+
+With `memory.minir.adviser_mode.claims=shadow|on`, the adviser selects at most three claims from
+the four global cards, SOUL's constraint sections and matching knowledge pages before each review.
+`shadow` stores the selection on `adviser_reviews.selected_claims` without changing the prompt;
+`on` also injects it and requires each advice to cite a claim. `apply_ceiling` caps a card or
+knowledge claim at `concern` and a SOUL/operator claim at `blocker`. `claim_gate` adds a
+model-free pre-tool check: an operator line whose predicate matches the tool call is refused
+before the model-produced blocker path runs. `advisories.claim_id` and `outcome` feed
+`store.claim_stats` (30 days), which `card_review.build_prompt` shows as cited / blocked /
+repeated; the same claim cannot be emitted twice in one session (the repeat updates the prior
+row's outcome to `repeated` and is dropped).
 
 ## Optional surfaces (not wired here)
 

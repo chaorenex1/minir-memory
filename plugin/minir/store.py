@@ -70,7 +70,7 @@ _MAX_SCAN = 200      # candidate rows fetched per table before scoring
 #: Bumped whenever ``_migrate`` changes the shape of the file. A database already at this
 #: version skips the migration write path on open, so a second process does not rewrite the
 #: schema while the first one is writing.
-_SCHEMA_VERSION = 4
+_SCHEMA_VERSION = 5
 
 #: Requeue budget for a job whose owning process died mid-run. A death is not a failed attempt
 #: (the window is still readable), so the row goes back to ``pending`` with ``attempts``
@@ -88,6 +88,41 @@ _MARKER_KINDS: tuple[str, ...] = (
 #: (``base.*``, ``dialectic.review``, ``session_summary``, ``window_summary``) are written by the
 #: layers only and are not in this whitelist.
 CONCLUSION_KINDS: tuple[str, ...] = ("note", *_MARKER_KINDS, "todo")
+
+
+def _versioned(kind: str) -> bool:
+    """Every conclusion kind except the per-session todo list keeps a history row."""
+    return kind in CONCLUSION_KINDS and kind != "todo"
+
+
+def _normalized_subject(text: Any) -> str:
+    return "".join(ch for ch in str(text or "").casefold() if ch.isalnum())
+
+
+def _trigrams(text: str) -> set[str]:
+    if len(text) < 3:
+        return {text} if text else set()
+    return {text[index:index + 3] for index in range(len(text) - 2)}
+
+
+_MERGE_STOP_SUBJECTS = {"tool", "tools", "session", "sessions", "user", "assistant",
+                        "adviser", "system", "model", "unknown", "none", "null"}
+
+
+def _mergeable_subject(text: Any) -> bool:
+    """A subject worth comparing: not a generic role tag and not a 1-3 character stub."""
+    normalized = _normalized_subject(text)
+    return len(normalized) >= 4 and normalized not in _MERGE_STOP_SUBJECTS
+
+
+def _similarity(left: Any, right: Any) -> float:
+    """Dice coefficient over character trigrams; normalized inputs make it script-agnostic."""
+    a = _trigrams(_normalized_subject(left))
+    b = _trigrams(_normalized_subject(right))
+    if not a or not b:
+        return 0.0
+    return 2.0 * len(a & b) / float(len(a) + len(b))
+
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS jobs (
@@ -285,6 +320,67 @@ CREATE TABLE IF NOT EXISTS session_usage (
     host_total_tokens INTEGER NOT NULL DEFAULT 0,
     finalized_at REAL NOT NULL
 );
+CREATE TABLE IF NOT EXISTS layer_failures (
+    layer TEXT NOT NULL,
+    subject TEXT NOT NULL,
+    window_key TEXT NOT NULL,
+    session_id TEXT NOT NULL DEFAULT '',
+    window_from_ts REAL NOT NULL DEFAULT 0,
+    window_to_ts REAL NOT NULL DEFAULT 0,
+    attempts INTEGER NOT NULL DEFAULT 0,
+    error TEXT NOT NULL DEFAULT '',
+    failed_at REAL NOT NULL,
+    resolved_at REAL,
+    PRIMARY KEY (layer, subject, window_key)
+);
+CREATE INDEX IF NOT EXISTS idx_layer_failures_open
+    ON layer_failures(layer, subject, resolved_at);
+CREATE TABLE IF NOT EXISTS conclusion_versions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    conclusion_id INTEGER NOT NULL,
+    kind TEXT NOT NULL,
+    key TEXT NOT NULL,
+    session_id TEXT NOT NULL DEFAULT '',
+    subject TEXT NOT NULL DEFAULT '',
+    content TEXT NOT NULL,
+    evidence TEXT NOT NULL DEFAULT '[]',
+    status TEXT NOT NULL DEFAULT 'active',
+    version INTEGER NOT NULL DEFAULT 0,
+    valid_from REAL NOT NULL,
+    valid_to REAL,
+    superseded_by INTEGER,
+    recorded_at REAL NOT NULL
+);
+CREATE UNIQUE INDEX IF NOT EXISTS ix_cv_open
+    ON conclusion_versions(conclusion_id) WHERE valid_to IS NULL;
+CREATE INDEX IF NOT EXISTS ix_cv_key ON conclusion_versions(kind, key, valid_to);
+CREATE INDEX IF NOT EXISTS ix_cv_asof ON conclusion_versions(valid_from, valid_to);
+CREATE TABLE IF NOT EXISTS edges (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    src_kind TEXT NOT NULL, src_key TEXT NOT NULL,
+    rel TEXT NOT NULL,
+    dst_kind TEXT NOT NULL, dst_key TEXT NOT NULL,
+    weight REAL NOT NULL DEFAULT 1.0,
+    meta TEXT NOT NULL DEFAULT '{}',
+    valid_from REAL NOT NULL, valid_to REAL,
+    source_conclusion_id INTEGER, created_at REAL NOT NULL,
+    UNIQUE(src_kind, src_key, rel, dst_kind, dst_key)
+);
+CREATE INDEX IF NOT EXISTS ix_edges_src ON edges(src_kind, src_key);
+CREATE INDEX IF NOT EXISTS ix_edges_dst ON edges(dst_kind, dst_key);
+CREATE TABLE IF NOT EXISTS scheduler_runs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    task TEXT NOT NULL,
+    trigger TEXT NOT NULL,
+    outcome TEXT NOT NULL,
+    detail TEXT NOT NULL DEFAULT '',
+    started_at REAL NOT NULL,
+    finished_at REAL NOT NULL,
+    ms REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS ix_sched_task ON scheduler_runs(task, id DESC);
+CREATE INDEX IF NOT EXISTS ix_sched_finished ON scheduler_runs(finished_at);
+CREATE TABLE IF NOT EXISTS vector_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
 """
 
 # The dialectic's pre-overwrite snapshot. Created by ``_migrate`` rather than ``_SCHEMA``: an
@@ -338,14 +434,20 @@ _ADDED_COLUMNS: dict[str, tuple[tuple[str, str], ...]] = {
                    # Numeric turn the note was produced in (turns_ago) and whether it waits
                    # for the turn-end aggregate instead of a mid-turn channel.
                    ("turn", "INTEGER NOT NULL DEFAULT 0"),
-                   ("deferred", "INTEGER NOT NULL DEFAULT 0")),
+                   ("deferred", "INTEGER NOT NULL DEFAULT 0"),
+                   # P4: the claim this note cites and what happened to it.
+                   ("claim_id", "TEXT NOT NULL DEFAULT ''"),
+                   ("outcome", "TEXT NOT NULL DEFAULT ''")),
     "adviser_reviews": (("adviser", "TEXT NOT NULL DEFAULT ''"),
                         # Emission-guard outcome, so a silent reviewer is distinguishable
                         # from one that produced only noise/duplicates.
                         ("notes_dropped", "INTEGER NOT NULL DEFAULT 0"),
                         ("drop_detail", "TEXT NOT NULL DEFAULT '{}'"),
                         # Per-review target coverage: target -> clean / found / n/a.
-                        ("coverage", "TEXT NOT NULL DEFAULT '{}'")),
+                        ("coverage", "TEXT NOT NULL DEFAULT '{}'"),
+                        # P0/P1: the claims the selector offered and the reviewer's coverage.
+                        ("selected_claims", "TEXT NOT NULL DEFAULT '[]'"),
+                        ("claim_coverage", "TEXT NOT NULL DEFAULT '{}'")),
 }
 
 # Tables a previous release wrote that this one must not keep: earlier versions persisted every
@@ -654,6 +756,17 @@ class MinirStore:
             self._conn.execute("DROP TABLE IF EXISTS conclusions_fts")
         # ``is_latest`` normalization and staged-request recovery are data repairs too; see
         # ``_repair_rows`` (every open, not only on a shape change).
+        # v4 -> v5: one open history row per eligible conclusion that predates the table.
+        placeholders = ",".join("?" * len(CONCLUSION_KINDS))
+        self._conn.execute(
+            "INSERT INTO conclusion_versions (conclusion_id, kind, key, session_id, subject, "
+            "content, evidence, status, version, valid_from, recorded_at) "
+            "SELECT c.id, c.kind, c.key, c.session_id, c.subject, c.content, c.evidence, "
+            "c.status, c.version, c.created_at, c.updated_at FROM conclusions AS c "
+            "WHERE c.kind IN (%s) AND c.kind != 'todo' "
+            "AND NOT EXISTS (SELECT 1 FROM conclusion_versions v "
+            "                WHERE v.conclusion_id = c.id)" % placeholders,
+            CONCLUSION_KINDS)
 
     def _migrate_dialectic_refreshes(self) -> None:
         """Rename ``base_revisions`` and drop its dead ``advices`` column (idempotent).
@@ -905,13 +1018,22 @@ class MinirStore:
             return row_id
 
     def forget_conclusion(self, kind: str, conclusions_id: int) -> bool:
-        """Delete one conclusion by id and kind; a wrong kind deletes nothing."""
+        """Delete one conclusion by id and kind; its history keeps a closed ``deleted`` row."""
         with self._lock:
-            cur = self._conn.execute(
+            now = time.time()
+            row = self._conn.execute(
+                "SELECT id FROM conclusions WHERE id = ? AND kind = ?",
+                (int(conclusions_id), str(kind or ""))).fetchone()
+            if row is None:
+                return False
+            self._conn.execute(
+                "UPDATE conclusion_versions SET valid_to = ?, status = 'deleted' "
+                "WHERE conclusion_id = ? AND valid_to IS NULL", (now, int(conclusions_id)))
+            self._conn.execute(
                 "DELETE FROM conclusions WHERE id = ? AND kind = ?",
                 (int(conclusions_id), str(kind or "")))
             self._conn.commit()
-            return cur.rowcount > 0
+            return True
 
     def newest_conclusion_by_content(self, kind: str, content: str, *,
                                      session_id: str = "") -> Optional[dict[str, Any]]:
@@ -950,6 +1072,13 @@ class MinirStore:
         write several rows inside one transaction and must not commit per row.
         """
         stamp = time.time()
+        previous = self._conn.execute(
+            "SELECT id FROM conclusions WHERE kind = ? AND key = ?", (kind, key)).fetchone()
+        if previous is not None and _versioned(kind):
+            self._conn.execute(
+                "UPDATE conclusion_versions SET valid_to = ? "
+                "WHERE conclusion_id = ? AND valid_to IS NULL",
+                (stamp, int(previous["id"])))
         self._conn.execute(
             "INSERT INTO conclusions (kind, key, session_id, subject, content, evidence, "
             "version, status, created_at, updated_at) "
@@ -961,14 +1090,375 @@ class MinirStore:
             (kind, key, session_id or "", subject or "", (content or "")[:_MAX_CONTENT],
              evidence or "[]", max(0, int(version)), status, created_at or stamp, stamp))
         row = self._conn.execute(
-            "SELECT id FROM conclusions WHERE kind = ? AND key = ?", (kind, key)).fetchone()
+            "SELECT id, version FROM conclusions WHERE kind = ? AND key = ?", (kind, key)).fetchone()
+        if row is not None and _versioned(kind):
+            self._conn.execute(
+                "INSERT INTO conclusion_versions (conclusion_id, kind, key, session_id, subject, "
+                "content, evidence, status, version, valid_from, recorded_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (int(row["id"]), kind, key, session_id or "", subject or "",
+                 (content or "")[:_MAX_CONTENT], evidence or "[]", status,
+                 int(row["version"]), stamp, stamp))
         return int(row["id"]) if row is not None else 0
+
+    def conclusion_by_id(self, conclusions_id: int) -> Optional[dict[str, Any]]:
+        """One row by primary key (the vector path maps ids back to rows)."""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM conclusions WHERE id = ?", (int(conclusions_id),)).fetchone()
+        return dict(row) if row is not None else None
 
     def get_conclusion(self, kind: str, key: str) -> Optional[dict[str, Any]]:
         with self._lock:
             row = self._conn.execute(
                 "SELECT * FROM conclusions WHERE kind = ? AND key = ?", (kind, key)).fetchone()
         return dict(row) if row is not None else None
+
+    # -- conclusion history, edges, scheduler runs -----------------------------
+
+    def version_at(self, conclusion_id: int, at: float,
+                   archive_dir: Any = None) -> Optional[dict[str, Any]]:
+        """The version row in force at *at*; reads the dated archive when the hot table misses."""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT content, version, status, valid_from, valid_to "
+                "FROM conclusion_versions WHERE conclusion_id = ? "
+                "AND valid_from <= ? AND (valid_to IS NULL OR valid_to > ?) "
+                "ORDER BY valid_from DESC LIMIT 1", (int(conclusion_id), float(at), float(at))
+            ).fetchone()
+        if row is not None:
+            return dict(row)
+        if archive_dir is None:
+            return None
+        for path in sorted(Path(archive_dir).glob("conclusion_archive_*.db"), reverse=True):
+            try:
+                archive = sqlite3.connect(str(path))
+                try:
+                    found = archive.execute(
+                        "SELECT content, version, status, valid_from, valid_to "
+                        "FROM conclusion_versions WHERE conclusion_id = ? "
+                        "AND valid_from <= ? AND (valid_to IS NULL OR valid_to > ?) "
+                        "ORDER BY valid_from DESC LIMIT 1",
+                        (int(conclusion_id), float(at), float(at))).fetchone()
+                finally:
+                    archive.close()
+            except sqlite3.Error:
+                continue
+            if found is not None:
+                return {"content": found[0], "version": found[1], "status": found[2],
+                        "valid_from": found[3], "valid_to": found[4],
+                        "archived": path.name}
+        return None
+
+    def conclusion_versions(self, conclusion_id: int, limit: int = 50
+                            ) -> list[dict[str, Any]]:
+        """Every history row for one conclusion, newest first."""
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT * FROM conclusion_versions WHERE conclusion_id = ? "
+                "ORDER BY valid_from DESC, id DESC LIMIT ?",
+                (int(conclusion_id), max(1, int(limit)))).fetchall()
+        return [dict(row) for row in rows]
+
+    def link(self, src: tuple[str, str], rel: str, dst: tuple[str, str], *,
+             weight: float = 1.0, meta: Optional[dict[str, Any]] = None,
+             now: Optional[float] = None) -> bool:
+        """Insert or refresh one directed edge; a missing endpoint is refused, never invented."""
+        stamp = float(now if now is not None else time.time())
+        if not str(rel or "").strip():
+            raise ValueError("relation is required")
+        with self._lock:
+            if self.get_conclusion(*src) is None or self.get_conclusion(*dst) is None:
+                return False
+            self._conn.execute(
+                "INSERT INTO edges (src_kind, src_key, rel, dst_kind, dst_key, weight, meta, "
+                "valid_from, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) "
+                "ON CONFLICT(src_kind, src_key, rel, dst_kind, dst_key) DO UPDATE SET "
+                "weight = excluded.weight, meta = excluded.meta, valid_to = NULL",
+                (src[0], src[1], str(rel), dst[0], dst[1], float(weight),
+                 json.dumps(meta or {}, ensure_ascii=False), stamp, stamp))
+            self._conn.commit()
+            return True
+
+    def edges_from(self, src: tuple[str, str], *, max_depth: int = 2,
+                   limit: int = 50) -> list[dict[str, Any]]:
+        """Neighbours reachable in 1..max_depth hops, depth first; dangling edges are skipped."""
+        depth = max(1, min(2, int(max_depth)))
+        cap = max(1, min(50, int(limit)))
+        sql = (
+            "WITH RECURSIVE hop(kind, key, depth) AS ("
+            "  SELECT ?, ?, 0"
+            "  UNION ALL"
+            "  SELECT e.dst_kind, e.dst_key, hop.depth + 1 FROM hop"
+            "    JOIN edges e ON e.src_kind = hop.kind AND e.src_key = hop.key"
+            "   WHERE hop.depth < ? AND e.valid_to IS NULL"
+            ") "
+            "SELECT h.kind, h.key, h.depth, c.id AS conclusion_id, c.content, c.status "
+            "FROM hop h JOIN conclusions c ON c.kind = h.kind AND c.key = h.key "
+            "WHERE h.depth > 0 ORDER BY h.depth, c.updated_at DESC LIMIT ?")
+        with self._lock:
+            rows = self._conn.execute(sql, (src[0], src[1], depth, cap)).fetchall()
+        seen: set[tuple[str, str]] = set()
+        found: list[dict[str, Any]] = []
+        for row in rows:
+            identity = (str(row["kind"]), str(row["key"]))
+            if identity in seen:
+                continue
+            seen.add(identity)
+            found.append(dict(row))
+        return found
+
+    def merge_into(self, src: tuple[str, str], dst: tuple[str, str], *,
+                   score: float = 0.0, now: Optional[float] = None) -> bool:
+        """Fold *src* into *dst* as a reversible alias; never deletes a row."""
+        stamp = float(now if now is not None else time.time())
+        with self._lock:
+            row = self.get_conclusion(*src)
+            if row is None or self.get_conclusion(*dst) is None:
+                return False
+            if self.resolve_alias(*dst) == src:
+                raise ValueError("merge would create a cycle")
+            meta = {"prev_status": row.get("status") or "active", "score": score,
+                    "merged_at": stamp}
+            self._conn.execute(
+                "INSERT INTO edges (src_kind, src_key, rel, dst_kind, dst_key, weight, meta, "
+                "valid_from, created_at) VALUES (?, ?, 'same_as', ?, ?, ?, ?, ?, ?) "
+                "ON CONFLICT(src_kind, src_key, rel, dst_kind, dst_key) DO UPDATE SET "
+                "meta = excluded.meta, valid_to = NULL",
+                (src[0], src[1], dst[0], dst[1], float(score or 1.0),
+                 json.dumps(meta, ensure_ascii=False), stamp, stamp))
+            self._conn.execute(
+                "UPDATE conclusions SET status = 'merged', updated_at = ? WHERE id = ?",
+                (stamp, int(row["id"])))
+            self._conn.execute(
+                "UPDATE conclusion_versions SET valid_to = ?, status = 'merged' "
+                "WHERE conclusion_id = ? AND valid_to IS NULL", (stamp, int(row["id"])))
+            self._conn.commit()
+            return True
+
+    def resolve_alias(self, kind: str, key: str, depth: int = 3) -> tuple[str, str]:
+        """Follow ``same_as`` edges to the representative row; bounded to stop a cycle."""
+        current = (str(kind), str(key))
+        with self._lock:
+            for _ in range(max(1, int(depth))):
+                row = self._conn.execute(
+                    "SELECT e.dst_kind, e.dst_key FROM edges e "
+                    "JOIN conclusions c ON c.kind = e.src_kind AND c.key = e.src_key "
+                    "WHERE e.rel = 'same_as' AND e.src_kind = ? AND e.src_key = ? "
+                    "AND c.status = 'merged' AND e.valid_to IS NULL LIMIT 1", current
+                ).fetchone()
+                if row is None:
+                    return current
+                current = (str(row[0]), str(row[1]))
+        return current
+
+    def unmerge(self, kind: str, key: str, reason: str, *,
+                now: Optional[float] = None) -> dict[str, Any]:
+        """Undo one ``same_as`` merge; requires a reason and never rewrites history."""
+        if not str(reason or "").strip():
+            raise ValueError("unmerge needs a reason")
+        stamp = float(now if now is not None else time.time())
+        with self._lock:
+            edge = self._conn.execute(
+                "SELECT meta, dst_kind, dst_key FROM edges WHERE rel = 'same_as' "
+                "AND src_kind = ? AND src_key = ? AND valid_to IS NULL", (kind, key)).fetchone()
+            row = self.get_conclusion(kind, key)
+            if edge is None or row is None or row.get("status") != "merged":
+                return {"unmerged": False, "reason": "not_merged"}
+            try:
+                prev = json.loads(edge["meta"] or "{}").get("prev_status") or "active"
+            except (TypeError, ValueError):
+                prev = "active"
+            self._conn.execute(
+                "UPDATE conclusions SET status = ?, updated_at = ? WHERE id = ?",
+                (prev, stamp, int(row["id"])))
+            self._conn.execute(
+                "INSERT INTO conclusion_versions (conclusion_id, kind, key, session_id, subject, "
+                "content, evidence, status, version, valid_from, recorded_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, "
+                "        (SELECT COALESCE(MAX(version), 0) + 1 FROM conclusion_versions "
+                "         WHERE conclusion_id = ?), ?, ?)",
+                (int(row["id"]), kind, key, row.get("session_id") or "",
+                 row.get("subject") or "", row.get("content") or "",
+                 row.get("evidence") or "[]", prev, int(row["id"]), stamp, stamp))
+            self._conn.execute(
+                "DELETE FROM edges WHERE rel = 'same_as' AND src_kind = ? AND src_key = ?",
+                (kind, key))
+            self._conn.commit()
+        return {"unmerged": True, "restored_status": prev,
+                "into": [edge["dst_kind"], edge["dst_key"]]}
+
+    def generate_merge_candidates(self, *, now: Optional[float] = None,
+                                  auto_threshold: float = 0.92,
+                                  advise_threshold: float = 0.85,
+                                  limit: int = 300) -> dict[str, int]:
+        """Compare active subjects by trigram; auto-merge ≥0.92, advise 0.85-0.92.
+
+        The pass only changes a row's status through ``merge_into`` (reversible) and never
+        deletes text. A pair below ``advise_threshold`` is ignored; a pair already in the ledger
+        is deduped by ``add_advisories``. It is meant for the idle extraction tick, not a hot path.
+        """
+        stamp = float(now if now is not None else time.time())
+        kinds = ",".join("?" * len(_MARKER_KINDS))
+        with self._lock:
+            rows = [dict(row) for row in self._conn.execute(
+                "SELECT id, kind, key, subject FROM conclusions "
+                f"WHERE status = 'active' AND subject != '' AND kind IN ({kinds}) "
+                "ORDER BY id LIMIT ?",
+                (*_MARKER_KINDS, max(2, int(limit)))).fetchall()]
+            rows = [row for row in rows if _mergeable_subject(row.get("subject"))]
+        pairs: list[tuple[float, dict[str, Any], dict[str, Any]]] = []
+        for index, left in enumerate(rows):
+            for right in rows[index + 1:]:
+                if left["kind"] != right["kind"]:
+                    continue
+                score = _similarity(left.get("subject"), right.get("subject"))
+                if score >= advise_threshold:
+                    pairs.append((score, left, right))
+        pairs.sort(key=lambda item: (-item[0], item[1]["id"], item[2]["id"]))
+        merged = advised = 0
+        for score, src, dst in pairs:
+            source = (str(src["kind"]), str(src["key"]))
+            target = (str(dst["kind"]), str(dst["key"]))
+            if source == target:
+                continue
+            current_src = self.get_conclusion(*source)
+            current_dst = self.get_conclusion(*target)
+            if (current_src is None or current_dst is None
+                    or current_src.get("status") != "active"
+                    or current_dst.get("status") != "active"):
+                continue
+            if score >= auto_threshold:
+                try:
+                    if self.merge_into(source, target, score=score, now=stamp):
+                        merged += 1
+                except ValueError:
+                    continue
+            else:
+                self.add_advisories("", [{
+                    "content": "merge_candidate: %s:%s -> %s:%s (score %.3f)" % (
+                        source[0], source[1], target[0], target[1], score),
+                    "severity": "concern", "target": "merge_candidate",
+                    "evidence": [{"src": list(source), "dst": list(target),
+                                  "score": round(score, 4)}],
+                }], source="merge")
+                advised += 1
+        return {"merged": merged, "advised": advised}
+
+    def record_scheduler_run(self, task: str, trigger: str, outcome: str, detail: str,
+                             started_at: float, finished_at: float, ms: float) -> int:
+        """Append one scheduler execution; history is observation, never authority."""
+        with self._lock:
+            if self._conn is None:
+                return 0
+            cur = self._conn.execute(
+                "INSERT INTO scheduler_runs (task, trigger, outcome, detail, started_at, "
+                "finished_at, ms) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (str(task), str(trigger), str(outcome), str(detail)[:2000],
+                 float(started_at), float(finished_at), float(ms)))
+            self._conn.commit()
+            return int(cur.lastrowid)
+
+    def scheduler_runs(self, task: str = "", limit: int = 20) -> list[dict[str, Any]]:
+        """Newest scheduler runs, optionally for one task."""
+        with self._lock:
+            if task:
+                rows = self._conn.execute(
+                    "SELECT * FROM scheduler_runs WHERE task = ? ORDER BY id DESC LIMIT ?",
+                    (str(task), max(1, int(limit)))).fetchall()
+            else:
+                rows = self._conn.execute(
+                    "SELECT * FROM scheduler_runs ORDER BY id DESC LIMIT ?",
+                    (max(1, int(limit)),)).fetchall()
+        return [dict(row) for row in rows]
+
+    def maintain_conclusion_history(self, archive_dir: Any = None, *,
+                                    now: Optional[float] = None, retain_days: int = 180,
+                                    keep_versions: int = 32) -> dict[str, int]:
+        """Fold, archive and clean the history; every pass is re-entrant."""
+        stamp = float(now if now is not None else time.time())
+        cutoff = stamp - max(1, int(retain_days)) * 86_400.0
+        folded = archived = dangling = 0
+        with self._lock:
+            ids = [int(row[0]) for row in self._conn.execute(
+                "SELECT conclusion_id FROM conclusion_versions GROUP BY conclusion_id "
+                "HAVING COUNT(*) > ?", (max(1, int(keep_versions)),)).fetchall()]
+            for cid in ids:
+                rows = self._conn.execute(
+                    "SELECT id, content, evidence, version, valid_from, valid_to "
+                    "FROM conclusion_versions WHERE conclusion_id = ? AND status != 'collapsed' "
+                    "ORDER BY valid_from DESC", (cid,)).fetchall()
+                if len(rows) <= keep_versions or float(rows[-1]["valid_from"]) >= cutoff:
+                    continue
+                old = rows[keep_versions:]
+                self._conn.execute(
+                    "INSERT INTO conclusion_versions (conclusion_id, kind, key, session_id, "
+                    "subject, content, evidence, status, version, valid_from, valid_to, "
+                    "recorded_at) SELECT conclusion_id, kind, key, session_id, subject, ?, ?, "
+                    "'collapsed', ?, ?, ?, ? FROM conclusion_versions WHERE id = ?",
+                    (" ".join(str(row["content"]) for row in reversed(old)),
+                     old[0]["evidence"], int(old[0]["version"]),
+                     float(old[-1]["valid_from"]), float(old[0]["valid_to"]), stamp,
+                     int(old[0]["id"])))
+                self._conn.executemany(
+                    "DELETE FROM conclusion_versions WHERE id = ?",
+                    [(int(row["id"]),) for row in old])
+                folded += len(old)
+            cur = self._conn.execute(
+                "DELETE FROM edges WHERE NOT EXISTS (SELECT 1 FROM conclusions c "
+                "WHERE c.kind = edges.dst_kind AND c.key = edges.dst_key)")
+            dangling = max(0, int(cur.rowcount))
+            self._conn.execute("DELETE FROM scheduler_runs WHERE finished_at < ?", (cutoff,))
+            self._conn.execute(
+                "DELETE FROM scheduler_runs WHERE id IN (SELECT id FROM ("
+                "SELECT id, ROW_NUMBER() OVER (PARTITION BY task ORDER BY id DESC) AS rn "
+                "FROM scheduler_runs) WHERE rn > 200)")
+            self._conn.commit()
+            if archive_dir is not None:
+                archived = self._archive_versions_locked(Path(archive_dir), cutoff, stamp)
+        return {"folded": folded, "archived": archived, "dangling": dangling}
+
+    def _archive_versions_locked(self, archive_dir: Path, cutoff: float, now: float) -> int:
+        """Copy closed pre-cutoff versions to a dated archive file, then delete only copied rows."""
+        archive_dir.mkdir(parents=True, exist_ok=True)
+        path = archive_dir / ("conclusion_archive_%s.db" % time.strftime("%Y%m%d",
+                                                                        time.localtime(now)))
+        rows = self._conn.execute(
+            "SELECT id, conclusion_id, kind, key, session_id, subject, content, evidence, "
+            "status, version, valid_from, valid_to, superseded_by, recorded_at "
+            "FROM conclusion_versions WHERE valid_to IS NOT NULL AND valid_to < ?",
+            (cutoff,)).fetchall()
+        if not rows:
+            return 0
+        archive = sqlite3.connect(str(path))
+        try:
+            archive.execute(
+                "CREATE TABLE IF NOT EXISTS conclusion_versions ("
+                "original_id INTEGER PRIMARY KEY, conclusion_id INTEGER NOT NULL, "
+                "kind TEXT NOT NULL, key TEXT NOT NULL, session_id TEXT NOT NULL DEFAULT '', "
+                "subject TEXT NOT NULL DEFAULT '', content TEXT NOT NULL, "
+                "evidence TEXT NOT NULL DEFAULT '[]', status TEXT NOT NULL DEFAULT 'active', "
+                "version INTEGER NOT NULL DEFAULT 0, valid_from REAL NOT NULL, valid_to REAL, "
+                "superseded_by INTEGER, recorded_at REAL NOT NULL, archived_at REAL NOT NULL)")
+            archive.executemany(
+                "INSERT OR IGNORE INTO conclusion_versions (original_id, conclusion_id, kind, "
+                "key, session_id, subject, content, evidence, status, version, valid_from, "
+                "valid_to, superseded_by, recorded_at, archived_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                [tuple(row) + (now,) for row in rows])
+            archive.commit()
+            stored = {(int(item[0]), str(item[1] or ""), float(item[2]))
+                      for item in archive.execute(
+                          "SELECT original_id, content, valid_from FROM conclusion_versions"
+                      ).fetchall()}
+        finally:
+            archive.close()
+        moved = [(int(row[0]), float(row[10])) for row in rows
+                 if (int(row[0]), str(row[6] or ""), float(row[10])) in stored]
+        self._conn.executemany(
+            "DELETE FROM conclusion_versions WHERE id = ? AND valid_from = ?", moved)
+        self._conn.commit()
+        return len(moved)
 
     def newest_conclusion(self, kind: str, *, session_id: Optional[str] = None) -> Optional[dict[str, Any]]:
         """Newest active conclusion of a kind (optionally pinned to one session)."""
@@ -1216,6 +1706,54 @@ class MinirStore:
             )
             self._conn.commit()
             return status
+
+    def record_layer_failure(self, layer: str, subject: str, *, window_key: str,
+                             session_id: str, window_from_ts: float, window_to_ts: float,
+                             error: str, attempts: int = 0,
+                             now: Optional[float] = None) -> None:
+        """Remember one unresolved window failure for this layer and subject."""
+        stamp = float(now if now is not None else time.time())
+        with self._lock:
+            if self._conn is None:
+                return
+            self._conn.execute(
+                "INSERT INTO layer_failures (layer, subject, window_key, session_id, "
+                "window_from_ts, window_to_ts, attempts, error, failed_at, resolved_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL) "
+                "ON CONFLICT(layer, subject, window_key) DO UPDATE SET "
+                "session_id=excluded.session_id, window_from_ts=excluded.window_from_ts, "
+                "window_to_ts=excluded.window_to_ts, attempts=excluded.attempts, "
+                "error=excluded.error, failed_at=excluded.failed_at, resolved_at=NULL",
+                (layer, subject, window_key, session_id, float(window_from_ts),
+                 float(window_to_ts), int(attempts), str(error)[:2000], stamp))
+            self._conn.commit()
+
+    def resolve_layer_failure(self, layer: str, subject: str, window_key: str,
+                              now: Optional[float] = None) -> None:
+        """Close the open failure for a window that has since been published."""
+        stamp = float(now if now is not None else time.time())
+        with self._lock:
+            if self._conn is None:
+                return
+            self._conn.execute(
+                "UPDATE layer_failures SET resolved_at = ? "
+                "WHERE layer = ? AND subject = ? AND window_key = ? AND resolved_at IS NULL",
+                (stamp, layer, subject, window_key))
+            self._conn.commit()
+
+    def open_layer_failures(self, layer: str, subject: str,
+                            limit: int = 3) -> list[dict[str, Any]]:
+        """The newest unresolved failures for one layer and subject."""
+        with self._lock:
+            if self._conn is None:
+                return []
+            rows = self._conn.execute(
+                "SELECT layer, subject, window_key, session_id, window_from_ts, window_to_ts, "
+                "attempts, error, failed_at FROM layer_failures "
+                "WHERE layer = ? AND subject = ? AND resolved_at IS NULL "
+                "ORDER BY failed_at DESC LIMIT ?",
+                (layer, subject, max(1, int(limit)))).fetchall()
+        return [dict(row) for row in rows]
 
     def expire_open_jobs(self, reason: str, *, before: float) -> int:
         """Close jobs left ``pending``/``running`` by a *previous* process; returns the count.
@@ -1787,15 +2325,15 @@ class MinirStore:
                 cur = self._conn.execute(
                     "INSERT OR IGNORE INTO advisories (revision_id, review_id, session_id, "
                     "source, severity, target, content, decision, evidence, fingerprint, status, "
-                    "created_at, expires_at, turn, deferred, adviser) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?, ?)",
+                    "created_at, expires_at, turn, deferred, adviser, claim_id, outcome) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?, ?, ?, '')",
                     (int(revision_id), int(review_id), session_id, str(source),
                      str(item.get("severity") or "concern"), str(item.get("target") or ""),
                      content, str(item.get("decision") or ""),
                      json.dumps(item.get("evidence") or []), fingerprint, time.time(),
                      float(expires_at or 0.0) or None, int(item.get("turn") or 0),
                      1 if str(item.get("deferred")).lower() in {"1", "true", "yes", "on"} else 0,
-                     str(adviser or "")))
+                     str(adviser or ""), str(item.get("claim") or "")))
                 if cur.rowcount:
                     inserted.append(int(cur.lastrowid))
             self._conn.commit()
@@ -1874,6 +2412,50 @@ class MinirStore:
                 (time.time(), turn_id or "", *[int(item) for item in ids]))
             self._conn.commit()
             return int(cur.rowcount)
+
+    def mark_advisory_outcome(self, advisory_id: int, outcome: str) -> None:
+        """Record what happened to one note: blocked, repeated or delivered."""
+        with self._lock:
+            self._conn.execute(
+                "UPDATE advisories SET outcome = ? WHERE id = ?",
+                (str(outcome or ""), int(advisory_id)))
+            self._conn.commit()
+
+    def mark_claim_repeated(self, session_id: str, claim_id: str) -> bool:
+        """Mark the newest note citing a claim as repeated; True means suppress this one."""
+        if not session_id or not claim_id:
+            return False
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT id FROM advisories WHERE session_id = ? AND claim_id = ? "
+                "AND source = 'adviser_mode' ORDER BY id DESC LIMIT 1",
+                (str(session_id), str(claim_id))).fetchone()
+            if row is None:
+                return False
+            self._conn.execute(
+                "UPDATE advisories SET outcome = 'repeated' WHERE id = ?", (int(row["id"]),))
+            self._conn.commit()
+            return True
+
+    def claim_stats(self, session_id: str = "", *, window: float = 30 * 86_400,
+                    limit: int = 20) -> list[dict[str, Any]]:
+        """Adviser claims by citation, blocked and repeated counts over a time window."""
+        since = time.time() - max(1.0, float(window))
+        clauses = ["source = 'adviser_mode'", "claim_id != ''", "created_at >= ?"]
+        params: list[Any] = [since]
+        if session_id:
+            clauses.append("session_id = ?")
+            params.append(str(session_id))
+        params.append(max(1, int(limit)))
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT claim_id, COUNT(*) AS cited, "
+                "SUM(CASE WHEN outcome = 'blocked' THEN 1 ELSE 0 END) AS blocked, "
+                "SUM(CASE WHEN outcome = 'repeated' THEN 1 ELSE 0 END) AS repeated "
+                "FROM advisories WHERE " + " AND ".join(clauses) + " "
+                "GROUP BY claim_id ORDER BY cited DESC, blocked DESC, claim_id LIMIT ?",
+                params).fetchall()
+        return [dict(row) for row in rows]
 
     def release_advisories(self, ids: list[int]) -> int:
         """Return injected rows to ``pending`` after an accepted host delivery did not land.
@@ -2029,6 +2611,22 @@ class MinirStore:
                  str(adviser or ""), time.time()))
             self._conn.commit()
             return int(cur.lastrowid)
+
+    def set_adviser_review_claims(self, review_id: int, selected: Any,
+                                  coverage: Any = None) -> None:
+        """Persist the selector's offer and the reviewer's per-claim coverage."""
+        with self._lock:
+            if coverage is None:
+                self._conn.execute(
+                    "UPDATE adviser_reviews SET selected_claims = ? WHERE id = ?",
+                    (json.dumps(selected or [], ensure_ascii=False), int(review_id)))
+            else:
+                self._conn.execute(
+                    "UPDATE adviser_reviews SET selected_claims = ?, claim_coverage = ? "
+                    "WHERE id = ?",
+                    (json.dumps(selected or [], ensure_ascii=False),
+                     json.dumps(coverage or {}, ensure_ascii=False), int(review_id)))
+            self._conn.commit()
 
     def finish_adviser_review(self, review_id: int, *, status: str, model: str = "",
                               api_calls: int = 0, latency_ms: float = 0.0,
@@ -2189,7 +2787,9 @@ class MinirStore:
 
     def search(self, query: str, limit: int = 5, *, session_id: str = "",
                scope: str = "session",
-               kinds: Optional[frozenset[str]] = None) -> list[dict[str, Any]]:
+               kinds: Optional[frozenset[str]] = None,
+               as_of: Optional[float] = None, expand: int = 0,
+               include_superseded: bool = False) -> list[dict[str, Any]]:
         """Ranked matches across conclusions, scoped to *session_id* or every session.
 
         FTS5 with the trigram tokenizer is the primary index (CJK-safe). A scan over the same
@@ -2233,10 +2833,15 @@ class MinirStore:
             marks = ",".join("?" * len(kinds))
             kind_sql = f" AND c.kind IN ({marks})"
             kind_params = list(kinds)
+        if as_of is not None:
+            return self._search_as_of(
+                terms, limit=capped, visibility=visibility, visible_params=visible_params,
+                kind_sql=kind_sql, kind_params=kind_params, as_of=float(as_of))
         rows: list[dict[str, Any]] = []
         # Historical chunk summaries stay recallable inside their own session after a final
         # summary supersedes them; the visibility predicate keeps them from leaking elsewhere.
-        status = "(c.status = 'active' OR c.kind = 'window_summary')"
+        status = ("1=1" if include_superseded
+                  else "(c.status = 'active' OR c.kind = 'window_summary')")
         fts_terms = [term for term in terms if len(term) >= 3]
         if self._fts and fts_terms:
             match = " OR ".join(f'"{term.replace(chr(34), chr(34) * 2)}"' for term in fts_terms)
@@ -2286,7 +2891,68 @@ class MinirStore:
             })
         results.sort(key=lambda item: (item["score"], -item["rank"], item["when"],
                                        item["conclusions_id"]), reverse=True)
+        results = self._expand_results(results, expand=expand, limit=capped)
         return results[:capped]
+
+    def _search_as_of(self, terms: list[str], *, limit: int, visibility: str,
+                      visible_params: list[Any], kind_sql: str, kind_params: list[Any],
+                      as_of: float) -> list[dict[str, Any]]:
+        """Rank the version rows in force at *as_of*; the live table is never the answer."""
+        where = " OR ".join("lower(v.content) LIKE ?" for _ in terms)
+        sql = (
+            "SELECT c.id, c.kind, c.key, c.subject, c.session_id, v.content, v.version, "
+            "v.status, v.valid_from, v.valid_to FROM conclusions c "
+            "JOIN conclusion_versions v ON v.conclusion_id = c.id "
+            f"WHERE {visibility}{kind_sql} AND v.valid_from <= ? "
+            "AND (v.valid_to IS NULL OR v.valid_to > ?) "
+            f"AND ({where}) ORDER BY v.valid_from DESC LIMIT ?")
+        with self._lock:
+            found = self._conn.execute(
+                sql, [*visible_params, *kind_params, as_of, as_of,
+                      *[f"%{term}%" for term in terms], _MAX_SCAN]).fetchall()
+        results: list[dict[str, Any]] = []
+        for row in found:
+            text = str(row["content"] or "")
+            overlap = sum(1 for term in terms if term in text.lower())
+            if not overlap:
+                continue
+            results.append({
+                "conclusions_id": int(row["id"] or 0), "kind": row["kind"], "key": row["key"],
+                "text": text, "when": float(row["valid_from"] or 0),
+                "author": row["subject"] or row["kind"], "subject": row["subject"] or "",
+                "session_id": row["session_id"] or "",
+                "score": float(overlap) + _KIND_WEIGHT.get(str(row["kind"]), 0.5),
+                "rank": 0.0, "version": int(row["version"] or 0),
+                "version_status": row["status"],
+            })
+        results.sort(key=lambda item: (item["score"], item["when"],
+                                       item["conclusions_id"]), reverse=True)
+        return results[:limit]
+
+    def _expand_results(self, results: list[dict[str, Any]], *, expand: int,
+                        limit: int) -> list[dict[str, Any]]:
+        """Append 1-2 hop neighbours of the top hits; the direct hits keep their rank."""
+        depth = max(0, min(2, int(expand or 0)))
+        if not results or depth == 0:
+            return results
+        seen = {(row["kind"], row["key"]) for row in results}
+        extra: list[dict[str, Any]] = []
+        for row in results[:5]:
+            for hop in self.edges_from((row["kind"], row["key"]), max_depth=depth,
+                                       limit=10):
+                identity = (hop["kind"], hop["key"])
+                if identity in seen or len(extra) >= 50:
+                    continue
+                seen.add(identity)
+                extra.append({
+                    "conclusions_id": int(hop.get("conclusion_id") or 0),
+                    "kind": hop["kind"], "key": hop["key"],
+                    "text": hop["content"] or "", "when": 0.0,
+                    "author": hop["kind"], "subject": "", "session_id": "",
+                    "score": row["score"] * 0.5, "rank": 0.0,
+                    "via": f"{row['kind']}:{row['key']}",
+                })
+        return results + extra
 
     # -- card revisions (three-day review) -----------------------------------
 

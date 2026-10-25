@@ -44,6 +44,7 @@ def test_the_minir_toolset_registers_every_tool(make_provider, plugin_package):
     registered = plugin_package.plugin_tools.register(ctx, provider)
 
     assert registered == list(plugin_package.plugin_tools.TOOL_NAMES)
+    assert "minir_link" in registered and "minir_unmerge" in registered
     assert {toolset for toolset, _schema, _handler in ctx.tools.values()} == {"minir"}
     assert ctx.tools["minir_remember"][1]["parameters"]["required"] == ["type", "content"]
     result = json.loads(ctx.tools["minir_remember"][2](
@@ -277,7 +278,7 @@ def test_the_page_pass_reads_the_marker_rules(plugin_package, monkeypatch, tmp_p
     assert route_keys == [plugin_package.adviser.KNOWLEDGE_TASK], \
         "the page pass rides its own route, not the adviser chain"
     assert "OVERRIDE MARKER ORG" in system, "the profile override must reach the page pass"
-    assert "GOVERNANCE: what binds a subject." in system
+    assert "GOVERNANCE: obeys it." in system
     assert system.rstrip().endswith("no prose."), "the output contract closes the system prompt"
 
 

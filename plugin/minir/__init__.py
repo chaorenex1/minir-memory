@@ -65,12 +65,14 @@ from . import content_valid
 from . import extraction
 from . import file_guard
 from . import history as host_history
+from . import kb_write
 from . import knowledge
 from . import minir_agents
 from . import scheduler
 from . import session_summary
 from . import window_summary
 from . import tools as plugin_tools
+from . import vector
 from .adviser_mode import AdviserMode
 from .prompting import (
     CONSISTENCY_TARGETS,
@@ -98,7 +100,13 @@ from .turn_counter import (
     WINDOW_EPSILON,
     Trigger,
 )
-from .layers import artifact_from_columns
+from .layers import (
+    CATEGORIES,
+    EPISTEMIC,
+    ORGS,
+    RELATION_TYPES,
+    artifact_from_columns,
+)
 from .worker import LayerWorker
 # Imported (not just defined) so the engine loader's subclass scan finds it on this module: the
 # engine surface is resolved by ``issubclass(ContextEngine)`` against the package's attributes.
@@ -114,6 +122,7 @@ _PROVIDER_LABEL = "Minir"
 _STORE_DIRNAME = "minir-memory"   # under $HERMES_HOME
 _DB_FILENAME = "memory.db"
 _MAX_PREFERENCE_CHARS = 4_000     # system-prompt share of the operator's user preference card
+_MAX_IDENTITY_CARD_CHARS = 1_200  # the user identity card is an orientation, not a dossier
 _DEFAULT_PREFETCH_LIMIT = 5
 _MAX_AI_SELF_CHARS = 400          # injected ai_self_representation cap
 _MAX_WINDOW_CHARS = 2000          # injected window_summary cap; the goal ledger is protected
@@ -257,6 +266,15 @@ def _as_positive_int(value: Any, default: int = 1) -> int:
         return default
 
 
+def _endpoint(value: Any) -> tuple[str, str]:
+    """``"kind:key"`` -> (kind, key); a key may itself contain colons."""
+    text = str(value or "").strip()
+    kind, sep, key = text.partition(":")
+    if not sep or not kind.strip() or not key.strip():
+        raise ValueError("endpoint must be 'kind:key'")
+    return kind.strip(), key.strip()
+
+
 class MinirMemoryProvider(MemoryProvider):
     """Local-first memory: conclusions in SQLite, FTS recall, no transcripts."""
 
@@ -370,7 +388,9 @@ class MinirMemoryProvider(MemoryProvider):
         self._adviser_mode = AdviserMode(self)
         # One clock for every recurring decision: turn tasks tick on the host's turn thread,
         # time tasks (card review, idle extraction) run on this single daemon.
-        self._scheduler = scheduler.Scheduler()
+        self._scheduler = scheduler.Scheduler(
+            record=lambda *args: self._store.record_scheduler_run(*args)
+            if self._store is not None else 0)
 
     # -- contract -------------------------------------------------------------
 
@@ -389,6 +409,11 @@ class MinirMemoryProvider(MemoryProvider):
         self._state_db = str(Path(hermes_home) / "state.db")
         db_path = Path(hermes_home) / _STORE_DIRNAME / _DB_FILENAME
         self._store = MinirStore(db_path)
+        self._vector = vector.VectorIndex(self._store, self._config.get("vector") or {})
+        try:
+            self._vector.ensure_table()
+        except Exception as exc:  # a vector table must never block a provider start
+            logger.debug("Minir vector table unavailable at start: %s", exc)
         global _ACTIVE_PROVIDER
         _ACTIVE_PROVIDER = self
         self._session_id = session_id or ""
@@ -429,7 +454,10 @@ class MinirMemoryProvider(MemoryProvider):
                       if self._knowledge is not None else None))
         self._card_scheduler = card_review.CardReviewScheduler(
             self._store, self._run_card_review, subject=self._worker.user_subject(),
-            period=float(self._card_review_days) * 24 * 3600)
+            period=float(self._card_review_days) * 24 * 3600,
+            files_present=lambda: all(
+                path.is_file() for path in card_review.card_paths(
+                    self._hermes_home, self._profile).values()))
         # The idle timer must survive a process: rows are in SQLite, so a session that ended in
         # a previous process is picked up on the first tick here.
         self._extraction_scheduler = extraction.ExtractionScheduler(
@@ -445,6 +473,11 @@ class MinirMemoryProvider(MemoryProvider):
         if self._reasoning and self._session_extraction:
             self._scheduler.add_time("session_extraction", extraction.TICK_SECONDS,
                                      self._extraction_scheduler.tick, first_delay=0.0)
+        if self._reasoning:
+            self._scheduler.add_time("conclusion_history_maintenance", 6 * 3600,
+                                     self._maintain_conclusion_history, first_delay=60.0)
+            self._scheduler.add_time("vector_backfill", 3600,
+                                     self._backfill_vectors, first_delay=120.0)
         self._scheduler.start()
         # Configure before opening the session: intervals/mode apply to sessions opened later
         # (an already-running session keeps the cadence it started with).
@@ -552,30 +585,38 @@ class MinirMemoryProvider(MemoryProvider):
         """Session-static prompt text: memory, the user's preferences, craft, adviser contract."""
         logger.info("Minir system_prompt_block (built once per session)")
         return "\n\n".join(part for part in (
-            self._memory_prompt_block(), self._preference_prompt_block(),
+            self._memory_prompt_block(), self._cards_prompt_block(),
             self._craft_prompt_block(), self._adviser_prompt_block()) if part)
 
-    def _preference_prompt_block(self) -> str:
-        """The operator's global user preference card, when one exists.
+    def _cards_prompt_block(self) -> str:
+        """The two global user cards: identity and standing preferences.
 
-        The card is ``minir-memory/user/preference.md``: one file for every agent in this home,
-        operator-written, and changed only by a card review or a hand edit, so reading it once
-        per session is enough. It rides the system prompt because it is standing guidance, not
-        retrieved context.
+        Both live under ``minir-memory/user/``: written by a card review or a hand edit, so
+        reading them once per session is enough. They ride the system prompt because they are
+        standing guidance, not retrieved context.
         """
         home = str(self._hermes_home or "").strip()
         if not home:
             return ""
-        path = card_review.card_paths(home, self._profile)[card_review.USER_PREFERENCE]
-        preference = card_review.read_card(path)[1].strip()
-        if not preference:
-            return ""
-        shown = preference[:_MAX_PREFERENCE_CHARS]
-        if len(preference) > _MAX_PREFERENCE_CHARS:
-            shown += "\n…(truncated; read the card file for the rest)"
-        return ("# User Preferences\n"
-                "Standing preferences the operator wrote for this profile; they apply unless the "
-                "current request says otherwise.\n\n" + shown)
+        paths = card_review.card_paths(home, self._profile)
+        identity = card_review.read_card(paths[card_review.USER_SELF])[1].strip()
+        preference = card_review.read_card(paths[card_review.USER_PREFERENCE])[1].strip()
+        sections: list[str] = []
+        if identity:
+            shown = identity[:_MAX_IDENTITY_CARD_CHARS]
+            if len(identity) > _MAX_IDENTITY_CARD_CHARS:
+                shown += "\n…(truncated; read the card file for the rest)"
+            sections.append(
+                "# User Identity\nWho the operator is, as the cards record them; it names the "
+                "person, not the current task.\n\n" + shown)
+        if preference:
+            shown = preference[:_MAX_PREFERENCE_CHARS]
+            if len(preference) > _MAX_PREFERENCE_CHARS:
+                shown += "\n…(truncated; read the card file for the rest)"
+            sections.append(
+                "# User Preferences\nStanding preferences the operator wrote for this profile; "
+                "they apply unless the current request says otherwise.\n\n" + shown)
+        return "\n\n".join(sections)
 
     @staticmethod
     def _memory_prompt_block() -> str:
@@ -663,12 +704,44 @@ class MinirMemoryProvider(MemoryProvider):
         """
         session = session_id or self._session_id
         state, state_items = self._layer_block(session)
+        stale, stale_items = self._stale_block(session)
         todo, todo_items = self._todo_block(session)
-        block = "\n\n".join(part for part in (state, todo) if part)
-        count = state_items + todo_items if block else 0
+        block = "\n\n".join(part for part in (state, stale, todo) if part)
+        count = state_items + stale_items + todo_items if block else 0
         self._last_recall = (RecallStatus(provider_label=_PROVIDER_LABEL, count=count,
                                           glyph=INDICATOR_GLYPH) if block else None)
         return block
+
+    def _maintain_conclusion_history(self) -> dict[str, int]:
+        """Fold, archive and clean conclusion history; runs on the one scheduler."""
+        archive = Path(self._hermes_home) / _STORE_DIRNAME / "conclusion" / "archive"
+        return self._store.maintain_conclusion_history(archive)
+
+    def _backfill_vectors(self) -> int:
+        """Index conclusions the vector table does not have yet; a no-op without a key."""
+        return self._vector.backfill() if self._vector is not None else 0
+
+    def _stale_block(self, session: str) -> tuple[str, int]:
+        """Open base-refresh failures, so a silent gap never reads as 'nothing happened'."""
+        if self._store is None or self._worker is None:
+            return "", 0
+        try:
+            rows = self._store.open_layer_failures(
+                "base", self._worker.user_subject(), limit=3)
+        except Exception as exc:
+            logger.debug("Minir layer failure read failed: %s", exc)
+            return "", 0
+        if not rows:
+            return "", 0
+        lines = ["## Minir memory gaps",
+                 "These windows were never written to memory. Absence of a memory is not "
+                 "evidence that the work did not happen."]
+        for row in rows:
+            when = time.strftime("%m-%d %H:%M", time.localtime(
+                float(row.get("window_from_ts") or 0)))
+            error = " ".join(str(row.get("error") or "").split())[:160]
+            lines.append("- %s: base refresh failed (%s)" % (when, error))
+        return "\n".join(lines), len(lines) - 2
 
     def _layer_block(self, session: str) -> tuple[str, int]:
         """The live base row's two columns, capped; counts bullet lines.
@@ -1526,11 +1599,63 @@ class MinirMemoryProvider(MemoryProvider):
         """The same schemas the ``minir`` registry toolset registers (one source in tools.py)."""
         return list(plugin_tools.SCHEMAS)
 
+    def _remember_knowledge(self, org: str, content: str, args: dict[str, Any]) -> str:
+        """Queue one page unit for the writer; the tool never writes a page itself."""
+        if org not in ORGS:
+            return tool_error(f"type must be one of: {', '.join(ORGS)}")
+        category = str(args.get("category") or "").strip().upper()
+        if category not in CATEGORIES:
+            return tool_error(f"category must be one of: {', '.join(CATEGORIES)}")
+        lines = content.strip("\n").splitlines()
+        if len(lines) < 3 or len(lines) > 8:
+            return tool_error("knowledge content must be 3..8 lines")
+        if len(content.strip("\n")) > 1200:
+            return tool_error("knowledge content must be at most 1200 characters")
+        epistemic = str(args.get("epistemic") or "").strip().lower()
+        if category == "KNOWLEDGE" and epistemic not in EPISTEMIC:
+            return tool_error(f"KNOWLEDGE requires epistemic in {', '.join(EPISTEMIC)}")
+        summary = " ".join(str(args.get("summary") or lines[0]).split())[:120]
+        topic = " ".join(str(args.get("topic") or summary).split())
+        if len(topic) < 2:
+            return tool_error("topic must be at least 2 characters")
+        unit = {
+            "category": category, "org": org, "topic": topic, "summary": summary,
+            "epistemic": epistemic if category == "KNOWLEDGE" else "",
+            "time": str(args.get("time") or ""), "objects": [], "relations": [],
+            "content": "\n".join(lines),
+            "anchor": {"from_ts": time.time(), "to_ts": time.time(), "message_ids": []},
+        }
+        if self._knowledge is None:
+            return tool_error("knowledge pipeline is not initialized")
+        queued = self._knowledge.enqueue_from_refresh(
+            self._session_id, [unit], from_ts=unit["anchor"]["from_ts"],
+            to_ts=unit["anchor"]["to_ts"])
+        self._knowledge.start()  # a reasoning-off profile still needs its writer
+        return json.dumps({"queued": bool(queued), "type": org, "category": category,
+                           "topic": topic, "remember_mode": "knowledge"})
+
+    def _remember_card(self, part: str, content: str, args: dict[str, Any]) -> str:
+        """Overlay one global card part; the other three files are preserved."""
+        if part not in card_review.PARTS:
+            return tool_error(f"type must be one of: {', '.join(card_review.PARTS)}")
+        reason = str(args.get("reason") or "").strip()
+        if not reason:
+            return tool_error("reason is required for a card write")
+        revisions = card_review.write_cards(
+            self._store, self._hermes_home, self._profile, {part: content},
+            source="operator_edit", parts=(part,), reason=reason)
+        return json.dumps({"stored": True, "type": part, "revisions": revisions,
+                           "remember_mode": "card"})
+
     def handle_tool_call(self, tool_name: str, args: dict[str, Any], **kwargs) -> str:
         """Dispatch one of this provider's tools. Must return a JSON string."""
         if tool_name == content_valid.TOOL_NAME:
             # A local count: no store, no model, so it must answer before initialization too.
             return content_valid.handle(args or {})
+        if tool_name == kb_write.TOOL_NAME:
+            return kb_write.handle(
+                args or {}, hermes_home=self._hermes_home, language=self._language,
+                source_session=str(getattr(self, "_session_id", "") or ""))
         if self._store is None:
             return tool_error("Minir is not initialized")
         args = args or {}
@@ -1556,8 +1681,20 @@ class MinirMemoryProvider(MemoryProvider):
             if kinds and is_session_bound(kinds) and not explicit_session:
                 session_id = ""
             try:
+                as_of = float(args["as_of"]) if args.get("as_of") not in (None, "") else None
+            except (TypeError, ValueError):
+                return tool_error("as_of must be an epoch timestamp")
+            try:
+                expand = int(args.get("expand") or 0)
+            except (TypeError, ValueError):
+                return tool_error("expand must be 0, 1 or 2")
+            if not 0 <= expand <= 2:
+                return tool_error("expand must be 0, 1 or 2")
+            try:
                 rows = self._search(query, limit=args.get("limit"),
-                                    session_id=session_id, scope=scope, kinds=kinds)
+                                    session_id=session_id, scope=scope, kinds=kinds,
+                                    as_of=as_of, expand=expand,
+                                    include_superseded=bool(args.get("include_superseded")))
             except SessionScopeError as exc:
                 return tool_error(str(exc))
             results = [{
@@ -1571,6 +1708,9 @@ class MinirMemoryProvider(MemoryProvider):
                 "session_id": row.get("session_id") or "",
                 "score": row.get("score") or 0.0,
                 "rank": row.get("rank") or 0.0,
+                "version": row.get("version"),
+                "version_status": row.get("version_status") or "",
+                "via": row.get("via") or "",
             } for row in rows]
             return json.dumps({"count": len(rows), "scope": scope, "results": results})
         if tool_name == "minir_kb_search":
@@ -1595,22 +1735,52 @@ class MinirMemoryProvider(MemoryProvider):
                                   "backreferences)")
             return json.dumps(payload)
         if tool_name == "minir_remember":
+            mode = str(args.get("remember_mode") or "conclusion").strip().lower()
+            if mode not in ("conclusion", "knowledge", "card"):
+                return tool_error("remember_mode must be conclusion, knowledge or card")
             kind = str(args.get("type") or "").strip()
             if not kind:
                 return tool_error("type is required")
-            if kind not in CONCLUSION_KINDS:
-                return tool_error(f"type must be one of: {', '.join(CONCLUSION_KINDS)}")
             content = str(args.get("content") or "").strip()
             if not content:
                 return tool_error("content is required")
+            if mode == "knowledge":
+                return self._remember_knowledge(kind, content, args)
+            if mode == "card":
+                return self._remember_card(kind, content, args)
+            if kind not in CONCLUSION_KINDS:
+                return tool_error(f"type must be one of: {', '.join(CONCLUSION_KINDS)}")
             conclusions_id = self._store.save_conclusion(
                 kind, content, session_id=self._session_id, subject="tool")
             return json.dumps({"stored": True, "conclusions_id": conclusions_id,
-                               "type": kind, "session_id": self._session_id})
+                               "type": kind, "session_id": self._session_id,
+                               "remember_mode": mode})
         if tool_name == "minir_forget":
+            mode = str(args.get("remember_mode") or "conclusion").strip().lower()
+            if mode not in ("conclusion", "knowledge", "card"):
+                return tool_error("remember_mode must be conclusion, knowledge or card")
             kind = str(args.get("type") or "").strip()
             if not kind:
                 return tool_error("type is required")
+            if mode == "knowledge":
+                path = str(args.get("path") or "").strip()
+                if not path:
+                    return tool_error("path is required for knowledge mode")
+                result = knowledge.archive_page(
+                    knowledge.knowledge_dir(self._hermes_home), path,
+                    reason=str(args.get("reason") or ""))
+                return json.dumps(result)
+            if mode == "card":
+                if kind not in card_review.PARTS:
+                    return tool_error(
+                        f"type must be one of: {', '.join(card_review.PARTS)}")
+                reason = str(args.get("reason") or "").strip()
+                if not reason:
+                    return tool_error("reason is required for a card forget")
+                revisions = card_review.write_cards(
+                    self._store, self._hermes_home, self._profile, {kind: ""},
+                    source="operator_edit", parts=(kind,), reason=reason)
+                return json.dumps({"cleared": True, "type": kind, "revisions": revisions})
             if kind not in CONCLUSION_KINDS:
                 return tool_error(f"type must be one of: {', '.join(CONCLUSION_KINDS)}")
             try:  # tolerate "5" from models that stringify integers
@@ -1619,7 +1789,31 @@ class MinirMemoryProvider(MemoryProvider):
                 return tool_error("conclusions_id must be an integer")
             deleted = self._store.forget_conclusion(kind, conclusions_id)
             return json.dumps({"deleted": deleted, "conclusions_id": conclusions_id,
-                               "type": kind})
+                               "type": kind, "remember_mode": mode})
+        if tool_name == "minir_link":
+            try:
+                src = _endpoint(args.get("src"))
+                dst = _endpoint(args.get("dst"))
+            except ValueError as exc:
+                return tool_error(str(exc))
+            rel = str(args.get("rel") or "").strip()
+            if rel not in RELATION_TYPES:
+                return tool_error(f"rel must be one of: {', '.join(RELATION_TYPES)}")
+            linked = self._store.link(src, rel, dst,
+                                      weight=float(args.get("weight") or 1.0))
+            return json.dumps({"linked": linked, "src": ":".join(src), "rel": rel,
+                               "dst": ":".join(dst),
+                               "error": "" if linked else "endpoint not found"})
+        if tool_name == "minir_unmerge":
+            kind = str(args.get("kind") or "").strip()
+            key = str(args.get("key") or "").strip()
+            reason = str(args.get("reason") or "").strip()
+            if not kind or not key or not reason:
+                return tool_error("kind, key and reason are required")
+            try:
+                return json.dumps(self._store.unmerge(kind, key, reason))
+            except ValueError as exc:
+                return tool_error(str(exc))
         if tool_name == "minir_todo":
             return self._handle_todo(args)
         if tool_name == "minir_stats":
@@ -1631,6 +1825,7 @@ class MinirMemoryProvider(MemoryProvider):
                                "profile": self._profile,
                                "layers": TRACKER.snapshot(self._session_id),
                                "scheduler": self._scheduler.snapshot(),
+                               "scheduler_history": self._store.scheduler_runs(limit=20),
                                "adviser_mode": {
                                    **self._store.adviser_mode_stats(self._session_id),
                                    "usage": (self._adviser_mode.usage_stats(self._session_id)
@@ -1643,6 +1838,7 @@ class MinirMemoryProvider(MemoryProvider):
                                "artifacts": self._store.all_layer_states(),
                                "transcript": self._transcript.stats(),
                                "buffered_messages": len(self._transcript.messages(self._session_id)),
+                               "vector": (self._vector.stats() if self._vector is not None else {}),
                                "prefetch_limit": self._prefetch_limit,
                                "dialectic_depth": self._dialectic_depth,
                                "session_usage": self._store.session_usage(self._session_id),
@@ -1754,14 +1950,40 @@ class MinirMemoryProvider(MemoryProvider):
 
     def _search(self, query: str, limit: Optional[Any] = None, *, session_id: str = "",
                 kinds: Optional[frozenset[str]] = None,
-                scope: str = "session") -> list[dict[str, Any]]:
+                scope: str = "session", as_of: Optional[float] = None, expand: int = 0,
+                include_superseded: bool = False) -> list[dict[str, Any]]:
         try:
             requested = int(limit) if limit is not None else self._prefetch_limit
         except (TypeError, ValueError):
             requested = self._prefetch_limit
         session = session_id or self._session_id
         rows = self._store.search(query, limit=max(1, min(20, requested)),
-                                  session_id=session, scope=scope, kinds=kinds)
+                                  session_id=session, scope=scope, kinds=kinds,
+                                  as_of=as_of, expand=expand,
+                                  include_superseded=include_superseded)
+        if self._vector is not None and as_of is None:
+            ranks = self._vector.recall(query, limit=20)
+            if ranks:
+                by_id = {int(row["conclusions_id"]): row for row in rows}
+                for cid, rank in ranks.items():
+                    row = by_id.get(int(cid))
+                    if row is None:
+                        stored = self._store.conclusion_by_id(int(cid))
+                        if stored is None or str(stored.get("status") or "") != "active":
+                            continue
+                        row = {
+                            "conclusions_id": int(cid), "kind": stored.get("kind") or "",
+                            "key": stored.get("key") or "", "text": stored.get("content") or "",
+                            "when": float(stored.get("updated_at") or 0),
+                            "author": stored.get("subject") or stored.get("kind") or "",
+                            "subject": stored.get("subject") or "",
+                            "session_id": stored.get("session_id") or "",
+                            "score": 0.0, "rank": 0.0,
+                        }
+                        rows.append(row)
+                    row["score"] = float(row.get("score") or 0.0) + 0.7 / (60.0 + rank)
+                rows.sort(key=lambda item: (item.get("score") or 0.0,
+                                            item.get("when") or 0.0), reverse=True)
         return rows
 
 
@@ -2059,7 +2281,8 @@ def _on_pre_tool_call(tool_name: str = "", session_id: str = "",
         reason = file_guard.check(tool_name, kwargs.get("args") or {}, resolved._hermes_home)
         if reason:
             return {"action": "block", "message": reason}
-    reason = resolved._adviser_mode.block_reason(session_id, tool_name)
+    reason = resolved._adviser_mode.block_reason(session_id, tool_name,
+                                                 args=kwargs.get("args"))
     return {"action": "block", "message": reason} if reason else None
 
 

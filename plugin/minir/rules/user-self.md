@@ -40,4 +40,6 @@ QUALITY
 - The current task goal leaked into the card.
 - The same fact appears in both user bodies.
 - A role, employer or skill has no support in the window or baseline.
+- A count, a version, a project state or an expiry date that will drift out of date.
+- The same fact appears in the identity and preference bodies.
 - A line is too vague to act on.

@@ -23,9 +23,9 @@ def cards(plugin_package):
 
     def payload(**over):
         value = {
-            "user_identity": "# Who this person is\n\nAn Engineer on backend services. Python is "
+            "user_self_representation": "# Who this person is\n\nAn Engineer on backend services. Python is "
                              "the working language; they read a diff before they run it.\n",
-            "user_preference": "# How they want answers\n\n- Terse first, detail on request.\n",
+            "user_preferences": "# How they want answers\n\n- Terse first, detail on request.\n",
             "ai_identity": "# Who the assistant is\n\nminir 0.8.0, built by chaorenex1. Its duty "
                            "is to maintain memory.\n",
             "ai_preference": "# How the assistant answers\n\n- Short paragraphs, no preamble.\n",
@@ -39,13 +39,13 @@ def cards(plugin_package):
 def test_validation_rejects_a_non_string_body(cards):
     module, payload = cards
     bad = payload()
-    bad["user_identity"] = {"current_task": "ship it"}
+    bad["user_self_representation"] = {"current_task": "ship it"}
     with pytest.raises(module.CardReviewError) as info:
         module.validate_cards(bad)
-    assert "user_identity" in str(info.value)
+    assert "user_self_representation" in str(info.value)
     assert "markdown" in str(info.value), "the body is text, not a field object"
     field_value = payload()
-    field_value["user_preference"] = ["terse"]
+    field_value["user_preferences"] = ["terse"]
     with pytest.raises(module.CardReviewError):
         module.validate_cards(field_value)
 
@@ -53,7 +53,7 @@ def test_validation_rejects_a_non_string_body(cards):
 def test_validation_rejects_a_missing_or_extra_card(cards):
     module, payload = cards
     missing = payload()
-    missing.pop("user_preference")
+    missing.pop("user_preferences")
     with pytest.raises(module.CardReviewError):
         module.validate_cards(missing)
     extra = payload()
@@ -102,7 +102,7 @@ def test_write_cards_publishes_four_files_and_revisions(cards, store, tmp_path):
     assert json.loads(latest["changed_fields"]) == []
     assert latest["source"] == "review" and again
     module.write_cards(store, home, "default",
-                       payload(user_identity="# Who this person is\n\nAn Engineer who now "
+                       payload(user_self_representation="# Who this person is\n\nAn Engineer who now "
                                              "writes Go as well.\n"))
     moved = store.latest_card_revision("user", "identity")
     assert json.loads(moved["changed_fields"]) == ["body"], "a new body text is a body change"
@@ -151,12 +151,12 @@ def test_each_review_file_has_its_own_agent_rule_and_output(cards, plugin_packag
     module = plugin_package.card_review
     home = str(tmp_path / "hermes")
     cases = (
-        ("user_identity", "You maintain the user side", "Who this person is", "user_identity", False),
-        ("user_preference", "You maintain the user side", "How this person wants the assistant",
-         "user_preference", False),
+        ("user_self_representation", "You maintain the user side", "Who this person is", "user_self_representation", False),
+        ("user_preferences", "You maintain the user side", "How this person wants the assistant",
+         "user_preferences", False),
         ("ai_identity", "You maintain the AI side", "Who this assistant is in this profile",
          "ai_identity", True),
-        ("ai_preference", "You maintain the AI side", "Who this assistant is in this profile",
+        ("ai_preference", "You maintain the AI side", "How this assistant is required to work",
          "ai_preference", True),
     )
     for scope, core_text, rule_text, key, has_manifest in cases:
@@ -171,8 +171,8 @@ def test_each_review_file_has_its_own_agent_rule_and_output(cards, plugin_packag
 
 def _scope_key(scope):
     return {
-        "user_identity": "user_identity",
-        "user_preference": "user_preference",
+        "user_self_representation": "user_self_representation",
+        "user_preferences": "user_preferences",
         "ai_identity": "ai_identity",
         "ai_preference": "ai_preference",
     }[scope]
@@ -185,8 +185,8 @@ def _reply(payload, scope):
 
 def _scope_from_system(system):
     for scope, key in (
-        ("user_identity", "user_identity"),
-        ("user_preference", "user_preference"),
+        ("user_self_representation", "user_self_representation"),
+        ("user_preferences", "user_preferences"),
         ("ai_identity", "ai_identity"),
         ("ai_preference", "ai_preference"),
     ):
@@ -236,13 +236,26 @@ def test_build_prompt_flags_a_hand_edited_card(cards, store, tmp_path):
     path.write_text(path.read_text(encoding="utf-8").replace("Engineer", "Operator"),
                     encoding="utf-8")
     _system, user_prompt = module.build_prompt(store, home, "default", since=0.0,
-                                               scope="user_identity", plugin_yaml=PLUGIN_YAML)
+                                               scope="user_self_representation", plugin_yaml=PLUGIN_YAML)
     assert "Hand-edited since the last review" in user_prompt
     assert "user/identity" in user_prompt
     _ai_system, ai_prompt = module.build_prompt(store, home, "default", since=0.0,
                                                 scope="ai_identity", plugin_yaml=PLUGIN_YAML)
     assert "Hand-edited since the last review" not in ai_prompt, \
         "each file is told about its own body only"
+
+
+def test_build_prompt_shows_claim_usage(cards, store, tmp_path):
+    module, payload = cards
+    home = str(tmp_path / "hermes")
+    module.write_cards(store, home, "default", payload())
+    store.add_advisories("s1", [{
+        "content": "keep it terse", "severity": "concern", "target": "general",
+        "claim": "card:preference.md#4"}], source="adviser_mode")
+    _system, prompt = module.build_prompt(store, home, "default", since=0.0,
+                                          scope="user_preferences", plugin_yaml=PLUGIN_YAML)
+    assert "Claim usage in the last 30 days" in prompt
+    assert "card:preference.md#4" in prompt
 
 
 def test_a_missing_body_fails_the_review(cards, store, tmp_path):
@@ -268,9 +281,11 @@ def test_the_scheduler_waits_three_days_and_advances_only_on_success(cards, plug
         calls.append(since)
         return []
 
-    scheduler = module.CardReviewScheduler(store, run, subject="user:default", period=3 * 86400)
+    scheduler = module.CardReviewScheduler(store, run, subject="user:default",
+                                           period=3 * 86400, files_present=lambda: True)
     now = time.time()
     assert scheduler.ensure_anchor(now) == now
+    assert "last_success_at" not in scheduler._state(), "an anchor is not a successful review"
     assert scheduler.due(now + 86400) is False
     assert scheduler.tick(now + 86400) is False
     assert scheduler.due(now + 3 * 86400 + 1) is True
@@ -280,14 +295,15 @@ def test_the_scheduler_waits_three_days_and_advances_only_on_success(cards, plug
         raise module.CardReviewError("model down")
 
     broken = module.CardReviewScheduler(store, failing, subject="user:default",
-                                        period=3 * 86400)
+                                        period=3 * 86400, files_present=lambda: True)
     assert broken.tick(now + 3 * 86400 + 1) is False
     state = broken._state()
     assert state["attempts"] == 1
     assert state["next_attempt_at"] == pytest.approx(now + 3 * 86400 + 1 + 1800, abs=5)
     assert broken.due(now + 3 * 86400 + 1000) is False
 
-    healthy = module.CardReviewScheduler(store, run, subject="user:default", period=3 * 86400)
+    healthy = module.CardReviewScheduler(store, run, subject="user:default",
+                                         period=3 * 86400, files_present=lambda: True)
     retry_at = now + 3 * 86400 + 1 + 1800
     assert healthy.tick(retry_at - 1) is False, "the retry backoff gates the next attempt"
     assert healthy.due(retry_at + 1) is True, healthy._state()
@@ -295,3 +311,14 @@ def test_the_scheduler_waits_three_days_and_advances_only_on_success(cards, plug
     assert calls and calls[-1] == pytest.approx(now, abs=5)
     assert healthy._state()["attempts"] == 0
     assert healthy._state()["last_success_at"] == pytest.approx(retry_at + 1, abs=5)
+
+
+def test_a_missing_card_runs_the_first_review_immediately(cards, plugin_package, store):
+    module = plugin_package.card_review
+    scheduler = module.CardReviewScheduler(
+        store, lambda since: [], subject="user:default", period=3 * 86400,
+        files_present=lambda: False)
+    now = time.time()
+    scheduler.ensure_anchor(now)
+    assert scheduler.due(now) is True
+    assert scheduler.tick(now) is True

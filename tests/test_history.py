@@ -149,8 +149,8 @@ def test_profile_name_and_identity_files(plugin_package, tmp_path):
 
     identity, preference = plugin_package.history.identity_paths(tmp_path, "work")
     identity.parent.mkdir(parents=True)
-    identity.write_text("I am Masía.", encoding="utf-8")
-    preference.write_text("Prefer evidence.", encoding="utf-8")
+    identity.write_text("---\nsource: review\nreviewer: masia\n---\n\nI am Masía.", encoding="utf-8")
+    preference.write_text("---\nsource: review\n---\n\nPrefer evidence.", encoding="utf-8")
     assert plugin_package.history.load_identity(tmp_path, "work") == (
         "I am Masía.", "Prefer evidence.")
 

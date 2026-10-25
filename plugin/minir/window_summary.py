@@ -103,6 +103,14 @@ def validate(text: Any) -> str:
     return text.strip()
 
 
+def validate_nonempty(text: Any) -> str:
+    """A heading-only summary carries no evidence: reject it. An empty string is a failed child."""
+    value = validate(text)
+    if value and is_empty(value):
+        _fail("window_summary", "must carry at least one non-heading line")
+    return value
+
+
 def empty_summary() -> str:
     """The template with nothing filled in; what a row without a summary carries."""
     return load_template()

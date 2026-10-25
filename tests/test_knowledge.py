@@ -20,6 +20,7 @@ def _unit(**over):
         "epistemic": "",
         "content": "Run docker system prune to remove stopped containers and dangling images.",
         "time": "2026-10-21", "relations": [], "objects": ["tools:Docker"],
+        "anchor": {"from_ts": 0.0, "to_ts": 1e12, "message_ids": []},
     }
     unit.update(over)
     return unit
@@ -170,7 +171,8 @@ def test_queue_drops_the_oldest_and_counts_it(knowledge, tmp_path):
     pipeline = knowledge.KnowledgePipeline(str(tmp_path), autostart=False, queue_size=2)
     try:
         value_markers = [_unit(id=f"k{index}", topic=f"topic {index}") for index in range(5)]
-        assert pipeline.enqueue_from_refresh("s1", value_markers) == 5
+        assert pipeline.enqueue_from_refresh("s1", value_markers,
+                                             from_ts=0.0, to_ts=1e12) == 5
         assert pipeline.pending == 2
         assert pipeline.dropped == 3
         assert pipeline.stats()["dropped"] == 3
@@ -181,7 +183,8 @@ def test_queue_drops_the_oldest_and_counts_it(knowledge, tmp_path):
 def test_pipeline_thread_writes_and_skips_already_produced_units(knowledge, tmp_path):
     pipeline = knowledge.KnowledgePipeline(str(tmp_path))
     try:
-        assert pipeline.enqueue_from_refresh("session-1", [_unit()]) == 1
+        assert pipeline.enqueue_from_refresh("session-1", [_unit()],
+                                             from_ts=0.0, to_ts=1e12) == 1
     finally:
         pipeline.stop()
 
@@ -193,9 +196,11 @@ def test_pipeline_thread_writes_and_skips_already_produced_units(knowledge, tmp_
 
     idle = knowledge.KnowledgePipeline(str(tmp_path), autostart=False)
     try:
-        assert idle.enqueue_from_refresh("session-1", [_unit()]) == 0
+        assert idle.enqueue_from_refresh("session-1", [_unit()],
+                                         from_ts=0.0, to_ts=1e12) == 0
         changed = _unit(content="A rewritten body.", time="2026-10-22")
-        assert idle.enqueue_from_refresh("session-1", [changed]) == 1
+        assert idle.enqueue_from_refresh("session-1", [changed],
+                                         from_ts=0.0, to_ts=1e12) == 1
     finally:
         idle.stop()
 
@@ -284,22 +289,72 @@ def test_selection_scans_every_page_when_ripgrep_is_unavailable(knowledge, monke
     assert len(rows) == 3, "the org-folder scan keeps pages ripgrep could not pre-filter"
 
 
+def test_edit_page_creates_then_edits_by_line_and_text(knowledge, tmp_path):
+    path = "tools/METHOD-edit-page.md"
+    created = knowledge.edit_page(
+        root=tmp_path, path=path, op="create",
+        header={"topic": "edit page", "summary": "edit a page"},
+        content="first line\nsecond line\nthird line")
+    assert created["status"] == "created" and created["verified"]
+    target = tmp_path / path
+    sha = created["sha256"]
+
+    replaced = knowledge.edit_page(root=tmp_path, path=path, op="replace",
+                                   old="second line", content="second line changed")
+    assert replaced["status"] == "written" and replaced["verified"]
+    appended = knowledge.edit_page(root=tmp_path, path=path, op="append", content="fourth line")
+    assert appended["status"] == "written" and appended["lines"] == 4
+    assert knowledge.edit_page(root=tmp_path, path=path, op="append",
+                               content="fourth line")["status"] == "unchanged"
+    assert knowledge.edit_page(root=tmp_path, path=path, op="append", content="fifth line",
+                               expect_sha=sha)["status"] == "stale"
+    assert knowledge.edit_page(root=tmp_path, path=path, op="delete",
+                               old="first line")["status"] == "written"
+    assert "first line" not in target.read_text(encoding="utf-8")
+
+
+def test_a_failed_verification_restores_the_previous_bytes(knowledge, tmp_path, monkeypatch):
+    path = "tools/METHOD-restore.md"
+    knowledge.edit_page(root=tmp_path, path=path, op="create",
+                        header={"topic": "restore", "summary": "restore a page"},
+                        content="one\ntwo\nthree")
+    target = tmp_path / path
+    original = target.read_text(encoding="utf-8")
+    monkeypatch.setattr(knowledge, "_set_front_matter", lambda text, updates: text)
+    result = knowledge.edit_page(root=tmp_path, path=path, op="append", content="four")
+    assert result["status"] == "unverified" and result["restored"] is True
+    assert target.read_text(encoding="utf-8") == original
+
+
+def test_anchor_in_window_rejects_inherited_and_unanchored_units(knowledge):
+    unit = {"anchor": {"from_ts": 10, "to_ts": 20}}
+    assert knowledge.anchor_in_window(unit, 15, 25)
+    assert knowledge.anchor_in_window(unit, 20, 30)
+    assert not knowledge.anchor_in_window(unit, 21, 30)
+    assert not knowledge.anchor_in_window({}, 0, 100)
+    assert knowledge.anchor_in_window({"anchor": {"from_ts": "20", "to_ts": "10"}}, 0, 100)
+
+
 def test_search_pages_returns_matches_and_front_matter(knowledge, tmp_path):
     if knowledge.rgtool.find(str(tmp_path)) is None:
         pytest.skip("ripgrep is not installed")
     knowledge.write_unit(_unit(id="k1", topic="Docker prune"), root=tmp_path)
+    archived = tmp_path / "_archive" / "tools" / "METHOD-Docker-prune.md"
+    archived.parent.mkdir(parents=True)
+    archived.write_text((tmp_path / "tools" / "METHOD-Docker-prune.md").read_text(
+        encoding="utf-8"), encoding="utf-8")
 
     found = knowledge.search_pages("docker.*prune", tmp_path, hermes_home=str(tmp_path))
 
-    assert found["count"] == 1 and found["total"] == 1
+    assert found["count"] == 1 and found["total"] == 1, "an archived page is not recallable"
     row = found["results"][0]
     assert (row["org"], row["category"], row["topic"]) == ("tools", "METHOD", "Docker prune")
-    assert row["relative"] == "tools/METHOD-Docker-prune.md"
-    assert Path(row["path"]).is_file()
+    assert row["path"] == "tools/METHOD-Docker-prune.md"
+    assert (tmp_path / row["path"]).is_file()
+    assert row["file"] == "METHOD-Docker-prune.md" and len(row["sha256"]) == 64
     assert row["revisions"] == 1 and row["summary"]
-    assert not row["matches"][0]["text"].lstrip().startswith("topic:"), "body lines come first"
-    assert any("system prune" in hit["text"] for hit in row["matches"])
-    assert row["matches"][0]["line"] >= 1
+    assert any("system prune" in line["text"] for line in row["lines"])
+    assert row["match"] and row["match"]["text"].lstrip()[:5] != "topic:"
 
 
 def test_search_pages_filters_and_caps(knowledge, monkeypatch, tmp_path):
@@ -328,8 +383,8 @@ def test_search_pages_filters_and_caps(knowledge, monkeypatch, tmp_path):
 
     everyone = knowledge.search_pages("docker", tmp_path, limit=5)
     assert [row["org"] for row in everyone["results"]] == ["tools", "entities"]
-    assert len(everyone["results"][0]["matches"]) == 2, "per_page caps the quoted lines"
-    assert seen["ignore_case"] is True and seen["max_per_file"] == 12
+    assert everyone["results"][0]["match"]["text"] == "docker prune one"
+    assert seen["ignore_case"] is True and seen["max_per_file"] >= 12
 
     only_entities = knowledge.search_pages("docker", tmp_path, org="entities")
     assert [row["org"] for row in only_entities["results"]] == ["entities"]

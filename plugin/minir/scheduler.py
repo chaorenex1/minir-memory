@@ -93,12 +93,14 @@ class Scheduler:
     Thread-safe; a task failure is counted and logged, never raised into the caller.
     """
 
-    def __init__(self, *, tick: float = DEFAULT_TICK_SECONDS):
+    def __init__(self, *, tick: float = DEFAULT_TICK_SECONDS,
+                 record: Optional[Callable[..., Any]] = None):
         self._tick = max(0.01, float(tick))
         self._lock = threading.RLock()
         self._tasks: dict[str, Task] = {}
         self._stop = threading.Event()
         self._thread: Optional[threading.Thread] = None
+        self._record_run = record
 
     # -- registration ---------------------------------------------------------
 
@@ -195,10 +197,11 @@ class Scheduler:
                     if not task.due():
                         with self._lock:
                             task.skipped += 1
+                        self._record(task, "time", "skip", "due check false", 0.0)
                         logger.debug("Minir scheduler: task=%s trigger=time skipped", task.name)
                         continue
                 except Exception as exc:
-                    self._record(task, "error", f"due check failed: {exc}", 0.0)
+                    self._record(task, "time", "error", f"due check failed: {exc}", 0.0)
                     logger.warning("Minir scheduler: task=%s trigger=time due check failed: %s",
                                    task.name, exc, exc_info=True)
                     continue
@@ -212,7 +215,7 @@ class Scheduler:
             result = task.run(**kwargs)
         except Exception as exc:
             elapsed = (time.perf_counter() - started) * 1000.0
-            self._record(task, "error", f"{type(exc).__name__}: {exc}", elapsed)
+            self._record(task, trigger, "error", f"{type(exc).__name__}: {exc}", elapsed)
             logger.warning("Minir scheduler: task=%s trigger=%s failed after %.1fms: %s",
                            task.name, trigger, elapsed, exc, exc_info=True)
             return
@@ -221,11 +224,11 @@ class Scheduler:
         # A task returning literal False means "due but did not publish" (the card review's
         # retry path). Zero is a count, not a failure.
         if result is False:
-            self._record(task, "retry", detail, elapsed)
+            self._record(task, trigger, "retry", detail, elapsed)
             logger.warning("Minir scheduler: task=%s trigger=%s outcome=retry detail=%s ms=%.1f",
                            task.name, trigger, detail or "-", elapsed)
             return
-        self._record(task, "ok", detail, elapsed)
+        self._record(task, trigger, "ok", detail, elapsed)
         if detail:
             logger.info("Minir scheduler: task=%s trigger=%s outcome=ok detail=%s ms=%.1f",
                         task.name, trigger, detail, elapsed)
@@ -233,15 +236,25 @@ class Scheduler:
             logger.debug("Minir scheduler: task=%s trigger=%s outcome=ok ms=%.1f",
                          task.name, trigger, elapsed)
 
-    def _record(self, task: Task, outcome: str, detail: str, elapsed_ms: float) -> None:
+    def _record(self, task: Task, trigger: str, outcome: str, detail: str,
+                elapsed_ms: float) -> None:
+        finished = time.time()
         with self._lock:
-            task.runs += 1
+            if outcome != "skip":
+                task.runs += 1
             if outcome in {"error", "retry"}:
                 task.failures += 1
-            task.last_at = time.time()
+            task.last_at = finished
             task.last_ms = elapsed_ms
             task.last_outcome = outcome
             task.last_detail = detail
+        if self._record_run is not None:
+            try:
+                self._record_run(task.name, trigger, outcome, detail,
+                                 finished - max(0.0, elapsed_ms) / 1000.0, finished,
+                                 elapsed_ms)
+            except Exception as exc:  # observation must never break the clock
+                logger.warning("Minir scheduler history write failed: %s", exc)
 
     # -- introspection --------------------------------------------------------
 

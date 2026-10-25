@@ -86,7 +86,9 @@ def marker_section(*, heading: str = "VALUE MARKERS — DEFINITIONS",
 # sections). One advice carries exactly one target token.
 CONSISTENCY_TARGETS: tuple[str, ...] = (
     "user_preferences_check",
+    "user_identity_check",
     "ai_self_representation_check",
+    "knowledge_claim_check",
     "soul_tool_policy_check",
     "soul_workflow_check",
     "soul_craft_check",
@@ -116,6 +118,12 @@ ADVICE_TARGETS: tuple[tuple[str, str, str], ...] = (
     ("user_preferences_check", "the session against the user preference card",
      "blocker -> a safety or process preference was breached and the action is out; stop, "
      "report. concern -> correct the expression now. nit -> optional."),
+    ("user_identity_check", "the session against the operator's identity card",
+     "blocker -> the work is for the wrong domain or deliverable; stop and re-read. "
+     "concern -> re-check identity, deliverable or assumptions. nit -> optional."),
+    ("knowledge_claim_check", "the session against a cited knowledge claim",
+     "no blocker; a derived claim can only concern. concern -> the action contradicts, "
+     "duplicates or misses a recorded decision; cite the claim and correct it. nit -> optional."),
     ("ai_self_representation_check", "the session against its own published self representation",
      "blocker -> the completion claim is false; do not send, verify now. concern -> recalibrate "
      "now. nit -> optional."),
@@ -164,6 +172,8 @@ ADVICE_HANDLING: dict[str, dict[str, str]] = {
         "output_surface": "do not send; cut or rewrite the cited element",
         "code_economy": "do not add; reuse the existing capability",
         "user_preferences_check": "stop; report; do not continue",
+        "user_identity_check": "stop; re-read the identity card",
+        "knowledge_claim_check": "no blocker; a derived claim is at most a concern",
         "ai_self_representation_check": "do not send; verify now",
         "soul_tool_policy_check": "stop; report; do not restate sensitive content",
         "soul_workflow_check": "stop; report; do not restate sensitive content",
@@ -178,6 +188,8 @@ ADVICE_HANDLING: dict[str, dict[str, str]] = {
         "output_surface": "check the craft rules; adjust only if honesty or clarity changes",
         "code_economy": "check git, the license, the framework, or the stdlib first; justify or drop",
         "user_preferences_check": "correct the expression now",
+        "user_identity_check": "re-check identity, deliverable or assumptions",
+        "knowledge_claim_check": "cite the claim; contradict, duplicate or recall-miss",
         "ai_self_representation_check": "recalibrate now",
         "soul_tool_policy_check": "correct the procedure now",
         "soul_workflow_check": "correct the step now",

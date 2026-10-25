@@ -41,7 +41,7 @@ from pathlib import Path
 from typing import Any, Callable, Iterable, Mapping, Optional, Sequence
 
 from . import rgtool
-from .layers import CATEGORIES, ORGS
+from .layers import CATEGORIES, EPISTEMIC, ORGS
 from .rules import estimate_tokens
 
 logger = logging.getLogger(__name__)
@@ -54,12 +54,16 @@ SLUG_MAX = 60
 DEFAULT_BUDGET = 2000
 DEFAULT_LIMIT = 6
 DEFAULT_MAX_CHARS = 700
-DEFAULT_SEARCH_LIMIT = 8
+DEFAULT_SEARCH_LIMIT = 5
 MATCH_PREVIEW = 240
 MAX_BLOCK_CHARS = 700
 QUEUE_MAX = 512
 RECENCY_DAYS = 30.0
 SUMMARY_MAX = 120
+PAGE_BODY_MAX = 1200          # the same cap the B4 prompt states; points, not prose
+PAGE_BODY_MIN_LINES = 3
+PAGE_BODY_MAX_LINES = 8
+PAGE_LINE_MAX = 200
 _FRONT_MATTER_READ = 16_384
 
 BLOCK_HEADER = "[knowledge — retrieve on demand]"
@@ -317,6 +321,27 @@ def _is_stale(unit_time: Any, stored_time: Any) -> bool:
     return incoming < stored
 
 
+def anchor_in_window(unit: Mapping[str, Any], from_ts: float, to_ts: float) -> bool:
+    """True when the unit's anchor overlaps the window it is being enqueued for.
+
+    An inherited marker keeps the anchor of the window that produced it, so a refresh cannot
+    attribute another session's work to this one. A unit without a numeric anchor is not
+    enqueued: the writer that produced it already wrote the page, and a guess here is exactly
+    the misattribution this filter exists to prevent.
+    """
+    anchor = unit.get("anchor")
+    if not isinstance(anchor, Mapping):
+        return False
+    try:
+        start = float(anchor.get("from_ts"))
+        end = float(anchor.get("to_ts"))
+    except (TypeError, ValueError):
+        return False
+    if end < start:
+        start, end = end, start
+    return end >= float(from_ts) and start <= float(to_ts)
+
+
 def _now() -> str:
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
 
@@ -572,6 +597,336 @@ def _write_unit(unit: Any, *, root: Path, language: str, budget: int,
             "revisions": revisions, "error": ""}
 
 
+# -- file-level editing ------------------------------------------------------------------------
+
+OPS: tuple[str, ...] = ("create", "append", "insert", "replace", "delete")
+ARCHIVE_DIRNAME = "_archive"
+
+
+def _page_target(root: Path, path: Any) -> tuple[Path, str, str, str, str]:
+    """A page path -> (absolute, relative, org, category, slug); reject anything else."""
+    rel_text = str(path or "").strip().replace("\\", "/").lstrip("/")
+    rel = Path(rel_text)
+    if len(rel.parts) != 2 or rel.parts[0] not in ORGS:
+        raise KnowledgeError(f"page path must be <org>/<CATEGORY>-<slug>.md, got {rel_text!r}")
+    name = rel.parts[1]
+    if not name.endswith(".md"):
+        raise KnowledgeError(f"page path must end in .md, got {rel_text!r}")
+    category, sep, slug = name[:-3].partition("-")
+    category = category.upper()
+    if not sep or category not in CATEGORIES or not slug:
+        raise KnowledgeError(f"page file must be <CATEGORY>-<slug>.md, got {name!r}")
+    return Path(root) / rel, rel.as_posix(), rel.parts[0], category, slug
+
+
+def _body_lines(body: str) -> list[str]:
+    return body.splitlines()
+
+
+def _split_heading(body: str) -> tuple[str, str]:
+    """A page body -> (``# topic`` heading, content below it)."""
+    lines = body.splitlines()
+    while lines and not lines[0].strip():
+        lines.pop(0)
+    if lines and lines[0].startswith("# "):
+        rest = lines[1:]
+        while rest and not rest[0].strip():
+            rest = rest[1:]
+        return lines[0], "\n".join(rest).strip("\n")
+    return "", body.strip("\n")
+
+
+def _set_front_matter(text: str, updates: Mapping[str, Any]) -> str:
+    """Replace keys in an existing front-matter block, keeping every other line untouched."""
+    lines = text.splitlines()
+    if not lines or lines[0].strip() != "---":
+        raise KnowledgeError("page has no front-matter block")
+    end = next((index for index, line in enumerate(lines[1:], 1) if line.strip() == "---"), None)
+    if end is None:
+        raise KnowledgeError("page front-matter is not closed")
+    remaining = dict(updates)
+    for index in range(1, end):
+        key = lines[index].partition(":")[0].strip()
+        if key in remaining:
+            lines[index] = f"{key}: {_front_matter_value(remaining.pop(key))}"
+    insert_at = end
+    for key, value in remaining.items():
+        lines.insert(insert_at, f"{key}: {_front_matter_value(value)}")
+        insert_at += 1
+    return "\n".join(lines).rstrip() + "\n"
+
+
+def _page_warnings(lines: Sequence[str]) -> list[str]:
+    warnings: list[str] = []
+    if len(lines) > PAGE_BODY_MAX_LINES:
+        warnings.append(f"body has {len(lines)} lines; the page contract allows at most "
+                        f"{PAGE_BODY_MAX_LINES}")
+    if any(len(line) > PAGE_LINE_MAX for line in lines):
+        warnings.append(f"a line is longer than {PAGE_LINE_MAX} characters")
+    if any(line.lstrip().startswith(("本页", "我们", "本次")) for line in lines[:1]):
+        warnings.append("the body opens with a preamble instead of a claim")
+    return warnings
+
+
+def _edit_failure(root: Path, category: str, topic: str, op: str, path: str,
+                  error: str) -> dict[str, Any]:
+    _write_failure(root, {"category": category, "topic": topic, "op": op, "path": path}, error)
+    return {"status": "failed", "file": Path(path).name, "path": path, "org": "",
+            "category": category, "topic": topic, "lines": 0, "bytes": 0,
+            "sha256": "", "verified": False, "restored": False, "warnings": [],
+            "error": error}
+
+
+def edit_page(*, root: Any, path: Any, op: str, header: Optional[Mapping[str, Any]] = None,
+              content: str = "", line: int = 0, end_line: int = 0, old: str = "",
+              position: str = "after", expect_sha: str = "", language: str = "en",
+              budget: int = DEFAULT_BUDGET, source_session: str = "") -> dict[str, Any]:
+    """One file-level page edit; reads, writes atomically, verifies, and rolls back on mismatch.
+
+    ``create`` renders the header through :func:`write_unit`; every other op addresses the body
+    by 1-based line or by exact unique text. A failed verification restores the previous bytes.
+    """
+    root_path = Path(root)
+    header = dict(header or {})
+    try:
+        target, rel, org, category, slug = _page_target(root_path, path)
+    except KnowledgeError as exc:
+        return _edit_failure(root_path, "", "", str(op or ""), str(path or ""), str(exc))
+    if op not in OPS:
+        return _edit_failure(root_path, category, slug, str(op), rel,
+                             f"op must be one of: {', '.join(OPS)}")
+    if op == "create":
+        return _create_page(root_path, target, rel, org, category, slug, header, content,
+                            language=language, budget=budget, source_session=source_session)
+    if not target.is_file():
+        return _edit_failure(root_path, category, slug, op, rel, "page does not exist")
+
+    original = target.read_text(encoding="utf-8-sig", errors="replace")
+    current_sha = hashlib.sha256(original.encode("utf-8")).hexdigest()
+    meta, body = _read_document(target)
+    heading, page_body = _split_heading(body)
+    body_lines = page_body.splitlines()
+    if expect_sha and expect_sha != current_sha:
+        return {"status": "stale", "file": target.name, "path": rel, "org": org,
+                "category": category, "topic": str(meta.get("topic") or slug),
+                "lines": len(body_lines), "bytes": len(page_body.encode("utf-8")),
+                "sha256": current_sha, "verified": False, "restored": False,
+                "warnings": [], "error": "the file changed since it was read",
+                "content": page_body}
+    if not meta:
+        return _edit_failure(root_path, category, str(meta.get("topic") or slug), op, rel,
+                             "page has no parseable front-matter")
+    topic = " ".join(str(meta.get("topic") or "").split())
+    if (str(meta.get("org") or "") != org or str(meta.get("category") or "").upper() != category
+            or slugify(topic) != slug):
+        return _edit_failure(root_path, category, topic or slug, op, rel,
+                             "front-matter does not match the path")
+
+    try:
+        start, end = _edit_anchor(body_lines, op=op, line=line, end_line=end_line, old=old)
+    except KnowledgeError as exc:
+        if str(exc) == "__absent__":
+            return _edit_unchanged(target, rel, org, category, topic or slug, body_lines,
+                                   current_sha)
+        return _edit_failure(root_path, category, topic or slug, op, rel, str(exc))
+
+    new_lines = content.strip("\n").splitlines() if content.strip("\n") else []
+    if op != "delete" and not new_lines:
+        return _edit_failure(root_path, category, topic or slug, op, rel, "content is empty")
+    if op == "append":
+        if body_lines[-len(new_lines):] == new_lines:
+            return _edit_unchanged(target, rel, org, category, topic, body_lines, current_sha)
+        updated = body_lines + new_lines
+    elif op == "insert":
+        if position not in ("before", "after"):
+            return _edit_failure(root_path, category, topic or slug, op, rel,
+                                 "position must be before or after")
+        at = start - 1 if position == "before" else end
+        if body_lines[at:at + len(new_lines)] == new_lines:
+            return _edit_unchanged(target, rel, org, category, topic, body_lines, current_sha)
+        updated = body_lines[:at] + new_lines + body_lines[at:]
+    elif op == "replace":
+        if body_lines[start - 1:end] == new_lines:
+            return _edit_unchanged(target, rel, org, category, topic, body_lines, current_sha)
+        updated = body_lines[:start - 1] + new_lines + body_lines[end:]
+    else:  # delete
+        updated = body_lines[:start - 1] + body_lines[end:]
+
+    expected = "\n".join(updated).strip("\n")
+    text = _set_front_matter(original, {
+        "updated_at": _now(), "revisions": _revisions(meta) + 1,
+    })
+    head, _old_body = _read_document_text(text)
+    prefix = head + "\n\n" if head else ""
+    if heading:
+        prefix += heading + "\n\n"
+    new_text = prefix + (expected + "\n" if expected else "")
+    warnings = _page_warnings(updated)
+    try:
+        _atomic_write(target, new_text)
+    except OSError as exc:
+        return _edit_failure(root_path, category, topic or slug, op, rel,
+                             f"write failed: {type(exc).__name__}: {exc}")
+
+    verify_meta, verify_body = _read_document(target)
+    _verify_heading, verify_content = _split_heading(verify_body)
+    verified = (verify_content.strip("\n") == expected
+                and _revisions(verify_meta) == _revisions(meta) + 1)
+    if not verified:
+        try:
+            _atomic_write(target, original)
+        except OSError:
+            pass
+        error = "the write did not match its intent; the previous bytes were restored"
+        _write_failure(root_path, {"category": category, "topic": topic or slug, "op": op,
+                                   "path": rel}, error)
+        return {"status": "unverified", "file": target.name, "path": rel, "org": org,
+                "category": category, "topic": topic or slug, "lines": len(updated),
+                "bytes": len(expected.encode("utf-8")), "sha256": current_sha,
+                "lines_before": len(body_lines), "lines_after": len(updated),
+                "verified": False, "restored": True, "warnings": warnings, "error": error}
+    final_text = target.read_text(encoding="utf-8-sig", errors="replace")
+    return {"status": "written", "file": target.name, "path": rel, "org": org,
+            "category": category, "topic": topic or slug, "lines": len(updated),
+            "bytes": len(expected.encode("utf-8")),
+            "sha256": hashlib.sha256(final_text.encode("utf-8")).hexdigest(),
+            "lines_before": len(body_lines), "lines_after": len(updated), "verified": True,
+            "restored": False, "warnings": warnings, "error": ""}
+
+
+def archive_page(root: Any, path: Any, *, reason: str = "") -> dict[str, Any]:
+    """Move one page under ``_archive/`` and mark it archived; never deletes the text."""
+    root_path = Path(root)
+    try:
+        target, rel, _org, _category, _slug = _page_target(root_path, path)
+    except KnowledgeError as exc:
+        return {"status": "failed", "path": str(path or ""), "error": str(exc)}
+    if not target.is_file():
+        return {"status": "missing", "path": rel, "error": "page does not exist"}
+    original = target.read_text(encoding="utf-8-sig", errors="replace")
+    try:
+        text = _set_front_matter(original, {"archived_at": _now(), "archive_reason": reason})
+    except KnowledgeError as exc:
+        return {"status": "failed", "path": rel, "error": str(exc)}
+    archived = root_path / ARCHIVE_DIRNAME / rel
+    try:
+        _atomic_write(archived, text)
+        target.unlink()
+    except OSError as exc:
+        return {"status": "failed", "path": rel, "error": f"{type(exc).__name__}: {exc}"}
+    return {"status": "archived", "path": rel,
+            "archived_path": archived.relative_to(root_path).as_posix()}
+
+
+def _read_document_text(text: str) -> tuple[str, str]:
+    """A full page text -> (front-matter block including fences, body)."""
+    lines = text.splitlines()
+    if not lines or lines[0].strip() != "---":
+        return "", text
+    end = next((index for index, line in enumerate(lines[1:], 1) if line.strip() == "---"), None)
+    if end is None:
+        return "", text
+    return "\n".join(lines[:end + 1]), "\n".join(lines[end + 1:]).lstrip("\n")
+
+
+def _edit_anchor(lines: Sequence[str], *, op: str, line: int, end_line: int,
+                 old: str) -> tuple[int, int]:
+    """Resolve one edit anchor to a 1-based inclusive body-line range; append needs none."""
+    if line and old:
+        raise KnowledgeError("give either line or old, not both")
+    if not old and not line:
+        if op == "append":
+            return 0, 0
+        raise KnowledgeError("line or old is required")
+    if old:
+        hits = [index + 1 for index, text in enumerate(lines) if text == old]
+        if len(hits) == 1:
+            return hits[0], hits[0]
+        if not hits and op == "delete":
+            raise KnowledgeError("__absent__")
+        raise KnowledgeError(
+            f"old matches {len(hits)} lines; it must match exactly one (candidates: "
+            f"{', '.join(str(hit) for hit in hits[:5]) or 'none'})")
+    if not line:
+        raise KnowledgeError("line or old is required")
+    start = int(line)
+    end = int(end_line or line)
+    if start < 1 or end < start or end > len(lines):
+        raise KnowledgeError(f"line range {start}..{end} is outside the body ({len(lines)} lines)")
+    return start, end
+
+
+def _edit_unchanged(target: Path, rel: str, org: str, category: str, topic: str,
+                    lines: Sequence[str], sha: str) -> dict[str, Any]:
+    return {"status": "unchanged", "file": target.name, "path": rel, "org": org,
+            "category": category, "topic": topic, "lines": len(lines),
+            "bytes": len("\n".join(lines).encode("utf-8")), "sha256": sha,
+            "verified": True, "restored": False, "warnings": [], "error": ""}
+
+
+def _create_page(root: Path, target: Path, rel: str, org: str, category: str, slug: str,
+                 header: Mapping[str, Any], content: str, *, language: str, budget: int,
+                 source_session: str) -> dict[str, Any]:
+    topic = " ".join(str(header.get("topic") or "").split())
+    if target.exists():
+        _meta, body = _read_document(target)
+        _heading, existing = _split_heading(body)
+        if existing.strip() == content.strip():
+            return _edit_unchanged(target, rel, org, category, topic or slug,
+                                   existing.splitlines(), hashlib.sha256(
+                                       target.read_bytes()).hexdigest())
+        return {"status": "exists", "file": target.name, "path": rel, "org": org,
+                "category": category, "topic": topic or slug, "lines": 0, "bytes": 0,
+                "sha256": "", "verified": False, "restored": False, "warnings": [],
+                "error": "page exists; use replace/append instead of create"}
+    if not topic or len(topic) < 2 or len(topic) > 80:
+        return _edit_failure(root, category, topic, "create", rel,
+                            "topic must be 2..80 characters")
+    if slugify(topic) != slug:
+        return _edit_failure(root, category, topic, "create", rel,
+                            "the file stem must equal slugify(topic)")
+    lines = content.strip("\n").splitlines() if content.strip("\n") else []
+    if len(lines) < PAGE_BODY_MIN_LINES or len(lines) > PAGE_BODY_MAX_LINES:
+        return _edit_failure(root, category, topic, "create", rel,
+                            f"body must be {PAGE_BODY_MIN_LINES}..{PAGE_BODY_MAX_LINES} lines")
+    if len(content.strip("\n")) > PAGE_BODY_MAX:
+        return _edit_failure(root, category, topic, "create", rel,
+                            f"body exceeds {PAGE_BODY_MAX} characters")
+    summary = " ".join(str(header.get("summary") or "").split())
+    if not summary or len(summary) > SUMMARY_MAX:
+        return _edit_failure(root, category, topic, "create", rel,
+                            f"summary is required and must be at most {SUMMARY_MAX} characters")
+    epistemic = str(header.get("epistemic") or "").strip().lower()
+    if category == "KNOWLEDGE" and epistemic not in EPISTEMIC:
+        return _edit_failure(root, category, topic, "create", rel,
+                            f"KNOWLEDGE requires epistemic in {', '.join(EPISTEMIC)}")
+    unit = {
+        "category": category, "org": org, "topic": topic, "summary": summary,
+        "epistemic": epistemic if category == "KNOWLEDGE" else "",
+        "time": str(header.get("time") or ""),
+        "objects": header.get("objects") or [],
+        "relations": header.get("relations") or [],
+        "content": "\n".join(lines), "source_session": source_session,
+    }
+    result = write_unit(unit, language=language, budget=budget, root=root)
+    status = str(result.get("status") or "failed")
+    written = Path(result.get("path") or target)
+    if status not in ("created", "updated", "unchanged"):
+        return _edit_failure(root, category, topic, "create", rel,
+                             str(result.get("error") or status))
+    text = written.read_text(encoding="utf-8-sig", errors="replace")
+    _meta, body = _read_document(written)
+    _heading, written_body = _split_heading(body)
+    return {"status": "created" if status != "unchanged" else "unchanged",
+            "file": written.name, "path": rel, "org": org, "category": category,
+            "topic": topic, "lines": len(written_body.splitlines()),
+            "bytes": len(written_body.encode("utf-8")),
+            "sha256": hashlib.sha256(text.encode("utf-8")).hexdigest(),
+            "lines_before": 0, "lines_after": len(written_body.splitlines()), "verified": True,
+            "restored": False, "warnings": _page_warnings(written_body.splitlines()),
+            "error": ""}
+
+
 # -- retrieval: paths only ---------------------------------------------------------------------
 
 
@@ -749,7 +1104,7 @@ def _body_start(path: Path) -> int:
 
 
 def _page_row(path: Path, relative: str, category: str) -> Optional[dict[str, Any]]:
-    """One search result from a page's front-matter; ``None`` when it is not an index page."""
+    """One search result from a page's front-matter, with the body a writer can edit."""
     meta = read_front_matter(path)
     if not meta:
         return None
@@ -759,10 +1114,26 @@ def _page_row(path: Path, relative: str, category: str) -> Optional[dict[str, An
     topic = str(meta.get("topic") or "").strip()
     if not topic:
         return None
-    return {"path": str(path), "relative": relative, "org": relative.split("/")[0],
+    try:
+        raw = path.read_text(encoding="utf-8-sig", errors="replace")
+    except OSError:
+        return None
+    _meta, body = _read_document(path)
+    _heading, content = _split_heading(body)
+    body_lines = content.splitlines()
+    truncated = len(content) > PAGE_BODY_MAX or len(body_lines) > 40
+    shown = body_lines[:40]
+    if len(content) > PAGE_BODY_MAX:
+        content = content[:PAGE_BODY_MAX].rstrip() + "…"
+    return {"file": path.name, "path": relative, "org": relative.split("/")[0],
             "category": page_category, "topic": topic,
             "summary": str(meta.get("summary") or ""), "revisions": _revisions(meta),
-            "updated_at": str(meta.get("updated_at") or ""), "matches": []}
+            "updated_at": str(meta.get("updated_at") or ""),
+            "sha256": hashlib.sha256(raw.encode("utf-8")).hexdigest(),
+            "match": None, "lines": [{"n": index + 1, "text": text}
+                                     for index, text in enumerate(shown)],
+            "content": content, "bytes": len(content.encode("utf-8")),
+            "truncated": truncated}
 
 
 def search_pages(pattern: str, knowledge_dir: Any, *, org: str = "", category: str = "",
@@ -821,9 +1192,10 @@ def search_pages(pattern: str, knowledge_dir: Any, *, org: str = "", category: s
             continue
         body_start = _body_start(path)
         quoted = [hit for hit in grouped[key] if int(hit["line"]) >= body_start]
-        row["matches"] = [{"line": int(hit["line"]),
-                           "text": str(hit["text"])[:MATCH_PREVIEW]}
-                          for hit in (quoted or grouped[key])[:per_page]]
+        first = (quoted or grouped[key])[0]
+        line_no = int(first["line"])
+        row["match"] = {"line": line_no - body_start - 1 if quoted else line_no,
+                        "text": str(first["text"])[:MATCH_PREVIEW]}
         pages.append(row)
     found.update(count=len(pages[:max(1, limit)]), total=len(pages),
                  results=pages[:max(1, limit)])
@@ -936,7 +1308,8 @@ class KnowledgePipeline:
 
     # -- producer --------------------------------------------------------------
 
-    def enqueue_from_refresh(self, session_id: str, value_markers: Iterable[Mapping[str, Any]]) -> int:
+    def enqueue_from_refresh(self, session_id: str, value_markers: Iterable[Mapping[str, Any]],
+                             *, from_ts: float, to_ts: float) -> int:
         """Queue the markers this refresh produced that are new or whose content changed.
 
         File existence plus the stored content fingerprint answer "already produced?"; there is no
@@ -949,6 +1322,8 @@ class KnowledgePipeline:
                 if self._stopped:
                     break
                 if not isinstance(unit, Mapping):
+                    continue
+                if not anchor_in_window(unit, from_ts, to_ts):
                     continue
                 try:
                     if not self._needs_write(unit):

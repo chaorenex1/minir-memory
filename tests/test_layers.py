@@ -14,10 +14,10 @@ def layers(plugin_package):
 
 
 def _unit(**over):
-    unit = {"id": "k1", "info_type": "experience", "topic": "pytest verification",
-            "why": "a later build needs the verify command", "relations": [],
-            "render_plan": "write the experiences page", "objects": [],
-            "anchor": {"from_ts": 1.0, "to_ts": 2.0, "message_ids": []}}
+    unit = {"id": "k1", "category": "METHOD", "org": "tools", "topic": "pytest verification",
+            "content": "run pytest -q\nread the exit code", "summary": "verify with pytest",
+            "relations": [], "objects": [], "anchor": {"from_ts": 1.0, "to_ts": 2.0,
+                                                      "message_ids": []}}
     unit.update(over)
     return unit
 
@@ -44,21 +44,16 @@ def test_an_identity_body_is_accepted_as_markdown(layers):
         layers.validate_ai_identity({"name": "minir"})
 
 
-def test_a_marker_needs_an_anchor(layers):
+def test_a_marker_with_an_extra_key_is_kept(layers):
+    """Markers are data: an unknown key is carried, never fatal to the window."""
+    unit = _unit(extra="kept")
+    assert layers.validate_value_markers({"value_markers": [unit]})[0]["extra"] == "kept"
+
+
+def test_a_marker_without_an_anchor_is_kept_but_not_enqueued(layers):
     unit = _unit()
     unit.pop("anchor")
-    with pytest.raises(layers.LayerContractError, match="missing key.*anchor"):
-        layers.validate_value_markers({"value_markers": [unit]})
-
-
-def test_an_over_long_why_is_clamped_not_rejected(layers):
-    """The cap bounds storage and prompt cost: the tail goes, the window stays."""
-    why = ("the quick brown fox jumps over the lazy dog " * 5).strip()
-    assert len(why) > layers.MAX_UNIT_WHY
-    units = layers.validate_value_markers({"value_markers": [_unit(why=why)]})
-    assert len(units[0]["why"]) <= layers.MAX_UNIT_WHY
-    assert units[0]["why"].startswith("the quick brown fox")
-    assert not units[0]["why"].endswith(" ")
+    assert layers.validate_value_markers({"value_markers": [unit]})[0]["topic"] == unit["topic"]
 
 
 def test_a_relation_may_point_at_an_existing_page(layers):
@@ -67,22 +62,27 @@ def test_a_relation_may_point_at_an_existing_page(layers):
         {"type": "updates", "ref": "knowledge/experiences/page.md"}]
 
 
-def test_an_unknown_relation_type_is_refused(layers):
-    with pytest.raises(layers.LayerContractError, match="must be one of"):
-        layers.validate_value_markers(
-            {"value_markers": [_unit(relations=[{"type": "invented", "ref": "k2"}])]})
-
-
-def test_objects_must_be_typed(layers):
-    with pytest.raises(layers.LayerContractError, match='"type:name"'):
-        layers.validate_value_markers({"value_markers": [_unit(objects=["Docker"])]})
-
-
-def test_units_merge_on_info_type_and_topic(layers):
-    previous = [_unit(why="old evidence")]
+def test_units_merge_on_path_then_on_the_triple(layers):
+    previous = [_unit(content="old evidence")]
     merged = layers.validate_value_markers(
-        {"value_markers": [_unit(why="new evidence")]}, previous=previous)
-    assert len(merged) == 1 and merged[0]["why"] == "new evidence"
+        {"value_markers": [_unit(content="new evidence")]}, previous=previous)
+    assert len(merged) == 1 and merged[0]["content"] == "new evidence"
+    by_path = layers.validate_value_markers(
+        {"value_markers": [_unit(path="tools/METHOD-pytest-verification.md",
+                                 content="path wins")]},
+        previous=[_unit(path="tools/METHOD-pytest-verification.md", content="old")])
+    assert len(by_path) == 1 and by_path[0]["content"] == "path wins"
+
+
+def test_the_renderer_reads_the_unified_fields(layers):
+    rendered = layers.render_markers([_unit()])
+    assert "- [METHOD/tools] pytest verification: verify with pytest" in rendered
+
+
+def test_a_heading_only_summary_is_rejected(layers):
+    with pytest.raises(layers.LayerContractError, match="non-heading"):
+        layers.validate_summary_pass({"window_summary": "## Window Summary\n\n### Objective"})
+    assert layers.validate_summary_pass({"window_summary": ""})["window_summary"] == ""
 
 
 def test_a_review_cannot_prune(layers):

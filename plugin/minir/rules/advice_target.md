@@ -12,7 +12,7 @@ sections: [contract, review_checks]
 WHAT
 A target names the element an advice would change. It is not a severity, a topic, or a restatement.
 One advice carries exactly one target token. A token outside the vocabulary degrades to `general`,
-except a token ending in `_check` that is not one of the five consistency targets: that is rejected
+except a token ending in `_check` that is not one of the seven consistency targets: that is rejected
 as `bad_target`, never degraded.
 
 ADVICE TARGETS
@@ -40,6 +40,14 @@ Consistency targets:
   card's `### Preferences` heading is a view, not the column: cite a line from the body. Falling
   back to the global `minir-memory/user/preference.md`. Kinds: `violated`, `temporary_override`,
   `stale_card`.
+- `user_identity_check`: the session against the full `user_self_representation` body (file first,
+  then the base row). Entry condition: the step changes the domain, the deliverable or a standing
+  assumption. Kinds: `wrong_domain`, `wrong_deliverable`, `wrong_assumption`. Evidence must carry
+  `claim_ref` naming the card line.
+- `knowledge_claim_check`: the session against a cited knowledge page or conclusion. Entry
+  condition: a page exists whose line contradicts, duplicates or supersedes the step. Kinds:
+  `contradicts`, `duplicates`, `supersedes`, `recall_miss`. Evidence carries `claim_ref`; a derived
+  claim can never be a blocker.
 - `ai_self_representation_check`: three live cards, one per kind. `false_claim` against
   `base.ai_self_representation`; `missing_work` against `base.window_summary` (objective plus
   current_state); `scope_change` against `base.ai_identity_card`. `stale_card` when the card is
@@ -56,15 +64,15 @@ COVERAGE
 - A malformed coverage map does not fail the review; delivery depends on advice, not coverage.
 
 PARALLEL RULES
-- The five consistency targets are parallel and delivered, not candidate-only. There is no `soul`
+- The seven consistency targets are parallel and delivered, not candidate-only. There is no `soul`
   parent: the three `soul_*` targets are separate targets, and disabling one does not disable the
-  others or the first two.
+  others or the first four.
 - One advice carries one target; there is no separate check field. The token itself is the unit
   that parse, delivery and statistics read.
 - One observation produces one advice. A conflict that spans targets is one advice per target; a
   single SOUL sentence that matches several `soul_*` targets takes
   `soul_tool_policy_check` > `soul_workflow_check` > `soul_craft_check` and is not counted twice.
-- All five are handled in the live turn. No target has a follow-up job, a terminal column, or a
+- All seven are handled in the live turn. No target has a follow-up job, a terminal column, or a
   second delivery path.
 
 CHOOSING
@@ -120,10 +128,12 @@ EVIDENCE AND BUDGET
 - `final_answer` is used for one bad sentence in an otherwise sendable answer.
 - `code_economy` does not name the duplicated capability or the crossed threshold.
 - One finding carries two targets, or two findings are merged under an unrelated one.
-- A `_check` token outside the five consistency targets is accepted or degraded to `general`.
+- A `_check` token outside the seven consistency targets is accepted or degraded to `general`.
 - A soul finding uses a `soul` parent, two soul targets, or a section outside its mapping.
 - The same SOUL sentence is counted under two `soul_*` targets.
 - `user_preferences_check` cites the digest instead of the card line.
+- `user_identity_check` or `knowledge_claim_check` is emitted without a `claim_ref`, or a
+  knowledge claim is delivered as a blocker.
 - A consistency advice is missing the turn uid, the quoted reference, the observation, or the kind.
 - A knowledge path is guessed, outside the root, missing, over three, or never read.
 - Taste alone is the ground for the advice.

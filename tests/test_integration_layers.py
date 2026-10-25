@@ -26,11 +26,12 @@ def test_a_base_publish_hands_its_units_to_the_knowledge_pipeline(plugin_package
     captured: list[tuple[str, list[dict]]] = []
 
     marker = {
-        "id": "u1", "info_type": "tool behaviour", "topic": "Docker restart policy",
-        "why": "a later deploy needs the restart policy",
-        "relations": [], "render_plan": "write the tools page for Docker restart",
-        "anchor": {"from_ts": 0.0, "to_ts": 20.0, "message_ids": []},
-        "objects": ["tools:docker"]}
+        "id": "u1", "category": "KNOWLEDGE", "org": "tools",
+        "topic": "Docker restart policy",
+        "content": "restart policy unless-stopped\nsurvives a daemon restart\nverified on the host",
+        "summary": "Docker restart policy for deploys", "epistemic": "fact",
+        "relations": [], "objects": ["tools:docker"],
+        "anchor": {"from_ts": 0.0, "to_ts": 20.0, "message_ids": []}}
 
     def complete(task, system, prompt, **kwargs):
         if "dialectic reviewer" in system:
@@ -39,7 +40,8 @@ def test_a_base_publish_hands_its_units_to_the_knowledge_pipeline(plugin_package
             return json.dumps({
                 "user_self_representation": "# Who this person is\n\nAn Engineer.\n",
                 "user_preferences": "# How they want answers\n\n- Terse first.\n",
-                "window_summary": plugin_package.window_summary.empty_summary(),
+                "window_summary": "## Window Summary\n\n### Objective\n- restart docker\n\n"
+                                  "### Current State\n#### Done\n- read the restart policy",
                 "value_markers": [marker]})
         return json.dumps({"ai_self_representation": "# What this task is\n\nidle.\n",
                            "ai_identity": "# Who the assistant is\n\nminir 0.8.0.\n"})
@@ -48,7 +50,8 @@ def test_a_base_publish_hands_its_units_to_the_knowledge_pipeline(plugin_package
     store.record_job("base", "s1", 0.0, 20.0)
     instance = plugin_package.worker.LayerWorker(
         store, transcript, complete=complete,
-        on_value_markers=lambda session, value_markers: captured.append((session, value_markers)))
+        on_value_markers=lambda session, value_markers, **kwargs: captured.append(
+            (session, value_markers)))
     assert instance.run_once() == 1
     assert captured and captured[0][0] == "s1"
     assert captured[0][1][0]["topic"] == "Docker restart policy"

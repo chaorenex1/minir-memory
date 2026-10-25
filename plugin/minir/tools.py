@@ -38,7 +38,7 @@ from tools.registry import tool_error
 from .store import CONCLUSION_KINDS
 from .knowledge import DEFAULT_SEARCH_LIMIT
 from .layers import CATEGORIES, ORGS
-from . import agent_history, content_valid
+from . import agent_history, content_valid, kb_write
 
 logger = logging.getLogger(__name__)
 
@@ -50,12 +50,14 @@ SKILL_TOOLSET= "skills"
 FILE_TOOLSET = "file"
 TOOL_NAMES: tuple[str, ...] = (
     "minir_search", "minir_kb_search", "minir_remember", "minir_forget", "minir_todo",
-    "minir_stats", "minir_agents", content_valid.TOOL_NAME, "minir_aiagent_search")
+    "minir_stats", "minir_agents", content_valid.TOOL_NAME,
+    "minir_link", "minir_unmerge", kb_write.TOOL_NAME, "minir_aiagent_search")
 
 _EMOJI: dict[str, str] = {
     "minir_search": "🔎", "minir_kb_search": "📚", "minir_remember": "📌", "minir_forget": "🗑️",
     "minir_todo": "✅", "minir_stats": "📊", "minir_agents": "🧩",
-    content_valid.TOOL_NAME: "📏",
+    content_valid.TOOL_NAME: "📏", "minir_link": "🔗", "minir_unmerge": "↩️",
+    kb_write.TOOL_NAME: "📝",
 }
 
 
@@ -88,7 +90,13 @@ _TOOL_SEARCH = _tool_schema(
                    "is the only kind requested, which raises session_scope_required.",
                    "string", enum=list(CONCLUSION_KINDS)),
      "session_id": _prop("Optional session to search instead of the current one "
-                         "(ignored when scope='all').")},
+                         "(ignored when scope='all')."),
+     "as_of": _prop("Optional epoch timestamp: rank the version rows in force at that time "
+                    "instead of the live table.", "number"),
+     "expand": _prop("Optional 1 or 2: add 1-2 hop neighbours of the top hits via edges.",
+                     "integer"),
+     "include_superseded": _prop("Include superseded/merged live rows; default false.",
+                                 "boolean")},
     ("query",))
 _TOOL_KB_SEARCH = _tool_schema(
     "minir_kb_search",
@@ -107,21 +115,33 @@ _TOOL_KB_SEARCH = _tool_schema(
     ("query",))
 _TOOL_REMEMBER = _tool_schema(
     "minir_remember",
-    "Record a new conclusion: one kind plus the statement itself, bound to this session and "
-    "truncated at 12000 characters. The row is searchable by minir_search and deletable by "
-    "minir_forget with its conclusions_id. type='todo' stores a standalone row; the session's "
-    "todo list is minir_todo's job.",
-    {"type": _prop("Conclusion kind.", "string", enum=list(CONCLUSION_KINDS)),
-     "content": _prop("The value-output marker to remember.")},
+    "Record one durable item. remember_mode='conclusion' (default) writes a conclusions row "
+    "and its history; 'knowledge' only queues a page unit for the B4 writer (kind is the org, "
+    "category is required); 'card' overlays one global card part through card_review.write_cards "
+    "(kind is one of the four part names, and reason is required). The row is searchable by "
+    "minir_search and deletable by minir_forget.",
+    {"type": _prop("Conclusion kind, org, or card part name, depending on remember_mode."),
+     "content": _prop("The value-output marker to remember."),
+     "remember_mode": _prop("Where it goes.", "string",
+                            enum=["conclusion", "knowledge", "card"]),
+     "category": _prop("knowledge mode only: KNOWLEDGE | VALUE | INTENT | METHOD | GOVERNANCE.",
+                       "string", enum=list(CATEGORIES)),
+     "epistemic": _prop("knowledge mode on KNOWLEDGE only: fact | inference | hypothesis | "
+                        "prediction."),
+     "reason": _prop("card mode only: why this operator write is happening.")},
     ("type", "content"))
 _TOOL_FORGET = _tool_schema(
     "minir_forget",
-    "Delete one stored conclusion by its conclusions_id and kind. Use only an id returned by "
-    "minir_remember or minir_search; the kind must match the stored row or nothing is deleted.",
-    {"type": _prop("Conclusion kind the row was stored with.", "string",
-                   enum=list(CONCLUSION_KINDS)),
-     "conclusions_id": _prop("Id of the conclusion to delete.", "integer")},
-    ("type", "conclusions_id"))
+    "Delete one stored conclusion by conclusions_id and kind (default), archive one knowledge "
+    "page by path (remember_mode='knowledge'), or clear one global card part by kind and reason "
+    "(remember_mode='card'). A wrong kind deletes nothing.",
+    {"type": _prop("Conclusion kind, or card part name in card mode."),
+     "conclusions_id": _prop("Id of the conclusion to delete (conclusion mode).", "integer"),
+     "remember_mode": _prop("Where to forget.", "string",
+                            enum=["conclusion", "knowledge", "card"]),
+     "path": _prop("knowledge mode: relative page path, e.g. tools/METHOD-x.md."),
+     "reason": _prop("card mode only: evidence for the change.")},
+    ("type",))
 _TOOL_TODO = _tool_schema(
     "minir_todo",
     "Replace this session's todo list. At most two levels: a top-level item, and a child item "
@@ -194,9 +214,29 @@ _TOOL_CONTENT_VALID = _tool_schema(
                    "string", enum=list(content_valid.MODES))},
     ("content", "limit"))
 
+_TOOL_LINK = _tool_schema(
+    "minir_link",
+    "Write one directed edge between two existing conclusions. Endpoints are 'kind:key' "
+    "(e.g. 'projects:cert-lifecycle'). A missing endpoint is refused: never invent a target. "
+    "Relations follow the marker rule vocabulary (part_of, derived_from, same_as, ...).",
+    {"src": _prop("Source endpoint, 'kind:key'."),
+     "rel": _prop("Relation type, e.g. part_of."),
+     "dst": _prop("Target endpoint, 'kind:key'."),
+     "weight": _prop("Optional edge weight, default 1.0.", "number")},
+    ("src", "rel", "dst"))
+
+_TOOL_UNMERGE = _tool_schema(
+    "minir_unmerge",
+    "Undo one same_as merge: restore the source row's previous status, close its version "
+    "interval, and delete the alias edge. A reason is required; an idempotent call on a row "
+    "that is not merged returns {unmerged: false}.",
+    {"kind": _prop("Conclusion kind."), "key": _prop("Conclusion key."),
+     "reason": _prop("Why the merge is being undone.")},
+    ("kind", "key", "reason"))
+
 SCHEMAS: tuple[dict[str, Any], ...] = (
     _TOOL_SEARCH, _TOOL_KB_SEARCH, _TOOL_REMEMBER, _TOOL_FORGET, _TOOL_TODO, _TOOL_STATS,
-    _TOOL_AGENTS, _TOOL_CONTENT_VALID)
+    _TOOL_AGENTS, _TOOL_CONTENT_VALID, _TOOL_LINK, _TOOL_UNMERGE, kb_write.SCHEMA)
 
 
 def agent_toolsets(base: Any = None) -> list[str]:

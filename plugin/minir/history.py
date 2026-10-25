@@ -278,8 +278,19 @@ def identity_paths(hermes_home: Any, profile: str) -> tuple[Path, Path]:
     return base / "identity.md", base / "preference.md"
 
 
+def _card_body(text: str) -> str:
+    """A card file's markdown body: front matter is metadata, never prompt text."""
+    lines = text.splitlines()
+    if lines and lines[0].strip() == "---":
+        end = next((index for index, line in enumerate(lines[1:], 1)
+                    if line.strip() == "---"), None)
+        if end is not None:
+            return "\n".join(lines[end + 1:]).strip()
+    return text.strip()
+
+
 def load_identity(hermes_home: Any, profile: str) -> tuple[str, str]:
-    """Read the operator-authored identity/preference files; ``("", "")`` when absent."""
+    """Read the review-sourced identity/preference files as bodies; ``("", "")`` when absent."""
     if not str(hermes_home or "").strip():
         return "", ""
     identity_path, preference_path = identity_paths(hermes_home, profile)
@@ -289,5 +300,5 @@ def load_identity(hermes_home: Any, profile: str) -> tuple[str, str]:
             text = path.read_text(encoding="utf-8-sig").strip()
         except (OSError, UnicodeError):
             text = ""
-        texts.append(text[:_MAX_IDENTITY_CHARS])
+        texts.append(_card_body(text)[:_MAX_IDENTITY_CHARS])
     return texts[0], texts[1]

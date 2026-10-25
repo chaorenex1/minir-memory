@@ -7,6 +7,7 @@ import sqlite3
 import sys
 import time
 import types
+from pathlib import Path
 
 import pytest
 
@@ -55,10 +56,10 @@ def _summary_json():
 
 def _base_pass_json(*, summary: str | None = None, markers=None) -> str:
     """B1's orchestration reply: the user card plus both child artifacts."""
-    marker = {"id": "k1", "info_type": "experience", "topic": "pytest verification",
-              "why": "a later build needs the verify command", "relations": [],
-              "render_plan": "write the experiences page",
-              "anchor": {"from_ts": 0.0, "to_ts": 1.0, "message_ids": []}, "objects": []}
+    marker = {"id": "k1", "category": "METHOD", "org": "tools", "topic": "pytest verification",
+              "content": "run the project's verify command\nread its exit code",
+              "summary": "verify with pytest", "relations": [], "objects": [],
+              "anchor": {"from_ts": 0.0, "to_ts": 1e12, "message_ids": []}}
     return json.dumps({**json.loads(_base_user_json()),
                        "window_summary": _summary_section() if summary is None else summary,
                        "value_markers": [marker] if markers is None else markers})
@@ -124,8 +125,8 @@ def test_no_conversation_content_is_persisted_anywhere(plugin_package, make_prov
             "SELECT name FROM sqlite_master WHERE type = 'table'")]
         assert "turns" not in tables
         for table in tables:
-            if table.startswith("sqlite_"):
-                continue
+            if table.startswith("sqlite_") or table.startswith("conclusions_vec"):
+                continue  # vec0 shadow tables need the extension loaded to read
             rows = connection.execute(f"SELECT * FROM {table}").fetchall()
             assert "Frankfurt" not in str(rows), f"{table} must hold no conversation content"
     finally:
@@ -230,6 +231,16 @@ def test_prefetch_on_empty_store_is_blank(provider):
     assert provider.recall_status() is None
 
 
+def test_a_failed_base_window_leaves_a_stale_signal(provider):
+    provider._store.record_layer_failure(
+        "base", provider._worker.user_subject(), window_key="s:0",
+        session_id=provider._session_id, window_from_ts=0, window_to_ts=1,
+        error="LayerMergeError: boom")
+    block = provider.prefetch("x")
+    assert block.startswith("## Minir memory gaps")
+    assert "boom" in block and "not evidence" in block
+
+
 def _save_base_row(provider, *, session: str = "", ai_self: str = "", summary: str = "",
                    to_ts: float = 1.0) -> None:
     """One live ``base_refreshes`` row; the columns are JSON strings, as the worker writes them."""
@@ -303,7 +314,7 @@ def test_tools_roundtrip(provider):
                          "conclusions_id": str(conclusions_id)}))["deleted"] is False
     stats = json.loads(provider.handle_tool_call("minir_stats", {}))
     assert "notes" not in stats and "markers" not in stats and "db_path" in stats
-    assert len(stats["targets"]) == 5, "one row per consistency target"
+    assert len(stats["targets"]) == 7, "one row per consistency target"
     assert stats["conclusions_by_kind"] == {}, "every row of this session is gone"
 
 
@@ -353,8 +364,8 @@ def test_kb_search_answers_from_the_knowledge_directory(provider, plugin_package
     row = payload["results"][0]
     assert (row["org"], row["category"], row["topic"]) == ("tools", "METHOD", "Docker prune")
     assert row["path"].endswith("METHOD-Docker-prune.md")
-    assert not row["matches"][0]["text"].startswith("topic:"), "body lines are quoted first"
-    assert any("system prune" in hit["text"] for hit in row["matches"])
+    assert not row["match"]["text"].startswith("topic:"), "body lines are quoted first"
+    assert any("system prune" in hit["text"] for hit in row["lines"])
 
 
 def test_kb_search_rejects_bad_arguments_and_never_leaves_the_root(provider, plugin_package,
@@ -1077,6 +1088,19 @@ def test_system_prompt_block_includes_the_global_user_preference(
     assert block.index("# Minir Memory") < block.index("# User Preferences")
 
 
+def test_system_prompt_injects_the_user_identity_card(plugin_package, make_provider, tmp_path):
+    provider = make_provider()
+    identity = tmp_path / "minir-memory" / "user" / "identity.md"
+    identity.parent.mkdir(parents=True, exist_ok=True)
+    identity.write_text("---\nschema: minir-card/1\n---\n\n- 维护 minir-memory\n",
+                        encoding="utf-8")
+    block = provider.system_prompt_block()
+    assert "# User Identity" in block and "维护 minir-memory" in block
+    assert block.index("# Minir Memory") < block.index("# User Identity")
+    identity.write_text("---\nschema: minir-card/1\n---\n", encoding="utf-8")
+    assert "# User Identity" not in provider.system_prompt_block()
+
+
 def test_an_oversized_user_preference_is_capped(plugin_package, make_provider, tmp_path):
     provider = make_provider()
     card = tmp_path / "minir-memory" / "user" / "preference.md"
@@ -1198,3 +1222,41 @@ def test_todo_renders_in_prefetch_and_in_the_answer(plugin_package, provider):
     assert "| 1.1 | 先跑 unit | pending | t1 |" in answer
     assert "| 2 | 写迁移说明 | completed |  |" in answer
     assert answer.rstrip().endswith("Todo: 1/3 done, 1 in progress, 1 pending.")
+
+def test_remember_knowledge_queues_a_page_and_writes_no_conclusion(provider, plugin_package):
+    before = provider._store.conclusions_by_kind(provider._session_id).get("tools", 0)
+    payload = json.loads(provider.handle_tool_call("minir_remember", {
+        "type": "tools", "content": "line one\nline two\nline three",
+        "remember_mode": "knowledge", "category": "METHOD", "topic": "queue probe"}))
+    assert payload["queued"] is True and payload["remember_mode"] == "knowledge"
+    provider._knowledge.stop()
+    root = plugin_package.knowledge.knowledge_dir(provider._hermes_home)
+    assert (root / "tools" / "METHOD-queue-probe.md").is_file()
+    assert provider._store.conclusions_by_kind(provider._session_id).get("tools", 0) == before
+
+
+def test_remember_card_overlays_one_part_and_requires_a_reason(provider):
+    payload = json.loads(provider.handle_tool_call("minir_remember", {
+        "type": "user_preferences", "content": "## Preferences\n\n- be terse",
+        "remember_mode": "card", "reason": "the operator asked for it"}))
+    assert payload["stored"] is True and payload["revisions"]
+    path = Path(provider._hermes_home) / "minir-memory" / "user" / "preference.md"
+    assert "be terse" in path.read_text(encoding="utf-8")
+    missing = json.loads(provider.handle_tool_call("minir_remember", {
+        "type": "user_preferences", "content": "x", "remember_mode": "card"}))
+    assert "reason" in missing.get("error", "")
+
+
+def test_link_and_unmerge_tools_guard_their_endpoints(provider):
+    provider._store.save_conclusion("projects", "project row", key="p1")
+    provider._store.save_conclusion("experiences", "lesson row", key="e1")
+    bad = json.loads(provider.handle_tool_call("minir_link", {
+        "src": "projects:p1", "rel": "part_of", "dst": "tools:missing"}))
+    assert bad["linked"] is False
+    good = json.loads(provider.handle_tool_call("minir_link", {
+        "src": "experiences:e1", "rel": "part_of", "dst": "projects:p1"}))
+    assert good["linked"] is True
+    assert provider._store.merge_into(("experiences", "e1"), ("projects", "p1"))
+    undone = json.loads(provider.handle_tool_call("minir_unmerge", {
+        "kind": "experiences", "key": "e1", "reason": "it was a test"}))
+    assert undone["unmerged"] is True

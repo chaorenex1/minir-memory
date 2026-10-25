@@ -51,8 +51,8 @@ _CARD_TRANSCRIPT_CHARS = 4_000
 
 # Every card file is front-matter plus one markdown body. Nothing here is field-structured: the
 # model writes the body, the code frames it, and an empty body is a valid empty card.
-USER_SELF = "user_identity"
-USER_PREFERENCE = "user_preference"
+USER_SELF = "user_self_representation"
+USER_PREFERENCE = "user_preferences"
 AI_IDENTITY = "ai_identity"
 AI_PREFERENCE = "ai_preference"
 PARTS: tuple[str, ...] = (USER_SELF, USER_PREFERENCE, AI_IDENTITY, AI_PREFERENCE)
@@ -72,20 +72,20 @@ PART_CARD: dict[str, str] = {
 # One agent per file: each pass writes exactly one global card body, reads its own rule file, and
 # returns one key. Code joins the four passes before the all-or-nothing write.
 CARD_SCOPE_PARTS: dict[str, tuple[str, ...]] = {
-    "user_identity": (USER_SELF,),
-    "user_preference": (USER_PREFERENCE,),
+    "user_self_representation": (USER_SELF,),
+    "user_preferences": (USER_PREFERENCE,),
     "ai_identity": (AI_IDENTITY,),
     "ai_preference": (AI_PREFERENCE,),
 }
 CARD_SCOPE_RULES: dict[str, tuple[str, ...]] = {
-    "user_identity": ("user-self",),
-    "user_preference": ("user-preferences",),
+    "user_self_representation": ("user-self",),
+    "user_preferences": ("user-preferences",),
     "ai_identity": ("ai-identity",),
-    "ai_preference": ("ai-identity",),
+    "ai_preference": ("ai-preferences",),
 }
 CARD_SCOPE_CORE: dict[str, str] = {
-    "user_identity": "card_review_user",
-    "user_preference": "card_review_user",
+    "user_self_representation": "card_review_user",
+    "user_preferences": "card_review_user",
     "ai_identity": "card_review_ai",
     "ai_preference": "card_review_ai",
 }
@@ -232,21 +232,31 @@ def _atomic_write(path: Path, text: str) -> None:
 
 
 def write_cards(store: Any, hermes_home: str, profile: str, cards: dict[str, str],
-                *, reviewer: str = "model", budget: int = 2000) -> list[int]:
-    """Validate then publish all four files; any failure writes none of them.
+                *, reviewer: str = "model", budget: int = 2000,
+                source: str = "review", parts: Optional[tuple[str, ...]] = None,
+                reason: str = "") -> list[int]:
+    """Validate then publish the requested card files; any failure writes none of them.
 
-    The files are canonical; each write leaves a card_revisions row (before/after hash and the
-    changed body) as the change history.
+    A single-part write overlays the new body on the current file and preserves the other
+    three. The files are canonical; each write leaves a card_revisions row (before/after hash
+    and the changed body) as the change history.
     """
-    cleaned = validate_cards(cards, budget=budget)
+    requested = tuple(parts or PARTS)
+    unknown = [part for part in requested if part not in PARTS]
+    if unknown:
+        raise CardReviewError(f"unknown card part(s): {', '.join(unknown)}")
     paths = card_paths(hermes_home, profile)
+    merged = {part: read_card(paths[part])[1] for part in PARTS}
+    merged.update({part: cards[part] for part in requested if part in cards})
+    cleaned = validate_cards(merged, budget=budget)
     rendered = {part: render_card(part, cleaned[part], {
-        "source": "review", "reviewer": reviewer}) for part in PARTS}
+        "source": source, "reviewer": reviewer,
+        "evidence": [reason] if reason else []}) for part in PARTS}
     for part in PARTS:  # render-time budget is re-checked: the caller may pass a tiny budget
         if _tokens(rendered[part]) > budget:
             raise CardReviewError(f"{part} exceeds the configured card budget")
     revisions: list[int] = []
-    for part in PARTS:
+    for part in requested:
         path = paths[part]
         old_text = ""
         if path.exists():
@@ -273,8 +283,8 @@ def write_cards(store: Any, hermes_home: str, profile: str, cards: dict[str, str
         revisions.append(store.add_card_revision(
             PART_SCOPE[part], PART_NAME[part], str(path),
             before_hash=before_hash, after_hash=_sha(rendered[part]),
-            changed_fields=changed, source="review",
-            reviewer=reviewer))
+            changed_fields=changed, source=source,
+            evidence=[reason] if reason else [], reviewer=reviewer))
     return revisions
 
 
@@ -290,7 +300,7 @@ def _changed_body(old_text: str, new_text: str) -> list[str]:
 
 OUTPUT_USER_IDENTITY = """OUTPUT
 Return exactly one JSON object:
-{"user_identity": "<markdown body>"}
+{"user_self_representation": "<markdown body>"}
 The value is the final global identity card body: complete markdown, not an object, not a patch.
 An empty string is a valid empty card. No audit arrays, no front-matter, no code fence, no extra
 key. Code records the change history itself.
@@ -298,7 +308,7 @@ key. Code records the change history itself.
 
 OUTPUT_USER_PREFERENCE = """OUTPUT
 Return exactly one JSON object:
-{"user_preference": "<markdown body>"}
+{"user_preferences": "<markdown body>"}
 The value is the final global preference card body: complete markdown, not an object, not a patch.
 An empty string is a valid empty card. No audit arrays, no front-matter, no code fence, no extra
 key. Code records the change history itself.
@@ -321,8 +331,8 @@ key. Code records the change history itself.
 """
 
 CARD_SCOPE_OUTPUT: dict[str, str] = {
-    "user_identity": OUTPUT_USER_IDENTITY,
-    "user_preference": OUTPUT_USER_PREFERENCE,
+    "user_self_representation": OUTPUT_USER_IDENTITY,
+    "user_preferences": OUTPUT_USER_PREFERENCE,
     "ai_identity": OUTPUT_AI_IDENTITY,
     "ai_preference": OUTPUT_AI_PREFERENCE,
 }
@@ -416,6 +426,16 @@ def build_prompt(store: Any, hermes_home: str, profile: str, since: float, *, sc
         parts.append("Explicit markers:\n" + json.dumps(
             [{"type": row.get("kind"), "content": row.get("content")} for row in markers],
             ensure_ascii=False))
+    if hasattr(store, "claim_stats"):
+        try:
+            stats = store.claim_stats("", window=30 * 86_400, limit=5)
+        except Exception:
+            stats = []
+        if stats:
+            parts.append(
+                "Claim usage in the last 30 days (cited / blocked / repeated; a high cited+blocked "
+                "claim is load-bearing, a high repeated claim needs rewriting, not repeating):\n"
+                + json.dumps(stats, ensure_ascii=False))
     edited = _hand_edited(store, paths, parts_for_scope)
     if edited:
         parts.append("Hand-edited since the last review (operator text; keep unless the evidence "
@@ -499,12 +519,14 @@ class CardReviewScheduler:
 
     def __init__(self, store: Any, run: Callable[[float], list[int]], *,
                  subject: str, period: float = PERIOD_SECONDS,
-                 retries: tuple[int, ...] = RETRY_SECONDS):
+                 retries: tuple[int, ...] = RETRY_SECONDS,
+                 files_present: Optional[Callable[[], bool]] = None):
         self._store = store
         self._run = run
         self._subject = subject
         self._period = max(1.0, float(period))
         self._retries = retries
+        self._files_present = files_present
 
     def _state(self) -> dict[str, Any]:
         row = self._store.layer_state("card_review", self._subject)
@@ -518,21 +540,28 @@ class CardReviewScheduler:
                                     json.dumps(state, ensure_ascii=False))
 
     def ensure_anchor(self, now: Optional[float] = None) -> float:
-        """First call (install) starts the period; it never reviews an empty history."""
+        """Start the clock without claiming a review ran; a missing card still runs immediately."""
         now = time.time() if now is None else float(now)
         state = self._state()
-        if "last_success_at" not in state:
-            state = {"last_success_at": now, "attempts": 0, "next_attempt_at": now + self._period}
+        if "started_at" not in state and "last_success_at" not in state:
+            state = {"started_at": now, "attempts": 0, "next_attempt_at": now + self._period}
             self._save(state)
-        return float(state["last_success_at"])
+        return float(state.get("started_at") or state.get("last_success_at") or now)
 
     def due(self, now: Optional[float] = None) -> bool:
         now = time.time() if now is None else float(now)
+        if self._files_present is not None:
+            try:
+                if not self._files_present():
+                    return True
+            except Exception as exc:
+                logger.debug("Minir card presence check failed: %s", exc)
         state = self._state()
-        if "last_success_at" not in state:
-            return False
+        anchor = state.get("last_success_at") or state.get("started_at")
+        if anchor is None:
+            return True
         return now + 1e-6 >= float(state.get("next_attempt_at") or
-                            float(state["last_success_at"]) + self._period)
+                            float(anchor) + self._period)
 
     def tick(self, now: Optional[float] = None) -> bool:
         """Run one due review synchronously; returns True when it succeeded."""
@@ -540,7 +569,7 @@ class CardReviewScheduler:
         if not self.due(now):
             return False
         state = self._state()
-        since = float(state["last_success_at"])
+        since = float(state.get("last_success_at") or state.get("started_at") or now - self._period)
         try:
             self._run(since)
         except Exception as exc:

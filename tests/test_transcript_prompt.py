@@ -109,7 +109,8 @@ def test_the_prompt_assets_declare_the_blocks_the_builders_emit(plugin_package):
     for name, block in expected.items():
         text = (base / name).read_text(encoding="utf-8")
         assert block in text, name
-        assert "coverage" in text, name
+        if name != "b4_value_markers.md":
+            assert "coverage" in text, name
     assert "<session_transcript>" in (base / "knowledge_render.md").read_text(encoding="utf-8")
     reviewer = plugin_package.adviser_mode.review_prompt()
     assert "minir_hermes_session_search" in reviewer

@@ -39,3 +39,6 @@ provides_tools:
   - minir_stats
   - minir_agents
   - minir_content_valid
+  - minir_kb_write
+  - minir_link
+  - minir_unmerge
