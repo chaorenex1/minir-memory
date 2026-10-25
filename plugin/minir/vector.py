@@ -26,8 +26,8 @@ DEFAULTS = {
     "provider": "siliconflow",
     "model": "BAAI/bge-m3",
     "dim": 1024,
-    "base_url": "https://api.siliconflow.com/v1",
-    "api_key": "",
+    "base_url": "https://api.siliconflow.cn/v1",
+    "key_env": "SILICONFLOW_API_KEY",
 }
 
 
@@ -73,8 +73,9 @@ class VectorIndex:
         return bool(self._loaded)
 
     def _key(self) -> str:
-        return str(self.settings.get("api_key") or os.environ.get(
-            "SILICONFLOW_API_KEY", "") or "")
+        """The embedding key, read from the environment variable ``key_env`` names."""
+        name = str(self.settings.get("key_env") or "").strip()
+        return str(os.environ.get(name, "") or "") if name else ""
 
     def _meta(self, key: str, conn: Any = None) -> Optional[str]:
         conn = conn if conn is not None else self._conn()

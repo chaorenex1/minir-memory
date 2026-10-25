@@ -265,18 +265,19 @@ CREATE VIRTUAL TABLE IF NOT EXISTS conclusions_vec USING vec0(
 | `memory.minir.vector.provider` | `siliconflow` | |
 | `memory.minir.vector.model` | `BAAI/bge-m3` | 硅基流动支持该模型，最大输入 8192 token（官方文档） |
 | `memory.minir.vector.dim` | `1024` | bge-m3 原生维度；硅基流动的 `dimensions` 参数只对 Qwen3 系列生效，bge-m3 不接受该参数，配错维度会让 `vec0` 插入失败 |
-| `memory.minir.vector.base_url` | `https://api.siliconflow.com/v1` | 可整体替换成任何 OpenAI 兼容端点 |
-| `memory.minir.vector.api_key` | 空 | 空时回落到环境变量 `SILICONFLOW_API_KEY` |
+| `memory.minir.vector.base_url` | `https://api.siliconflow.cn/v1` | 可整体替换成任何 OpenAI 兼容端点；默认与该 key 所属的站点一致（`.cn`） |
+| `memory.minir.vector.key_env` | `SILICONFLOW_API_KEY` | 只存环境变量名，密钥本身不进 `config.yaml` |
 
 命名空间以现有读取路径为准：`__init__.py:182-185` 读的是 `load_config()["memory"]["minir"]`，
 所以向量配置挂在 `memory.minir.vector.*` 下，插件不用新开一条配置读取路径。草案上一版写的 `memory.vector.*` 是错的，已统一。
 
-`api_key` 可配置的代价要说明白：写在 `config.yaml` 里就是明文留在 `HERMES_HOME`，优先级高于环境变量。
-默认建议留空走 `SILICONFLOW_API_KEY`（或 gopass），配置项存在的意义是换端点时能一起换 key。
+`key_env` 只保存变量名，密钥本体留在 `HERMES_HOME/.env`（或 gopass 注入的环境变量）里，
+`config.yaml` 不再出现明文 key，密钥轮换也不必改配置文件。默认名 `SILICONFLOW_API_KEY`；
+要和别的端点共用一套命名时改这里即可（例如 `HERMES_CUSTOM_API_SILICONFLOW_CN_API_KEY`）。
 
-端点默认 `https://api.siliconflow.com/v1/embeddings`（Bearer 认证，官方文档示例）；`base_url` 可整体替换，
+端点默认 `https://api.siliconflow.cn/v1/embeddings`（Bearer 认证，官方文档示例）；`base_url` 可整体替换，
 拼接规则是 `base_url + "/embeddings"`，所以换成本地 vLLM / LM Studio 时只改配置、不改代码。
-key 解析顺序：`memory.minir.vector.api_key` → `SILICONFLOW_API_KEY` → 无 key（走降级）。
+key 解析：`os.environ[memory.minir.vector.key_env]`；变量名为空或未设值时按无 key 处理（走 bm25 降级）。
 
 默认开启必须一起接受的三个后果：
 
@@ -776,11 +777,11 @@ DuckPGQ 的其余实测（本机、duckdb 2.0.0、20k 边 / 5k 点）：冷 `INS
 | 11 | collapsed 行返回合并正文 | 可接受 | §4.9 |
 | 12 | 维护节奏 | 固定数值，不做自适应 | §4.9 |
 | 13 | 实体合并是否自动 | 分带：≥0.92 自动（重定向、可逆），0.85–0.92 人工，<0.85 忽略 | §4.7 |
-| 14 | embedding 密钥键名 | 环境变量 `SILICONFLOW_API_KEY`（全大写） | §4.6 |
+| 14 | embedding 密钥键名 | 由 `memory.minir.vector.key_env` 指定，默认 `SILICONFLOW_API_KEY` | §4.6 |
 | 15 | 换向量维度 | 注册后台调度任务，按游标重嵌，中断续跑 | §4.12 |
 | 16 | 调度器要记录表 | 新增 `scheduler_runs`，注入点 `Scheduler(record=...)` | §4.11 |
 | 17 | 归档挂载上限 | 1 档；更早的按需手工 ATTACH | §4.9 |
-| 18 | base_url / api_key | 都在 `memory.minir.vector.*` 下可替换；key 空时回落 `SILICONFLOW_API_KEY` | §4.6 |
+| 18 | base_url / key_env | 都在 `memory.minir.vector.*` 下可替换；`key_env` 只存变量名，默认 `SILICONFLOW_API_KEY` | §4.6 |
 | 19 | 撤销合并 | 新增 `minir_unmerge(kind, key, reason)`，合并前 status 存 `edges.meta` | §4.13 |
 
 2026-10-25 追加（与规则文件对齐）：

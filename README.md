@@ -1294,9 +1294,10 @@ status and appends a new open version. The idle extraction tick compares active 
 trigram: ≥0.92 is auto-merged, 0.85–0.92 writes a `merge_candidate` advisory, below that is ignored.
 
 Vector recall is optional and fail-open: `sqlite-vec` plus an OpenAI-compatible embedding endpoint
-(`memory.minir.vector.*`, default `BAAI/bge-m3` at 1024 dimensions). With no key, no package or a
-failed call, search stays on bm25; a background task indexes missing rows and the table is rebuilt
-when the configured dimension no longer matches it.
+(`memory.minir.vector.*`, default `BAAI/bge-m3` at 1024 dimensions). The key comes from the
+environment variable named by `memory.minir.vector.key_env` (default `SILICONFLOW_API_KEY`), never
+from `config.yaml`. With no key, no package or a failed call, search stays on bm25; a background
+task indexes missing rows and the table is rebuilt when the configured dimension no longer matches it.
 
 `minir_remember` routes on `remember_mode`: `conclusion` (default) writes the conclusions row,
 `knowledge` queues a page unit for the writer, and `card` overlays one global card part through

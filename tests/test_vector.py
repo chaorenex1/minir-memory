@@ -19,7 +19,7 @@ def store(plugin_package, tmp_path):
 def _vector(plugin_package, store):
     pytest.importorskip("sqlite_vec")
     return importlib.import_module(f"{plugin_package.__name__}.vector").VectorIndex(
-        store, {"dim": 4, "api_key": "test"})
+        store, {"dim": 4, "key_env": "MINIR_TEST_VECTOR_KEY"})
 
 
 def test_vector_index_and_recall_use_the_same_row(plugin_package, store):
@@ -88,7 +88,9 @@ class _Response:
 
 def test_http_failures_degrade_to_bm25_without_raising(plugin_package, store, monkeypatch):
     vector_mod = importlib.import_module(f"{plugin_package.__name__}.vector")
-    index = vector_mod.VectorIndex(store, {"api_key": "k", "dim": 4, "enabled": True})
+    monkeypatch.setenv("MINIR_TEST_VECTOR_KEY", "k")
+    index = vector_mod.VectorIndex(store, {"key_env": "MINIR_TEST_VECTOR_KEY",
+                                           "dim": 4, "enabled": True})
     assert index.ensure_table() is True
     monkeypatch.setattr(vector_mod.urllib.request, "urlopen",
                         lambda *args, **kwargs: (_ for _ in ()).throw(
@@ -98,7 +100,7 @@ def test_http_failures_degrade_to_bm25_without_raising(plugin_package, store, mo
     assert index.recall("docker") == {}
 
 
-def test_base_url_and_api_key_are_configurable(plugin_package, store, monkeypatch):
+def test_base_url_and_key_env_are_configurable(plugin_package, store, monkeypatch):
     vector_mod = importlib.import_module(f"{plugin_package.__name__}.vector")
     seen = {}
 
@@ -108,11 +110,28 @@ def test_base_url_and_api_key_are_configurable(plugin_package, store, monkeypatc
         return _Response({"data": [{"embedding": [0.1] * 4}]})
 
     monkeypatch.setattr(vector_mod.urllib.request, "urlopen", capture)
-    index = vector_mod.VectorIndex(store, {"api_key": "k2", "dim": 4,
+    monkeypatch.setenv("MINIR_TEST_OTHER_KEY", "k2")
+    index = vector_mod.VectorIndex(store, {"key_env": "MINIR_TEST_OTHER_KEY", "dim": 4,
                                            "base_url": "https://example.test/v1"})
 
     assert len(index.embed("docker") or []) == 4
     assert seen == {"url": "https://example.test/v1/embeddings", "auth": "Bearer k2"}
+
+
+def test_the_key_comes_only_from_the_env_var_named_by_key_env(plugin_package, store,
+                                                              monkeypatch):
+    vector_mod = importlib.import_module(f"{plugin_package.__name__}.vector")
+    monkeypatch.setenv("MINIR_TEST_NAMED_KEY", "from-env")
+    named = vector_mod.VectorIndex(store, {"key_env": "MINIR_TEST_NAMED_KEY"})
+    assert named._key() == "from-env"
+
+    monkeypatch.delenv("MINIR_TEST_NAMED_KEY")
+    assert named._key() == ""
+
+    monkeypatch.setenv("SILICONFLOW_API_KEY", "fallback")
+    assert vector_mod.VectorIndex(store)._key() == "fallback"
+    # an empty key_env is dropped by the settings merge, so the default name applies
+    assert vector_mod.VectorIndex(store, {"key_env": ""})._key() == "fallback"
 
 
 def test_the_pinned_defaults_are_siliconflow_bge_m3_1024(plugin_package, store):
@@ -120,12 +139,16 @@ def test_the_pinned_defaults_are_siliconflow_bge_m3_1024(plugin_package, store):
 
     assert (index.settings["provider"], index.settings["model"], index.dim) == (
         "siliconflow", "BAAI/bge-m3", 1024)
+    assert index.settings["key_env"] == "SILICONFLOW_API_KEY"
+    assert index.settings["base_url"] == "https://api.siliconflow.cn/v1"
 
 
 def test_a_wrong_dimension_is_refused_without_touching_the_table(plugin_package, store,
                                                                  monkeypatch):
     vector_mod = importlib.import_module(f"{plugin_package.__name__}.vector")
-    index = vector_mod.VectorIndex(store, {"api_key": "k", "dim": 4, "enabled": True})
+    monkeypatch.setenv("MINIR_TEST_VECTOR_KEY", "k")
+    index = vector_mod.VectorIndex(store, {"key_env": "MINIR_TEST_VECTOR_KEY", "dim": 4,
+                                           "enabled": True})
     assert index.ensure_table() is True
     monkeypatch.setattr(vector_mod.urllib.request, "urlopen",
                         lambda *args, **kwargs: _Response(
@@ -146,7 +169,7 @@ def test_a_missing_key_warns_once_and_reports_bm25(plugin_package, store, monkey
 
     monkeypatch.delenv("SILICONFLOW_API_KEY", raising=False)
     index = importlib.import_module(f"{plugin_package.__name__}.vector").VectorIndex(
-        store, {"api_key": "", "enabled": True})
+        store, {"key_env": "", "enabled": True})
 
     with caplog.at_level(logging.WARNING):
         assert index.embed("docker") is None
@@ -172,7 +195,7 @@ def test_index_async_hands_the_write_to_the_background_thread(plugin_package, st
 
 def test_vector_degrades_without_a_key(plugin_package, store):
     index = _vector(plugin_package, store)
-    index.settings["api_key"] = ""
+    index.settings["key_env"] = ""
     index.embed = lambda text: None
     store.save_conclusion("note", "docker restart policy", key="v1")
     assert index.recall("restart") == {}
