@@ -54,7 +54,7 @@ from . import agent_history, file_guard
 logger = logging.getLogger(__name__)
 
 #: Tool-call budget for one peer run — the Feishu comment agent's number.
-MAX_ITERATIONS = 30
+MAX_ITERATIONS = 10
 
 #: Constructor kwargs that come from the resolved runtime rather than from the caller — the same
 #: set the gateway forwards from ``_resolve_runtime_agent_kwargs()`` (``_runtime_agent_kwargs``),

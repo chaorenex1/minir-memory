@@ -763,7 +763,7 @@ the main key.
 
 Both entry points share one implementation: construct one `AIAgent` with `quiet_mode=True`,
 `skip_context_files=True`, `skip_memory=True`, `skip_background_review=True`,
-`load_soul_identity=True`, the fixed tool budget (`MAX_ITERATIONS`, the Feishu comment agent's 15)
+`load_soul_identity=True`, the fixed tool budget (`MAX_ITERATIONS`, 10)
 and an explicit `enabled_toolsets`, call `run_conversation(prompt, system_message=...)`, and
 `close()` it in a `finally` so a long-lived host does not leak tool subprocesses or HTTP clients.
 `run_async` is `asyncio.to_thread` around the same run, because `AIAgent`'s loop is synchronous (no
