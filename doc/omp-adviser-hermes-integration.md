@@ -410,7 +410,7 @@ scripts/install_host_patches.py 应用/检查/回滚（可单独运行）
 - 先 `git apply --check`，再 `git apply`；只查/写 patch 涉及的文件，宿主上无关的本地改动不受影响。
 - 冲突、本地改动覆盖到同一文件、manifest 校验和不符 → 退出码 2，不写任何文件。
 - 应用前把涉及文件复制到 `$HERMES_HOME/minir-memory/host-patches-backup/<timestamp>/`；应用后 `compileall` + 用宿主解释器 import `hermes_cli.plugin_runtime` 与 `agent.turn_stop_gates`，失败自动逆序回滚。
-- 状态写 `$HERMES_HOME/minir-memory/host-patches.json`；重复运行按"已应用"跳过（幂等）。
+- 状态写 `$HERMES_HOME/minir-memory/host-patches.json`；重复运行按"已应用"跳过（幂等）。记录里的 `host_head` 与当前 HEAD 不一致时，"反向能打上"不再算证据：宿主升级只撤掉已跟踪文件的改动、留下补丁新建的文件，末位补丁仍能反向匹配而前面全部丢失，安装器会打印原因并逐条重查，冲突时不写任何文件。
 - 系列按前缀判定"已应用"：后一个 patch 可以修改前一个新建的文件，所以不能拿每个 patch 的反向检查独立判断；`--check` 只对第一个未应用 patch 做独立检查，其余标 "after predecessors"。
 - `--check` 只报告；`--revert` 逆序撤销并验证模块消失；宿主升级后 `git apply --check` 失败时，安装器报告系列期望的基线版本，不做 `reset`/`stash`。
 
@@ -523,6 +523,7 @@ reviewer 固定只读：`agent_loop` 在运行前移除 `write_file`/`patch` 以
 | 重基后系列等价 | `git add -A && git write-tree`（干净 v0.22.5 worktree） | 重新生成的 14 个 patch 重放得到 `fe1e80d13c…`，与重基树一致（0015 在这次重基之后新增） |
 | 装到 live host | `python scripts/install_host_patches.py` | apply 14 → `verified: plugin_runtime_v2`、状态 14 行、`host_head=bf0203a794`；0015 单独应用后状态 15 行，`--check` 逐条 "already applied" |
 | 安装后宿主单测 | `pytest tests/agent/test_plugin_runtime.py tests/agent/test_plugin_continuation_gate.py tests/agent/test_steer.py tests/hermes_cli/test_adviser_items.py tests/tui_gateway/test_adviser_row_callback.py tests/tui_gateway/test_adviser_trigger_row.py tests/tui_gateway/contracts/test_generated.py` | 66 passed，1 failed（`home_io_guard` 误报，基线 worktree 上同样失败） |
+| 安装器陈旧状态回归 | `python -m pytest tests/test_install_host_patches.py` | 8 passed（新增用例：升级只留下补丁新建的文件时不再报"已应用"） |
 
 ### 9.8 reviewer 自身：常驻 runtime（已实现）
 

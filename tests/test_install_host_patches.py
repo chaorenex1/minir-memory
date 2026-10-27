@@ -192,3 +192,59 @@ def test_a_series_may_build_on_its_own_new_files(tmp_path):
     )
     assert code == ihp.EXIT_OK
     assert any("already applied" in line for line in check_logs)
+
+
+def _survivor_repo(tmp_path):
+    """A two-patch series whose late patch only creates a file, so it survives a revert alone."""
+    host = tmp_path / "hermes-agent"
+    host.mkdir()
+    _git(host, "init", "-q")
+    _git(host, "config", "user.email", "test@example.com")
+    _git(host, "config", "user.name", "test")
+    (host / "module.py").write_text(BASE, encoding="utf-8")
+    _git(host, "add", ".")
+    _git(host, "commit", "-q", "-m", "base")
+    patches = tmp_path / "host-patches"
+    patches.mkdir()
+
+    (host / "module.py").write_text(PATCHED, encoding="utf-8")
+    (patches / "0001-change-value.patch").write_text(_git(host, "diff").stdout, encoding="utf-8")
+    _git(host, "checkout", "--", "module.py")
+
+    (host / "extra.py").write_text("EXTRA = True\n", encoding="utf-8")
+    _git(host, "add", "-N", "extra.py")
+    (patches / "0002-add-extra.patch").write_text(_git(host, "diff").stdout, encoding="utf-8")
+    (host / "extra.py").unlink()
+    _git(host, "reset", "-q")
+
+    entries = []
+    for name in ("0001-change-value.patch", "0002-add-extra.patch"):
+        digest = hashlib.sha256((patches / name).read_bytes()).hexdigest()
+        entries.append({"name": name, "sha256": digest})
+    (patches / "manifest.json").write_text(json.dumps({
+        "series": "survivor-v1", "capability": "test", "base_version": "0.0.0",
+        "patches": entries,
+    }), encoding="utf-8")
+    return host, patches
+
+
+def test_an_upgrade_that_keeps_only_the_created_files_is_not_read_as_applied(tmp_path):
+    """The host moved after the install: the last patch still reverse-applies, the earlier one does not.
+
+    Leaving the created file behind (an upgrade reverts tracked hunks only) used to make the prefix
+    rule report the whole series as applied, so the re-run silently did nothing.
+    """
+    host, patches = _survivor_repo(tmp_path)
+    assert _run(host, patches)[0] == ihp.EXIT_OK
+    assert (host / "module.py").read_text(encoding="utf-8") == PATCHED
+
+    _git(host, "checkout", "--", "module.py")
+    _git(host, "commit", "-q", "--allow-empty", "-m", "upgrade")
+    assert (host / "module.py").read_text(encoding="utf-8") == BASE
+
+    code, logs = _run(host, patches)
+    assert code == ihp.EXIT_BLOCKED
+    assert any("does not prove it is still in place" in line for line in logs)
+    assert not any("already applied" in line for line in logs)
+    # The blocked run leaves the tree as it found it, not half patched.
+    assert (host / "module.py").read_text(encoding="utf-8") == BASE

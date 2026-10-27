@@ -255,6 +255,17 @@ def applied_names(state: dict[str, Any]) -> list[str]:
     return [str(row.get("name") or "") for row in rows if isinstance(row, dict) and row.get("name")]
 
 
+def recorded_host_head(state: dict[str, Any]) -> str:
+    """The head the recorded series was applied at; '' when nothing recorded one."""
+    rows = state.get("applied") if isinstance(state, dict) else None
+    if not isinstance(rows, list):
+        return ""
+    for row in reversed(rows):
+        if isinstance(row, dict) and row.get("host_head"):
+            return str(row["host_head"])
+    return ""
+
+
 def _record(state: dict[str, Any], spec: PatchSpec, host: Path) -> None:
     rows = state.setdefault("applied", [])
     for row in rows:
@@ -352,6 +363,15 @@ def apply_series(
         reverse_flags = [is_applied(host, spec.path) for spec in specs]
         applied_through = max(
             (index for index, flag in enumerate(reverse_flags) if flag), default=-1)
+        # A reverse-apply match is evidence only while the checkout has not moved: an upgrade can
+        # revert the tracked hunks and leave the files the series created behind, so a late patch
+        # matches while every earlier one is gone. That shape must not read as "already applied".
+        recorded_head = recorded_host_head(state)
+        if applied_through >= 0 and recorded_head and recorded_head != host_head(host):
+            log(f"note: the recorded series was applied at {recorded_head}; the host is now "
+                f"{host_head(host) or 'unknown'}, so a reverse match does not prove it is still "
+                "in place. Checking every patch against this tree.")
+            applied_through = -1
         for index, spec in enumerate(specs):
             if spec.sha256 and spec.digest() != spec.sha256:
                 raise InstallerError(f"checksum mismatch for {spec.name}; refusing a modified series")

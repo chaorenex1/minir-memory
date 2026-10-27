@@ -1116,7 +1116,10 @@ python scripts/install.py --no-copy                # plugin installed by hermes;
 
 Hermes has no post-install hook, so the patch step belongs to this script rather than
 `hermes plugins install`; re-run it after a host update (the update overwrites patched files, the
-state file remembers what was applied).
+state file remembers what was applied). An update reverts only the tracked edits and leaves the
+files the series created behind, so when the recorded `host_head` no longer matches the checkout
+the installer re-checks every patch instead of trusting a reverse-apply match, and reports the
+first one that conflicts without writing anything.
 
 `pip install .` is the alternative for the **memory provider**: the wheel ships
 `plugin/minir` as a top-level `minir` package and declares the `hermes_agent.memory_providers`
