@@ -1,22 +1,121 @@
-From 0000000000000000000000000000000000000000013 Mon Sep 17 00:00:00 2001
+From 69cd8a12cd364f8d54c5f979436cc3224888a6a8 Mon Sep 17 00:00:00 2001
 From: chaorenex1 <24537608z@gmail.com>
-Date: Thu, 22 Oct 2026 13:25:50 +0800
-Subject: [PATCH] Render chat natively in the web dashboard
+Date: Tue, 27 Oct 2026 11:39:59 +0800
+Subject: [PATCH] 0013-Render-chat-natively-in-the-web-dashboard
 
-The browser chat was a PTY of the TUI, so adviser cards existed only as terminal glyphs.
-Add a native transcript fed by the gateway JSON-RPC socket: history, streaming turns,
-tool rows, reasoning, approvals, and adviser cards rendered as React components.
 ---
-
- web/src/lib/native-chat.ts        |  251 ++++++++++++++++++++++
- web/src/lib/native-chat.test.ts   |   92 ++++++++
- web/src/pages/NativeChat.tsx      |  419 +++++++++++++++++++++++++++++++++++++
- web/src/pages/NativeChat.test.tsx |   91 ++++++++
- web/src/pages/ChatPage.tsx        |   42 ++++
+ web/src/lib/native-chat.test.ts   |  92 +++++++
+ web/src/lib/native-chat.ts        | 251 ++++++++++++++++++
+ web/src/pages/ChatPage.tsx        |  42 +++
+ web/src/pages/NativeChat.test.tsx |  91 +++++++
+ web/src/pages/NativeChat.tsx      | 419 ++++++++++++++++++++++++++++++
  5 files changed, 895 insertions(+)
+ create mode 100644 web/src/lib/native-chat.test.ts
+ create mode 100644 web/src/lib/native-chat.ts
+ create mode 100644 web/src/pages/NativeChat.test.tsx
+ create mode 100644 web/src/pages/NativeChat.tsx
 
+diff --git a/web/src/lib/native-chat.test.ts b/web/src/lib/native-chat.test.ts
+new file mode 100644
+index 0000000000..277c75496f
+--- /dev/null
++++ b/web/src/lib/native-chat.test.ts
+@@ -0,0 +1,92 @@
++import { describe, expect, it } from "vitest";
++
++import {
++  EMPTY_CHAT,
++  adviserSeverity,
++  applyEvent,
++  rowsFromHistory,
++  type ChatEvent,
++} from "./native-chat";
++
++function event<T extends ChatEvent["type"]>(type: T, payload: unknown, seq = 1): ChatEvent {
++  return { type, payload, seq } as ChatEvent;
++}
++
++describe("rowsFromHistory", () => {
++  it("maps an adopted adviser row to a card, not a user bubble", () => {
++    const rows = rowsFromHistory([
++      {
++        role: "user",
++        display_kind: "adviser",
++        text: "[adviser — advisory only]\n- [concern · reviewer] check the migration",
++      },
++    ]);
++    expect(rows).toHaveLength(1);
++    expect(rows[0].kind).toBe("adviser");
++    if (rows[0].kind === "adviser") expect(rows[0].severity).toBe("concern");
++  });
++
++  it("keeps tool rows and drops empty assistant rows", () => {
++    const rows = rowsFromHistory([
++      { role: "assistant", text: "done" },
++      { role: "assistant", text: "" },
++      { role: "tool", name: "read_file", args: { path: "a.py" }, content: "ok" },
++    ]);
++    expect(rows.map((row) => row.kind)).toEqual(["assistant", "tool"]);
++  });
++});
++
++describe("applyEvent", () => {
++  it("streams one assistant row and seals it on complete", () => {
++    let state = applyEvent(EMPTY_CHAT, event("message.start", {}, 1));
++    state = applyEvent(state, event("message.delta", { text: "hel" }, 2));
++    state = applyEvent(state, event("message.delta", { text: "lo" }, 3));
++    expect(state.rows).toHaveLength(1);
++    expect(state.rows[0].kind).toBe("assistant");
++    if (state.rows[0].kind === "assistant") expect(state.rows[0].text).toBe("hello");
++
++    state = applyEvent(state, event("message.complete", { text: "hello" }, 4));
++    if (state.rows[0].kind === "assistant") {
++      expect(state.rows[0].streaming).toBe(false);
++    }
++    expect(state.streamingId).toBeNull();
++  });
++
++  it("adds an adviser card at the turn end and dedupes by id", () => {
++    const payload = {
++      id: "ad-1",
++      text: "[adviser] check it",
++      severity: "blocker",
++      label: "adviser · blocker",
++      display_kind: "adviser",
++    };
++    let state = applyEvent(EMPTY_CHAT, event("message.adviser", payload));
++    state = applyEvent(state, event("message.adviser", payload, 2));
++    expect(state.rows).toHaveLength(1);
++    expect(state.rows[0].kind).toBe("adviser");
++  });
++
++  it("updates a tool row in place", () => {
++    let state = applyEvent(
++      EMPTY_CHAT,
++      event("tool.start", { tool_id: "t1", name: "read_file", args: { path: "a.py" } }),
++    );
++    state = applyEvent(
++      state,
++      event("tool.complete", { tool_id: "t1", name: "read_file", result_text: "file body" }),
++    );
++    expect(state.rows).toHaveLength(1);
++    if (state.rows[0].kind === "tool") {
++      expect(state.rows[0].status).toBe("done");
++      expect(state.rows[0].output).toBe("file body");
++    }
++  });
++});
++
++describe("adviserSeverity", () => {
++  it("reads the per-note header, then falls back to the block header", () => {
++    expect(adviserSeverity("- [blocker · reviewer] stop")).toBe("blocker");
++    expect(adviserSeverity("[adviser — concern] note")).toBe("concern");
++    expect(adviserSeverity("no marker")).toBe("advisory");
++  });
++});
 diff --git a/web/src/lib/native-chat.ts b/web/src/lib/native-chat.ts
 new file mode 100644
+index 0000000000..f62e4032e7
 --- /dev/null
 +++ b/web/src/lib/native-chat.ts
 @@ -0,0 +1,251 @@
@@ -271,105 +370,173 @@ new file mode 100644
 +      return state;
 +  }
 +}
-diff --git a/web/src/lib/native-chat.test.ts b/web/src/lib/native-chat.test.ts
+diff --git a/web/src/pages/ChatPage.tsx b/web/src/pages/ChatPage.tsx
+index 9baf930498..943b2b485d 100644
+--- a/web/src/pages/ChatPage.tsx
++++ b/web/src/pages/ChatPage.tsx
+@@ -32,6 +32,7 @@ import { useNavigate, useSearchParams } from "react-router";
+ 
+ import { ChatSidebar } from "@/components/ChatSidebar";
+ import { ChatSessionList } from "@/components/ChatSessionList";
++import { NativeChat } from "@/pages/NativeChat";
+ import { usePageHeader } from "@/contexts/usePageHeader";
+ import { useI18n } from "@/i18n";
+ import { api } from "@/lib/api";
+@@ -185,6 +186,22 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
+   // Why ptyState is "ended": the agent process exited (/exit or crash), or the
+   // server could not start it at all (close 1011; the reason is in the terminal).
+   const [endedReason, setEndedReason] = useState<"exited" | "start-failed">("exited");
++  // Native transcript is the default surface; the PTY stays mounted underneath so switching
++  // is instant and the running session is not lost. `0` is the only persisted opt-out.
++  const [nativeView, setNativeView] = useState(() => {
++    try {
++      return localStorage.getItem("hermes.chat.native-view") !== "0";
++    } catch {
++      return true;
++    }
++  });
++  useEffect(() => {
++    try {
++      localStorage.setItem("hermes.chat.native-view", nativeView ? "1" : "0");
++    } catch {
++      // private mode: keep the in-memory choice
++    }
++  }, [nativeView]);
+   const navigate = useNavigate();
+   const [copyState, setCopyState] = useState<"idle" | "copied">("idle");
+   const copyResetRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+@@ -2015,6 +2032,31 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
+               </span>
+             </Button>
+           )}
++
++          {nativeView && (
++            <div className="absolute inset-0 z-40 flex min-h-0 flex-col overflow-hidden rounded-lg bg-background">
++              <NativeChat onExit={() => setNativeView(false)} />
++            </div>
++          )}
++
++          {!nativeView && (
++            <Button
++              ghost
++              onClick={() => setNativeView(true)}
++              title="Switch to native chat"
++              aria-label="Switch to native chat"
++              className={cn(
++                "absolute z-10",
++                "normal-case tracking-normal font-normal",
++                "rounded border border-current/30 bg-black/20",
++                "opacity-70 hover:opacity-100 hover:border-current/60",
++                "bottom-2 left-2 px-2 py-1 text-xs",
++              )}
++              style={{ color: terminalFg }}
++            >
++              Native
++            </Button>
++          )}
+         </div>
+ 
+         {!narrow && !chatPanelCollapsed && (
+diff --git a/web/src/pages/NativeChat.test.tsx b/web/src/pages/NativeChat.test.tsx
 new file mode 100644
+index 0000000000..716ca4abcf
 --- /dev/null
-+++ b/web/src/lib/native-chat.test.ts
-@@ -0,0 +1,92 @@
-+import { describe, expect, it } from "vitest";
++++ b/web/src/pages/NativeChat.test.tsx
+@@ -0,0 +1,91 @@
++// @vitest-environment jsdom
++import { act } from "react";
++import { createRoot, type Root } from "react-dom/client";
++import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 +
-+import {
-+  EMPTY_CHAT,
-+  adviserSeverity,
-+  applyEvent,
-+  rowsFromHistory,
-+  type ChatEvent,
-+} from "./native-chat";
++const harness = vi.hoisted(() => {
++  const handlers = new Map<string, Set<(event: unknown) => void>>();
++  const requests: { method: string; params: Record<string, unknown> }[] = [];
++  return { handlers, requests };
++});
 +
-+function event<T extends ChatEvent["type"]>(type: T, payload: unknown, seq = 1): ChatEvent {
-+  return { type, payload, seq } as ChatEvent;
++vi.mock("@/lib/gatewayClient", () => {
++  class FakeGatewayClient {
++    on(type: string, handler: (event: unknown) => void) {
++      const set = harness.handlers.get(type) ?? new Set();
++      set.add(handler);
++      harness.handlers.set(type, set);
++      return () => set.delete(handler);
++    }
++    onState(handler: (state: string) => void) {
++      handler("open");
++      return () => undefined;
++    }
++    onRequest() {
++      return () => undefined;
++    }
++    async connect() {}
++    async request(method: string, params: Record<string, unknown> = {}) {
++      harness.requests.push({ method, params });
++      if (method === "session.create" || method === "session.resume") {
++        return { session_id: "s1", messages: [] };
++      }
++      return {};
++    }
++    close() {}
++  }
++  return { GatewayClient: FakeGatewayClient };
++});
++
++import { NativeChat } from "./NativeChat";
++
++function emit(type: string, payload: unknown) {
++  for (const handler of harness.handlers.get(type) ?? []) {
++    handler({ type, payload, session_id: "s1", seq: 1 });
++  }
 +}
 +
-+describe("rowsFromHistory", () => {
-+  it("maps an adopted adviser row to a card, not a user bubble", () => {
-+    const rows = rowsFromHistory([
-+      {
-+        role: "user",
++describe("NativeChat", () => {
++  let container: HTMLDivElement;
++  let root: Root;
++
++  beforeEach(() => {
++    harness.handlers.clear();
++    harness.requests.length = 0;
++    localStorage.clear();
++    Element.prototype.scrollIntoView = () => undefined;
++    container = document.createElement("div");
++    document.body.appendChild(container);
++    root = createRoot(container);
++  });
++
++  afterEach(() => {
++    act(() => root.unmount());
++    container.remove();
++  });
++
++  it("hydrates a live session and renders an adviser event as a card", async () => {
++    await act(async () => {
++      root.render(<NativeChat onExit={() => undefined} />);
++    });
++    await act(async () => {
++      await Promise.resolve();
++    });
++
++    expect(harness.requests.some((call) => call.method === "session.create")).toBe(true);
++
++    await act(async () => {
++      emit("message.adviser", {
++        id: "ad-1",
++        text: "[adviser] check the migration before deploy",
++        severity: "blocker",
++        label: "adviser · blocker",
 +        display_kind: "adviser",
-+        text: "[adviser — advisory only]\n- [concern · reviewer] check the migration",
-+      },
-+    ]);
-+    expect(rows).toHaveLength(1);
-+    expect(rows[0].kind).toBe("adviser");
-+    if (rows[0].kind === "adviser") expect(rows[0].severity).toBe("concern");
-+  });
++      });
++    });
 +
-+  it("keeps tool rows and drops empty assistant rows", () => {
-+    const rows = rowsFromHistory([
-+      { role: "assistant", text: "done" },
-+      { role: "assistant", text: "" },
-+      { role: "tool", name: "read_file", args: { path: "a.py" }, content: "ok" },
-+    ]);
-+    expect(rows.map((row) => row.kind)).toEqual(["assistant", "tool"]);
-+  });
-+});
-+
-+describe("applyEvent", () => {
-+  it("streams one assistant row and seals it on complete", () => {
-+    let state = applyEvent(EMPTY_CHAT, event("message.start", {}, 1));
-+    state = applyEvent(state, event("message.delta", { text: "hel" }, 2));
-+    state = applyEvent(state, event("message.delta", { text: "lo" }, 3));
-+    expect(state.rows).toHaveLength(1);
-+    expect(state.rows[0].kind).toBe("assistant");
-+    if (state.rows[0].kind === "assistant") expect(state.rows[0].text).toBe("hello");
-+
-+    state = applyEvent(state, event("message.complete", { text: "hello" }, 4));
-+    if (state.rows[0].kind === "assistant") {
-+      expect(state.rows[0].streaming).toBe(false);
-+    }
-+    expect(state.streamingId).toBeNull();
-+  });
-+
-+  it("adds an adviser card at the turn end and dedupes by id", () => {
-+    const payload = {
-+      id: "ad-1",
-+      text: "[adviser] check it",
-+      severity: "blocker",
-+      label: "adviser · blocker",
-+      display_kind: "adviser",
-+    };
-+    let state = applyEvent(EMPTY_CHAT, event("message.adviser", payload));
-+    state = applyEvent(state, event("message.adviser", payload, 2));
-+    expect(state.rows).toHaveLength(1);
-+    expect(state.rows[0].kind).toBe("adviser");
-+  });
-+
-+  it("updates a tool row in place", () => {
-+    let state = applyEvent(
-+      EMPTY_CHAT,
-+      event("tool.start", { tool_id: "t1", name: "read_file", args: { path: "a.py" } }),
-+    );
-+    state = applyEvent(
-+      state,
-+      event("tool.complete", { tool_id: "t1", name: "read_file", result_text: "file body" }),
-+    );
-+    expect(state.rows).toHaveLength(1);
-+    if (state.rows[0].kind === "tool") {
-+      expect(state.rows[0].status).toBe("done");
-+      expect(state.rows[0].output).toBe("file body");
-+    }
-+  });
-+});
-+
-+describe("adviserSeverity", () => {
-+  it("reads the per-note header, then falls back to the block header", () => {
-+    expect(adviserSeverity("- [blocker · reviewer] stop")).toBe("blocker");
-+    expect(adviserSeverity("[adviser — concern] note")).toBe("concern");
-+    expect(adviserSeverity("no marker")).toBe("advisory");
++    expect(container.textContent).toContain("check the migration before deploy");
++    expect(container.textContent).toContain("adviser · blocker");
++    expect(container.textContent).toContain("Terminal");
 +  });
 +});
 diff --git a/web/src/pages/NativeChat.tsx b/web/src/pages/NativeChat.tsx
 new file mode 100644
+index 0000000000..9944ade589
 --- /dev/null
 +++ b/web/src/pages/NativeChat.tsx
 @@ -0,0 +1,419 @@
@@ -792,165 +959,6 @@ new file mode 100644
 +    </div>
 +  );
 +}
-diff --git a/web/src/pages/NativeChat.test.tsx b/web/src/pages/NativeChat.test.tsx
-new file mode 100644
---- /dev/null
-+++ b/web/src/pages/NativeChat.test.tsx
-@@ -0,0 +1,91 @@
-+// @vitest-environment jsdom
-+import { act } from "react";
-+import { createRoot, type Root } from "react-dom/client";
-+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-+
-+const harness = vi.hoisted(() => {
-+  const handlers = new Map<string, Set<(event: unknown) => void>>();
-+  const requests: { method: string; params: Record<string, unknown> }[] = [];
-+  return { handlers, requests };
-+});
-+
-+vi.mock("@/lib/gatewayClient", () => {
-+  class FakeGatewayClient {
-+    on(type: string, handler: (event: unknown) => void) {
-+      const set = harness.handlers.get(type) ?? new Set();
-+      set.add(handler);
-+      harness.handlers.set(type, set);
-+      return () => set.delete(handler);
-+    }
-+    onState(handler: (state: string) => void) {
-+      handler("open");
-+      return () => undefined;
-+    }
-+    onRequest() {
-+      return () => undefined;
-+    }
-+    async connect() {}
-+    async request(method: string, params: Record<string, unknown> = {}) {
-+      harness.requests.push({ method, params });
-+      if (method === "session.create" || method === "session.resume") {
-+        return { session_id: "s1", messages: [] };
-+      }
-+      return {};
-+    }
-+    close() {}
-+  }
-+  return { GatewayClient: FakeGatewayClient };
-+});
-+
-+import { NativeChat } from "./NativeChat";
-+
-+function emit(type: string, payload: unknown) {
-+  for (const handler of harness.handlers.get(type) ?? []) {
-+    handler({ type, payload, session_id: "s1", seq: 1 });
-+  }
-+}
-+
-+describe("NativeChat", () => {
-+  let container: HTMLDivElement;
-+  let root: Root;
-+
-+  beforeEach(() => {
-+    harness.handlers.clear();
-+    harness.requests.length = 0;
-+    localStorage.clear();
-+    Element.prototype.scrollIntoView = () => undefined;
-+    container = document.createElement("div");
-+    document.body.appendChild(container);
-+    root = createRoot(container);
-+  });
-+
-+  afterEach(() => {
-+    act(() => root.unmount());
-+    container.remove();
-+  });
-+
-+  it("hydrates a live session and renders an adviser event as a card", async () => {
-+    await act(async () => {
-+      root.render(<NativeChat onExit={() => undefined} />);
-+    });
-+    await act(async () => {
-+      await Promise.resolve();
-+    });
-+
-+    expect(harness.requests.some((call) => call.method === "session.create")).toBe(true);
-+
-+    await act(async () => {
-+      emit("message.adviser", {
-+        id: "ad-1",
-+        text: "[adviser] check the migration before deploy",
-+        severity: "blocker",
-+        label: "adviser · blocker",
-+        display_kind: "adviser",
-+      });
-+    });
-+
-+    expect(container.textContent).toContain("check the migration before deploy");
-+    expect(container.textContent).toContain("adviser · blocker");
-+    expect(container.textContent).toContain("Terminal");
-+  });
-+});
-diff --git a/web/src/pages/ChatPage.tsx b/web/src/pages/ChatPage.tsx
---- a/web/src/pages/ChatPage.tsx
-+++ b/web/src/pages/ChatPage.tsx
-@@ -32,6 +32,7 @@
- 
- import { ChatSidebar } from "@/components/ChatSidebar";
- import { ChatSessionList } from "@/components/ChatSessionList";
-+import { NativeChat } from "@/pages/NativeChat";
- import { usePageHeader } from "@/contexts/usePageHeader";
- import { useI18n } from "@/i18n";
- import { api } from "@/lib/api";
-@@ -185,6 +186,22 @@
-   // Why ptyState is "ended": the agent process exited (/exit or crash), or the
-   // server could not start it at all (close 1011; the reason is in the terminal).
-   const [endedReason, setEndedReason] = useState<"exited" | "start-failed">("exited");
-+  // Native transcript is the default surface; the PTY stays mounted underneath so switching
-+  // is instant and the running session is not lost. `0` is the only persisted opt-out.
-+  const [nativeView, setNativeView] = useState(() => {
-+    try {
-+      return localStorage.getItem("hermes.chat.native-view") !== "0";
-+    } catch {
-+      return true;
-+    }
-+  });
-+  useEffect(() => {
-+    try {
-+      localStorage.setItem("hermes.chat.native-view", nativeView ? "1" : "0");
-+    } catch {
-+      // private mode: keep the in-memory choice
-+    }
-+  }, [nativeView]);
-   const navigate = useNavigate();
-   const [copyState, setCopyState] = useState<"idle" | "copied">("idle");
-   const copyResetRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-@@ -2015,6 +2032,31 @@
-               </span>
-             </Button>
-           )}
-+
-+          {nativeView && (
-+            <div className="absolute inset-0 z-40 flex min-h-0 flex-col overflow-hidden rounded-lg bg-background">
-+              <NativeChat onExit={() => setNativeView(false)} />
-+            </div>
-+          )}
-+
-+          {!nativeView && (
-+            <Button
-+              ghost
-+              onClick={() => setNativeView(true)}
-+              title="Switch to native chat"
-+              aria-label="Switch to native chat"
-+              className={cn(
-+                "absolute z-10",
-+                "normal-case tracking-normal font-normal",
-+                "rounded border border-current/30 bg-black/20",
-+                "opacity-70 hover:opacity-100 hover:border-current/60",
-+                "bottom-2 left-2 px-2 py-1 text-xs",
-+              )}
-+              style={{ color: terminalFg }}
-+            >
-+              Native
-+            </Button>
-+          )}
-         </div>
- 
-         {!narrow && !chatPanelCollapsed && (
+-- 
+2.53.0.windows.3
+

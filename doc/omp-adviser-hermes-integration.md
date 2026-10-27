@@ -2,7 +2,7 @@
 
 - 状态：design + implementation（§1–§8 为设计与插件侧实现；§9 记录补齐 steer/续跑的宿主补丁系列与安装器）
 - omp 基线：本机 `omp/18.12.2`（`C:\Users\zarag\AppData\Local\Tern\omp\bin\omp.exe`）；行号与文件引用取自上游 `can1357/oh-my-pi` 的 `packages/coding-agent/src/`，关键常量已在本机二进制里逐条核对
-- Hermes 基线：本机安装 `C:\Users\zarag\AppData\Local\hermes\hermes-agent`（v0.22.2）
+- Hermes 基线：本机安装 `C:\Users\zarag\AppData\Local\hermes\hermes-agent`（v0.22.5，`bf0203a794`；补丁系列从 v0.22.2 重基到该版本，见 §9.4/§9.7）
 - 本文回答一件事：omp 的 adviser 如何工作，哪些部分能落到 Hermes 的 hook / middleware / memory-provider 三个缝上，落不上的用什么替代，以及为"完整 adviser"新增的最小宿主面
 
 ## 0. 结论
@@ -399,6 +399,8 @@ plugin/minir/host-patches/
   0011-...patch     web inspector 按 severity 着色 + turns-ago
   0012-...patch     adviser trigger 回合标 display_kind；adviser steer 不计用户介入
   0013-...patch     web 原生聊天 transcript（gateway WS + adviser 卡 + 工具/审批）
+  0014-...patch     每条 adviser 建议按自身 severity 着色（Desktop/TUI/classic CLI/web）
+  0015-...patch     classic CLI 的 verbose 工具进程：完成的工具行下打印 result 正文；all/new/off 为折叠，`/verbose <mode>` 直接指定
 scripts/install.py              复制插件 → 应用系列 → 验证
 scripts/install_host_patches.py 应用/检查/回滚（可单独运行）
 ```
@@ -517,6 +519,10 @@ reviewer 固定只读：`agent_loop` 在运行前移除 `write_file`/`patch` 以
 | 插件契约 | `hermes plugins validate plugin/minir` | Validation passed（仅既有 private-core-import 警告，新增的 `hermes_cli.plugin_runtime` 是补丁提供的面） |
 | 插件套件 | `python -m pytest` | 539 passed, exit 0 |
 | Adviser 历史/roster | `pytest tests/test_adviser_history.py tests/test_agent_loop.py tests/test_transcript.py` | 全绿（历史落盘、usage、WATCHDOG 合并、per-entry cadence、reasoning、strict 配置） |
+| 宿主升级 → 重基（v0.22.2 → v0.22.5 `bf0203a794`） | 干净 v0.22.5 worktree 上逐条 `git apply --3way` | 7 个冲突文件，落在 0001（steer 缓冲）、0002（turn_context/turn_stop_gates 锚点）、0006（生成的 openrpc）、0007（TUI import）、0008（会话初始化）、0012（steer 干预标记 + 测试） |
+| 重基后系列等价 | `git add -A && git write-tree`（干净 v0.22.5 worktree） | 重新生成的 14 个 patch 重放得到 `fe1e80d13c…`，与重基树一致（0015 在这次重基之后新增） |
+| 装到 live host | `python scripts/install_host_patches.py` | apply 14 → `verified: plugin_runtime_v2`、状态 14 行、`host_head=bf0203a794`；0015 单独应用后状态 15 行，`--check` 逐条 "already applied" |
+| 安装后宿主单测 | `pytest tests/agent/test_plugin_runtime.py tests/agent/test_plugin_continuation_gate.py tests/agent/test_steer.py tests/hermes_cli/test_adviser_items.py tests/tui_gateway/test_adviser_row_callback.py tests/tui_gateway/test_adviser_trigger_row.py tests/tui_gateway/contracts/test_generated.py` | 66 passed，1 failed（`home_io_guard` 误报，基线 worktree 上同样失败） |
 
 ### 9.8 reviewer 自身：常驻 runtime（已实现）
 

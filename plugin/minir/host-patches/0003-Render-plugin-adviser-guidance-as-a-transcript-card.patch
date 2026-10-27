@@ -1,12 +1,8 @@
-From 703c3bb95ac72cdcec986d65ae015db65d98c634 Mon Sep 17 00:00:00 2001
+From 9a9a6290e706c94519cbf33ae4a435100d0868dc Mon Sep 17 00:00:00 2001
 From: chaorenex1 <24537608z@gmail.com>
-Date: Thu, 22 Oct 2026 04:06:17 +0800
-Subject: [PATCH] Render plugin adviser guidance as a transcript card
+Date: Tue, 27 Oct 2026 11:38:59 +0800
+Subject: [PATCH] 0003-Render-plugin-adviser-guidance-as-a-transcript-card
 
-A display_kind=adviser row is a user-role message the model saw, but it is not a
-human prompt. Hydrate it as a system notice, parse the rendered block into a
-severity/label/body, and draw it as a labelled card instead of a user bubble.
-Unparseable rows stay visible as plain advice; a normal user row is untouched.
 ---
  .../hooks/use-session-actions/utils.ts        | 16 ++++++++
  .../thread/system-message.test.tsx            | 36 ++++++++++++++++-
@@ -20,10 +16,10 @@ Unparseable rows stay visible as plain advice; a normal user row is untouched.
  create mode 100644 apps/desktop/src/lib/chat-messages/adviser.test.ts
 
 diff --git a/apps/desktop/src/app/session/hooks/use-session-actions/utils.ts b/apps/desktop/src/app/session/hooks/use-session-actions/utils.ts
-index 1d79a4d796..40f73e22b8 100644
+index 511010ee00..ed2ea924e2 100644
 --- a/apps/desktop/src/app/session/hooks/use-session-actions/utils.ts
 +++ b/apps/desktop/src/app/session/hooks/use-session-actions/utils.ts
-@@ -4,6 +4,7 @@ import { getSession } from '@/hermes'
+@@ -6,6 +6,7 @@ import { getSession } from '@/hermes'
  import { sameAttachmentTurn, spliceOlderPreservedRows } from '@/lib/chat-messages'
  import {
    assistantTextPart,
@@ -31,7 +27,7 @@ index 1d79a4d796..40f73e22b8 100644
    type ChatMessage,
    chatMessageText,
    preserveLocalAssistantErrors,
-@@ -237,6 +238,8 @@ const COMPARED_FIELDS = [
+@@ -242,6 +243,8 @@ const COMPARED_FIELDS = [
    'recovered',
    'asyncResult',
    'asyncResultKind',
@@ -40,7 +36,7 @@ index 1d79a4d796..40f73e22b8 100644
    'id',
    'role',
    'pending',
-@@ -354,6 +357,18 @@ export function chatReactionsEquivalent(a: ChatMessage['reactions'], b: ChatMess
+@@ -359,6 +362,18 @@ export function chatReactionsEquivalent(a: ChatMessage['reactions'], b: ChatMess
    )
  }
  
@@ -59,7 +55,7 @@ index 1d79a4d796..40f73e22b8 100644
  export function chatMessagesEquivalent(a: ChatMessage, b: ChatMessage): boolean {
    if (
      a.id !== b.id ||
-@@ -373,6 +388,7 @@ export function chatMessagesEquivalent(a: ChatMessage, b: ChatMessage): boolean
+@@ -378,6 +393,7 @@ export function chatMessagesEquivalent(a: ChatMessage, b: ChatMessage): boolean
      a.branchGroupId !== b.branchGroupId ||
      a.timestamp !== b.timestamp ||
      a.completedAt !== b.completedAt ||
@@ -68,7 +64,7 @@ index 1d79a4d796..40f73e22b8 100644
      // previewed final settling onto a sealed interim bubble restores the bar).
      (a.interim ?? false) !== (b.interim ?? false) ||
 diff --git a/apps/desktop/src/components/assistant-ui/thread/system-message.test.tsx b/apps/desktop/src/components/assistant-ui/thread/system-message.test.tsx
-index aab8867ad2..33d58ca92f 100644
+index 83ad392eb2..200f2985a2 100644
 --- a/apps/desktop/src/components/assistant-ui/thread/system-message.test.tsx
 +++ b/apps/desktop/src/components/assistant-ui/thread/system-message.test.tsx
 @@ -18,13 +18,21 @@ $displayTimestamps.set(true)
@@ -127,7 +123,7 @@ index aab8867ad2..33d58ca92f 100644
    it('separates an ordinary system row timestamp in accessible and copied text', () => {
      const { container } = render(<Harness text="Review saved." />)
 diff --git a/apps/desktop/src/components/assistant-ui/thread/system-message.tsx b/apps/desktop/src/components/assistant-ui/thread/system-message.tsx
-index 37ab0c0986..7a3923ec82 100644
+index 702a14b90c..d551aa27b6 100644
 --- a/apps/desktop/src/components/assistant-ui/thread/system-message.tsx
 +++ b/apps/desktop/src/components/assistant-ui/thread/system-message.tsx
 @@ -8,6 +8,7 @@ import { SCAFFOLD_GLYPH_CLASS, SCAFFOLD_LABEL_CLASS, ScaffoldRow } from '@/compo
@@ -138,7 +134,7 @@ index 37ab0c0986..7a3923ec82 100644
  import { LinkifiedText } from '@/lib/external-link'
  import { cn } from '@/lib/utils'
  
-@@ -64,6 +65,37 @@ export const SystemMessage: FC = () => {
+@@ -67,6 +68,37 @@ export const SystemMessage: FC = () => {
    const text = useAuiState(s => messageContentText(s.message.content))
    const asyncResult = useAuiState(s => s.message.metadata.custom?.asyncResult)
    const processResult = useAuiState(s => s.message.metadata.custom?.asyncResultKind === 'process')
@@ -222,10 +218,10 @@ index 0000000000..ee92890530
 +  expect(message.adviser).toBeUndefined()
 +})
 diff --git a/apps/desktop/src/lib/chat-messages/hydration.ts b/apps/desktop/src/lib/chat-messages/hydration.ts
-index f04de45b2a..435b8b4ef6 100644
+index 57a7883e26..15998166cb 100644
 --- a/apps/desktop/src/lib/chat-messages/hydration.ts
 +++ b/apps/desktop/src/lib/chat-messages/hydration.ts
-@@ -167,9 +167,37 @@ const NOTICE_DISPLAY_KINDS = [
+@@ -182,9 +182,37 @@ const NOTICE_DISPLAY_KINDS = [
    'auto_continue',
    'personality_switch',
    // Hermes closing a failed turn, not the model speaking.
@@ -264,15 +260,15 @@ index f04de45b2a..435b8b4ef6 100644
  function isMachineNotice(displayKind: SessionMessage['display_kind']): boolean {
    return displayKind !== undefined && (NOTICE_DISPLAY_KINDS as readonly string[]).includes(displayKind)
  }
-@@ -462,6 +490,7 @@ export function toChatMessages(messages: SessionMessage[]): ChatMessage[] {
-     const imageRefExtraction = displayRole === 'user' && rawDisplayContent ? extractImageRefs(rawDisplayContent) : null
+@@ -486,6 +514,7 @@ export function toChatMessages(messages: SessionMessage[]): ChatMessage[] {
+     const imageRefExtraction = displayRole === 'user' && rawDisplayContent ? persistedImageRefs(rawDisplayContent) : null
      const fileRefExtraction = imageRefExtraction ? splitLeadingAttachmentRefs(imageRefExtraction.cleanedText) : null
      const displayContent = fileRefExtraction ? fileRefExtraction.text : rawDisplayContent
 +    const adviser = message.display_kind === 'adviser' ? adviserFromMessage(displayContent || '') : undefined
      const liftedRefs = [...(fileRefExtraction?.refs ?? []), ...(imageRefExtraction?.refs ?? [])]
      const extractedAttachmentRefs = liftedRefs.length ? liftedRefs : undefined
  
-@@ -599,6 +628,7 @@ export function toChatMessages(messages: SessionMessage[]): ChatMessage[] {
+@@ -625,6 +654,7 @@ export function toChatMessages(messages: SessionMessage[]): ChatMessage[] {
        id: `${message.timestamp || Date.now()}-${index}-${displayRole}`,
        role: displayRole,
        parts,
@@ -281,17 +277,17 @@ index f04de45b2a..435b8b4ef6 100644
        ...(message.display_kind === 'async_delegation_complete' || message.display_kind === 'process_complete'
          ? { asyncResult: asyncResultBody(displayContentForMessage(message.role, message.content || content)) }
 diff --git a/apps/desktop/src/lib/chat-messages/index.ts b/apps/desktop/src/lib/chat-messages/index.ts
-index 1837f9e836..1d7fb3adf8 100644
+index efde87bcd2..c85f5d26ee 100644
 --- a/apps/desktop/src/lib/chat-messages/index.ts
 +++ b/apps/desktop/src/lib/chat-messages/index.ts
-@@ -36,4 +36,4 @@ export {
+@@ -38,4 +38,4 @@ export {
    withUniqueToolCallIdsWithinMessage
  } from './tool-parts'
  export type { PendingClarifyProjection, SettledClarifyProjection } from './tool-parts'
 -export type { ChatMessage, ChatMessagePart, GatewayEventPayload, TimelinePartMetadata } from './types'
 +export type { AdviserDisplay, ChatMessage, ChatMessagePart, GatewayEventPayload, TimelinePartMetadata } from './types'
 diff --git a/apps/desktop/src/lib/chat-messages/types.ts b/apps/desktop/src/lib/chat-messages/types.ts
-index 0a2844b324..e5d52c195d 100644
+index 2473f0ce2a..4c3876d372 100644
 --- a/apps/desktop/src/lib/chat-messages/types.ts
 +++ b/apps/desktop/src/lib/chat-messages/types.ts
 @@ -28,6 +28,13 @@ export interface TimelinePartMetadata {
@@ -331,3 +327,6 @@ index 190148142c..ec976eb24c 100644
          }
        }
      } as ThreadMessage
+-- 
+2.53.0.windows.3
+

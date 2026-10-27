@@ -1,9 +1,8 @@
-From 1be764e0047af754af2fe61bda136fbd0fb963c0 Mon Sep 17 00:00:00 2001
+From bff16bcf2cfff3399f76c1f0771d9717cdf058ac Mon Sep 17 00:00:00 2001
 From: chaorenex1 <24537608z@gmail.com>
-Date: Thu, 22 Oct 2026 11:25:46 +0800
-Subject: [PATCH 2/3] Draw plugin adviser rows in the classic CLI
+Date: Tue, 27 Oct 2026 11:39:45 +0800
+Subject: [PATCH] 0008 Draw plugin adviser rows in the classic CLI
 
-The classic CLI installs plugin_message_callback: an injected adviser row prints as a labelled block, held to the reply box footer while streaming, and the resume recap lists it as adviser guidance instead of a You: turn. Rows whose display_kind is not adviser (a mid-turn steer) are left to the prompt path.
 ---
  hermes_cli/cli_agent_setup_mixin.py           | 42 +++++++++++++++++++
  hermes_cli/cli_stream_mixin.py                | 26 ++++++++++++
@@ -12,7 +11,7 @@ The classic CLI installs plugin_message_callback: an injected adviser row prints
  4 files changed, 131 insertions(+)
 
 diff --git a/hermes_cli/cli_agent_setup_mixin.py b/hermes_cli/cli_agent_setup_mixin.py
-index 52907c5183..192cb77c0a 100644
+index d9ded68de9..a23fc53d74 100644
 --- a/hermes_cli/cli_agent_setup_mixin.py
 +++ b/hermes_cli/cli_agent_setup_mixin.py
 @@ -4,6 +4,7 @@ imported lazily inside each method (import cycle)."""
@@ -55,7 +54,7 @@ index 52907c5183..192cb77c0a 100644
  
  def _single_query_clarify_callback(questions: list) -> dict:
      """Headless clarify answer for ``hermes chat -q``.
-@@ -173,6 +199,17 @@ def _collect_resume_entries(display_history, disp: dict, clean_assistant):
+@@ -199,6 +225,17 @@ def _collect_resume_entries(display_history, disp: dict, clean_assistant):
              label = metadata.get("display_text") if display_kind in ("async_delegation_complete", "process_complete") else None
              entries.append(("event", _sanitize_display_text(label or t(_RESUME_EVENT_KEYS[display_kind]))))
              continue
@@ -73,17 +72,17 @@ index 52907c5183..192cb77c0a 100644
          if role == "user":
              text = _sanitize_display_text(_user_display_text(content))
              if len(text) > max_user_len:
-@@ -697,6 +734,9 @@ class CLIAgentSetupMixin:
-             # patch_stdout's StdoutProxy (#2262), holding lines while a response box streams so a
-             # subagent/background completion notice never splits the reply mid-paragraph.
-             self.agent._print_fn = self._agent_status_print
+@@ -760,6 +797,9 @@ class CLIAgentSetupMixin:
+             self.agent._finite = single_query_mode  # -q/-Q: a finite gateway admission (headless clarify)
+             from hermes_cli.gateway_tools import bind
+             bind(self.agent)  # main's dock / status bar / /stop read this session's gateway processes
 +            # Plugin-injected adviser rows (host `plugin_message_callback`): draw the guidance
 +            # at injection time instead of letting the next prompt repaint show a bare user turn.
 +            self.agent.plugin_message_callback = self._on_adviser_row
              # Hydrate credits notices at session OPEN (parity with the TUI) so a depletion
              # warning shows before the first message. Idempotent + fail-open in the helper.
              try:
-@@ -831,8 +871,10 @@ class CLIAgentSetupMixin:
+@@ -899,8 +939,10 @@ class CLIAgentSetupMixin:
          # role -> (label, label style, body style, continuation indent)
          you_label = f"  {t('cli.resume.label_you')} "
          assistant_label = f"  {t('cli.resume.label_assistant', agent_name='Hermes')} "
@@ -95,10 +94,10 @@ index 52907c5183..192cb77c0a 100644
              "assistant_last": (assistant_label, f"bold {_assistant_label_c}", "", " " * len(assistant_label)),  # full, non-dim
          }
 diff --git a/hermes_cli/cli_stream_mixin.py b/hermes_cli/cli_stream_mixin.py
-index cb8efde892..5cb2cf824b 100644
+index 12c7e37cae..b1d69a47a0 100644
 --- a/hermes_cli/cli_stream_mixin.py
 +++ b/hermes_cli/cli_stream_mixin.py
-@@ -291,6 +291,32 @@ class CLIStreamMixin:
+@@ -321,6 +321,32 @@ class CLIStreamMixin:
          for line in held:
              _cprint(line)
  

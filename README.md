@@ -1100,7 +1100,9 @@ python scripts/install.py           # copy the plugin, apply + verify the host s
 (`hermes_cli/plugin_runtime.py`), the stop-gate continuation channel, the live `message.adviser`
 event with a labelled adviser block on every host surface (Desktop card, TUI card that the web
 chat inherits over its PTY, classic CLI block, web session-inspector row), and the
-history/compaction guards that keep an adviser row from being treated as a human turn;
+history/compaction guards that keep an adviser row from being treated as a human turn, plus the
+CLI's verbose tool transcript (`display.tool_progress: verbose` prints each finished call's
+result body under its row; `all`/`new`/`off` are the fold and `/verbose <mode>` pins one);
 without it the adviser falls back to the ledger channels (see the adviser section). The installer
 is idempotent, refuses to apply over overlapping local edits, verifies the patched host by
 importing both Python modules, and rolls back if verification fails. Its record lives in

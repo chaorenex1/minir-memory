@@ -1,9 +1,8 @@
-From 76a565bda71c9e02a0123f5592b83b226f2a815b Mon Sep 17 00:00:00 2001
+From 8dbfa7b4ba5d31bd47563ef9f1e8537a3fa5bc16 Mon Sep 17 00:00:00 2001
 From: chaorenex1 <24537608z@gmail.com>
-Date: Thu, 22 Oct 2026 11:25:46 +0800
-Subject: [PATCH 1/3] Render plugin adviser rows as cards in the TUI
+Date: Tue, 27 Oct 2026 11:39:40 +0800
+Subject: [PATCH] 0007 Render plugin adviser rows as cards in the TUI
 
-The gateway emits message.adviser with plugin_message_id, and a resumed transcript carries the same row with display_kind=adviser. Draw both as an adviser block (severity tone, label, parsed body) instead of a user-turn bubble, deduping the live card by id so the hydrate cannot double it. The web chat runs the TUI over a PTY, so it inherits the same card. The gateway now announces only display_kind=adviser rows: plugin_message_callback also fires for a mid-turn steer, which is the operator's words and keeps its own surface path.
 ---
  .../tui_gateway/test_adviser_row_callback.py  | 54 +++++++++++++++++
  tui_gateway/agent_callbacks.py                | 18 +++++-
@@ -77,7 +76,7 @@ index 0000000000..396f54ead7
 +
 +    assert emitted == []
 diff --git a/tui_gateway/agent_callbacks.py b/tui_gateway/agent_callbacks.py
-index 75a8e538f2..092dabdbd5 100644
+index 238a5fb154..a7ac48f812 100644
 --- a/tui_gateway/agent_callbacks.py
 +++ b/tui_gateway/agent_callbacks.py
 @@ -184,9 +184,9 @@ def _agent_cbs(sid: str) -> dict:
@@ -113,10 +112,10 @@ index 75a8e538f2..092dabdbd5 100644
      """The event payload for one injected adviser row; the Desktop draws the card."""
      text = str(row.get("content") or "")
 diff --git a/ui-tui/src/__tests__/createGatewayEventHandler.test.ts b/ui-tui/src/__tests__/createGatewayEventHandler.test.ts
-index 259704a661..a2461348d5 100644
+index 0f48af0132..2b31415925 100644
 --- a/ui-tui/src/__tests__/createGatewayEventHandler.test.ts
 +++ b/ui-tui/src/__tests__/createGatewayEventHandler.test.ts
-@@ -2288,6 +2288,50 @@ describe('createGatewayEventHandler', () => {
+@@ -2282,6 +2282,50 @@ describe('createGatewayEventHandler', () => {
      })
    })
  
@@ -244,18 +243,18 @@ index 0e3c04b70d..93dbb8e5bd 100644
      const stdout = new PassThrough()
      const stdin = new PassThrough()
 diff --git a/ui-tui/src/app/createGatewayEventHandler.ts b/ui-tui/src/app/createGatewayEventHandler.ts
-index 97108ba1b4..a453d31cd4 100644
+index c435d29b02..b1e6ea70c7 100644
 --- a/ui-tui/src/app/createGatewayEventHandler.ts
 +++ b/ui-tui/src/app/createGatewayEventHandler.ts
-@@ -8,6 +8,7 @@ import type { StreamDeltaPayload, SubagentStatus, Usage } from '@hermes/shared/g
+@@ -9,6 +9,7 @@ import type { UsageLimit } from '@hermes/shared/plan-usage'
  import { STARTUP_IMAGE, STARTUP_QUERY } from '../config/env.js'
  import { STREAM_BATCH_MS } from '../config/timing.js'
  import { buildSetupRequiredSections, setupRequiredTitle } from '../content/setup.js'
 +import { adviserFromText } from '../domain/messages.js'
+ import { usageFromTick } from '../domain/usage.js'
  import type {
    AnyGatewayEvent,
-   CommandsCatalogResponse,
-@@ -467,6 +468,9 @@ export function createGatewayEventHandler(ctx: GatewayEventHandlerContext): (ev:
+@@ -830,6 +831,9 @@ export function createGatewayEventHandler(ctx: GatewayEventHandlerContext): (ev:
    // an abandoned-prompt record, so the tool.complete and message.complete
    // paths can't both persist the same prompt twice.
    const persistedAbandonedClarify = new Set<string>()
@@ -265,8 +264,8 @@ index 97108ba1b4..a453d31cd4 100644
    const showChallenge = createFreeTierChallengePresenter(sys, openExternalUrl)
    const showBillingVerification = createBillingVerificationPresenter(sys, openExternalUrl)
  
-@@ -1500,6 +1504,43 @@ export function createGatewayEventHandler(ctx: GatewayEventHandlerContext): (ev:
-         turnController.recordMessageDelta(ev.payload ?? ({} as StreamDeltaPayload))
+@@ -1814,6 +1818,43 @@ export function createGatewayEventHandler(ctx: GatewayEventHandlerContext): (ev:
+         turnController.recordMessageDelta(ev.payload ?? ({} as MessageDeltaPayload))
  
          return
 +      case 'message.adviser': {
@@ -310,10 +309,10 @@ index 97108ba1b4..a453d31cd4 100644
          const text = ev.payload?.text
  
 diff --git a/ui-tui/src/components/messageLine.tsx b/ui-tui/src/components/messageLine.tsx
-index 135448153f..f401a8f5cb 100644
+index def92f2185..1c130ef27b 100644
 --- a/ui-tui/src/components/messageLine.tsx
 +++ b/ui-tui/src/components/messageLine.tsx
-@@ -145,6 +145,38 @@ export const MessageLine = memo(function MessageLine({
+@@ -146,6 +146,38 @@ export const MessageLine = memo(function MessageLine({
      )
    }
  
@@ -410,10 +409,10 @@ index 9af6ac3eae..e0aaf02ea9 100644
        out.push({ role, text, ...(createdAt !== undefined && { createdAt }) })
        pending = []
 diff --git a/ui-tui/src/types.ts b/ui-tui/src/types.ts
-index a056b9d6fe..b6e7831669 100644
+index 97c52b8825..b2659b0add 100644
 --- a/ui-tui/src/types.ts
 +++ b/ui-tui/src/types.ts
-@@ -130,12 +130,29 @@ export interface ClarifyReq {
+@@ -134,12 +134,29 @@ export interface ClarifyReq {
    answers?: Record<string, string>
  }
  

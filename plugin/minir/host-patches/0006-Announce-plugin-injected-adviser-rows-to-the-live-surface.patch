@@ -1,13 +1,9 @@
-From 1c373d92575a419ece341d6ab18222580290b873 Mon Sep 17 00:00:00 2001
+From 43309ca389f33f6f00a0776bb6d9c95132d13b8b Mon Sep 17 00:00:00 2001
 From: chaorenex1 <24537608z@gmail.com>
-Date: Thu, 22 Oct 2026 09:28:06 +0800
-Subject: [PATCH] Announce plugin-injected adviser rows to the live surface
+Date: Tue, 27 Oct 2026 11:39:27 +0800
+Subject: [PATCH] 0006 Announce plugin injected adviser rows to the live
+ surface
 
-The adviser row is durable, but until now the Desktop only saw it after a
-rehydrate. Give every injected row a stable plugin_message_id, notify an
-optional agent.plugin_message_callback at the three injection points, emit
-message.adviser from the gateway, and append it as a system card in the
-Desktop stream. The id makes the later hydrate a no-op instead of a duplicate.
 ---
  agent/agent_init.py                           |  2 +
  agent/agent_runtime_helpers.py                |  5 +-
@@ -34,10 +30,10 @@ Desktop stream. The id makes the later hydrate a no-op instead of a duplicate.
  create mode 100644 agent/plugin_events.py
 
 diff --git a/agent/agent_init.py b/agent/agent_init.py
-index d3b4dcbb8a..2c36a3ad3e 100644
+index 5f9ce64692..a0c50f114b 100644
 --- a/agent/agent_init.py
 +++ b/agent/agent_init.py
-@@ -549,6 +549,8 @@ _CONTROL_STATE: dict[str, Any] = {
+@@ -551,6 +551,8 @@ _CONTROL_STATE: dict[str, Any] = {
      "_pending_steer": None,
      "_pending_steer_kind": "user",
      "_pending_steer_lock": threading.Lock,
@@ -47,7 +43,7 @@ index d3b4dcbb8a..2c36a3ad3e 100644
      # rebuild the tail with the correction. Drained at a role-safe boundary.
      "_pending_redirect": None,
 diff --git a/agent/agent_runtime_helpers.py b/agent/agent_runtime_helpers.py
-index d2b32d9d87..a75fcceb8d 100644
+index 5188d298a7..4a797ff74e 100644
 --- a/agent/agent_runtime_helpers.py
 +++ b/agent/agent_runtime_helpers.py
 @@ -22,6 +22,7 @@ from agent.message_sanitization import (
@@ -58,7 +54,7 @@ index d2b32d9d87..a75fcceb8d 100644
  from agent.tool_dispatch_helpers import _trajectory_normalize_msg, make_tool_result_message
  from agent.think_scrubber import THINK_TAG_NAMES
  from agent.trajectory import convert_scratchpad_to_think
-@@ -3791,7 +3792,9 @@ def apply_pending_steer_to_tool_results(agent, messages: list, num_tool_msgs: in
+@@ -3739,7 +3740,9 @@ def apply_pending_steer_to_tool_results(agent, messages: list, num_tool_msgs: in
          # user message (which persists like any other user turn).
          _requeue_pending_steer(agent, steer_text)
          return
@@ -106,7 +102,7 @@ index 0000000000..3efa1f5c35
 +
 +__all__ = ["notify_plugin_message"]
 diff --git a/agent/prompt_builder.py b/agent/prompt_builder.py
-index bcf2d68c53..94b8291a2e 100644
+index eed6805c96..63d5de4b1d 100644
 --- a/agent/prompt_builder.py
 +++ b/agent/prompt_builder.py
 @@ -11,6 +11,7 @@ import os
@@ -145,10 +141,10 @@ index fcf6ea7566..c8488f2003 100644
              return
      from agent.agent_runtime_helpers import _requeue_pending_steer
 diff --git a/agent/turn_stop_gates.py b/agent/turn_stop_gates.py
-index cf8396f950..78422ae3ec 100644
+index 36d495eee8..5a11a06eb0 100644
 --- a/agent/turn_stop_gates.py
 +++ b/agent/turn_stop_gates.py
-@@ -13,10 +13,12 @@ from __future__ import annotations
+@@ -14,10 +14,12 @@ from __future__ import annotations
  
  import logging
  import os
@@ -161,7 +157,7 @@ index cf8396f950..78422ae3ec 100644
  
  logger = logging.getLogger("agent.conversation_loop")
  
-@@ -117,6 +119,7 @@ def _plugin_continuation_row(pending: dict) -> dict:
+@@ -118,6 +120,7 @@ def _plugin_continuation_row(pending: dict) -> dict:
          "content": str(pending.get("text") or "").strip(),
          "display_kind": DISPLAY_KIND,
          "plugin_source": str(pending.get("source") or ""),
@@ -169,7 +165,7 @@ index cf8396f950..78422ae3ec 100644
      }
  
  
-@@ -181,7 +184,9 @@ def apply_stop_gates(
+@@ -207,7 +210,9 @@ def apply_stop_gates(
              agent, final_msg, messages, conversation_history,
              "plugin continuation interim flush failed",
          )
@@ -181,10 +177,10 @@ index cf8396f950..78422ae3ec 100644
          logger.debug(
              "plugin continuation nudge issued (attempt %d, source=%s)",
 diff --git a/apps/desktop/src/app/session/hooks/use-message-stream/gateway-event/index.ts b/apps/desktop/src/app/session/hooks/use-message-stream/gateway-event/index.ts
-index a969653586..2fa8eeda82 100644
+index 1673a615ab..9cfcc87ac8 100644
 --- a/apps/desktop/src/app/session/hooks/use-message-stream/gateway-event/index.ts
 +++ b/apps/desktop/src/app/session/hooks/use-message-stream/gateway-event/index.ts
-@@ -54,6 +54,7 @@ const DRAFT_SUPERSEDING_EVENT_TYPES = new Set([
+@@ -56,6 +56,7 @@ const DRAFT_SUPERSEDING_EVENT_TYPES = new Set([
  const COMPACTION_RESUME_EVENT_TYPES = new Set([
    'message.delta',
    'message.interim',
@@ -192,7 +188,7 @@ index a969653586..2fa8eeda82 100644
    'thinking.delta',
    'reasoning.delta',
    'reasoning.available',
-@@ -71,6 +72,7 @@ const PROVIDER_WAIT_SUPERSEDING_EVENT_TYPES = new Set([
+@@ -73,6 +74,7 @@ const PROVIDER_WAIT_SUPERSEDING_EVENT_TYPES = new Set([
    'message.complete',
    'message.delta',
    'message.interim',
@@ -201,10 +197,10 @@ index a969653586..2fa8eeda82 100644
    'reasoning.available',
    'reasoning.delta',
 diff --git a/apps/desktop/src/app/session/hooks/use-message-stream/gateway-event/message-stream.test.ts b/apps/desktop/src/app/session/hooks/use-message-stream/gateway-event/message-stream.test.ts
-index a792be8fd0..4f1cc49116 100644
+index f543cd972e..25aa023772 100644
 --- a/apps/desktop/src/app/session/hooks/use-message-stream/gateway-event/message-stream.test.ts
 +++ b/apps/desktop/src/app/session/hooks/use-message-stream/gateway-event/message-stream.test.ts
-@@ -22,6 +22,7 @@ function context(type: GatewayEventName): GatewayEventContext {
+@@ -37,6 +37,7 @@ function context(type: GatewayEventName): GatewayEventContext {
        completeAssistantMessage: vi.fn(),
        failAssistantMessage: vi.fn(),
        finalizeInterimAssistantMessage: vi.fn(),
@@ -213,10 +209,10 @@ index a792be8fd0..4f1cc49116 100644
        dropQueuedDeltas: vi.fn(),
        hydrateFromStoredSession: vi.fn(async () => undefined),
 diff --git a/apps/desktop/src/app/session/hooks/use-message-stream/gateway-event/message-stream.ts b/apps/desktop/src/app/session/hooks/use-message-stream/gateway-event/message-stream.ts
-index a03b4706b1..12ab1d78f7 100644
+index 92392b292c..437a0a9b5d 100644
 --- a/apps/desktop/src/app/session/hooks/use-message-stream/gateway-event/message-stream.ts
 +++ b/apps/desktop/src/app/session/hooks/use-message-stream/gateway-event/message-stream.ts
-@@ -119,6 +119,7 @@ export function handleMessageStreamEvent(ctx: GatewayEventContext): boolean {
+@@ -129,6 +129,7 @@ export function handleMessageStreamEvent(ctx: GatewayEventContext): boolean {
    const { deps, event, payload, sessionId, isActiveEvent, occurredAt } = ctx
  
    const {
@@ -224,7 +220,7 @@ index a03b4706b1..12ab1d78f7 100644
      appendAssistantDelta,
      appendReasoningDelta,
      compactedTurnRef,
-@@ -223,6 +224,20 @@ export function handleMessageStreamEvent(ctx: GatewayEventContext): boolean {
+@@ -233,6 +234,20 @@ export function handleMessageStreamEvent(ctx: GatewayEventContext): boolean {
      return true
    }
  
@@ -263,10 +259,10 @@ index 0cb8b6e24a..57458fcb01 100644
      attempts?: number,
      storedSessionId?: string | null,
 diff --git a/apps/desktop/src/app/session/hooks/use-message-stream/index.ts b/apps/desktop/src/app/session/hooks/use-message-stream/index.ts
-index fce0fabcbb..55204f6736 100644
+index 4035aaaa1e..6eb0a23d60 100644
 --- a/apps/desktop/src/app/session/hooks/use-message-stream/index.ts
 +++ b/apps/desktop/src/app/session/hooks/use-message-stream/index.ts
-@@ -18,6 +18,7 @@ import {
+@@ -19,6 +19,7 @@ import {
    reasoningPart,
    renderMediaTags,
    sealOpenToolParts,
@@ -274,7 +270,7 @@ index fce0fabcbb..55204f6736 100644
    toolCallOwnerMessageId,
    upsertToolPart
  } from '@/lib/chat-messages'
-@@ -612,6 +613,46 @@ export function useMessageStream({
+@@ -626,6 +627,46 @@ export function useMessageStream({
      [flushQueuedDeltas, mutateStream, sessionInterrupted]
    )
  
@@ -321,7 +317,7 @@ index fce0fabcbb..55204f6736 100644
    const finalizeInterimAssistantMessage = useCallback(
      (sessionId: string, text: string, occurredAt = Date.now() / 1000) => {
        updateSessionState(sessionId, state => {
-@@ -1219,6 +1260,7 @@ export function useMessageStream({
+@@ -1241,6 +1282,7 @@ export function useMessageStream({
      failAssistantMessage,
      flushQueuedDeltas,
      dropQueuedDeltas,
@@ -329,7 +325,7 @@ index fce0fabcbb..55204f6736 100644
      finalizeInterimAssistantMessage,
      hydrateFromStoredSession,
      queryClient,
-@@ -1249,6 +1291,7 @@ export function useMessageStream({
+@@ -1271,6 +1313,7 @@ export function useMessageStream({
      completeAssistantMessage,
      handleGatewayEvent,
      handleServerRequest,
@@ -338,10 +334,10 @@ index fce0fabcbb..55204f6736 100644
      upsertToolCall
    }
 diff --git a/apps/desktop/src/app/session/hooks/use-prompt-actions/steering-recovery.test.tsx b/apps/desktop/src/app/session/hooks/use-prompt-actions/steering-recovery.test.tsx
-index fe61c7ab0f..2bbec40cc1 100644
+index 48ac4d1f42..4ba9844a5b 100644
 --- a/apps/desktop/src/app/session/hooks/use-prompt-actions/steering-recovery.test.tsx
 +++ b/apps/desktop/src/app/session/hooks/use-prompt-actions/steering-recovery.test.tsx
-@@ -468,6 +468,7 @@ it.each(rebuiltRuntimeCases)(
+@@ -470,6 +470,7 @@ it.each(rebuiltRuntimeCases)(
            completeAssistantMessage: vi.fn(),
            failAssistantMessage: vi.fn(),
            flushQueuedDeltas: vi.fn(),
@@ -350,10 +346,10 @@ index fe61c7ab0f..2bbec40cc1 100644
            finalizeInterimAssistantMessage: vi.fn(),
            hydrateFromStoredSession: vi.fn(async () => undefined),
 diff --git a/apps/desktop/src/app/session/hooks/use-session-actions/utils.ts b/apps/desktop/src/app/session/hooks/use-session-actions/utils.ts
-index 40f73e22b8..ef33426e2a 100644
+index ed2ea924e2..d51e934030 100644
 --- a/apps/desktop/src/app/session/hooks/use-session-actions/utils.ts
 +++ b/apps/desktop/src/app/session/hooks/use-session-actions/utils.ts
-@@ -240,6 +240,8 @@ const COMPARED_FIELDS = [
+@@ -245,6 +245,8 @@ const COMPARED_FIELDS = [
    'asyncResultKind',
    // Plugin adviser card content; a rehydrated label/body must repaint.
    'adviser',
@@ -363,10 +359,10 @@ index 40f73e22b8..ef33426e2a 100644
    'role',
    'pending',
 diff --git a/apps/desktop/src/lib/chat-messages/hydration.ts b/apps/desktop/src/lib/chat-messages/hydration.ts
-index 435b8b4ef6..3a4844176c 100644
+index 15998166cb..40e71aecbf 100644
 --- a/apps/desktop/src/lib/chat-messages/hydration.ts
 +++ b/apps/desktop/src/lib/chat-messages/hydration.ts
-@@ -629,6 +629,9 @@ export function toChatMessages(messages: SessionMessage[]): ChatMessage[] {
+@@ -655,6 +655,9 @@ export function toChatMessages(messages: SessionMessage[]): ChatMessage[] {
        role: displayRole,
        parts,
        ...(adviser ? { adviser } : {}),
@@ -377,7 +373,7 @@ index 435b8b4ef6..3a4844176c 100644
        ...(message.display_kind === 'async_delegation_complete' || message.display_kind === 'process_complete'
          ? { asyncResult: asyncResultBody(displayContentForMessage(message.role, message.content || content)) }
 diff --git a/apps/desktop/src/lib/chat-messages/types.ts b/apps/desktop/src/lib/chat-messages/types.ts
-index e5d52c195d..3153e4ddb9 100644
+index 4c3876d372..45543fa555 100644
 --- a/apps/desktop/src/lib/chat-messages/types.ts
 +++ b/apps/desktop/src/lib/chat-messages/types.ts
 @@ -44,6 +44,8 @@ export type ChatMessage = {
@@ -390,10 +386,10 @@ index e5d52c195d..3153e4ddb9 100644
    completedAt?: number
    pending?: boolean
 diff --git a/apps/desktop/src/types/hermes.ts b/apps/desktop/src/types/hermes.ts
-index 6b2b7d73df..f193788bdd 100644
+index 927c98b200..8c74daaad8 100644
 --- a/apps/desktop/src/types/hermes.ts
 +++ b/apps/desktop/src/types/hermes.ts
-@@ -708,6 +708,7 @@ export interface SessionMessage {
+@@ -729,6 +729,7 @@ export interface SessionMessage {
    reasoning_content?: null | string
    reasoning_details?: unknown
    display_kind?:
@@ -401,7 +397,7 @@ index 6b2b7d73df..f193788bdd 100644
      | 'async_delegation_complete'
      | 'auto_continue'
      | 'failed_turn'
-@@ -717,6 +718,8 @@ export interface SessionMessage {
+@@ -738,6 +739,8 @@ export interface SessionMessage {
      | 'process_complete'
      | 'steer'
      | string
@@ -411,10 +407,10 @@ index 6b2b7d73df..f193788bdd 100644
     * A backend older than this app can still serve this as unparsed JSON text,
     * so readers must narrow before indexing into it.
 diff --git a/apps/shared/src/gateway-contract.generated.ts b/apps/shared/src/gateway-contract.generated.ts
-index 61cd9bcd4e..56d6abaa17 100644
+index 57a5f6d677..02de47950e 100644
 --- a/apps/shared/src/gateway-contract.generated.ts
 +++ b/apps/shared/src/gateway-contract.generated.ts
-@@ -4793,6 +4793,14 @@ export interface MessageInterimPayload {
+@@ -5666,6 +5666,14 @@ export interface MessageInterimPayload {
    text: string
    already_streamed: boolean
  }
@@ -429,7 +425,7 @@ index 61cd9bcd4e..56d6abaa17 100644
  /** ``prompt_turn._complete_turn_payload`` / ``session_auto_continue._emit_terminal_turn_error`` / ``agent_callbacks._mirror_subagent_to_child`` (child watch mirror: ``text`` only) / ``compute_host_bridge`` (``text`` + ``status``). */
  export interface MessageCompletePayload {
    text?: string | unknown
-@@ -5990,6 +5998,8 @@ export interface BackendGatewayEventMap {
+@@ -7064,6 +7072,8 @@ export interface BackendGatewayEventMap {
    'free_tier.challenge': FreeTierChallengePayload
    /** First frame of a connection: the resolved skin, the change-event capability and the replay epoch. */
    'gateway.ready': GatewayReadyPayload
@@ -437,8 +433,8 @@ index 61cd9bcd4e..56d6abaa17 100644
 +  'message.adviser': MessageAdviserPayload
    /** The turn ended: final text, usage and outcome. */
    'message.complete': MessageCompletePayload
-   /** One streamed chunk of the assistant reply. */
-@@ -6128,6 +6138,7 @@ export const GATEWAY_EVENT_TYPES = [
+   /** One streamed chunk of the assistant reply (null text: segment boundary). */
+@@ -7207,6 +7217,7 @@ export const GATEWAY_EVENT_TYPES = [
    'error',
    'free_tier.challenge',
    'gateway.ready',
@@ -447,10 +443,10 @@ index 61cd9bcd4e..56d6abaa17 100644
    'message.delta',
    'message.interim',
 diff --git a/apps/shared/src/gateway-contract.openrpc.json b/apps/shared/src/gateway-contract.openrpc.json
-index ba761e0f91..1c778b760d 100644
+index 0e7e02c8a9..39ab639779 100644
 --- a/apps/shared/src/gateway-contract.openrpc.json
 +++ b/apps/shared/src/gateway-contract.openrpc.json
-@@ -19071,6 +19071,41 @@
+@@ -23599,6 +23599,41 @@
          "title": "McpServersTestResult",
          "type": "object"
        },
@@ -492,7 +488,7 @@ index ba761e0f91..1c778b760d 100644
        "MessageCompletePayload": {
          "additionalProperties": false,
          "description": "``prompt_turn._complete_turn_payload`` / ``session_auto_continue._emit_terminal_turn_error`` /\n``agent_callbacks._mirror_subagent_to_child`` (child watch mirror: ``text`` only) /\n``compute_host_bridge`` (``text`` + ``status``).",
-@@ -41314,6 +41349,18 @@
+@@ -49129,6 +49164,18 @@
          }
        ]
      },
@@ -545,7 +541,7 @@ index 37bc9b83b9..5db5060cfb 100644
      def model_call(_api_kwargs):
          queued = plugin_runtime.queue_post_turn(
 diff --git a/tui_gateway/agent_callbacks.py b/tui_gateway/agent_callbacks.py
-index 26249132cb..75a8e538f2 100644
+index f2c019edf4..238a5fb154 100644
 --- a/tui_gateway/agent_callbacks.py
 +++ b/tui_gateway/agent_callbacks.py
 @@ -7,6 +7,7 @@ from __future__ import annotations
@@ -593,10 +589,10 @@ index 26249132cb..75a8e538f2 100644
      """Intentional workspace move from the project_* tools: re-anchor the live session's cwd
      and push session.info. The ONLY auto-cwd path — an explicit tool call, never a `cd`."""
 diff --git a/tui_gateway/contracts/events.py b/tui_gateway/contracts/events.py
-index 632f8be57c..d2d6ef33de 100644
+index d782b3e6ee..8325ba3ad7 100644
 --- a/tui_gateway/contracts/events.py
 +++ b/tui_gateway/contracts/events.py
-@@ -159,6 +159,20 @@ event("message.interim", MessageInterimPayload,
+@@ -183,6 +183,20 @@ event("message.interim", MessageInterimPayload,
        doc="Interim assistant commentary (text beside tool calls) sealed as its own segment.")
  
  
@@ -617,3 +613,6 @@ index 632f8be57c..d2d6ef33de 100644
  class TurnStatus(WireEnum):
      """``prompt_turn._result_status``."""
  
+-- 
+2.53.0.windows.3
+

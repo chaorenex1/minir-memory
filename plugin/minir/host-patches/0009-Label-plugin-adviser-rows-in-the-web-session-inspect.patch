@@ -1,9 +1,8 @@
-From 462ef684dab5a102213ed8ba102595b8f65c9ba9 Mon Sep 17 00:00:00 2001
+From 4aca5172694b13332f72ddfcaabbca35e190fe65 Mon Sep 17 00:00:00 2001
 From: chaorenex1 <24537608z@gmail.com>
-Date: Thu, 22 Oct 2026 11:25:46 +0800
-Subject: [PATCH 3/3] Label plugin adviser rows in the web session inspector
+Date: Tue, 27 Oct 2026 11:39:45 +0800
+Subject: [PATCH] 0009-Label-plugin-adviser-rows-in-the-web-session-inspect
 
-The REST transcript keeps display_kind=adviser, which the dashboard rendered with the user bubble style. Show the severity label and advice body, with the block's bracketed header/footer stripped.
 ---
  web/src/lib/api.ts                  |  2 +
  web/src/pages/SessionsPage.test.tsx | 35 +++++++++++++++++
@@ -11,10 +10,10 @@ The REST transcript keeps display_kind=adviser, which the dashboard rendered wit
  3 files changed, 86 insertions(+), 9 deletions(-)
 
 diff --git a/web/src/lib/api.ts b/web/src/lib/api.ts
-index 629c886378..e0bb5ca9a4 100644
+index 567891e09a..6d42e7d8a5 100644
 --- a/web/src/lib/api.ts
 +++ b/web/src/lib/api.ts
-@@ -2227,6 +2227,8 @@ export interface WhatsAppOnboardingApplyResponse {
+@@ -2195,6 +2195,8 @@ export interface TelegramOnboardingApplyResponse {
  export interface SessionMessage {
    role: "user" | "assistant" | "system" | "tool";
    content: string | null;

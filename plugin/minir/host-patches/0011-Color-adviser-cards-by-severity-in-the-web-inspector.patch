@@ -1,21 +1,48 @@
-From 0000000000000000000000000000000000000011 Mon Sep 17 00:00:00 2001
+From 2e1dbfea20e6915e78227831c33cb9520afeabbd Mon Sep 17 00:00:00 2001
 From: chaorenex1 <24537608z@gmail.com>
-Date: Thu, 22 Oct 2026 13:01:09 +0800
-Subject: [PATCH] Color adviser cards by severity in the web inspector
+Date: Tue, 27 Oct 2026 11:39:46 +0800
+Subject: [PATCH] 0011-Color-adviser-cards-by-severity-in-the-web-inspector
 
-The inspector labelled adviser rows but drew every severity with the muted style and
-ignored the note age. Drive the card color from the parsed severity and surface the
-turns-ago suffix the adviser block already carries.
 ---
-
- web/src/pages/SessionsPage.tsx      |   41 +++++++++++++++++++++++++++++++----
- web/src/pages/SessionsPage.test.tsx |    9 +++++++-
+ web/src/pages/SessionsPage.test.tsx |  9 ++++++-
+ web/src/pages/SessionsPage.tsx      | 41 +++++++++++++++++++++++++----
  2 files changed, 44 insertions(+), 6 deletions(-)
 
+diff --git a/web/src/pages/SessionsPage.test.tsx b/web/src/pages/SessionsPage.test.tsx
+index 06082a7e0f..46de94346d 100644
+--- a/web/src/pages/SessionsPage.test.tsx
++++ b/web/src/pages/SessionsPage.test.tsx
+@@ -270,7 +270,7 @@ describe("adviser transcript rows", () => {
+           role: "user",
+           display_kind: "adviser",
+           content:
+-            "[adviser — advisory only]\n- [blocker · reviewer] Stop: the migration drops the index.\n[end adviser]",
++            "[adviser — advisory only]\n- [blocker · reviewer] Stop: the migration drops the index. (1 turn ago)\n[end adviser]",
+         },
+       ],
+     });
+@@ -284,9 +284,16 @@ describe("adviser transcript rows", () => {
+ 
+     const text = document.body.textContent ?? "";
+     expect(text).toContain("adviser · blocker · reviewer");
++    expect(text).toContain("adviser · blocker · reviewer · 1 turn ago");
+     expect(text).toContain("Stop: the migration drops the index.");
+     expect(text).not.toContain("[adviser — advisory only]");
+     expect(text).not.toContain("[end adviser]");
++    // The severity drives the card color, the same way the TUI/Desktop cards read.
++    const cardLabel = Array.from(document.querySelectorAll("span")).find(
++      (span) => span.textContent?.trim() === "adviser · blocker · reviewer · 1 turn ago",
++    );
++    expect(cardLabel).toBeTruthy();
++    expect(cardLabel!.closest('[class*="bg-destructive"]')).not.toBeNull();
+     // Only the real prompt wears the User label.
+     const userLabels = Array.from(document.querySelectorAll("span")).filter(
+       (span) => span.textContent?.trim() === "User",
 diff --git a/web/src/pages/SessionsPage.tsx b/web/src/pages/SessionsPage.tsx
+index ef00f0acbe..3141c84c69 100644
 --- a/web/src/pages/SessionsPage.tsx
 +++ b/web/src/pages/SessionsPage.tsx
-@@ -216,10 +216,11 @@
+@@ -216,10 +216,11 @@ function splitCompactionContent(content: string): CompactionSplit | null {
  const ADVISER_HEADER_RE = /^\[adviser[^\n]*\]\s*/;
  const ADVISER_FOOTER_RE = /\s*\[end adviser\]\s*$/;
  const ADVISER_ITEM_RE = /^- \[([^\]]+)\]\s*(.+)$/gm;
@@ -28,7 +55,7 @@ diff --git a/web/src/pages/SessionsPage.tsx b/web/src/pages/SessionsPage.tsx
    const raw = content.trim();
    if (!ADVISER_HEADER_RE.test(raw)) return null;
    const body = raw
-@@ -227,9 +228,33 @@
+@@ -227,9 +228,33 @@ function splitAdviserContent(
      .replace(ADVISER_FOOTER_RE, "")
      .trim();
    const items = [...body.matchAll(ADVISER_ITEM_RE)];
@@ -63,7 +90,7 @@ diff --git a/web/src/pages/SessionsPage.tsx b/web/src/pages/SessionsPage.tsx
  
  function MessageBubble({
    msg,
-@@ -320,13 +345,19 @@
+@@ -320,13 +345,19 @@ function MessageBubble({
      msg.display_kind === "adviser" && typeof msg.content === "string"
        ? splitAdviserContent(msg.content)
        : null;
@@ -86,32 +113,6 @@ diff --git a/web/src/pages/SessionsPage.tsx b/web/src/pages/SessionsPage.tsx
      : isCompaction
        ? ROLE_STYLES.compaction.label
        : msg.tool_name
-diff --git a/web/src/pages/SessionsPage.test.tsx b/web/src/pages/SessionsPage.test.tsx
---- a/web/src/pages/SessionsPage.test.tsx
-+++ b/web/src/pages/SessionsPage.test.tsx
-@@ -270,7 +270,7 @@
-           role: "user",
-           display_kind: "adviser",
-           content:
--            "[adviser — advisory only]\n- [blocker · reviewer] Stop: the migration drops the index.\n[end adviser]",
-+            "[adviser — advisory only]\n- [blocker · reviewer] Stop: the migration drops the index. (1 turn ago)\n[end adviser]",
-         },
-       ],
-     });
-@@ -284,9 +284,16 @@
- 
-     const text = document.body.textContent ?? "";
-     expect(text).toContain("adviser · blocker · reviewer");
-+    expect(text).toContain("adviser · blocker · reviewer · 1 turn ago");
-     expect(text).toContain("Stop: the migration drops the index.");
-     expect(text).not.toContain("[adviser — advisory only]");
-     expect(text).not.toContain("[end adviser]");
-+    // The severity drives the card color, the same way the TUI/Desktop cards read.
-+    const cardLabel = Array.from(document.querySelectorAll("span")).find(
-+      (span) => span.textContent?.trim() === "adviser · blocker · reviewer · 1 turn ago",
-+    );
-+    expect(cardLabel).toBeTruthy();
-+    expect(cardLabel!.closest('[class*="bg-destructive"]')).not.toBeNull();
-     // Only the real prompt wears the User label.
-     const userLabels = Array.from(document.querySelectorAll("span")).filter(
-       (span) => span.textContent?.trim() === "User",
+-- 
+2.53.0.windows.3
+

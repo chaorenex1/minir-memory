@@ -1,22 +1,18 @@
-From 0000000000000000000000000000000000000010 Mon Sep 17 00:00:00 2001
+From ce22cf235d71e285178e67d48b11912642931133 Mon Sep 17 00:00:00 2001
 From: chaorenex1 <24537608z@gmail.com>
-Date: 周四, 22 10月 2026 12:52:31 +0800
-Subject: [PATCH] Preserve plugin advice as a card at the turn end
+Date: Tue, 27 Oct 2026 11:39:46 +0800
+Subject: [PATCH] 0010-Preserve-plugin-advice-as-a-card-at-the-turn-end
 
-A review that decides to keep advice for later runs after the turn, when the plugin
-no longer has an agent handle. Capture a writer while the turn is live, append one
-adviser row at the end of the turn, flush it to the session DB, and notify the live
-surface, so the card is visible in order and hydrates as a card on resume.
 ---
-
- hermes_cli/plugin_runtime.py       |   61 +++++++++++++++++++++++++++++++++++-
- tests/agent/test_plugin_runtime.py |   44 ++++++++++++++++++++++++++
+ hermes_cli/plugin_runtime.py       | 61 +++++++++++++++++++++++++++++-
+ tests/agent/test_plugin_runtime.py | 44 +++++++++++++++++++++
  2 files changed, 103 insertions(+), 2 deletions(-)
 
 diff --git a/hermes_cli/plugin_runtime.py b/hermes_cli/plugin_runtime.py
+index 16fbf2ff5c..76f4aa8987 100644
 --- a/hermes_cli/plugin_runtime.py
 +++ b/hermes_cli/plugin_runtime.py
-@@ -28,12 +28,12 @@
+@@ -28,12 +28,12 @@ import logging
  import threading
  import time
  import weakref
@@ -31,7 +27,7 @@ diff --git a/hermes_cli/plugin_runtime.py b/hermes_cli/plugin_runtime.py
  #: ``display_kind`` on the durable row a continuation is delivered as. Clients
  #: that do not know it still render the text; the value keeps it distinguishable
  #: from a human prompt in the transcript.
-@@ -267,6 +267,61 @@
+@@ -267,6 +267,61 @@ def attach_post_turn(agent: Any, result: Any) -> None:
          logger.debug("plugin_runtime.attach_post_turn failed", exc_info=True)
  
  
@@ -93,7 +89,7 @@ diff --git a/hermes_cli/plugin_runtime.py b/hermes_cli/plugin_runtime.py
  def steer(session_id: str, text: str, *, source: str = "") -> dict[str, Any]:
      """Queue plugin advice for the live turn.
  
-@@ -419,6 +474,8 @@
+@@ -419,6 +474,8 @@ __all__ = [
      "interrupt",
      "live_turn",
      "max_continuations",
@@ -103,9 +99,10 @@ diff --git a/hermes_cli/plugin_runtime.py b/hermes_cli/plugin_runtime.py
      "request_continuation",
      "request_interrupt",
 diff --git a/tests/agent/test_plugin_runtime.py b/tests/agent/test_plugin_runtime.py
+index e0baf3b1a4..4d3132db78 100644
 --- a/tests/agent/test_plugin_runtime.py
 +++ b/tests/agent/test_plugin_runtime.py
-@@ -37,6 +37,19 @@
+@@ -37,6 +37,19 @@ class _LegacyAgent(_Agent):
          return True
  
  
@@ -125,7 +122,7 @@ diff --git a/tests/agent/test_plugin_runtime.py b/tests/agent/test_plugin_runtim
  @pytest.fixture(autouse=True)
  def _clean_runtime():
      plugin_runtime.clear_session("session-1")
-@@ -163,3 +176,34 @@
+@@ -163,3 +176,34 @@ def test_session_flags_are_readable_only_while_live():
  
      plugin_runtime.unbind_turn(agent)
      assert plugin_runtime.set_flag("session-1", "plan_mode", False) is False
@@ -160,3 +157,6 @@ diff --git a/tests/agent/test_plugin_runtime.py b/tests/agent/test_plugin_runtim
 +    plugin_runtime.bind_turn(agent)
 +    assert plugin_runtime.preserve("session-1", "on time")["ok"] is True
 +    assert agent.messages[-1]["display_kind"] == "adviser"
+-- 
+2.53.0.windows.3
+

@@ -1,65 +1,70 @@
 {
   "series": "plugin-runtime-v1",
   "capability": "plugin_runtime_v2",
-  "base_version": "0.22.2",
-  "base_commit": "d923a5eb48",
-  "description": "Plugin control bridge (steer/continuation/interrupt), post-turn triggers, cooperative flags, live adviser events, a preserved card at the turn end, labeled adviser-triggered turns, and adviser rows on every host surface: Desktop card, TUI card, classic CLI block, web session inspector, and a native web chat transcript (the PTY stays available as a fallback); each adviser note carries its own severity on every surface.",
+  "base_version": "0.22.5",
+  "base_commit": "bf0203a794",
+  "description": "Plugin control bridge (steer/continuation/interrupt), post-turn triggers, cooperative flags, live adviser events, a preserved card at the turn end, labeled adviser-triggered turns, and adviser rows on every host surface: Desktop card, TUI card, classic CLI block, web session inspector, and a native web chat transcript (the PTY stays available as a fallback); each adviser note carries its own severity on every surface; and the CLI's verbose tool progress prints each call's result body under its row, with the one-line modes as the fold.",
   "patches": [
     {
       "name": "0001-Add-a-session-scoped-plugin-control-bridge.patch",
-      "sha256": "0128b2687f187f69cf72668bf00ac4edaa442aa41f898c76b9830e9395bc677b"
+      "sha256": "c9189bb63457e119e59c47d2e908be36185912869cfb182eed2a82532253a0da"
     },
     {
       "name": "0002-Let-a-plugin-keep-a-turn-open-after-a-text-answer.patch",
-      "sha256": "ee605d154dfdcae9191a50872edece9485eea384a2e8347112997d7d4fda4942"
+      "sha256": "45ffc8edde12a58585d782ebed317b97e01ba70cbf48096026b3fb1ed3d4f32f"
     },
     {
       "name": "0003-Render-plugin-adviser-guidance-as-a-transcript-card.patch",
-      "sha256": "c098c26afa814db390181bfa905713def539c66a4c6af4d7eb072cc302b6f923"
+      "sha256": "ce09b5f31331d2873e2bdeceb3469d3dfc6ad30df03f4b6b2590dc7262d558b5"
     },
     {
       "name": "0004-Keep-adviser-rows-out-of-user-turn-merging-and-tool-rounds.patch",
-      "sha256": "2c9a5c373071b6af416ff4aa8c93f5dee29a7257377a0da6014409b377bcaa2d"
+      "sha256": "0af2fb15cc845940ca5e403abd21e506aea8b9f3d11316ae2424e0068a6da2fb"
     },
     {
       "name": "0005-Let-a-plugin-interrupt-a-tool-batch-start-the-next-turn.patch",
-      "sha256": "462ef9feab16e4aebd3022953930fa54efadcf452afaed6fdfa839737bad8dbc"
+      "sha256": "4d66e78e9ae52fd43ee3e11dad7d5e655b2c2545019a44606e288926d0a4bfa1"
     },
     {
       "name": "0006-Announce-plugin-injected-adviser-rows-to-the-live-surface.patch",
-      "sha256": "1af9db3d74a148d8e21855697f055979b1318f0a733143c1afc6fa11402c710d"
+      "sha256": "528bee153c6c826f76fa8696d9cb7e0287c55cd8a4d5d035134dee8ee2309d02"
     },
     {
       "name": "0007-Render-plugin-adviser-rows-as-cards-in-the-TUI.patch",
-      "sha256": "db395b201e9cac92ea3721717bc2009e554a5d56c676c06471b0aa0d751833fa"
+      "sha256": "35f5406aab87c530793c25c8e5f1b3e69c330a336abaf5d6d2fcb2d44668806f"
     },
     {
       "name": "0008-Draw-plugin-adviser-rows-in-the-classic-CLI.patch",
-      "sha256": "5ef2e9f48293029fa0b58fee5d7dd1eceeed64aa6dc056229ff5d3ccb969945a"
+      "sha256": "86565bf725c93fc79595e27947c5a7d6783d59e4c2af82bd12f9b975e701fa70"
     },
     {
       "name": "0009-Label-plugin-adviser-rows-in-the-web-session-inspect.patch",
-      "sha256": "d5cc43f445151dd8ee6ac4a588f3bbd3ee700482dea04e2d16e08acc43c58528"
+      "sha256": "7cba2839a469fc3dbd58b518f7ea666f59995b39866a78b3d6f8b9764a8f98e6"
     },
     {
       "name": "0010-Preserve-plugin-advice-as-a-card-at-the-turn-end.patch",
-      "sha256": "cfdc43bbea567db81dfec6de4527e987c033f303b0f1d92c23ba66da9013935e"
+      "sha256": "f8a25fdcb2a940e355562eeab9ebe907cb6a85604ecc9e4c5da00181e7e07a52"
     },
     {
       "name": "0011-Color-adviser-cards-by-severity-in-the-web-inspector.patch",
-      "sha256": "b647d659a7d5327deeddf4d4df6c388077ee1d8b32a372094e30efe93f4535f0"
+      "sha256": "8f761c3a093d7aa48a8b3d85e9c1061e93b5cc788638a0b60a66513317824e9f"
     },
     {
       "name": "0012-Label-adviser-triggered-turns-and-keep-adviser-steers-out-of-user-intervention.patch",
-      "sha256": "64f63c73501cf0b6654a83f22cbe9f60405a2bd044d7f238de7673b6b495cf87"
+      "sha256": "e736dd77923c88c5dab338968311b6c0f189130263a1900c9d13dbd80d62bb7a"
     },
     {
       "name": "0013-Render-chat-natively-in-the-web-dashboard.patch",
-      "sha256": "2408f5a103ca31a7c03c8f01131b0c79229d1aeceae077de242ac667c2d1ca1a"
+      "sha256": "5276b83156d89ce92699267e7b80bd7378edc5de19dc5daa7cd8547b5fad8139"
     },
     {
       "name": "0014-Paint-each-adviser-note-with-its-own-severity.patch",
-      "sha256": "ce9913ee061dc69abd7d114aecbd38201cf9542907d3cf88f2b302c2c45dde35"
+      "sha256": "56a9df2e56db6134c262d87a47a3ebd5bf60ca098d3fee2c84b4508f0ed526dd"
+    },
+    {
+      "name": "0015-Print-a-completed-tool-result-under-its-row-in-verbose-mode.patch",
+      "sha256": "716056dc771a9988f190777c3cc1b897568c4fb8bae45c5e5e94a0928172aa0d"
     }
-  ]
+  ],
+  "rebased": "v0.22.5 (bf0203a794). Two merge decisions: the steer buffer holds (ticket, text, kind) triples so the upstream ticket API keeps working while an adviser row stays labeled, and the plugin continuation gate runs before the late-LSP gate (a blocker outranks a note)."
 }

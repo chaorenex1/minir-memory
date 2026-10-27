@@ -1,35 +1,30 @@
-From 0000000000000000000000000000000000000014 Mon Sep 17 00:00:00 2001
+From 87db71c7ce80ff966d383fe479c8c92a716efe10 Mon Sep 17 00:00:00 2001
 From: chaorenex1 <24537608z@gmail.com>
-Date: Fri, 23 Oct 2026 15:50:04 
-Subject: [PATCH] Paint each adviser note with its own severity
-
-One adviser block can carry notes at different severities, but every surface took the
-first note's severity for the whole card and drew the body in one tone. Parse each
-note's `[severity · target · adviser]` label, let the strongest note set the card badge, and
-draw each note as its own line in the Desktop card (live and hydrated), the TUI card, the
-web inspector, and the classic CLI.
+Date: Tue, 27 Oct 2026 11:39:59 +0800
+Subject: [PATCH] 0014-Paint-each-adviser-note-with-its-own-severity
 
 ---
- .../app/session/hooks/use-message-stream/index.ts  |  8 ++-
- .../assistant-ui/thread/system-message.test.tsx    | 24 +++++++++
- .../assistant-ui/thread/system-message.tsx         | 29 +++++++---
- apps/desktop/src/lib/chat-messages/adviser.test.ts | 14 +++++
- apps/desktop/src/lib/chat-messages/hydration.ts    | 14 +++--
- hermes_cli/cli_agent_setup_mixin.py                | 14 +++++
- hermes_cli/cli_stream_mixin.py                     | 31 +++++++----
- tests/hermes_cli/test_adviser_items.py             | 25 +++++++++
- ui-tui/src/__tests__/messages.test.ts              | 63 ++++++++++++++++++++++
- ui-tui/src/components/messageLine.tsx              | 22 +++++---
- ui-tui/src/domain/messages.ts                      |  9 +++-
- web/src/pages/SessionsPage.test.tsx                | 28 ++++++++++
- web/src/pages/SessionsPage.tsx                     | 55 ++++++++++++++-----
+ .../session/hooks/use-message-stream/index.ts |  8 ++-
+ .../thread/system-message.test.tsx            | 24 +++++++
+ .../assistant-ui/thread/system-message.tsx    | 29 ++++++---
+ .../src/lib/chat-messages/adviser.test.ts     | 14 +++++
+ .../src/lib/chat-messages/hydration.ts        | 14 ++++-
+ hermes_cli/cli_agent_setup_mixin.py           | 14 +++++
+ hermes_cli/cli_stream_mixin.py                | 31 ++++++---
+ tests/hermes_cli/test_adviser_items.py        | 25 ++++++++
+ ui-tui/src/__tests__/messages.test.ts         | 63 +++++++++++++++++++
+ ui-tui/src/components/messageLine.tsx         | 22 ++++---
+ ui-tui/src/domain/messages.ts                 |  9 ++-
+ web/src/pages/SessionsPage.test.tsx           | 28 +++++++++
+ web/src/pages/SessionsPage.tsx                | 55 ++++++++++++----
  13 files changed, 293 insertions(+), 43 deletions(-)
----
+ create mode 100644 tests/hermes_cli/test_adviser_items.py
+
 diff --git a/apps/desktop/src/app/session/hooks/use-message-stream/index.ts b/apps/desktop/src/app/session/hooks/use-message-stream/index.ts
-index 55204f6736..840673c492 100644
+index 6eb0a23d60..80125d0a24 100644
 --- a/apps/desktop/src/app/session/hooks/use-message-stream/index.ts
 +++ b/apps/desktop/src/app/session/hooks/use-message-stream/index.ts
-@@ -22,6 +22,7 @@ import {
+@@ -23,6 +23,7 @@ import {
    toolCallOwnerMessageId,
    upsertToolPart
  } from '@/lib/chat-messages'
@@ -37,7 +32,7 @@ index 55204f6736..840673c492 100644
  import type { ErrorSurface } from '@/lib/error-surface'
  import {
    dedupeGeneratedImageEchoesInParts,
-@@ -633,6 +634,9 @@ export function useMessageStream({
+@@ -647,6 +648,9 @@ export function useMessageStream({
  
          const label = String(payload?.label || 'advisory')
          const severity = String(payload?.severity || 'advisory')
@@ -47,7 +42,7 @@ index 55204f6736..840673c492 100644
  
          return {
            ...state,
-@@ -642,7 +646,9 @@ export function useMessageStream({
+@@ -656,7 +660,9 @@ export function useMessageStream({
                id: `adviser-${id}`,
                role: 'system',
                parts: [textPart(text, occurredAt)],
@@ -59,7 +54,7 @@ index 55204f6736..840673c492 100644
                timestamp: occurredAt
              }
 diff --git a/apps/desktop/src/components/assistant-ui/thread/system-message.test.tsx b/apps/desktop/src/components/assistant-ui/thread/system-message.test.tsx
-index 33d58ca92f..b1c5af3659 100644
+index 200f2985a2..6ee1ef9ca4 100644
 --- a/apps/desktop/src/components/assistant-ui/thread/system-message.test.tsx
 +++ b/apps/desktop/src/components/assistant-ui/thread/system-message.test.tsx
 @@ -125,6 +125,30 @@ describe('adviser card', () => {
@@ -94,10 +89,10 @@ index 33d58ca92f..b1c5af3659 100644
  
  describe('system message timestamp text separation', () => {
 diff --git a/apps/desktop/src/components/assistant-ui/thread/system-message.tsx b/apps/desktop/src/components/assistant-ui/thread/system-message.tsx
-index 7a3923ec82..4a330ef41d 100644
+index d551aa27b6..302a91db70 100644
 --- a/apps/desktop/src/components/assistant-ui/thread/system-message.tsx
 +++ b/apps/desktop/src/components/assistant-ui/thread/system-message.tsx
-@@ -61,6 +61,15 @@ export const BackgroundResult: FC<BackgroundResultProps> = ({ text, report, proc
+@@ -64,6 +64,15 @@ export const BackgroundResult: FC<BackgroundResultProps> = ({ text, report, proc
    )
  }
  
@@ -113,7 +108,7 @@ index 7a3923ec82..4a330ef41d 100644
  export const SystemMessage: FC = () => {
    const text = useAuiState(s => messageContentText(s.message.content))
    const asyncResult = useAuiState(s => s.message.metadata.custom?.asyncResult)
-@@ -68,12 +77,7 @@ export const SystemMessage: FC = () => {
+@@ -71,12 +80,7 @@ export const SystemMessage: FC = () => {
    const adviser = useAuiState(s => s.message.metadata.custom?.adviser as AdviserDisplay | undefined)
  
    if (adviser) {
@@ -127,7 +122,7 @@ index 7a3923ec82..4a330ef41d 100644
  
      return (
        <MessagePrimitive.Root
-@@ -91,7 +95,18 @@ export const SystemMessage: FC = () => {
+@@ -94,7 +98,18 @@ export const SystemMessage: FC = () => {
              </span>
              <MessageTimelineTimestamp />
            </div>
@@ -173,10 +168,10 @@ index ee92890530..c5aed24b9f 100644
    const [message] = toChatMessages([
      { role: 'user', content: 'plain advice from an older host', display_kind: 'adviser', timestamp: 2 }
 diff --git a/apps/desktop/src/lib/chat-messages/hydration.ts b/apps/desktop/src/lib/chat-messages/hydration.ts
-index 3a4844176c..176e660962 100644
+index 40e71aecbf..ae7af1b760 100644
 --- a/apps/desktop/src/lib/chat-messages/hydration.ts
 +++ b/apps/desktop/src/lib/chat-messages/hydration.ts
-@@ -175,9 +175,10 @@ const NOTICE_DISPLAY_KINDS = [
+@@ -190,9 +190,10 @@ const NOTICE_DISPLAY_KINDS = [
  const ADVISER_HEADER_RE = /^\[adviser[^\n]*\]\s*/
  const ADVISER_FOOTER_RE = /\s*\[end adviser\]\s*$/
  const ADVISER_ITEM_RE = /^- \[([^\]]+)\]\s*(.*)$/gm
@@ -188,7 +183,7 @@ index 3a4844176c..176e660962 100644
    const raw = String(content || '').trim()
    if (!raw) {
      return undefined
-@@ -189,10 +190,17 @@ function adviserFromMessage(content: string): ChatMessage['adviser'] | undefined
+@@ -204,10 +205,17 @@ function adviserFromMessage(content: string): ChatMessage['adviser'] | undefined
  
      return { label, severity: label.split(' · ')[0]?.trim() || 'advisory', text: match[2].trim() }
    })
@@ -209,7 +204,7 @@ index 3a4844176c..176e660962 100644
      items
    }
 diff --git a/hermes_cli/cli_agent_setup_mixin.py b/hermes_cli/cli_agent_setup_mixin.py
-index 192cb77c0a..2f8f88616e 100644
+index a23fc53d74..e0f1d69f6e 100644
 --- a/hermes_cli/cli_agent_setup_mixin.py
 +++ b/hermes_cli/cli_agent_setup_mixin.py
 @@ -38,6 +38,20 @@ def _adviser_rows(content) -> tuple[str, list[str]]:
@@ -234,10 +229,10 @@ index 192cb77c0a..2f8f88616e 100644
      """Headless clarify answer for ``hermes chat -q``.
  
 diff --git a/hermes_cli/cli_stream_mixin.py b/hermes_cli/cli_stream_mixin.py
-index 5cb2cf824b..d42e766dac 100644
+index b1d69a47a0..f470bd416b 100644
 --- a/hermes_cli/cli_stream_mixin.py
 +++ b/hermes_cli/cli_stream_mixin.py
-@@ -299,21 +299,32 @@ class CLIStreamMixin:
+@@ -329,21 +329,32 @@ class CLIStreamMixin:
          so a streaming reply box holds them to its footer instead of splitting the answer.
          """
          try:
@@ -393,10 +388,10 @@ index 93dbb8e5bd..c67e431602 100644
      const stdout = new PassThrough()
      const stdin = new PassThrough()
 diff --git a/ui-tui/src/components/messageLine.tsx b/ui-tui/src/components/messageLine.tsx
-index f401a8f5cb..a1c691a223 100644
+index 1c130ef27b..e7a7b899ff 100644
 --- a/ui-tui/src/components/messageLine.tsx
 +++ b/ui-tui/src/components/messageLine.tsx
-@@ -148,12 +148,9 @@ export const MessageLine = memo(function MessageLine({
+@@ -149,12 +149,9 @@ export const MessageLine = memo(function MessageLine({
    // Plugin adviser guidance: a card, not a "you" bubble — the model saw this row,
    // the human never typed it.
    if (msg.adviser) {
@@ -412,7 +407,7 @@ index f401a8f5cb..a1c691a223 100644
      const adviserGutter = transcriptGutterWidth('system', t.brand.prompt)
      const adviserWidth = transcriptBodyWidth(cols, 'system', t.brand.prompt, TERMUX_TUI_MODE)
  
-@@ -169,8 +166,17 @@ export const MessageLine = memo(function MessageLine({
+@@ -170,8 +167,17 @@ export const MessageLine = memo(function MessageLine({
            <NoSelect flexShrink={0} fromLeftEdge width={adviserGutter}>
              <Text> </Text>
            </NoSelect>
@@ -582,3 +577,6 @@ index 3141c84c69..3e7cbdba7e 100644
          </div>
        )}
        {!adviserSplit &&
+-- 
+2.53.0.windows.3
+

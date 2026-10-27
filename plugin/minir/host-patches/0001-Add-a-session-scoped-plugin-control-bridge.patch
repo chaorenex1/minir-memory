@@ -1,36 +1,26 @@
-From b867a4e93181a364c3c5ee5be3d2163e6afd40f1 Mon Sep 17 00:00:00 2001
+From dd134646e421e49e4a2639ed2baa57829bce10af Mon Sep 17 00:00:00 2001
 From: chaorenex1 <24537608z@gmail.com>
-Date: Thu, 22 Oct 2026 03:55:02 +0800
-Subject: [PATCH 1/2] Add a session-scoped plugin control bridge
+Date: Tue, 27 Oct 2026 11:38:36 +0800
+Subject: [PATCH] 0001 Add a session-scoped plugin control bridge
 
-Plugins see a session id in every hook payload but never the agent, so a
-background reviewer has no way to steer the live turn. hermes_cli.plugin_runtime
-binds the running agent for the duration of run_conversation and exposes steer
-(queue text at the next safe boundary), a one-slot turn continuation queue with an
-observable token, and a read-only turn_state probe.
-
-The advice is queued through a new steer(kind="adviser") path and delivered as a
-display_kind=adviser row, not the operator /steer frame: a reviewer's advice must
-not claim the user's authority. redirect() is deliberately not used because it
-persists a user correction.
 ---
  agent/agent_init.py                |   5 +-
  agent/agent_runtime_helpers.py     |   5 +-
  agent/conversation_loop.py         |   7 +
- agent/interrupt_control.py         |  12 +-
+ agent/interrupt_control.py         |  43 ++--
  agent/prompt_builder.py            |  20 ++
  agent/turn_iteration_prep.py       |   5 +-
  hermes_cli/plugin_runtime.py       | 305 +++++++++++++++++++++++++++++
  tests/agent/test_plugin_runtime.py | 128 ++++++++++++
- 8 files changed, 479 insertions(+), 8 deletions(-)
+ 8 files changed, 499 insertions(+), 19 deletions(-)
  create mode 100644 hermes_cli/plugin_runtime.py
  create mode 100644 tests/agent/test_plugin_runtime.py
 
 diff --git a/agent/agent_init.py b/agent/agent_init.py
-index 938ca517a5..d3b4dcbb8a 100644
+index 59006475de..5f9ce64692 100644
 --- a/agent/agent_init.py
 +++ b/agent/agent_init.py
-@@ -543,8 +543,11 @@ _CONTROL_STATE: dict[str, Any] = {
+@@ -545,8 +545,11 @@ _CONTROL_STATE: dict[str, Any] = {
      "_model_request_active": threading.Event,
      "_supports_active_turn_redirect": True,
      # /steer: the drain hook appends the note to the last tool result after the current
@@ -44,7 +34,7 @@ index 938ca517a5..d3b4dcbb8a 100644
      # Active-turn redirect: keep the valid turn prefix, cancel only the in-flight request,
      # rebuild the tail with the correction. Drained at a role-safe boundary.
 diff --git a/agent/agent_runtime_helpers.py b/agent/agent_runtime_helpers.py
-index 15cd862855..6e463920ad 100644
+index 1d8e485170..3ff24f885d 100644
 --- a/agent/agent_runtime_helpers.py
 +++ b/agent/agent_runtime_helpers.py
 @@ -21,7 +21,7 @@ from agent.message_sanitization import (
@@ -56,7 +46,7 @@ index 15cd862855..6e463920ad 100644
  from agent.tool_dispatch_helpers import _trajectory_normalize_msg, make_tool_result_message
  from agent.think_scrubber import THINK_TAG_NAMES
  from agent.trajectory import convert_scratchpad_to_think
-@@ -3780,6 +3780,7 @@ def apply_pending_steer_to_tool_results(agent, messages: list, num_tool_msgs: in
+@@ -3728,6 +3728,7 @@ def apply_pending_steer_to_tool_results(agent, messages: list, num_tool_msgs: in
      steer_text = agent._drain_pending_steer()
      if not steer_text:
          return
@@ -64,7 +54,7 @@ index 15cd862855..6e463920ad 100644
      # Skip non-tool messages in the tail in case something else is appended at the boundary.
      tail = range(len(messages) - 1, max(len(messages) - num_tool_msgs - 1, -1), -1)
      target = next((messages[j] for j in tail if isinstance(messages[j], dict) and messages[j].get("role") == "tool"), None)
-@@ -3789,7 +3790,7 @@ def apply_pending_steer_to_tool_results(agent, messages: list, num_tool_msgs: in
+@@ -3737,7 +3738,7 @@ def apply_pending_steer_to_tool_results(agent, messages: list, num_tool_msgs: in
          # user message (which persists like any other user turn).
          _requeue_pending_steer(agent, steer_text)
          return
@@ -74,10 +64,10 @@ index 15cd862855..6e463920ad 100644
          "Delivered /steer to agent after tool batch (%d chars) as new user message: %s", len(steer_text),
          steer_text[:120] + ("..." if len(steer_text) > 120 else ""),
 diff --git a/agent/conversation_loop.py b/agent/conversation_loop.py
-index 411134b41a..a1bd8775ba 100644
+index a16c43669c..de810ab193 100644
 --- a/agent/conversation_loop.py
 +++ b/agent/conversation_loop.py
-@@ -1732,6 +1732,7 @@ def run_conversation(
+@@ -1808,6 +1808,7 @@ def run_conversation(
      """
      from agent.turn_context import export_current_turn_boundary
      from agent.voice_turn_route import end_voice_turn_route
@@ -85,7 +75,7 @@ index 411134b41a..a1bd8775ba 100644
      from tools.vision_tools_history_budget import native_turn_images
  
      # Steer / redirect / interrupt set this mid-turn; the result reports whether the turn ran untouched.
-@@ -1740,6 +1741,11 @@ def run_conversation(
+@@ -1816,6 +1817,11 @@ def run_conversation(
      # it does not embed the same pixels a second time into the same request (#76411).
      with native_turn_images(user_message):
          try:
@@ -97,7 +87,7 @@ index 411134b41a..a1bd8775ba 100644
              result = _run_conversation_turn(
                  agent,
                  user_message,
-@@ -1758,6 +1764,7 @@ def run_conversation(
+@@ -1834,6 +1840,7 @@ def run_conversation(
                  prelude=prelude,
              )
          finally:
@@ -106,22 +96,69 @@ index 411134b41a..a1bd8775ba 100644
      result = export_current_turn_boundary(agent, result, user_message)
      if isinstance(result, dict):
 diff --git a/agent/interrupt_control.py b/agent/interrupt_control.py
-index 06117c1c9a..956676278d 100644
+index af647a1c4f..789e41066a 100644
 --- a/agent/interrupt_control.py
 +++ b/agent/interrupt_control.py
-@@ -262,17 +262,23 @@ class InterruptControlMixin:
+@@ -88,18 +88,25 @@ def _ic_slot(agent, lock_attr: str, slot: str):
+ 
+ 
+ def _steer_parts(agent) -> list:
+-    """The buffered steers as ``(ticket, text)`` pairs; ``_pending_steer`` is their newline join. A ticket
+-    names one submission (a gateway transfer). A buffer another writer set directly is one ticketless part."""
++    """The buffered steers as ``(ticket, text, kind)`` triples; ``_pending_steer`` is their newline join. A
++    ticket names one submission (a gateway transfer). A buffer another writer set directly is one
++    ticketless user part."""
+     pending = _ic_slot(agent, "_pending_steer_lock", "_pending_steer")
+     parts = vars(agent).get("_pending_steer_parts") or []
+-    if "\n".join(text for _, text in parts) != (pending or ""):
+-        return [(None, pending)] if pending else []
++    if "\n".join(text for _, text, _ in parts) != (pending or ""):
++        return [(None, pending, "user")] if pending else []
+     return list(parts)
+ 
+ 
+ def _set_steer_parts(agent, parts: list) -> None:
+     agent._pending_steer_parts = parts
+-    agent._pending_steer = "\n".join(text for _, text in parts) or None
++    agent._pending_steer = "\n".join(text for _, text, _ in parts) or None
++    # Advice from a plugin reviewer must not borrow the user's authority: the drained row carries
++    # ``display_kind="adviser"`` only when every buffered part is advice. A mixed buffer is an
++    # ordinary user row, so user text never ends up dressed as machine advice.
++    agent._pending_steer_kind = (
++        "adviser" if parts and all(kind == "adviser" for _, _, kind in parts) else "user"
++    )
+ 
+ 
+ def _steer_fates(agent) -> dict:
+@@ -114,8 +121,8 @@ def requeue_drained_steer(agent, steer_text: str) -> None:
+     with _ic_lock(agent, "_pending_steer_lock"):
+         drained, parts = vars(agent).pop("_steer_last_drain", (None, None))
+         if drained != steer_text or not parts:
+-            parts = [(None, steer_text)]
+-        for ticket, _ in parts:
++            parts = [(None, steer_text, "user")]
++        for ticket, _, _ in parts:
+             _steer_fates(agent).pop(ticket, None)
+         _set_steer_parts(agent, _steer_parts(agent) + parts)
+ 
+@@ -301,21 +308,29 @@ class InterruptControlMixin:
+             # claimed a hard interrupt supersedes the steer — but nothing gated this wipe on
              # hard_cancel, so a soft clear dropped a live user message with no trace.
              with _ic_lock(self, "_pending_steer_lock"):
-                 self._pending_steer = None
-+                self._pending_steer_kind = "user"
+-                for ticket, _ in _steer_parts(self):
++                for ticket, _, _ in _steer_parts(self):
+                     if ticket is not None:
+                         _steer_fates(self)[ticket] = False
+                 _set_steer_parts(self, [])
          return True
  
--    def steer(self, text: str) -> bool:
+-    def steer(self, text: str, *, ticket=None) -> bool:
 -        """Queue user text for delivery as its own user row after the current tool batch finishes (no
--        interrupt); multiple calls concatenate with newlines. Returns False for empty text."""
-+    def steer(self, text: str, *, kind: str = "user") -> bool:
++    def steer(self, text: str, *, ticket=None, kind: str = "user") -> bool:
 +        """Queue text for delivery as its own user row after the current tool batch finishes (no
-+        interrupt); multiple calls concatenate with newlines. Returns False for empty text.
+         interrupt); multiple calls concatenate with newlines. Returns False for empty text. ``ticket``
+-        names the submission, so ``withdraw_steer`` can settle exactly it, whatever text others carry."""
++        names the submission, so ``withdraw_steer`` can settle exactly it, whatever text others carry.
 +
 +        ``kind="adviser"`` marks the row so the model is not told the text is a direct user
 +        message: a plugin reviewer's advice must not borrow the user's authority.
@@ -130,14 +167,35 @@ index 06117c1c9a..956676278d 100644
              return False
          cleaned = text.strip()
          with _ic_lock(self, "_pending_steer_lock"):
-             existing = _ic_slot(self, "_pending_steer_lock", "_pending_steer")
-             self._pending_steer = (existing + "\n" + cleaned) if existing else cleaned
-+            self._pending_steer_kind = "adviser" if str(kind or "").lower() == "adviser" else "user"
+-            _set_steer_parts(self, _steer_parts(self) + [(ticket, cleaned)])
++            _set_steer_parts(
++                self,
++                _steer_parts(self)
++                + [(ticket, cleaned, "adviser" if str(kind or "").lower() == "adviser" else "user")],
++            )
          # The turn no longer ran on its own (first-task-done detection reads this off the result).
          self._turn_user_intervened = True
          return True
+@@ -401,7 +416,7 @@ class InterruptControlMixin:
+             text = _ic_slot(self, "_pending_steer_lock", "_pending_steer")
+             parts = _steer_parts(self)
+             _set_steer_parts(self, [])
+-            for ticket, _ in parts:
++            for ticket, _, _ in parts:
+                 if ticket is not None:
+                     _steer_fates(self)[ticket] = True
+             self._steer_last_drain = (text, parts)  # requeue_drained_steer restores its tickets
+@@ -414,7 +429,7 @@ class InterruptControlMixin:
+         with _ic_lock(self, "_pending_steer_lock"):
+             parts = _steer_parts(self)
+             _set_steer_parts(self, [part for part in parts if part[0] is not None])
+-        return "\n".join(text for ticket, text in parts if ticket is None) or None
++        return "\n".join(text for ticket, text, _ in parts if ticket is None) or None
+ 
+     def withdraw_steer(self, ticket) -> bool:
+         """Settle one ``steer(text, ticket=...)`` by identity (the gateway's transfer of a queued prompt):
 diff --git a/agent/prompt_builder.py b/agent/prompt_builder.py
-index 21d36c2815..bcf2d68c53 100644
+index 68375dea3d..eed6805c96 100644
 --- a/agent/prompt_builder.py
 +++ b/agent/prompt_builder.py
 @@ -584,6 +584,9 @@ def format_steer_marker(steer_text: str) -> str:
@@ -635,3 +693,6 @@ index 0000000000..e7f2420c64
 +    result = plugin_runtime.steer("session-1", "x" * (plugin_runtime.MAX_TEXT_CHARS + 100))
 +    assert result["ok"] is True
 +    assert len(agent.steered[0][0]) <= plugin_runtime.MAX_TEXT_CHARS
+-- 
+2.53.0.windows.3
+

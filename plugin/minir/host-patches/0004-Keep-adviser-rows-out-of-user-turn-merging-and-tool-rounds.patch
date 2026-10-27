@@ -1,14 +1,9 @@
-From 5e2514d16de789d819a6753aa7ac039d3e99dbdc Mon Sep 17 00:00:00 2001
+From 55cf7bd8acd5b1dc6cf67b0501e6cb74807e5b61 Mon Sep 17 00:00:00 2001
 From: chaorenex1 <24537608z@gmail.com>
-Date: Thu, 22 Oct 2026 04:13:58 +0800
-Subject: [PATCH] Keep adviser rows out of user-turn merging and tool-round
- detection
+Date: Tue, 27 Oct 2026 11:39:00 +0800
+Subject: [PATCH] 
+ 0004-Keep-adviser-rows-out-of-user-turn-merging-and-tool-rounds
 
-An adviser row is user-shaped for the provider but not written by the user. The
-alternation repair would merge the next prompt into the persisted row, and the
-pending-tool-round scan would stop at a trailing adviser row and lose the round.
-Treat display_kind=adviser like the /steer row in both places; the row stays
-byte-identical and compaction still pairs the tool result with the model reply.
 ---
  agent/agent_runtime_helpers.py |  7 ++++---
  agent/context_compressor.py    | 10 +++++-----
@@ -16,7 +11,7 @@ byte-identical and compaction still pairs the tool result with the model reply.
  3 files changed, 39 insertions(+), 8 deletions(-)
 
 diff --git a/agent/agent_runtime_helpers.py b/agent/agent_runtime_helpers.py
-index 6e463920ad..d2b32d9d87 100644
+index 3ff24f885d..5188d298a7 100644
 --- a/agent/agent_runtime_helpers.py
 +++ b/agent/agent_runtime_helpers.py
 @@ -21,7 +21,7 @@ from agent.message_sanitization import (
@@ -28,7 +23,7 @@ index 6e463920ad..d2b32d9d87 100644
  from agent.tool_dispatch_helpers import _trajectory_normalize_msg, make_tool_result_message
  from agent.think_scrubber import THINK_TAG_NAMES
  from agent.trajectory import convert_scratchpad_to_think
-@@ -680,8 +680,9 @@ def _merge_consecutive_users(messages: list[dict]) -> tuple[list[dict], int]:
+@@ -681,8 +681,9 @@ def _merge_consecutive_users(messages: list[dict]) -> tuple[list[dict], int]:
              # retry/rewind; never mutate the persisted carrier (sanitizers merge copies later).
              and split_user_originated_turn(prev)[0] is None
              # A /steer row that ended the previous run is already persisted; merging the next
@@ -41,10 +36,10 @@ index 6e463920ad..d2b32d9d87 100644
              and _plain_text(prev.get("content", "")) and _plain_text(msg.get("content", ""))
          ):
 diff --git a/agent/context_compressor.py b/agent/context_compressor.py
-index 13b1d4a08b..b573719b4e 100644
+index de049abd7d..9db735195e 100644
 --- a/agent/context_compressor.py
 +++ b/agent/context_compressor.py
-@@ -36,7 +36,7 @@ from agent.context_compressor_summary import SummaryDispatchMixin
+@@ -39,7 +39,7 @@ from agent.context_compressor_tail import demote_stale_tail_tools, is_demoted_st
  from agent.context_compressor_telemetry import CompressionTelemetryMixin
  from agent.error_classifier import FailoverReason, classify_api_error
  from agent.micro_compaction import MicroCompactionMixin
@@ -53,7 +48,7 @@ index 13b1d4a08b..b573719b4e 100644
  from agent.model_metadata import (
      CHARS_PER_TOKEN, MINIMUM_CONTEXT_LENGTH, get_model_context_length, estimate_messages_tokens_rough, estimate_tokens_rough,
      strip_opaque_replay_items,
-@@ -1336,11 +1336,11 @@ def _last_assistant_index(messages: list[dict[str, Any]]) -> int:
+@@ -1338,11 +1338,11 @@ def _last_assistant_index(messages: list[dict[str, Any]]) -> int:
  
  def _pending_tool_round(messages: list[dict[str, Any]]) -> range:
      """Indices of the tool results the transcript ends with — a round the model has not answered yet; empty when
@@ -70,10 +65,10 @@ index 13b1d4a08b..b573719b4e 100644
      start = end
      while start > 0 and messages[start - 1].get("role") == "tool":
 diff --git a/tests/agent/test_steer.py b/tests/agent/test_steer.py
-index 95ff222dbd..5925d8ba69 100644
+index 2cd5b99880..adb66aa394 100644
 --- a/tests/agent/test_steer.py
 +++ b/tests/agent/test_steer.py
-@@ -489,6 +489,36 @@ class TestSteerInjection:
+@@ -538,6 +538,36 @@ class TestSteerInjection:
          assert [m["role"] for m in merged] == ["user", "user"]
          assert merged[-1]["content"] == "next question"
  
@@ -110,3 +105,6 @@ index 95ff222dbd..5925d8ba69 100644
      def test_multimodal_tool_content_untouched_steer_lands_as_user_row(self):
          """Anthropic-style list content on tool results is left untouched —
          the steer is appended as a standalone user message instead of being
+-- 
+2.53.0.windows.3
+

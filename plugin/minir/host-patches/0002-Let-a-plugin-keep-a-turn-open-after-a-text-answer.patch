@@ -1,16 +1,8 @@
-From 68086dd9003c6f6bd146e5d3c44f5b2d0eb0aad5 Mon Sep 17 00:00:00 2001
+From 0f0dd095e286afac6578172a1f0f5b84f99fc439 Mon Sep 17 00:00:00 2001
 From: chaorenex1 <24537608z@gmail.com>
-Date: Thu, 22 Oct 2026 03:55:04 +0800
-Subject: [PATCH 2/2] Let a plugin keep a turn open after a text answer
+Date: Tue, 27 Oct 2026 11:38:59 +0800
+Subject: [PATCH] 0002 Let a plugin keep a turn open after a text answer
 
-The stop gates could only continue a turn for code edits (pre_verify) or the
-kanban protocol, so a plugin that found a blocker while the final model call ran
-had no way to act on it. Drain hermes_cli.plugin_runtime's continuation slot
-before verify-on-stop, append the text as a durable user row typed
-display_kind=adviser, and bound the behaviour with agent.max_plugin_continuations
-(default 2, separate from the verify budget). An over-budget request is discarded
-with token state expired, so the plugin returns its rows to pending instead of
-assuming delivery.
 ---
  agent/turn_context.py                        |   3 +
  agent/turn_stop_gates.py                     |  66 ++++++++++
@@ -21,13 +13,13 @@ assuming delivery.
  create mode 100644 tests/agent/test_plugin_continuation_gate.py
 
 diff --git a/agent/turn_context.py b/agent/turn_context.py
-index fa61b311c9..0306ee7d63 100644
+index 009f43c795..a15cbcba62 100644
 --- a/agent/turn_context.py
 +++ b/agent/turn_context.py
-@@ -614,6 +614,9 @@ _PER_TURN_RESET_STATE: tuple[tuple[str, Any], ...] = (
+@@ -615,6 +615,9 @@ _PER_TURN_RESET_STATE: tuple[tuple[str, Any], ...] = (
      ("_iteration_budget_warning_injected", False),
      ("_run_budget_wrapup_injected", False), ("_verification_stop_nudges", 0),
-     ("_pre_verify_nudges", 0),
+     ("_pre_verify_nudges", 0), ("_lsp_turn_end_notes", 0),
 +    # Plugin stop-gate continuations (`hermes_cli.plugin_runtime`); a per-turn
 +    # budget so a plugin asking to continue forever cannot trap the loop.
 +    ("_plugin_continue_nudges", 0),
@@ -35,10 +27,10 @@ index fa61b311c9..0306ee7d63 100644
  
  
 diff --git a/agent/turn_stop_gates.py b/agent/turn_stop_gates.py
-index 9580c635d4..cf8396f950 100644
+index c3c24088cf..36d495eee8 100644
 --- a/agent/turn_stop_gates.py
 +++ b/agent/turn_stop_gates.py
-@@ -76,6 +76,50 @@ def _pre_verify_nudge(agent, final_response, attempt: int) -> Optional[str]:
+@@ -77,6 +77,50 @@ def _pre_verify_nudge(agent, final_response, attempt: int) -> Optional[str]:
      return None
  
  
@@ -89,7 +81,7 @@ index 9580c635d4..cf8396f950 100644
  def _kanban_stop_nudge(agent, messages) -> Optional[str]:
      """Workers must end with a terminal board tool (kanban_complete / kanban_block /
      kanban_request_review / kanban_request_changes); a narrated stop is recorded
-@@ -129,6 +173,28 @@ def apply_stop_gates(
+@@ -155,6 +199,28 @@ def apply_stop_gates(
              ),
          )
  
@@ -115,14 +107,14 @@ index 9580c635d4..cf8396f950 100644
 +            ),
 +        )
 +
-     _verify_nudge = _verify_on_stop_nudge(agent)
-     if _verify_nudge:
-         agent._verification_stop_nudges = getattr(agent, "_verification_stop_nudges", 0) + 1
+     _lsp_note = _late_lsp_verdicts(agent)
+     if _lsp_note:
+         agent._lsp_turn_end_notes = getattr(agent, "_lsp_turn_end_notes", 0) + 1  # int: checked above
 diff --git a/cli-config.yaml.example b/cli-config.yaml.example
-index 629ea2ea93..bafb2c674c 100644
+index 5343b2acf7..d8481e7380 100644
 --- a/cli-config.yaml.example
 +++ b/cli-config.yaml.example
-@@ -1292,6 +1292,12 @@ agent:
+@@ -1321,6 +1321,12 @@ agent:
    # Default 3.
    # max_verify_nudges: 3
  
@@ -136,7 +128,7 @@ index 629ea2ea93..bafb2c674c 100644
    verbose: false
    
 diff --git a/hermes_cli/config_defaults.py b/hermes_cli/config_defaults.py
-index 76b6fbd23a..514cc42b85 100644
+index 63ff490ee7..702fced955 100644
 --- a/hermes_cli/config_defaults.py
 +++ b/hermes_cli/config_defaults.py
 @@ -213,6 +213,11 @@ DEFAULT_CONFIG = {
@@ -278,3 +270,6 @@ index 0000000000..104397ab17
 +    assert result["final_response"] == "clean answer"
 +    assert not [row for row in result["messages"]
 +                if row.get("display_kind") == plugin_runtime.DISPLAY_KIND]
+-- 
+2.53.0.windows.3
+

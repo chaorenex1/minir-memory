@@ -1,36 +1,37 @@
-From 0000000000000000000000000000000000000000012 Mon Sep 17 00:00:00 2001
+From 9dab1f00ed35cdd9520b4af1067315d32d2f8c81 Mon Sep 17 00:00:00 2001
 From: chaorenex1 <24537608z@gmail.com>
-Date: Thu, 22 Oct 2026 13:21:05 +0800
-Subject: [PATCH] Label adviser-triggered turns and keep adviser steers out of user intervention
+Date: Tue, 27 Oct 2026 11:39:59 +0800
+Subject: [PATCH] 0012 Label adviser-triggered turns and keep adviser steers
+ out of user intervention
 
-A leftover adviser steer is requeued as the next turn by both live hosts. Persist that
-row with display_kind=adviser so every surface draws a card, not a user bubble, and stop
-clearing the unattended flag when the steer came from a reviewer.
 ---
-
- agent/interrupt_control.py                    |    9 ++++--
- hermes_cli/cli_chat_turn_mixin.py             |   17 +++++++++++-
- tui_gateway/prompt_turn.py                    |    9 ++++++
- tui_gateway/session_auto_continue.py          |    4 ++-
- tests/agent/test_steer.py                     |   10 +++++++
- tests/tui_gateway/test_adviser_trigger_row.py |   35 +++++++++++++++++++++++++
- 6 files changed, 78 insertions(+), 6 deletions(-)
+ agent/interrupt_control.py                    | 10 +++---
+ hermes_cli/cli_chat_turn_mixin.py             | 17 ++++++++-
+ tests/agent/test_steer.py                     | 10 ++++++
+ tests/tui_gateway/test_adviser_trigger_row.py | 35 +++++++++++++++++++
+ tui_gateway/prompt_turn.py                    |  9 ++++-
+ tui_gateway/session_auto_continue.py          |  4 ++-
+ 6 files changed, 78 insertions(+), 7 deletions(-)
+ create mode 100644 tests/tui_gateway/test_adviser_trigger_row.py
 
 diff --git a/agent/interrupt_control.py b/agent/interrupt_control.py
+index 789e41066a..d883d44c1b 100644
 --- a/agent/interrupt_control.py
 +++ b/agent/interrupt_control.py
-@@ -275,12 +275,15 @@
+@@ -325,14 +325,16 @@ class InterruptControlMixin:
          if not text or not text.strip():
              return False
          cleaned = text.strip()
 +        is_adviser = str(kind or "").lower() == "adviser"
          with _ic_lock(self, "_pending_steer_lock"):
-             existing = _ic_slot(self, "_pending_steer_lock", "_pending_steer")
-             self._pending_steer = (existing + "\n" + cleaned) if existing else cleaned
--            self._pending_steer_kind = "adviser" if str(kind or "").lower() == "adviser" else "user"
+             _set_steer_parts(
+                 self,
+-                _steer_parts(self)
+-                + [(ticket, cleaned, "adviser" if str(kind or "").lower() == "adviser" else "user")],
++                _steer_parts(self) + [(ticket, cleaned, "adviser" if is_adviser else "user")],
+             )
 -        # The turn no longer ran on its own (first-task-done detection reads this off the result).
 -        self._turn_user_intervened = True
-+            self._pending_steer_kind = "adviser" if is_adviser else "user"
 +        # A reviewer's advice is not a user intervention: first-task-done detection must keep
 +        # reading the turn as unattended. Only a human steer clears that flag.
 +        if not is_adviser:
@@ -39,9 +40,10 @@ diff --git a/agent/interrupt_control.py b/agent/interrupt_control.py
  
      def redirect(self, text: str) -> bool:
 diff --git a/hermes_cli/cli_chat_turn_mixin.py b/hermes_cli/cli_chat_turn_mixin.py
+index 94d49d3553..28855f77b7 100644
 --- a/hermes_cli/cli_chat_turn_mixin.py
 +++ b/hermes_cli/cli_chat_turn_mixin.py
-@@ -348,6 +348,14 @@
+@@ -330,6 +330,14 @@ class CLIChatTurnMixin:
          # Notes and voice prefix are API-local: the staged input stays the durable transcript
          # value so a close-path marker follows the same dict instead of a second user row.
          _persist_clean_user_message = message if (turn.voice_prefix or agent_message != message) else None
@@ -56,7 +58,7 @@ diff --git a/hermes_cli/cli_chat_turn_mixin.py b/hermes_cli/cli_chat_turn_mixin.
          _one_turn_model_restore = getattr(self, "_pending_one_turn_model_restore", None)
          self._pending_one_turn_model_restore = None
          try:
-@@ -358,7 +366,8 @@
+@@ -340,7 +348,8 @@ class CLIChatTurnMixin:
                      user_message=agent_message,
                      conversation_history=self.conversation_history[:-1],
                      stream_callback=None if muted else turn.stream_callback, task_id=self.session_id,
@@ -66,7 +68,7 @@ diff --git a/hermes_cli/cli_chat_turn_mixin.py b/hermes_cli/cli_chat_turn_mixin.
                  )
              if getattr(self, "_pending_moa_disable_after_turn", False):
                  _restore = getattr(self, "_pending_moa_restore_model", None) or {}
-@@ -610,6 +619,12 @@
+@@ -595,6 +604,12 @@ class CLIChatTurnMixin:
              preview = _leftover_steer[:60] + ("..." if len(_leftover_steer) > 60 else "")
              _cprint(f"\n{t('cli.chat.delivering_leftover_steer', preview=preview)}")
              self._pending_input.put(_leftover_steer)
@@ -79,45 +81,11 @@ diff --git a/hermes_cli/cli_chat_turn_mixin.py b/hermes_cli/cli_chat_turn_mixin.
  
          return response
  
-diff --git a/tui_gateway/prompt_turn.py b/tui_gateway/prompt_turn.py
---- a/tui_gateway/prompt_turn.py
-+++ b/tui_gateway/prompt_turn.py
-@@ -442,9 +442,16 @@
-     requeued first so it isn't dropped; then goal continuation, then completion
-     notifications.  Each nested submit re-checks ``running`` under the lock."""
-     steer = result.get("pending_steer") if isinstance(result, dict) else None
-+    steer_kind = result.get("pending_steer_kind") if isinstance(result, dict) else None
-     if isinstance(steer, str) and steer.strip():
-         with session["history_lock"]:
--            _enqueue_prompt(session, steer, session.get("transport"))
-+            envelope = _enqueue_prompt(session, steer, session.get("transport"))
-+            if envelope is not None:
-+                # An adviser trigger is still a real turn, but its row must render as an adviser
-+                # card, not as words the user typed. The label rides the queued row into the
-+                # drained turn, where ``_run_prompt_submit`` adopts it.
-+                _persist_queued_user_row(
-+                    session, envelope, "adviser" if steer_kind == "adviser" else None)
-     if _drain_queued_prompt(rid, sid, session):
-         return
-     if goal_followup:
-diff --git a/tui_gateway/session_auto_continue.py b/tui_gateway/session_auto_continue.py
---- a/tui_gateway/session_auto_continue.py
-+++ b/tui_gateway/session_auto_continue.py
-@@ -506,7 +506,9 @@
-     dispatch_failed = False
-     try:
-         if not use_compute_host:
--            _run_prompt_submit(rid, sid, session, queued["text"], **kwargs, **author_kwargs)
-+            _run_prompt_submit(rid, sid, session, queued["text"],
-+                               display_kind=queued.get("_queued_display_kind"),
-+                               **kwargs, **author_kwargs)
-         elif (resp := _submit_prompt_to_compute_host(rid, sid, session, queued["text"], **kwargs)).get("error"):
-             with session["history_lock"]:
-                 session["running"] = False
 diff --git a/tests/agent/test_steer.py b/tests/agent/test_steer.py
+index adb66aa394..c1d7b37d4e 100644
 --- a/tests/agent/test_steer.py
 +++ b/tests/agent/test_steer.py
-@@ -80,6 +80,16 @@
+@@ -80,6 +80,16 @@ class TestSteerDrain:
          assert agent._drain_pending_steer() == "hello"
          assert agent._pending_steer is None
  
@@ -131,11 +99,12 @@ diff --git a/tests/agent/test_steer.py b/tests/agent/test_steer.py
 +        assert agent.steer("typed note") is True
 +        assert agent._turn_user_intervened is True
 +
- 
- 
- class TestActiveTurnRedirect:
+     def test_withdraw_takes_back_one_unconsumed_ticket_and_keeps_the_rest(self):
+         agent = _bare_agent()
+         agent.steer("first")
 diff --git a/tests/tui_gateway/test_adviser_trigger_row.py b/tests/tui_gateway/test_adviser_trigger_row.py
 new file mode 100644
+index 0000000000..4ae96103e5
 --- /dev/null
 +++ b/tests/tui_gateway/test_adviser_trigger_row.py
 @@ -0,0 +1,35 @@
@@ -174,3 +143,43 @@ new file mode 100644
 +def test_leftover_human_steer_stays_an_ordinary_turn(monkeypatch):
 +    rows = _run(monkeypatch, {"pending_steer": "typed by the user"})
 +    assert rows == [({"text": "typed by the user"}, None)]
+diff --git a/tui_gateway/prompt_turn.py b/tui_gateway/prompt_turn.py
+index 67bf1e3c30..27be0111d6 100644
+--- a/tui_gateway/prompt_turn.py
++++ b/tui_gateway/prompt_turn.py
+@@ -443,9 +443,16 @@ def _run_post_turn_followups(
+     requeued first so it isn't dropped; then goal continuation, then completion
+     notifications.  Each nested submit re-checks ``running`` under the lock."""
+     steer = result.get("pending_steer") if isinstance(result, dict) else None
++    steer_kind = result.get("pending_steer_kind") if isinstance(result, dict) else None
+     if isinstance(steer, str) and steer.strip():
+         with session["history_lock"]:
+-            _enqueue_prompt(session, steer, session.get("transport"))
++            envelope = _enqueue_prompt(session, steer, session.get("transport"))
++            if envelope is not None:
++                # An adviser trigger is still a real turn, but its row must render as an adviser
++                # card, not as words the user typed. The label rides the queued row into the
++                # drained turn, where ``_run_prompt_submit`` adopts it.
++                _persist_queued_user_row(
++                    session, envelope, "adviser" if steer_kind == "adviser" else None)
+     if _drain_queued_prompt(rid, sid, session):
+         return
+     if goal_followup:
+diff --git a/tui_gateway/session_auto_continue.py b/tui_gateway/session_auto_continue.py
+index ba20b94d41..7c4b8e0540 100644
+--- a/tui_gateway/session_auto_continue.py
++++ b/tui_gateway/session_auto_continue.py
+@@ -506,7 +506,9 @@ def _drain_queued_prompt(rid, sid: str, session: dict) -> bool:
+     dispatch_failed = False
+     try:
+         if not use_compute_host:
+-            _run_prompt_submit(rid, sid, session, queued["text"], **kwargs, **author_kwargs)
++            _run_prompt_submit(rid, sid, session, queued["text"],
++                               display_kind=queued.get("_queued_display_kind"),
++                               **kwargs, **author_kwargs)
+         elif (resp := _submit_prompt_to_compute_host(rid, sid, session, queued["text"], **kwargs)).get("error"):
+             with session["history_lock"]:
+                 session["running"] = False
+-- 
+2.53.0.windows.3
+
