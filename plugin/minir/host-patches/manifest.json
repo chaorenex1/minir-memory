@@ -3,7 +3,7 @@
   "capability": "plugin_runtime_v2",
   "base_version": "0.22.5",
   "base_commit": "bf0203a794",
-  "description": "Plugin control bridge (steer/continuation/interrupt), post-turn triggers, cooperative flags, live adviser events, a preserved card at the turn end, labeled adviser-triggered turns, and adviser rows on every host surface: Desktop card, TUI card, classic CLI block, web session inspector, and a native web chat transcript (the PTY stays available as a fallback); each adviser note carries its own severity on every surface; and the CLI's verbose tool progress prints each call's result body under its row, with the one-line modes as the fold.",
+  "description": "Plugin control bridge (steer/continuation/interrupt), post-turn triggers, cooperative flags, live adviser events, a preserved card at the turn end, labeled adviser-triggered turns, and adviser rows on every host surface: Desktop card, TUI card, classic CLI block, web session inspector, and a native web chat transcript (the PTY stays available as a fallback); each adviser note carries its own severity on every surface; and the CLI's verbose tool progress prints each call's result body under its row, with the one-line modes as the fold; and a tool step's reasoning prints above the rows it asked for, never under the final answer; and a plugin callback may declare its own hook budget so a pre-tool gate can wait for one model answer without slowing every other hook.",
   "patches": [
     {
       "name": "0001-Add-a-session-scoped-plugin-control-bridge.patch",
@@ -64,6 +64,22 @@
     {
       "name": "0015-Print-a-completed-tool-result-under-its-row-in-verbose-mode.patch",
       "sha256": "716056dc771a9988f190777c3cc1b897568c4fb8bae45c5e5e94a0928172aa0d"
+    },
+    {
+      "name": "0016-Print-the-reasoning-that-asked-for-a-tool-call-above-its-rows.patch",
+      "sha256": "20039ad5fe41f1f8de23a87c24b7d785935594936959650d77c16d58cbbb0c1c"
+    },
+    {
+      "name": "0017-Resend-the-reasoning-display-flag-when-the-session-rotates.patch",
+      "sha256": "e9b1619453619efff24e95efff30c8088aab827f4ef4d6282860beaf35788a43"
+    },
+    {
+      "name": "0018-Commit-the-reasoning-level-to-a-rotated-session.patch",
+      "sha256": "9f23a3588f14df964906c299a0a4dcb611bc1952f3ea5d8da4cfebc920cc9b3f"
+    },
+    {
+      "name": "0019-Let-a-plugin-callback-declare-its-own-hook-budget.patch",
+      "sha256": "0846dd0661a1d7768f41a861369ee4c3b0572ed12de912c67917621368b6f73f"
     }
   ],
   "rebased": "v0.22.5 (bf0203a794). Two merge decisions: the steer buffer holds (ticket, text, kind) triples so the upstream ticket API keeps working while an adviser row stays labeled, and the plugin continuation gate runs before the late-LSP gate (a blocker outranks a note)."

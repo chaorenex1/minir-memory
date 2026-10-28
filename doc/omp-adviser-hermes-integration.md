@@ -401,6 +401,7 @@ plugin/minir/host-patches/
   0013-...patch     web 原生聊天 transcript（gateway WS + adviser 卡 + 工具/审批）
   0014-...patch     每条 adviser 建议按自身 severity 着色（Desktop/TUI/classic CLI/web）
   0015-...patch     classic CLI 的 verbose 工具进程：完成的工具行下打印 result 正文；all/new/off 为折叠，`/verbose <mode>` 直接指定
+  0016-...patch     工具步骤的思考打印在它发起的工具行之上；思考不再出现在最终回答之后
 scripts/install.py              复制插件 → 应用系列 → 验证
 scripts/install_host_patches.py 应用/检查/回滚（可单独运行）
 ```
