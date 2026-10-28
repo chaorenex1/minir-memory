@@ -48,8 +48,10 @@ include = ["minir*"]
 # Summary shape (`window_summary.py`) all resolve them next to their module.
 [tool.setuptools.package-data]
 minir = ["plugin.yaml", "prompts/*.md", "prompts/adviser/*.md", "agents/*.md",
-         "templates/*.md", "rules/*.md", "skills/*/SKILL.md", "host-patches/*.patch",
-         "host-patches/manifest.json"]
+         "templates/*.md", "rules/*.md", "skills/*/SKILL.md",
+         "skills/*/agents/*.md", "skills/*/references/*.md",
+         "skills/*/references/*.yaml",
+         "host-patches/*.patch", "host-patches/manifest.json"]
 
 [tool.setuptools.exclude-package-data]
 minir = ["__pycache__/*", "*.py[cod]"]

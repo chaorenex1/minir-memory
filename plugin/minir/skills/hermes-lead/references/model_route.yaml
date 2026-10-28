@@ -1,0 +1,21 @@
+# Model routes for the three hermes-lead roles.
+#
+# The lead loads this file with
+#   skill_view(name="minir:hermes-lead", file_path="references/model_route.yaml")
+# and passes one role's pair to minir_agents as model="<provider>:<model>" — the tool's route
+# form. A bare model name would keep the gateway's provider, which is not what these entries say.
+#
+# Keys are agent_name values. The three pairs are independent: changing one reroutes one role.
+# A role this file does not name runs on the gateway route, and the lead reports that gap instead
+# of inventing an entry.
+
+roles:
+  minir_explorer:
+    provider: opencode-go
+    model: glm-5.3-flash
+  minir_researcher:
+    provider: opencode-go
+    model: deepseek-v4.1-flash
+  minir_worker:
+    provider: opencode-go
+    model: kimi-k3.1-pro
