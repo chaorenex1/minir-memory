@@ -1,6 +1,6 @@
 # 规则文件与动态组装草稿
 
-状态：草稿。依据 `doc/base-dialectic-layers-draft.md` 与 `doc/layer-agent-contracts-draft.md`。
+状态：草稿。依据 `docs/draft/base-dialectic-layers-draft.md` 与 `docs/draft/layer-agent-contracts-draft.md`。
 
 目标：把用户卡、AI 卡、Value Markers 两个维度的判定规则从提示词正文里抽出来，变成 6 份独立规则文件，由加载器在每次调用时组装进对应层的 system prompt。
 
@@ -279,6 +279,6 @@ REVIEW CHECKS：
 
 ## 5. 与两份主文档的改动
 
-- `doc/layer-agent-contracts-draft.md` 里 B1 的 FIELDS、B2 的 FIELDS 与 GROUNDING、B3 的 MARKERS 三节改为引用 `<rules>` 块，不再内联规则正文。各层的章节摘要表补一行 `RULES`。
+- `docs/draft/layer-agent-contracts-draft.md` 里 B1 的 FIELDS、B2 的 FIELDS 与 GROUNDING、B3 的 MARKERS 三节改为引用 `<rules>` 块，不再内联规则正文。各层的章节摘要表补一行 `RULES`。
 - 分层草稿 4.7 的写拒绝清单增加 `rules/`：模型侧不可写，operator 可覆写。
 - 规则文件随插件发布，路径 `plugin/minir/rules/`；operator 覆写目录 `$HERMES_HOME/minir-memory/rules/`，不参与知识文件、卡文件、transcript 的清理。

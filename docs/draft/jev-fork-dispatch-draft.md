@@ -1,6 +1,6 @@
 # JEV fork 层 · 设计草稿（插件内中央调度）
 
-状态：草稿，落在本插件 `doc/` 下。没有接线、没有建表、没有建文件、没有改 config；§5.1 的 host patch 0019 也只有规格，没有写、没有应用。代码块只说明形状，未抽出去跑。
+状态：草稿，落在本插件 `docs/` 下。没有接线、没有建表、没有建文件、没有改 config；§5.1 的 host patch 0019 也只有规格，没有写、没有应用。代码块只说明形状，未抽出去跑。
 
 依据：本仓库 HEAD 工作树（`git status` 8 个已改文件，本文不碰它们）；宿主源码 `C:\Users\zarag\AppData\Local\hermes\hermes-agent`；另见 §1 的行号。
 
@@ -426,7 +426,7 @@ adviser_mode:
   review_interval: 8      # 阶段触发之外，减少步中复盘
 ```
 
-默认 `off`，行为与今天完全一致。新增键要同步 manifest、README 与 `verify_against_host.py` 的配置断言，按会话模式那一版的做法（`doc/adviser-session-modes-draft.md:90-99`）。host 侧的 120 s 不是配置项，是 callback 上的 `__hook_timeout__`（§5.1）。
+默认 `off`，行为与今天完全一致。新增键要同步 manifest、README 与 `verify_against_host.py` 的配置断言，按会话模式那一版的做法（`docs/draft/adviser-session-modes-draft.md:90-99`）。host 侧的 120 s 不是配置项，是 callback 上的 `__hook_timeout__`（§5.1）。
 
 ## 8. 代码骨架
 

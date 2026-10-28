@@ -2,7 +2,7 @@
 
 状态：定稿，待实施。
 基线：`main` `4036df0`。
-取代 `doc/minir-todo-draft.md`（v4：JSONL 多列表）：todo 改为 conclusions 单行，`kind="todo"`。
+取代 `docs/draft/minir-todo-draft.md`（v4：JSONL 多列表）：todo 改为 conclusions 单行，`kind="todo"`。
 
 ## 1. 范围与非目标
 

@@ -313,6 +313,6 @@ previous = 本会话 window_to_ts 最大的 base_refreshes 行（无则空）
 
 ## 11. 与现有草稿的关系
 
-- 沿用 `doc/window-summary-template-draft.md` 的字段与上限，不重复定义。
-- 修正 `doc/conclusions-only-draft.md` 中把 `dialectic_refreshes` 当作发布面的读法：它只是覆写前快照。
-- 与 `doc/base-dialectic-layers-draft.md` 的 base/dialectic 双节拍不冲突；本稿只加一个窗口概念，compress 只是窗口内的校准事件。
+- 沿用 `docs/draft/window-summary-template-draft.md` 的字段与上限，不重复定义。
+- 修正 `docs/draft/conclusions-only-draft.md` 中把 `dialectic_refreshes` 当作发布面的读法：它只是覆写前快照。
+- 与 `docs/draft/base-dialectic-layers-draft.md` 的 base/dialectic 双节拍不冲突；本稿只加一个窗口概念，compress 只是窗口内的校准事件。

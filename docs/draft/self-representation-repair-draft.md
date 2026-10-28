@@ -355,7 +355,7 @@ review（transcript + 准绳 + 统计块）
 | 10 | `store.py` | `adviser_reviews.coverage`（走 `_ADDED_COLUMNS`）；`review_stats(session_id, window)` 只读 review / advisories / drop_detail |
 | 11 | `adviser_guard.py` | `_drop` 的计数键带 target，`drop_detail` 仍是 reason→count |
 | 12 | `__init__.py` | `minir_stats` 输出增 `targets` 段（review 覆盖、投递、重复观测） |
-| 13 | `README.md`、`doc/rule-files-draft.md` | 目标计数改为按常量表述（README 现写 11，常量是 7）；补 `advice_target` / `advice_judgment` 两个规则行 |
+| 13 | `README.md`、`docs/draft/rule-files-draft.md` | 目标计数改为按常量表述（README 现写 11，常量是 7）；补 `advice_target` / `advice_judgment` 两个规则行 |
 
 ## 6. 测试
 

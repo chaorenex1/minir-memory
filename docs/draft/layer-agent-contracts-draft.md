@@ -1,6 +1,6 @@
 # 各层 AI Agent 契约与提示词草稿
 
-状态：已实现（2026-10-23，T8-T10/T12-T13）。依据 `doc/base-dialectic-layers-draft.md`（下称"分层草稿"）。
+状态：已实现（2026-10-23，T8-T10/T12-T13）。依据 `docs/draft/base-dialectic-layers-draft.md`（下称"分层草稿"）。
 
 范围：只写模型驱动的层。`TranscriptBuffer` 是机械写入，没有提示词；adviser 链路不在本文件内。
 
@@ -107,7 +107,7 @@ B2 读 user_self / user_preferences / window_summary → ai_self / ai_identity
 
 - B1、B2 仍是层 pass（`auxiliary.minir_dialectic`）。B3、B4 不再是层 pass，而是 B1 通过 `minir_agents` 起的子 agent；提示词就是 `agents/b3_window_summary.md`、`agents/b4_value_markers.md`，由 `minir_agents` 的 `PROMPT_DIRS`（`plugins/minir/agents`，`minir_agents.py:53-59`）解析。
 - 子 agent 的 `tool_sets` 固定：B3 `["file", "session_search"]`；B4 `["file", "minir", "session_search"]`，`minir_kb_search` 在 `minir` 里。`skip_memory`、`skip_context_files`、`load_soul_identity` 全关，子 agent 只读窗口证据与规则，不带宿主的记忆与身份。
-- 子 agent 的 `model` 由 B1 从自己的 `[run-meta]` 读 `provider:model` 后传给 `minir_agents`；子 agent 不接受 model 覆盖。机制见 `doc/session-todo-draft.md` §3.5 T16。
+- 子 agent 的 `model` 由 B1 从自己的 `[run-meta]` 读 `provider:model` 后传给 `minir_agents`；子 agent 不接受 model 覆盖。机制见 `docs/draft/session-todo-draft.md` §3.5 T16。
 - 递归上限 `MAX_DEPTH = 3`（`minir_agents.py:43`）。B1 是第 1 层，子 agent 是第 2 层；子 agent 的提示词禁止再调 `minir_agents`，否则第 3 层就撞上限。
 - 窗口证据用文件传，不让子 agent 自己拼窗口：worker 把本窗口的 digest 写到 scratch 的 `window-<session>-<from>-<to>.txt`，B1 的输入里给 `<window_digest_path>`，调子 agent 时放进 `context_files`。B1 的上下文只多一个路径，子 agent 拿到同一份证据，B3/B4 不必用 session_search 重建窗口。
 - B3 与 B4 互不依赖，可以在同一回合并行发出；宿主串行执行也不影响结果。任一子 agent 失败时，B1 仍输出另外三个键，失败键留空串或空数组；worker 记 `child_failed` 并只重跑那一个子 agent 一次。连续失败则本次 base 刷新失败，保留旧 artifact。

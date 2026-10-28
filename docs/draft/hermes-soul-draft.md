@@ -321,7 +321,7 @@ SOUL 覆盖不到的地方：
 - 能力级措辞：`when exposed` / `if available`，不硬编码可选工具名。
 - 不出现 `HERMES_HOME`、profile 路径、端口、项目名、数据库路径。
 - 不写只对 `delegate_task` 子 agent 生效的规则；它们读不到 SOUL，应写进 child prompt / `AGENTS.md`。
-- 目标体量 ≤2,200 词（英文成稿）是软上限，不是删除规则的借口。实测：`doc/hermes-soul.md` 16 章 2,061 词（宿主 loader 统计，6,016 中文字符 ÷ 2.92，早期按 1,580 词估低了）。成稿超预算时提高预算，落笔前把新上限写回本节；只有同一约束被写两遍时才合并，合并后规则本体必须仍在。
+- 目标体量 ≤2,200 词（英文成稿）是软上限，不是删除规则的借口。实测：`docs/hermes-soul.md` 16 章 2,061 词（宿主 loader 统计，6,016 中文字符 ÷ 2.92，早期按 1,580 词估低了）。成稿超预算时提高预算，落笔前把新上限写回本节；只有同一约束被写两遍时才合并，合并后规则本体必须仍在。
 - `NEVER`/`MUST` 只用于硬规则；其余用陈述句。
 - 不写元评论、不写“这个文件的作用是……”。
 
@@ -338,9 +338,9 @@ SOUL 覆盖不到的地方：
 
 ## 8. 下一步
 
-1. 英文成稿：`doc/hermes-soul.md`，16 章、2,061 词。
+1. 英文成稿：`docs/hermes-soul.md`，16 章、2,061 词。
 2. 装载验证已过：`load_soul_md(home_override=<临时 home>)` 返回 13,232 字符、无截断标记、无注入告警、无遗留 Bot Mode 段。
-   真实 profile 复查（2026-10-19 14:29，`home_override=$HERMES_HOME`，宿主 .venv）：返回 13,232 字符，与 `doc/hermes-soul.md` 逐字符相同；无 `truncated` 标记（上限 20,000）、无扫描告警、无 Bot Mode 段；首行 `# Role`。本会话 system prompt 已含该内容，装载路径生效。
+   真实 profile 复查（2026-10-19 14:29，`home_override=$HERMES_HOME`，宿主 .venv）：返回 13,232 字符，与 `docs/hermes-soul.md` 逐字符相同；无 `truncated` 标记（上限 20,000）、无扫描告警、无 Bot Mode 段；首行 `# Role`。本会话 system prompt 已含该内容，装载路径生效。
 3. 在 adviser 子运行中抽查：角色让位与实现流程关闭是否生效。
 4. 在 `delegate_task` 子运行中抽查：不依赖 SOUL 的 worker 规则是否由 child prompt 提供。
 5. 抽查 `# Craft`：构造一个含编造数字与叙述式注释的产物，确认 review 能列出具体行、clean 只改列出的项、re-review 收敛，且代码被改动后重跑了检查。

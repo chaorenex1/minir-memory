@@ -6,7 +6,7 @@
 
 ## 1. 决定
 
-1. minir 拟新增 `events` org；变更草稿见 `doc/events-org-change-draft.md`，当前代码未改。
+1. minir 拟新增 `events` org；变更草稿见 `docs/draft/events-org-change-draft.md`，当前代码未改。
 2. 适配时 category 用固定映射，不跑分类模型。
 3. 超过 2k token 的页面拆子页，不丢内容。
 4. 同一 (category, org, topic) 的多个来源合并成一页，不加后缀。
@@ -72,7 +72,7 @@
 - 不写 `import_lancedb_knowledge.py`，不跑迁移，不改 lancedb 文件。
 - `identity.md`/`preference.md` 属于用户卡/AI 身份，`contexts/*` 属于会话卡与会话摘要，都不进知识库。
 - `summary.md`/`detailed-summary.md` 只作为 §4 的 `summary` 来源，文件本身不导入。
-- 若将来要导入，上表与 §4-§6 是合同；先按 `doc/events-org-change-draft.md` 落地 `events` org。
+- 若将来要导入，上表与 §4-§6 是合同；先按 `docs/draft/events-org-change-draft.md` 落地 `events` org。
 
 ## 8. 与现有机制的接口
 

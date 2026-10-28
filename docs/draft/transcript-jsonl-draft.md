@@ -9,7 +9,7 @@ v2 相对 v1：
 - `minir_aiagent_search` 的数据源改为 TranscriptBuffer，读接口并入 buffer。
 - 补三条已核事实（摄取截断、每流 4000 条上限、记录数无界），对应新增约束。
 
-取代 `doc/minir-todo-draft.md` §6.1 中「超过两个 part 删除最旧整份」一节（与永久保留冲突）。
+取代 `docs/draft/minir-todo-draft.md` §6.1 中「超过两个 part 删除最旧整份」一节（与永久保留冲突）。
 
 ## 1. 需求重述
 
@@ -306,7 +306,7 @@ buffer.digest(platform, layer, session_id, *,
 | 10 | `adviser_mode.py:55,86,787-789,1404`、`tools.py:38,142`、`handoff.py:149-150`、`adviser.py:42` | 工具集归并，删除 `adviser` 常量 |
 | 11 | `plugin.yaml` | `provides_tools`：改名 + 新增 `minir_aiagent_search` |
 | 12 | `README.md` | 工具表、toolset 说明、transcript 格式与保留策略 |
-| 13 | `doc/minir-todo-draft.md` | §6.1 标注被本稿取代 |
+| 13 | `docs/draft/minir-todo-draft.md` | §6.1 标注被本稿取代 |
 | 14 | `tests/` | `test_transcript_buffer.py`（新）、`test_transcript_process.py`（新）、`test_transcript_prompt.py`（新）、`test_agent_history.py`（新）、`test_adviser.py:265-305`、`test_session_search.py`、`test_adviser_history.py:66,88` 全改 `.jsonl`；删 `adviser_consult` 相关断言 |
 
 ## 11. 验收

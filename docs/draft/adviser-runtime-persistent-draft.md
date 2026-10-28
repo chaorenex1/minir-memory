@@ -97,7 +97,7 @@ class AdvisorRuntime:
    turns_ago/deferred、roster 上限、暂停。
 5. 测试：`test_adviser_history.py`、`test_adviser_mode.py`、`test_adviser_channels.py`、
    `test_agent_loop.py`、`test_store*.py` 增加对应断言。
-6. 文档：`doc/omp-adviser-hermes-integration.md` §5/§9.5 更新为已实现与剩余边界；
+6. 文档：`docs/omp-adviser-hermes-integration.md` §5/§9.5 更新为已实现与剩余边界；
    `plugin/minir/plugin.yaml` 版本号随发布递增。
 
 ## 测试

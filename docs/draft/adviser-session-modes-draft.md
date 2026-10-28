@@ -186,7 +186,7 @@ SKILL.md 六节，顺序写死：
 | --- | --- | --- |
 | U1 | 「多智能体协作」归 research 阶段，还是被这两级整体替代 | 需用户定 |
 | U1 建议答案 | 委派式多体进 implement：每个写者一个 `git clone --shared` 目录 + `feature/N` 分支；只读体共用主树；门禁在 merge 不在 commit；不用 git worktree | 待你确认 |
-| 建议 | `/adviser implement` 是否必须带目标草稿路径（如 `/adviser implement doc/xxx-draft.md`） | 我建议必须带；多份草稿时不给路径只能猜 |
+| 建议 | `/adviser implement` 是否必须带目标草稿路径（如 `/adviser implement docs/draft/xxx-draft.md`） | 我建议必须带；多份草稿时不给路径只能猜 |
 | V1 | 研究阶段「贴代码片段」算不算写代码 | 初值：算，只描述位置与改法 |
 | V2 | 模式切换判据：只由用户决定，还是允许模型建议 | 初值：只由用户决定，模型收尾可提一句 |
 | V3 | default 模式下读到本技能后是否立刻停 | 初值：停，不执行任何一节 |

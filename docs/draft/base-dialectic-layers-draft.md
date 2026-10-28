@@ -263,7 +263,7 @@
 
 `ai_self.state` 取固定枚举 `idle|executing|reasoning|reviewing|blocked|done`，对应需求里的待命、执行、推理、审查、阻塞、完成；自由文本会让状态无法聚合。
 
-窗口摘要的字段与上限以 `doc/window-summary-template-draft.md` 为准：markdown 单一形态，`objective` 是目标集合，`current_state` 把每个目标 id 分到 done/doing/todo 之一。
+窗口摘要的字段与上限以 `docs/draft/window-summary-template-draft.md` 为准：markdown 单一形态，`objective` 是目标集合，`current_state` 把每个目标 id 分到 done/doing/todo 之一。
 
 字段边界（防止同一句话写两处）：
 
@@ -322,7 +322,7 @@ Identity 卡来源（已定：模型输出 + FILE 工具）：
 - 每次刷新输入上一份 8 字段 + 本窗口，输出新的 8 字段全量，不输出增量补丁。
 - 存储仍写 `conclusions` 的 `session_chunk_summary` 链（保留审计与 dialectic 证据），但 artifact 只投影最新一份，合并输入不再取整条链。
 - 首次刷新允许 `objective` 为空、`current_state` 为空列表；禁止用占位词填充。
-- 渲染按 `doc/window-summary-template-draft.md` 的固定模板：八个标题、固定顺序、`####` 三个子状态。标题与顺序是解析契约，改模板要 bump `template_version`；旧 artifact 不重渲染。
+- 渲染按 `docs/draft/window-summary-template-draft.md` 的固定模板：八个标题、固定顺序、`####` 三个子状态。标题与顺序是解析契约，改模板要 bump `template_version`；旧 artifact 不重渲染。
 
 ### 4.6 用户卡角色预设（首次空白）
 

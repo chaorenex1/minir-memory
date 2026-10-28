@@ -1,6 +1,6 @@
 # minir_todo：会话内使用的两级待办工具（草稿 v4）
 
-> 已被 `doc/conclusions-only-draft.md` 取代：todo 改为 conclusions 单行（`kind="todo"`），
+> 已被 `docs/draft/conclusions-only-draft.md` 取代：todo 改为 conclusions 单行（`kind="todo"`），
 > 不再用 JSONL 文件、多列表、`due_at`、`blocked`。本文件仅保留作历史记录。
 
 状态：草稿，供评审（v4）。代码基线：`plugin/minir/` 当前 main（`9269854`）。
@@ -140,7 +140,7 @@ completed ──→ pending        （重开，清 done_at）
 
 ### 6.1 目标格式
 
-> 本节已被 `doc/transcript-jsonl-draft.md` 取代：最终路径多一层 `<profile>`，part 只增不删，
+> 本节已被 `docs/draft/transcript-jsonl-draft.md` 取代：最终路径多一层 `<profile>`，part 只增不删，
 > 内存缓存与 `last_cache` 标记也在该稿定义。下面的旧版描述仅保留作历史记录。
 
 ```

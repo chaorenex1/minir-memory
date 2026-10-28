@@ -2,18 +2,18 @@
 
 状态：T1-T16 已全部实现（2026-10-23）；T14 的 events org 已批准并落地。
 
-用途：把 `doc/` 下本次会话的草稿折成可执行清单。每条只写"改哪里、做完的标准"，细节回查对应草稿，不在这里重复设计。
+用途：把 `docs/` 下本次会话的草稿折成可执行清单。每条只写"改哪里、做完的标准"，细节回查对应草稿，不在这里重复设计。
 
 ## 0. 草稿清单
 
 | 草稿 | 覆盖任务 | 状态 |
 | --- | --- | --- |
-| `doc/window-lifecycle-and-ai-self-draft.md` | T1-T7 | 已实现 |
-| `doc/window-summary-template-draft.md` | T2、T3、T5 | 已实现 |
-| `doc/layer-agent-contracts-draft.md` | T8-T10、T12-T13 | 已实现 |
-| `doc/events-org-change-draft.md` | T14 | 已实现 |
-| `doc/lancedb-knowledge-adaptation-draft.md` | T15 | 规则已固化；不导入数据 |
-| `doc/base-dialectic-layers-draft.md`、`doc/layer-terminology-draft.md`、`doc/rule-files-draft.md` | 术语与预算口径 | 已同步；代码按本清单落地 |
+| `docs/draft/window-lifecycle-and-ai-self-draft.md` | T1-T7 | 已实现 |
+| `docs/draft/window-summary-template-draft.md` | T2、T3、T5 | 已实现 |
+| `docs/draft/layer-agent-contracts-draft.md` | T8-T10、T12-T13 | 已实现 |
+| `docs/draft/events-org-change-draft.md` | T14 | 已实现 |
+| `docs/draft/lancedb-knowledge-adaptation-draft.md` | T15 | 规则已固化；不导入数据 |
+| `docs/draft/base-dialectic-layers-draft.md`、`docs/draft/layer-terminology-draft.md`、`docs/draft/rule-files-draft.md` | 术语与预算口径 | 已同步；代码按本清单落地 |
 
 ## 1. 注入面（T1）
 
@@ -27,7 +27,7 @@
 ## 2. 窗口与摘要（T2-T7）
 
 - [x] **T2 窗口摘要改成目标列表 + 状态分区**
-  改：`plugin/minir/agents/b3_window_summary.md`、`plugin/minir/window_summary.py`、`doc/window-summary-template-draft.md` 已定口径。
+  改：`plugin/minir/agents/b3_window_summary.md`、`plugin/minir/window_summary.py`、`docs/draft/window-summary-template-draft.md` 已定口径。
   做：objective 是完整目标列表（无编号/状态/来源，大小目标都列）；current_state 用 Done/Doing/Todo 分组；markdown 单一形态，无 JSON 正文；不加 md 校验、不解析正文。
   做完：B3 提示词只要求按模板写；`window_summary.validate` 仍只查字符串；示例含空章节。
 
@@ -111,13 +111,13 @@
   做完：第二次 base 刷新后准绳是第二版卡；不再用一次性 conclusion；`missing_work` 能看到完整目标列表。
 
 - [x] **T13 命名映射**
-  改：`doc/layer-agent-contracts-draft.md` §0.7 已列；实现时按表。
+  改：`docs/draft/layer-agent-contracts-draft.md` §0.7 已列；实现时按表。
   做：草稿键 `user_self/user_preferences/ai_self/ai_identity/window_summary` ↔ artifact 列 ↔ conclusion kind ↔ adviser 用法，三套名字不许漂移。
 
 ## 6. 知识 org（T14，待批准）
 
 - [x] **T14 新增 events org**
-  文档：`doc/events-org-change-draft.md`。
+  文档：`docs/draft/events-org-change-draft.md`。
   改：`layers.ORGS`、`rules/markers-org.md`（v2→v3）、`README.md`、术语/规则草稿、`tests/test_knowledge.py`。
   做：加 `events`；定义"单次带日期的发生，无复用教训"；教训归 experiences；`_MARKER_KINDS` 与 `minir_remember` 不变。
   做完：events 页落在 `knowledge/events/`；kb_search org 过滤可见；回归测试全绿。
@@ -126,7 +126,7 @@
 ## 7. lancedb 适配（T15）
 
 - [x] **T15 只固化规则，不导入数据**
-  文档：`doc/lancedb-knowledge-adaptation-draft.md`。
+  文档：`docs/draft/lancedb-knowledge-adaptation-draft.md`。
   做：固定 category 映射、front-matter 合成、超 2k 拆子页、同名合并。**不写导入器、不迁移、不改 lancedb 文件。**
   做完：本机 `lancedb-memory` 目录保持原样；`identity/preference/contexts/summary` 不进知识库。
 
@@ -182,9 +182,9 @@ T13 是贯穿项（键 ↔ artifact 列 ↔ conclusion kind ↔ adviser 用法�
 
 ## 12. 参考
 
-- 生命周期与 ai_self：`doc/window-lifecycle-and-ai-self-draft.md`
-- 摘要模板：`doc/window-summary-template-draft.md`
-- agent 契约与 adviser 对齐：`doc/layer-agent-contracts-draft.md`
-- events 变更：`doc/events-org-change-draft.md`
-- lancedb 规则：`doc/lancedb-knowledge-adaptation-draft.md`
+- 生命周期与 ai_self：`docs/draft/window-lifecycle-and-ai-self-draft.md`
+- 摘要模板：`docs/draft/window-summary-template-draft.md`
+- agent 契约与 adviser 对齐：`docs/draft/layer-agent-contracts-draft.md`
+- events 变更：`docs/draft/events-org-change-draft.md`
+- lancedb 规则：`docs/draft/lancedb-knowledge-adaptation-draft.md`
 - run-meta 与多级 system_message：已并入本文 §3.5 T16

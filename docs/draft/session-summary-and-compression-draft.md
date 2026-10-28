@@ -191,11 +191,11 @@ agent 拿不到自己的 tokenizer，也不该靠"感觉长度"裁内容。这�
 | `README.md` | 修改 | 模块表、压缩段、配置段、环境变量列表、recall 段、工具表 |
 | `pyproject.toml` | 修改 | 注释里的 `handoff.py` |
 | `scripts/verify_against_host.py` | 修改 | 去掉 `handoff_enabled` 与 `MINIR_HANDOFF_ENABLED` |
-| `doc/layer-terminology-draft.md` | 修改 | 退休 Task Handoff 三条（kind 列表、术语行、对照行） |
-| `doc/window-lifecycle-and-ai-self-draft.md` | 修改 | 第 184、255 行改述压缩期 B3 |
-| `doc/layer-agent-contracts-draft.md` | 修改 | 第 814 行"8 字段"改为引用终稿模板 |
-| `doc/session-todo-draft.md` | 修改 | 第 55、56 行同步 |
-| `doc/conclusions-only-draft.md` | 修改 | 第 300 行 legacy 清理的新位置 |
+| `docs/draft/layer-terminology-draft.md` | 修改 | 退休 Task Handoff 三条（kind 列表、术语行、对照行） |
+| `docs/draft/window-lifecycle-and-ai-self-draft.md` | 修改 | 第 184、255 行改述压缩期 B3 |
+| `docs/draft/layer-agent-contracts-draft.md` | 修改 | 第 814 行"8 字段"改为引用终稿模板 |
+| `docs/draft/session-todo-draft.md` | 修改 | 第 55、56 行同步 |
+| `docs/draft/conclusions-only-draft.md` | 修改 | 第 300 行 legacy 清理的新位置 |
 
 ## 9. 测试
 

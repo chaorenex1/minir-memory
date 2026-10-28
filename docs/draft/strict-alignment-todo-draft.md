@@ -50,7 +50,7 @@
 
 剩余（全部有明确原因，不再有未写的代码项）：
 
-- W4-2 身份行谓词：这是 A 稿自列的限制（`doc/adviser-brain-to-hand-draft.md:359`「身份行没有可判定谓词，`_infer_test` 对描述行返回空，身份 claim 只能靠 scope 或词面重合被选中」）。本轮已修掉同一行的另一半（`###` 现在参与 scope）；谓词部分没有规范来源，按 A 稿原样记为已知限制，不自造。
+- W4-2 身份行谓词：这是 A 稿自列的限制（`docs/draft/adviser-brain-to-hand-draft.md:359`「身份行没有可判定谓词，`_infer_test` 对描述行返回空，身份 claim 只能靠 scope 或词面重合被选中」）。本轮已修掉同一行的另一半（`###` 现在参与 scope）；谓词部分没有规范来源，按 A 稿原样记为已知限制，不自造。
 - W2-7 两条：search golden 无基线文件；note 异步只是结构性保证。
 - W3-6：14 条清单未逐条编号；"双卡皆空"由稀疏 base 用例间接覆盖。
 - W4-6 的"38 条编号"：A 稿 §4 是指标总表，不存在 38 条用例清单，无法逐条映射。
@@ -58,10 +58,10 @@
 作用：把四份草稿的实现缺口按依赖关系合并成一份可执行的收口清单。
 源稿：
 
-- `doc/marker-schema-and-page-writes-draft.md`（下称 M）
-- `doc/conclusion-history-and-edges-draft.md`（下称 C）
-- `doc/global-cards-convergence-draft.md`（下称 G）
-- `doc/adviser-brain-to-hand-draft.md`（下称 A）
+- `docs/draft/marker-schema-and-page-writes-draft.md`（下称 M）
+- `docs/draft/conclusion-history-and-edges-draft.md`（下称 C）
+- `docs/draft/global-cards-convergence-draft.md`（下称 G）
+- `docs/draft/adviser-brain-to-hand-draft.md`（下称 A）
 
 ## 1. 判定与原则
 

@@ -1,6 +1,6 @@
 # 窗口摘要模板草稿
 
-状态：已实现（2026-10-23，T2/T3/T5）。依据 `doc/base-dialectic-layers-draft.md` 4.5 与 `doc/layer-agent-contracts-draft.md` B3。
+状态：已实现（2026-10-23，T2/T3/T5）。依据 `docs/draft/base-dialectic-layers-draft.md` 4.5 与 `docs/draft/layer-agent-contracts-draft.md` B3。
 
 ## 1. 定位
 
@@ -116,7 +116,7 @@
 - [normal] 补窗口摘要的验收断言
 
 ### References
-- file: doc/base-dialectic-layers-draft.md
+- file: docs/draft/base-dialectic-layers-draft.md
 - log: pytest -q 输出
 ```
 

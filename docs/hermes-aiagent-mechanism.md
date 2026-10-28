@@ -4,7 +4,7 @@
 >
 > 官方文档页 `developer-guide/agent-loop` 给的是正确骨架，但有三处落后于代码：文件规模、中断语义、`step_callback` 时机。第 7 节逐条列出。本文其余部分都对着源码核对过。
 >
-> 配图（单轮执行与回调出口）：`doc/hermes-aiagent-mechanism-diagram.html`（与本文同目录；生成工作区在 `.archify/workflow-agent-loop-20261022-133238/`，含 candidate JSON 与各道校验回执）。图只画主链路和四条回调出口，省略了压缩、审批、回退的具体分支；阶段顺序和回调落点与本文一致。
+> 配图（单轮执行与回调出口）：`docs/hermes-aiagent-mechanism-diagram.html`（与本文同目录；生成工作区在 `.archify/workflow-agent-loop-20261022-133238/`，含 candidate JSON 与各道校验回执）。图只画主链路和四条回调出口，省略了压缩、审批、回退的具体分支；阶段顺序和回调落点与本文一致。
 
 ## 1. 结构：一个门面，一个循环，一组相位
 

@@ -22,8 +22,8 @@
 | `plugin/minir/extraction.py` | `validate_pages` | `events` + `KNOWLEDGE` 强制 `epistemic = "fact"` |
 | `plugin/minir/knowledge.py` | `_write_unit` | 同上，直接写页也强制 fact |
 | `README.md` | Knowledge pages 节 | org 列表加 `events` |
-| `doc/layer-terminology-draft.md` | org 行 | 加 `events` |
-| `doc/rule-files-draft.md` | ORGS / SELECTION / EXAMPLES | 加 events 定义、选择顺序与示例 |
+| `docs/draft/layer-terminology-draft.md` | org 行 | 加 `events` |
+| `docs/draft/rule-files-draft.md` | ORGS / SELECTION / EXAMPLES | 加 events 定义、选择顺序与示例 |
 | `tests/test_knowledge.py` | 写页测试附近 | 新增 `test_events_org_is_a_valid_knowledge_page`（写页落在 `events/`、front-matter org 正确、kb_search 可见）与 `test_events_pages_are_facts`（`validate_pages` 强制 fact） |
 
 ## 4. 自动生效的路径
@@ -37,7 +37,7 @@
 
 - `store._MARKER_KINDS` 与 `minir_remember` 的 kind 不加 events：events 是知识 org，不是记忆卡类型。
 - `knowledge.write_unit` 的 2k 预算与"丢最旧证据再失败"不改。
-- 不导入 lancedb-memory 数据，不写适配器；相关映射见 `doc/lancedb-knowledge-adaptation-draft.md`。
+- 不导入 lancedb-memory 数据，不写适配器；相关映射见 `docs/draft/lancedb-knowledge-adaptation-draft.md`。
 
 ## 6. 验收
 

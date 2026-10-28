@@ -2,7 +2,7 @@
 
 状态：草稿，供审阅。术语已按 2026-10-22 的口径落到代码；本文只做归集与消歧。
 
-依据：当前 `plugin/minir/` 源码、`doc/layer-agent-contracts-draft.md`，以及本次审阅给出的正名口径。
+依据：当前 `plugin/minir/` 源码、`docs/draft/layer-agent-contracts-draft.md`，以及本次审阅给出的正名口径。
 
 范围：base、dialectic、card_review、knowledge、会话收尾、压缩、adviser 旁路，以及它们共用的存储与召回概念。
 
@@ -126,11 +126,11 @@
 | 证据窗口 | `evidence` | 本层作业窗口内的消息。设计稿的正名是 `[artifact.window_to_ts, now]`；独立调度后代码按本层水位取窗，两者边界不总相同。 | `worker._merge_dialectic` |
 | 校订三件事 | correct / fill / advance | 纠正冲突字段、补齐空字段、把窗口摘要推进到当前。 | `agents/dialectic.md` |
 | 变更字段 | `base_changed.fields` | 真正变化的 part 名；`changed` 为真时不得为空。 | `agents/dialectic.md` |
-| 模型变更清单 | `changes` `[草案]` | 设计稿要求模型输出的审计数组；当前模型回复里的该键不被读取、不被校验，变更由代码按 `base_changed` 计算。 | `doc/layer-agent-contracts-draft.md` |
+| 模型变更清单 | `changes` `[草案]` | 设计稿要求模型输出的审计数组；当前模型回复里的该键不被读取、不被校验，变更由代码按 `base_changed` 计算。 | `docs/draft/layer-agent-contracts-draft.md` |
 | 剪枝 | `prunings` `[草案]` | 只有 card_review 允许删；dialectic 恒为空。当前代码无此输出。 | 同上 |
 | 版本栅栏 | version fence | 写回前确认被审 base 行仍是 latest 且 `window_to_ts` 未变；否则整份丢弃。 | `worker._merge_dialectic` |
 | 过期基线 | `stale_base` | 版本栅栏失败时的返回标记与日志事件。 | `worker._merge_dialectic` |
-| 无基线 | `no_base` `[草案]` | 设计稿的降级标记；当前代码直接跳过，不写事件。 | `doc/base-dialectic-layers-draft.md` |
+| 无基线 | `no_base` `[草案]` | 设计稿的降级标记；当前代码直接跳过，不写事件。 | `docs/draft/base-dialectic-layers-draft.md` |
 | 修订注 | `## Base Revision` | dialectic 产物正文，只有被改字段的短注；无改动写 `no change this window`。 | `worker._render_revision_note` |
 | 覆盖前快照 | `base_revisions` | 每次写回前保存的被覆盖字段与 changed_fields，供回滚与检索。 | `store.apply_base_revision` |
 | 自适应深度 | `dialectic_depth` | 证据越长 pass 越多：单次、加自审、再加对账。 | `worker._merge_dialectic_depth` |
@@ -249,7 +249,7 @@
 ## 11. 命名冲突与待裁定
 
 1. **base 是三个 pass 还是四个。**
-   `doc/layer-agent-contracts-draft.md` §1.1 的表格写“3 个 pass（B1 用户卡、B2 AI 卡、B3 摘要与 markers）”，但同一文件 §1.3 又列出了 B4 的 markers 输出；当前代码是 B1–B4 四个 pass。默认：以代码为准，把设计稿改成四个 pass。
+   `docs/draft/layer-agent-contracts-draft.md` §1.1 的表格写“3 个 pass（B1 用户卡、B2 AI 卡、B3 摘要与 markers）”，但同一文件 §1.3 又列出了 B4 的 markers 输出；当前代码是 B1–B4 四个 pass。默认：以代码为准，把设计稿改成四个 pass。
 
 2. **`## Base Revision` 与 `base_revisions` 表不是一回事。**
    前者是 dialectic 的产物正文（短注）；后者是写回前的字段快照（表）。默认：文档把前者叫“修订注”，后者叫“覆盖前快照”。
