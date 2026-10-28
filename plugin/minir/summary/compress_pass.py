@@ -16,8 +16,12 @@ import logging
 import re
 from typing import Any
 
-from . import agent_loop, history, layers, transcript_prompt, window_summary
-from .prompting import data_block
+from ..agentrun import agent_loop
+from ..store import history
+from ..passes import layers
+from ..prompting import transcript_prompt
+from . import window_summary
+from ..prompting.prompting import data_block
 
 logger = logging.getLogger(__name__)
 

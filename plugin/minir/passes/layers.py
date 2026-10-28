@@ -20,8 +20,8 @@ from pathlib import Path
 from string import Template
 from typing import Any
 
-from . import window_summary as summary_template
-from .window_summary import WindowSummaryError
+from ..summary import window_summary as summary_template
+from ..summary.window_summary import WindowSummaryError
 
 # Every card part is markdown text: the model writes the body, the code only frames it. Empty is a
 # valid card, so nothing here is a field contract; CARD_TEXT_LIMIT stops a runaway body.
@@ -65,7 +65,7 @@ class LayerContractError(ValueError):
 
 # -- prompts -----------------------------------------------------------------------------------
 
-AGENTS_DIR = Path(__file__).resolve().parent / "agents"
+AGENTS_DIR = Path(__file__).resolve().parents[1] / "agents"
 
 
 class AgentPromptError(RuntimeError):
@@ -311,7 +311,7 @@ def _merge_units(units: list[dict[str, Any]], previous: Any) -> list[dict[str, A
     the window that produced it — while a path-less entry from this window is carried through
     once so the writer can record it as a failure instead of losing it silently.
     """
-    from .knowledge import normalize_path  # knowledge imports layers; keep this edge lazy
+    from ..knowledge.knowledge import normalize_path  # knowledge imports layers; keep this edge lazy
 
     carried = list(previous or [])
     merged: dict[Any, dict[str, Any]] = {}

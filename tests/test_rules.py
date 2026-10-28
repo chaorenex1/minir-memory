@@ -14,7 +14,7 @@ import pytest
 
 @pytest.fixture()
 def rules(plugin_package):
-    return importlib.import_module(f"{plugin_package.__name__}.rules")
+    return importlib.import_module(f"{plugin_package.__name__}.prompting.rules")
 
 
 def _packaged_ids(rules) -> list[str]:

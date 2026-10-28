@@ -28,9 +28,13 @@ import re
 import time
 from typing import Any, Callable, Optional
 
-from . import accounting, agent_loop, knowledge, layers, tools
-from . import rules as layer_rules
-from .prompting import data_block
+from ..runtime import accounting
+from ..agentrun import agent_loop
+from ..knowledge import knowledge
+from . import layers
+from ..runtime import tools
+from ..prompting import rules as layer_rules
+from ..prompting.prompting import data_block
 
 logger = logging.getLogger(__name__)
 
@@ -180,7 +184,7 @@ def build_prompt(*, session_id: str, summary: str, markers: Any,
                      json.dumps(usage if usage is not None else {}, ensure_ascii=False)[:2_000]),
     ]
     if transcript is not None and session_id:
-        from . import transcript_prompt
+        from ..prompting import transcript_prompt
 
         text = transcript_prompt.digest_block(
             "extraction", transcript, profile or "default", "host", session_id,
@@ -204,7 +208,7 @@ def extract_pages(*, session_id: str, summary: str, markers: Any = None,
                           profile=profile, window_end=window_end)
 
     def run() -> str:
-        from . import adviser
+        from ..adviser import adviser
 
         cfg = adviser.load_config(adviser.KNOWLEDGE_TASK)
         with accounting.accounting_scope(state_db, session_id):

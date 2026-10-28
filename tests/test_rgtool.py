@@ -11,7 +11,7 @@ import pytest
 
 @pytest.fixture()
 def rgtool(plugin_package):
-    return importlib.import_module(f"{plugin_package.__name__}.rgtool")
+    return importlib.import_module(f"{plugin_package.__name__}.agentrun.rgtool")
 
 
 def _store(root: Path, rgtool, *, entry: str = "ripgrep-15.2.0-win32-x64",

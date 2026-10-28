@@ -23,7 +23,7 @@ import contextvars
 import json
 from typing import Any, Optional
 
-from .transcript import KINDS, ROLES
+from ..store.transcript import KINDS, ROLES
 
 TOOL_NAME = "minir_aiagent_search"
 TOOLSET = "minir"

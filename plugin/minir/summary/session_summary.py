@@ -20,13 +20,15 @@ import re
 from pathlib import Path
 from typing import Any
 
-from . import agent_loop, layers, tools
-from .prompting import data_block
+from ..agentrun import agent_loop
+from ..passes import layers
+from ..runtime import tools
+from ..prompting.prompting import data_block
 
 logger = logging.getLogger(__name__)
 
 MAX_CHARS = 6_000
-TEMPLATE_PATH = Path(__file__).resolve().parent / "templates" / "session_summary.md"
+TEMPLATE_PATH = Path(__file__).resolve().parents[1] / "templates" / "session_summary.md"
 
 _THINK_RE = re.compile(r"<think\b[^>]*>.*?</think\s*>", re.DOTALL | re.IGNORECASE)
 _FENCE_RE = re.compile(r"^\s*```[a-zA-Z]*\s*|\s*```\s*$")
@@ -98,7 +100,7 @@ def summarize_agent(*, session_id: str, session_record: str, markers: Any = None
                           usage=usage, window_end=window_end)
 
     def run() -> str:
-        from . import adviser
+        from ..adviser import adviser
 
         cfg = adviser.load_config()
         result = agent_loop.run(

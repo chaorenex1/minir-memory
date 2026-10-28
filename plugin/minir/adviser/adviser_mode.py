@@ -41,14 +41,14 @@ from .adviser_prompts import (
     prompt_section,
     review_prompt,
 )
-from .rules import rule_text
-from .transcript import HOST_LAYER
-from . import accounting
-from . import agent_watch
+from ..prompting.rules import rule_text
+from ..store.transcript import HOST_LAYER
+from ..runtime import accounting
+from ..agentrun import agent_watch
 from . import claims as claims_mod
 from . import fork_rules
-from . import host_bridge
-from .prompting import (
+from ..runtime import host_bridge
+from ..prompting.prompting import (
     ACTION_TARGETS,
     ADVICE_TARGETS,
     ARTIFACT_TARGETS,
@@ -566,7 +566,7 @@ def structured_review(answer: str, prompt: str, cfg: dict[str, Any], *,
     rejects it, so the last attempt is a plain completion. Returns ``(object text, calls made)``;
     the text is ``""`` when no attempt produced one.
     """
-    from .worker import call_model
+    from ..passes.worker import call_model
 
     task = (
         "The review below was written as prose. Restate it as the required JSON object. Keep "
@@ -1720,7 +1720,7 @@ class AdviserMode:
             return ""
         parts: list[str] = []
         try:
-            from .layers import artifact_from_columns
+            from ..passes.layers import artifact_from_columns
 
             row = self._live_base_row(store, session, durable=True)
             columns = artifact_from_columns(row) if row else {}
@@ -1744,15 +1744,15 @@ class AdviserMode:
         if store is None:
             return ""
         try:
-            from .layers import artifact_from_columns
-            from .window_summary import for_prompt as window_for_prompt
+            from ..passes.layers import artifact_from_columns
+            from ..summary.window_summary import for_prompt as window_for_prompt
 
             parts: list[str] = []
             durable = artifact_from_columns(self._live_base_row(store, session, durable=True))
             current = artifact_from_columns(self._live_base_row(store, session))
             identity = durable.get("user_self_representation")
             try:
-                from . import card_review
+                from ..passes import card_review
                 path = card_review.card_paths(
                     self._hermes_home(), str(getattr(self._provider, "_profile", "default"))
                 )[card_review.USER_SELF]
@@ -1811,7 +1811,7 @@ class AdviserMode:
         if not home or not text:
             return ""
         try:
-            from . import knowledge
+            from ..knowledge import knowledge
 
             root = knowledge.knowledge_dir(home)
             if not root.is_dir():
@@ -1839,7 +1839,7 @@ class AdviserMode:
         if not home:
             return ""
         try:
-            from . import soul_rules
+            from ..prompting import soul_rules
 
             return soul_rules.block(home)
         except Exception:
@@ -1887,7 +1887,7 @@ class AdviserMode:
         if not notes:
             return notes, counts
         try:
-            from . import knowledge
+            from ..knowledge import knowledge
 
             root = knowledge.knowledge_dir(self._hermes_home())
         except Exception:
@@ -1951,7 +1951,7 @@ class AdviserMode:
             return []
         if query:
             try:
-                from . import knowledge
+                from ..knowledge import knowledge
                 pool.extend(claims_mod.knowledge_claims(
                     query, knowledge.knowledge_dir(home), limit=3))
             except Exception as exc:
@@ -2047,7 +2047,7 @@ class AdviserMode:
         history = ""
         transcript = getattr(self._provider, "_transcript", None)
         if transcript is not None and context:
-            from . import transcript_prompt
+            from ..prompting import transcript_prompt
 
             try:
                 history = transcript_prompt.digest_block(
@@ -2274,7 +2274,9 @@ class AdviserMode:
         selected_forks = self._select_forks(fresh, session)
         applied_forks = self._applied_forks(session)
         try:
-            from . import adviser, agent_loop, tools
+            from . import adviser
+            from ..agentrun import agent_loop
+            from ..runtime import tools
 
             route = adviser.load_config()
             # Read-only by default: a roster entry may add tools, but the
@@ -2560,7 +2562,9 @@ class AdviserMode:
     def consult(self, question: str, context: str = "", toolsets: Any = None,
                 session: str = "") -> dict[str, Any]:
         """Synchronous consult on the same adviser identity, route, and session context."""
-        from . import adviser, agent_loop, tools
+        from . import adviser
+        from ..agentrun import agent_loop
+        from ..runtime import tools
 
         route = adviser.load_config()
         session = session or str(getattr(self._provider, "_session_id", "") or "")
@@ -2583,7 +2587,9 @@ class AdviserMode:
     async def consult_async(self, question: str, context: str = "", toolsets: Any = None,
                             session: str = "") -> dict[str, Any]:
         """Async consult; the loop is synchronous, so this runs it off the event loop."""
-        from . import adviser, agent_loop, tools
+        from . import adviser
+        from ..agentrun import agent_loop
+        from ..runtime import tools
 
         route = adviser.load_config()
         session = session or str(getattr(self._provider, "_session_id", "") or "")

@@ -59,32 +59,32 @@ from agent.memory_provider import (
 )
 from tools.registry import tool_error
 
-from . import adviser
-from . import adviser_command
-from . import agent_history
-from . import agent_watch
-from . import card_review
-from . import content_valid
-from . import extraction
-from . import file_guard
-from . import fork as fork_dispatch
-from . import history as host_history
-from . import kb_write
-from . import knowledge
-from . import minir_agents
-from . import scheduler
-from . import session_summary
-from . import window_summary
-from . import tools as plugin_tools
-from .adviser_mode import AdviserMode
-from .prompting import CONSISTENCY_TARGETS, marker_glossary
-from .store import (CONCLUSION_KINDS, MinirStore, SessionScopeError, format_when,
+from .adviser import adviser
+from .adviser import adviser_command
+from .agentrun import agent_history
+from .agentrun import agent_watch
+from .passes import card_review
+from .prompting import content_valid
+from .passes import extraction
+from .agentrun import file_guard
+from .adviser import fork as fork_dispatch
+from .store import history as host_history
+from .knowledge import kb_write
+from .knowledge import knowledge
+from .agentrun import minir_agents
+from .runtime import scheduler
+from .summary import session_summary
+from .summary import window_summary
+from .runtime import tools as plugin_tools
+from .adviser.adviser_mode import AdviserMode
+from .prompting.prompting import CONSISTENCY_TARGETS, marker_glossary
+from .store.store import (CONCLUSION_KINDS, MinirStore, SessionScopeError, format_when,
                     is_session_bound)
 # The same stored-text bound the store truncates at: a longer todo payload must be refused
 # rather than silently cut into invalid JSON.
-from .store import _MAX_CONTENT as _MAX_CONCLUSION_CHARS
-from .transcript import HOST_LAYER, TranscriptBuffer, fingerprint
-from .turn_counter import (
+from .store.store import _MAX_CONTENT as _MAX_CONCLUSION_CHARS
+from .store.transcript import HOST_LAYER, TranscriptBuffer, fingerprint
+from .passes.turn_counter import (
     BASE_LAYER,
     DEFAULT_BASE_INTERVAL,
     DEFAULT_DIALECTIC_INTERVAL,
@@ -94,17 +94,30 @@ from .turn_counter import (
     WINDOW_EPSILON,
     Trigger,
 )
-from .layers import (
+from .passes.layers import (
     CATEGORIES,
     EPISTEMIC,
     ORGS,
     RELATION_TYPES,
     artifact_from_columns,
 )
-from .worker import LayerWorker
+from .passes.worker import LayerWorker
 # Imported (not just defined) so the engine loader's subclass scan finds it on this module: the
 # engine surface is resolved by ``issubclass(ContextEngine)`` against the package's attributes.
-from .context_engine import MinirContextEngine
+from .summary.context_engine import MinirContextEngine
+
+# Module surface: a caller reaches a module as `minir.<module>`. The tests and the host patch
+# series do, so every module is bound here by name even where its classes are imported above.
+from .store import store, history, transcript, transcript_process, session_search
+from .passes import worker, layers, turn_counter, cadence, extraction, card_review
+from .summary import context_engine, compress_pass, session_summary, window_summary
+from .prompting import prompting, rules, soul_rules, content_valid, transcript_prompt
+from .adviser import (adviser, adviser_mode, adviser_guard, adviser_command, adviser_prompts, claims, fork,
+                      fork_rules)
+from .agentrun import agent_loop, agent_history, agent_watch, minir_agents, file_guard, rgtool
+from .knowledge import knowledge, kb_write
+from .runtime import tools, scheduler, accounting, host_bridge
+
 
 #: ``MinirContextEngine`` is exported for the context-engine loader's subclass scan (and is
 #: otherwise unused here, which is exactly why it is listed).

@@ -349,7 +349,7 @@ class ForkDispatcher:
         return verdict
 
     def _consult(self, question: str, *, session: str, timeout: float) -> Any:
-        from . import agent_loop
+        from ..agentrun import agent_loop
 
         return agent_loop.run_with_timeout(
             lambda: self._provider._adviser_mode.consult(
@@ -808,6 +808,6 @@ def _first_line(text: str) -> str:
 
 
 def _advice_targets() -> frozenset[str]:
-    from .prompting import DELIVERED_TARGETS
+    from ..prompting.prompting import DELIVERED_TARGETS
 
     return frozenset(DELIVERED_TARGETS)

@@ -36,7 +36,7 @@ from pathlib import Path
 from typing import Any, Callable, Optional
 
 from . import layers
-from . import rules as layer_rules
+from ..prompting import rules as layer_rules
 
 logger = logging.getLogger(__name__)
 
@@ -412,7 +412,7 @@ def build_prompt(store: Any, hermes_home: str, profile: str, since: float, *, sc
         # Calibration needs the original text, not only the derived cards. Only sessions that
         # the review window already covers are read, each bounded, and the whole section is
         # capped: the card bodies above are the baseline and win the budget.
-        from . import transcript_prompt
+        from ..prompting import transcript_prompt
 
         snippets: list[str] = []
         used = 0

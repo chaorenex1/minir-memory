@@ -11,7 +11,7 @@ import pytest
 
 @pytest.fixture()
 def knowledge(plugin_package):
-    return importlib.import_module(f"{plugin_package.__name__}.knowledge")
+    return importlib.import_module(f"{plugin_package.__name__}.knowledge.knowledge")
 
 
 def _page_path(org, category, topic):
@@ -96,7 +96,7 @@ def test_different_topics_produce_two_files(knowledge, tmp_path):
 
 
 def test_events_org_is_a_valid_knowledge_page(plugin_package, knowledge, tmp_path):
-    layers = importlib.import_module(f"{plugin_package.__name__}.layers")
+    layers = importlib.import_module(f"{plugin_package.__name__}.passes.layers")
     page = knowledge.write_unit(
         _unit(id="k3", org="events", category="KNOWLEDGE", epistemic="hypothesis",
               topic="2026-10-23 发布无事故",

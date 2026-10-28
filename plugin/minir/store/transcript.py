@@ -903,7 +903,7 @@ class TranscriptBuffer:
 
     def digest(self, profile: str, layer: str, session_id: str, **kwargs: Any) -> str:
         """Plain-text transcript digest for a prompt block (see ``transcript_prompt``)."""
-        from .transcript_prompt import render_digest
+        from ..prompting.transcript_prompt import render_digest
 
         return render_digest(self, profile, layer, session_id, **kwargs)
 

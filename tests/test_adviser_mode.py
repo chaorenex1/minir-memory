@@ -854,7 +854,7 @@ def test_the_ruler_tracks_the_latest_base_row(plugin_package, make_provider):
 
 def test_knowledge_citation_suffix_is_validated(plugin_package, make_provider):
     provider = _mode_provider(make_provider)
-    knowledge = importlib.import_module(f"{plugin_package.__name__}.knowledge")
+    knowledge = importlib.import_module(f"{plugin_package.__name__}.knowledge.knowledge")
     root = knowledge.knowledge_dir(provider._hermes_home)
     root.mkdir(parents=True, exist_ok=True)
     page = root / "note.md"

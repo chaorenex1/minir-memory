@@ -10,7 +10,7 @@ import pytest
 
 @pytest.fixture()
 def claims(plugin_package):
-    return importlib.import_module(f"{plugin_package.__name__}.claims")
+    return importlib.import_module(f"{plugin_package.__name__}.adviser.claims")
 
 
 def _card(tmp_path, name, body, source="review"):

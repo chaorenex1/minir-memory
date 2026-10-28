@@ -23,7 +23,8 @@ from __future__ import annotations
 import logging
 from typing import Any, Optional
 
-from . import file_guard, session_search
+from ..agentrun import file_guard
+from ..store import session_search
 
 logger = logging.getLogger(__name__)
 
@@ -93,7 +94,7 @@ def register(ctx, provider: Any = None) -> None:
     # platform are injected here: an agent run is scoped to the current host session, a host
     # caller to its own platform's session sources.
     def _session_search_handler(args: dict[str, Any], **kwargs: Any) -> str:
-        from . import agent_history
+        from ..agentrun import agent_history
 
         kwargs.pop("provider", None)
         live = provider

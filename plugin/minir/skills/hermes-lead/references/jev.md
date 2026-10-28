@@ -2,7 +2,7 @@
 
 Scope: task-level routing. This rule reads the user message and derives the agent set, the
 workflow, the self-check, and the repair loop. Nothing runs at this stage. The fork-level dispatcher
-in `doc/jev-fork-dispatch-draft.md` is a different layer; do not merge the two.
+in `docs/draft/jev-fork-dispatch-draft.md` is a different layer; do not merge the two.
 
 The lead applies this rule itself, first, on every new user message: the classification is a lead
 step, never a dispatched agent, and no shortcut replaces the rule. Load it with

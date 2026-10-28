@@ -11,7 +11,7 @@ import pytest
 
 @pytest.fixture()
 def layers(plugin_package):
-    return importlib.import_module(f"{plugin_package.__name__}.layers")
+    return importlib.import_module(f"{plugin_package.__name__}.passes.layers")
 
 
 def _unit(**over):

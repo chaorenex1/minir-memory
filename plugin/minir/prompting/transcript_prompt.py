@@ -10,7 +10,7 @@ data, never instructions:
     [reasoning t3] … (elided, 3120 chars)
     [coverage] seq 1204..1892 of this session; 12 of 14 event(s) shown; source=buffer
 
-Rules (doc/transcript-jsonl-draft.md §9):
+Rules (docs/draft/transcript-jsonl-draft.md §9):
 
 * every elision carries ``elided`` and the original character count;
 * the block ends with a coverage line and never claims to be the whole session;

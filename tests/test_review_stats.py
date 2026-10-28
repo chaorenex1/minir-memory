@@ -25,7 +25,7 @@ def _review(store, session: str, coverage: dict[str, str],
 
 
 def test_counts_coverage_advice_delivery_and_recurrence(plugin_package, store):
-    targets = importlib.import_module(f"{plugin_package.__name__}.prompting").CONSISTENCY_TARGETS
+    targets = importlib.import_module(f"{plugin_package.__name__}.prompting.prompting").CONSISTENCY_TARGETS
     review_id = _review(store, "s1", {"user_preferences_check": "clean",
                                       "soul_craft_check": "found"})
     ids = store.add_advisories("s1", [
@@ -55,7 +55,7 @@ def test_counts_coverage_advice_delivery_and_recurrence(plugin_package, store):
 
 
 def test_window_limits_the_review_denominator(plugin_package, store):
-    targets = importlib.import_module(f"{plugin_package.__name__}.prompting").CONSISTENCY_TARGETS
+    targets = importlib.import_module(f"{plugin_package.__name__}.prompting.prompting").CONSISTENCY_TARGETS
     _review(store, "s1", {"soul_craft_check": "clean"})
     _review(store, "s1", {"soul_craft_check": "found"})
     _review(store, "s1", {"soul_craft_check": "found"})

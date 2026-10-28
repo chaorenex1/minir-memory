@@ -17,7 +17,7 @@ from typing import Optional, Sequence
 
 logger = logging.getLogger(__name__)
 
-PACKAGE_PROMPTS_DIR = Path(__file__).resolve().parent / "prompts" / "adviser"
+PACKAGE_PROMPTS_DIR = Path(__file__).resolve().parents[1] / "prompts" / "adviser"
 OVERRIDE_ENV = "MINIR_PROMPTS_DIR"
 
 

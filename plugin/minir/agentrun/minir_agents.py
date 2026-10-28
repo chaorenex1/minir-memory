@@ -51,7 +51,8 @@ from typing import Any, Optional
 from agent.memory_provider import spawn_context_thread
 from tools.registry import tool_error
 
-from . import agent_history, agent_loop, agent_watch, file_guard, layers
+from . import agent_history, agent_loop, agent_watch, file_guard
+from ..passes import layers
 
 logger = logging.getLogger(__name__)
 

@@ -62,19 +62,19 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Callable, Mapping, Optional, Sequence
 
-from . import accounting
-from . import adviser
+from ..runtime import accounting
+from ..adviser import adviser
 from . import card_review
-from . import history as host_history
+from ..store import history as host_history
 from . import layers
-from . import rules as layer_rules
-from . import window_summary as summary_template
+from ..prompting import rules as layer_rules
+from ..summary import window_summary as summary_template
 # The routes' keys are owned by ``adviser``; base and dialectic deliberately share one.
-from .adviser import CARD_VIEW_TASK, DIALECTIC_TASK
-from .prompting import data_block
-from .store import MinirStore
-from .transcript import HOST_LAYER, TranscriptBuffer
-from . import transcript_prompt
+from ..adviser.adviser import CARD_VIEW_TASK, DIALECTIC_TASK
+from ..prompting.prompting import data_block
+from ..store.store import MinirStore
+from ..store.transcript import HOST_LAYER, TranscriptBuffer
+from ..prompting import transcript_prompt
 from .turn_counter import BASE_LAYER, DIALECTIC_LAYER
 
 logger = logging.getLogger(__name__)
@@ -588,9 +588,9 @@ def _dialectic_prompt(subject: str, previous: str, base_content: str, evidence: 
 
 
 def _read_plugin_yaml() -> str:
-    """The manifest beside this module: deployment facts for the AI identity card."""
+    """The manifest at the package root: deployment facts for the AI identity card."""
     try:
-        return (Path(__file__).with_name("plugin.yaml")).read_text(encoding="utf-8")
+        return (Path(__file__).resolve().parents[1] / "plugin.yaml").read_text(encoding="utf-8")
     except OSError as exc:
         logger.warning("Minir plugin.yaml is unreadable (%s); the AI card loses manifest context",
                        exc)
@@ -747,7 +747,9 @@ class LayerWorker:
         one-shot client under the same key rather than leaving the layer unrefreshed.
         """
         try:
-            from . import agent_loop, session_search, tools
+            from ..agentrun import agent_loop
+            from ..store import session_search
+            from ..runtime import tools
 
             cfg = adviser.load_config(DIALECTIC_TASK)
             # Fixed surface: the host's file tools (granted by ``agent_toolsets``, scoped by
@@ -774,7 +776,7 @@ class LayerWorker:
         if not session or not str(self._state_db or "").strip():
             return ""  # no host store configured: never fall back to a platform default
         try:
-            from . import session_search
+            from ..store import session_search
 
             data = session_search.query(
                 {"mode": "messages", "session_id": session, "role": "user",
@@ -907,7 +909,7 @@ class LayerWorker:
     def _base_child(self, name: str, user_prompt: str, context_files: list[str], session: str,
                     tool_sets: list[str]) -> str:
         """Run one failed child once more; the gateway route, no host baggage."""
-        from . import minir_agents
+        from ..agentrun import minir_agents
 
         provider = SimpleNamespace(_hermes_home=self._hermes_home,
                                    _session_id=session or "",

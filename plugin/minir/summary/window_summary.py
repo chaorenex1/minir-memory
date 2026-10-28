@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import Any
 
 TEMPLATE_VERSION = 1
-TEMPLATE_PATH = Path(__file__).resolve().parent / "templates" / "window_summary.md"
+TEMPLATE_PATH = Path(__file__).resolve().parents[1] / "templates" / "window_summary.md"
 
 #: The section heading ``layers.is_artifact`` requires before the field headings.
 SECTION_HEADING = "## Window Summary"

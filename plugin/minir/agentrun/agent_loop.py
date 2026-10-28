@@ -49,7 +49,8 @@ from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import Any, Callable, Optional, Sequence
 
-from . import accounting, agent_history, file_guard
+from ..runtime import accounting
+from . import agent_history, file_guard
 
 logger = logging.getLogger(__name__)
 

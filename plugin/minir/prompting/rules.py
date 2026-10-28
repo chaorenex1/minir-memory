@@ -20,7 +20,7 @@ from typing import Optional
 
 logger = logging.getLogger(__name__)
 
-PACKAGE_RULES_DIR = Path(__file__).resolve().parent / "rules"
+PACKAGE_RULES_DIR = Path(__file__).resolve().parents[1] / "rules"
 OVERRIDE_ENV = "MINIR_RULES_DIR"
 
 _CJK_RE = re.compile(r"[\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff\uac00-\ud7af]")

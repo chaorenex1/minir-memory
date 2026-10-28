@@ -299,7 +299,7 @@ def load_identity(hermes_home: Any, profile: str) -> tuple[tuple[dict[str, Any],
     empty: tuple[dict[str, Any], str] = ({}, "")
     if not str(hermes_home or "").strip():
         return empty, empty
-    from . import card_review  # local import keeps this module stdlib-only at load time
+    from ..passes import card_review  # local import keeps this module stdlib-only at load time
 
     identity_path, preference_path = identity_paths(hermes_home, profile)
     out: list[tuple[dict[str, Any], str]] = []

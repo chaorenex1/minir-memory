@@ -10,7 +10,7 @@ import pytest
 
 @pytest.fixture()
 def soul(plugin_package):
-    return importlib.import_module(f"{plugin_package.__name__}.soul_rules")
+    return importlib.import_module(f"{plugin_package.__name__}.prompting.soul_rules")
 
 
 def _write(home, text: str, *, bump: float = 0.0):

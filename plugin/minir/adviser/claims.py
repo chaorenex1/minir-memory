@@ -13,7 +13,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Optional
 
-from . import card_review, knowledge
+from ..passes import card_review
+from ..knowledge import knowledge
 
 AUTHORITY_RANK = {"operator": 3, "card": 2, "knowledge": 1, "inference": 0}
 SEVERITY_ORDER = {"nit": 0, "concern": 1, "blocker": 2}

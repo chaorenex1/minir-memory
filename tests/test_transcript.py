@@ -1,7 +1,7 @@
 """Transcript event store: JSONL rows, dedupe, reads, cache replay and process locks.
 
 The in-memory window keeps its own contract (bounded, half-open timestamps); the file is the
-permanent record. These tests are the acceptance table of doc/transcript-jsonl-draft.md §11.
+permanent record. These tests are the acceptance table of docs/draft/transcript-jsonl-draft.md §11.
 """
 
 from __future__ import annotations

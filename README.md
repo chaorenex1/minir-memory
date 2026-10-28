@@ -946,7 +946,7 @@ adviser_mode:
   max_advices: 3            # rows per injected block
   max_chars: 900
   toolsets: [adviser]       # read-only by default; never inherits the base/dialectic route
-  # omp `advisor` parity knobs; remaining host-only bounds are in doc/omp-adviser-hermes-
+  # omp `advisor` parity knobs; remaining host-only bounds are in docs/omp-adviser-hermes-
   # integration.md §5, and the closed reviewer-side list is §9.8.
   review_mode: turn         # turn | agent-end (only the finished turn)
   review_interval: 1        # every N tool-triggered updates
@@ -970,7 +970,7 @@ adviser_mode:
   history_messages: 60      # model-facing adviser history cap
   history_chars: 120000
   roster: []                # empty = one `default` adviser; no fixed cap; see below
-  # Fork dispatch (doc/jev-fork-dispatch-draft.md §7). Off by default: with every key at its
+  # Fork dispatch (docs/draft/jev-fork-dispatch-draft.md §7). Off by default: with every key at its
   # default the plugin behaves exactly as it did before this layer existed.
   forks: off                # off | shadow (classify and ledger only) | on
   fork_rules_max: 500       # cap on learned.json; the least recently hit go first
@@ -1375,7 +1375,7 @@ package is `plugin/minir`, so it is never collected as a test module.
    provider's `name` property, the engine's `name` property (it must equal the directory name for
    `context.engine` to resolve), tool prefixes, `MINIR_*` env vars, and the `pyproject.toml`
    package/entry-point names.
-2. **Replace the storage**: `plugin/minir/store.py` is self-contained (open/remember/forget/
+2. **Replace the storage**: `plugin/minir/store/store.py` is self-contained (open/remember/forget/
    record_job/claim_jobs/complete_job/fail_job/layer_state/search/stats/close). Keep that method
    shape and `__init__.py` needs no edits; go further for a remote backend (HTTP client,
    background write queue, retries). Whatever you add, keep the two invariants the tests pin:
