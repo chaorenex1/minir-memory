@@ -223,7 +223,9 @@ Explicit markers are separate from the base layer's automatic value markers: the
 merging its own five-key inventory per refresh, while a remembered marker is a session-bound,
 kind-tagged conclusions row that search can recall and `minir_forget` can remove. Writes mirrored
 from the host's built-in memory tools (`on_memory_write`) land under `kind="note"`; they are
-recallable in both public scopes.
+recallable in both public scopes. That mirror only fires while the built-in tool exists, so with
+the default `block_builtin_memory: true` (host patch 0020) there is nothing to mirror; set it to
+`false` to keep both stores.
 
 Two further tools exist only in the agent-facing `minir` registry toolset (not in the provider's
 main-agent surface):
@@ -1193,9 +1195,16 @@ chat inherits over its PTY, classic CLI block, web session-inspector row), and t
 history/compaction guards that keep an adviser row from being treated as a human turn, plus the
 CLI's verbose tool transcript (`display.tool_progress: verbose` prints each finished call's
 result body under its row; `all`/`new`/`off` are the fold and `/verbose <mode>` pins one);
-without it the adviser falls back to the ledger channels (see the adviser section). The installer
-is idempotent, refuses to apply over overlapping local edits, verifies the patched host by
-importing both Python modules, and rolls back if verification fails. Its record lives in
+without it the adviser falls back to the ledger channels (see the adviser section).
+
+Patch 0020 adds `memory.minir.block_builtin_memory` (default `true`): while the plugin is in
+use the host builds no built-in `MemoryStore`, so `MEMORY.md` and `USER.md` are neither loaded
+nor rendered into the system prompt. Set it to `false` to keep the built-in stores alongside the
+plugin. A host without a `memory.minir` block, or one whose `memory.provider` names a different
+provider, is unaffected. The key does nothing until the patch is installed.
+
+The installer is idempotent, refuses to apply over overlapping local edits, verifies the patched
+host by importing both Python modules, and rolls back if verification fails. Its record lives in
 `$HERMES_HOME/minir-memory/host-patches.json`; `--revert` undoes the series in reverse order.
 
 ```bash
@@ -1227,6 +1236,7 @@ memory:
     dialectic_depth: 2         # upper bound: 1 synthesize, 2 audit, 3 reconcile (adaptive by window size)
     reasoning_enabled: true    # run the layer reasoning passes (auxiliary model, no key needed)
     session_mode: default      # mode stamped on each newly opened session
+    block_builtin_memory: true # host patch 0020: stop the host loading its own MEMORY.md/USER.md
     prefetch_limit: 5          # cap for one minir_search result set
     content_language: en       # language for card/knowledge prose; field names stay English
     buffer_streams: 20         # transcript streams cached in memory (current session pinned)
@@ -1250,13 +1260,14 @@ memory:
 
 `memory.minir.*` is the block this plugin reads and the one `hermes memory setup` writes
 (`memory_setup.py` persists the schema answers under `memory.<provider>`), so the wizard and a
-hand-edited config.yaml are equivalent. Most keys also have an env override —
+hand-edited config.yaml are equivalent. One key, `block_builtin_memory`, is read by host patch
+0020 rather than by the plugin. Most keys also have an env override —
 `MINIR_CONTEXT_CADENCE`, `MINIR_DIALECTIC_CADENCE`, `MINIR_DIALECTIC_DEPTH`,
 `MINIR_BASE_INTERVAL`, `MINIR_DIALECTIC_INTERVAL`, `MINIR_REASONING_ENABLED`,
 `MINIR_SESSION_MODE`, `MINIR_PREFETCH_LIMIT`, `MINIR_CONTENT_LANGUAGE`,
 `MINIR_CARD_TOKEN_BUDGET`, `MINIR_CARD_REVIEW_DAYS`, `MINIR_KNOWLEDGE_TOKEN_BUDGET`,
 `MINIR_SESSION_EXTRACTION`, `MINIR_KNOWLEDGE_IDLE_HOURS`, `MINIR_BUFFER_STREAMS`,
-`MINIR_BUFFER_EVENTS`, `MINIR_BUFFER_BYTES` — and **the
+`MINIR_BUFFER_EVENTS`, `MINIR_BUFFER_BYTES`, `MINIR_BLOCK_BUILTIN_MEMORY` — and **the
 env var wins** when both are set. Layer intervals, depth, `reasoning_enabled` and the transcript
 cache budget are read when a session opens.
 

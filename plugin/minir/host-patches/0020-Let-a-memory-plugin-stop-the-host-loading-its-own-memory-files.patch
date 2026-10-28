@@ -1,0 +1,240 @@
+From 5ecd1db576fa7cf2309bbd3cce7c2b099a25aea1 Mon Sep 17 00:00:00 2001
+From: chaorenex1 <24537608z@gmail.com>
+Date: Wed, 28 Oct 2026 15:37:54 +0800
+Subject: [PATCH] 0020 Let a memory plugin stop the host loading its own memory files
+
+A memory provider's own cards and recall are injected alongside the built-in
+MEMORY.md and USER.md blocks, so the same facts ride the prompt twice and the model reads two
+stores that can disagree.
+
+``memory.minir.block_builtin_memory`` now resolves through
+``get_builtin_memory_store_flags``, the one function ``agent_init`` and the memory tool's
+availability check both read. The plugin owns the switch: it defaults on inside
+``memory.minir``, and that block is the opt-in. A host without the plugin, or one that selected
+a different provider, keeps both files; ``MINIR_BLOCK_BUILTIN_MEMORY`` overrides the stored
+value, matching the plugin's env-wins contract. The plugin declares the key in its
+``get_config_schema``, so ``hermes memory setup`` writes it with the rest of the block.
+
+Blocking at the flags means no ``MemoryStore`` is constructed and ``load_from_disk`` never
+runs: the files are not read, not snapshotted, and not rendered, and the ``memory`` tool
+leaves the surface instead of dispatching against ``store=None``.
+---
+ tests/agent/test_plugin_block_builtin_memory.py |  143 +++++++++++++++++++++++
+ tools/memory_tool.py                            |   38 ++++++
+ 2 files changed, 180 insertions(+), 1 deletion(-)
+
+diff --git a/tests/agent/test_plugin_block_builtin_memory.py b/tests/agent/test_plugin_block_builtin_memory.py
+new file mode 100644
+index 0000000000..4384f36eb3
+--- /dev/null
++++ b/tests/agent/test_plugin_block_builtin_memory.py
+@@ -0,0 +1,143 @@
++"""A memory plugin may stop the host loading its own two memory files.
++
++``memory.minir.block_builtin_memory`` (on by default) resolves through the same flag
++function ``agent_init`` uses, so while the plugin owns the memory surface no ``MemoryStore``
++is built and MEMORY.md / USER.md are neither read nor rendered into the prompt. A missing
++plugin block, a different selected provider, or an explicit ``false`` keeps the built-in
++files exactly as before.
++"""
++
++import hermes_yaml as yaml
++import pytest
++
++from agent import agent_init
++from model_tools import get_tool_definitions
++
++
++@pytest.fixture(autouse=True)
++def _no_ambient_override(monkeypatch):
++    """The env override wins by design; a developer shell must not decide these tests."""
++    monkeypatch.delenv("MINIR_BLOCK_BUILTIN_MEMORY", raising=False)
++
++
++@pytest.fixture(autouse=True)
++def _clear_caches():
++    """check_fn results and tool definitions are cached; a config write must be visible."""
++    from model_tools import _clear_tool_defs_cache
++    from tools.registry import invalidate_check_fn_cache
++
++    invalidate_check_fn_cache()
++    _clear_tool_defs_cache()
++    yield
++    invalidate_check_fn_cache()
++    _clear_tool_defs_cache()
++
++
++@pytest.fixture
++def hermes_home(tmp_path, monkeypatch):
++    home = tmp_path / ".hermes"
++    monkeypatch.setenv("HERMES_HOME", str(home))
++    home.mkdir(parents=True)
++    return home
++
++
++def _write_memory_config(home, **memory_section):
++    (home / "config.yaml").write_text(
++        yaml.safe_dump({"memory": memory_section}), encoding="utf-8"
++    )
++
++
++def _flags(**memory_section):
++    from tools.memory_tool import get_builtin_memory_store_flags
++
++    return get_builtin_memory_store_flags({"memory": memory_section})
++
++
++def _memory_tool_names():
++    return {
++        tool["function"]["name"]
++        for tool in get_tool_definitions(enabled_toolsets=["memory"], quiet_mode=True)
++    }
++
++
++class TestPluginSwitchResolution:
++    def test_block_defaults_on_inside_the_plugin_block(self):
++        assert _flags(provider="minir", minir={}) == (False, False)
++
++    def test_block_applies_without_an_explicit_provider(self):
++        """A context-engine install has no ``memory.provider``; the block is the opt-in."""
++        assert _flags(minir={}) == (False, False)
++
++    def test_explicit_false_keeps_the_builtin_files(self):
++        assert _flags(provider="minir", minir={"block_builtin_memory": "false"}) == (True, True)
++        assert _flags(provider="minir", minir={"block_builtin_memory": False}) == (True, True)
++
++    def test_another_selected_provider_wins_over_a_stale_block(self):
++        assert _flags(provider="mem0", minir={"block_builtin_memory": "true"}) == (True, True)
++
++    def test_no_plugin_block_changes_nothing(self):
++        assert _flags(provider="minir") == (True, True)
++        assert _flags() == (True, True)
++
++    def test_env_override_wins_in_both_directions(self, monkeypatch):
++        monkeypatch.setenv("MINIR_BLOCK_BUILTIN_MEMORY", "false")
++        assert _flags(provider="minir", minir={}) == (True, True)
++        monkeypatch.setenv("MINIR_BLOCK_BUILTIN_MEMORY", "true")
++        assert _flags(provider="minir", minir={"block_builtin_memory": "false"}) == (False, False)
++
++
++class TestRealConfigChain:
++    def test_memory_tool_disappears_while_the_plugin_owns_memory(self, hermes_home):
++        _write_memory_config(hermes_home, provider="minir", minir={})
++        assert "memory" not in _memory_tool_names()
++
++    def test_memory_tool_stays_when_the_operator_opts_out(self, hermes_home):
++        _write_memory_config(
++            hermes_home, provider="minir", minir={"block_builtin_memory": False}
++        )
++        assert "memory" in _memory_tool_names()
++
++
++class TestAgentInitDoesNotLoadTheFiles:
++    @pytest.fixture(autouse=True)
++    def _ordinary_worker(self, monkeypatch):
++        monkeypatch.setattr("agent.safe_worker_policy.safe_worker_enabled", lambda: False)
++
++    def _agent(self):
++        class _Agent:
++            enabled_toolsets = ["memory"]
++            disabled_toolsets = []
++            _memory_manager = None
++            tools = None
++
++            def _emit_startup_warning(self, *args, **kwargs):
++                pass
++
++        return _Agent()
++
++    def _seed_files(self, home):
++        memories = home / "memories"
++        memories.mkdir(parents=True, exist_ok=True)
++        (memories / "MEMORY.md").write_text("an agent note\n", encoding="utf-8")
++        (memories / "USER.md").write_text("a user fact\n", encoding="utf-8")
++
++    def test_no_store_is_built_for_the_plugin_block(self, hermes_home):
++        self._seed_files(hermes_home)
++        agent = self._agent()
++        agent_init._init_memory(agent, {"memory": {"minir": {}}}, True, "cli")
++
++        assert agent._memory_store is None
++        assert (agent._memory_enabled, agent._user_profile_enabled) == (False, False)
++
++    def test_files_still_load_when_the_operator_opts_out(self, hermes_home):
++        self._seed_files(hermes_home)
++        agent = self._agent()
++        agent_init._init_memory(
++            agent, {"memory": {"minir": {"block_builtin_memory": False}}}, True, "cli"
++        )
++
++        assert agent._memory_store is not None
++        assert "a user fact" in (agent._memory_store.format_for_system_prompt("user") or "")
++        assert "an agent note" in (
++            agent._memory_store.format_for_system_prompt("memory") or ""
++        )
+diff --git a/tools/memory_tool.py b/tools/memory_tool.py
+index aeb839a2e6..6ebba378a1 100644
+--- a/tools/memory_tool.py
++++ b/tools/memory_tool.py
+@@ -7,12 +7,13 @@ Single `memory` tool: add/patch/remove or a batch `operations` list."""
+ import copy
+ import json
+ import logging
++import os
+ from contextvars import ContextVar
+ from pathlib import Path
+ from hermes_constants import get_hermes_home
+ from typing import Dict, Any, List, Optional, Tuple
+ 
+-from utils import is_truthy_value
++from utils import TRUTHY_STRINGS, is_truthy_value
+ from tools.registry import no_cache_check_fn
+ 
+ # fcntl is Unix-only; Windows uses msvcrt. MemoryStore reads both lazily from
+@@ -303,9 +304,44 @@ def get_builtin_memory_config(config: Optional[dict[str, Any]] = None) -> dict[s
+     return section if isinstance(section, dict) else {}
+ 
+ 
++#: The minir memory plugin takes over the two built-in stores through its own config block,
++#: the same ``memory.minir`` block ``hermes memory setup`` writes. The switch defaults on inside
++#: that block: a host without the plugin (no block) keeps MEMORY.md and USER.md untouched, and
++#: the plugin documents the opt-out plus its env override.
++_PLUGIN_MEMORY_BLOCK = "minir"
++_BLOCK_BUILTIN_MEMORY_KEY = "block_builtin_memory"
++_BLOCK_BUILTIN_MEMORY_ENV = "MINIR_BLOCK_BUILTIN_MEMORY"
++_FALSEY_STRINGS = frozenset({"0", "false", "no", "off"})
++
++
++def _plugin_blocks_builtin_memory(section: dict[str, Any]) -> bool:
++    """Whether the configured memory plugin suppresses MEMORY.md and USER.md.
++
++    Gating on the plugin's block keeps every other install unchanged: no block means no
++    suppression, and a different selected provider wins over a stale block. ``provider`` may be
++    empty when the plugin is installed as a context engine only, so an unset provider does not
++    veto the block. ``MINIR_BLOCK_BUILTIN_MEMORY`` overrides the stored value, matching the
++    plugin's env-wins contract.
++    """
++    provider = str(section.get("provider") or "").strip()
++    if provider and provider != _PLUGIN_MEMORY_BLOCK:
++        return False
++    block = section.get(_PLUGIN_MEMORY_BLOCK)
++    if not isinstance(block, dict):
++        return False
++    raw = str(os.environ.get(_BLOCK_BUILTIN_MEMORY_ENV, "")).strip().lower()
++    if raw in TRUTHY_STRINGS:
++        return True
++    if raw in _FALSEY_STRINGS:
++        return False
++    return is_truthy_value(block.get(_BLOCK_BUILTIN_MEMORY_KEY), default=True)
++
++
+ def get_builtin_memory_store_flags(config: Optional[dict[str, Any]] = None) -> tuple[bool, bool]:
+     """Return ``(memory_enabled, user_profile_enabled)`` from resolved config."""
+     section = get_builtin_memory_config(config)
++    if _plugin_blocks_builtin_memory(section):
++        return False, False
+     return tuple(is_truthy_value(section.get(k), default=True) for k in ("memory_enabled", "user_profile_enabled"))
+ 
+ 
+-- 
+2.53.0.windows.3

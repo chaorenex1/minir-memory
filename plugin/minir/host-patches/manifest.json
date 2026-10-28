@@ -3,7 +3,7 @@
   "capability": "plugin_runtime_v2",
   "base_version": "0.22.5",
   "base_commit": "bf0203a794",
-  "description": "Plugin control bridge (steer/continuation/interrupt), post-turn triggers, cooperative flags, live adviser events, a preserved card at the turn end, labeled adviser-triggered turns, and adviser rows on every host surface: Desktop card, TUI card, classic CLI block, web session inspector, and a native web chat transcript (the PTY stays available as a fallback); each adviser note carries its own severity on every surface; and the CLI's verbose tool progress prints each call's result body under its row, with the one-line modes as the fold; and a tool step's reasoning prints above the rows it asked for, never under the final answer; and a plugin callback may declare its own hook budget so a pre-tool gate can wait for one model answer without slowing every other hook.",
+  "description": "Plugin control bridge (steer/continuation/interrupt), post-turn triggers, cooperative flags, live adviser events, a preserved card at the turn end, labeled adviser-triggered turns, and adviser rows on every host surface: Desktop card, TUI card, classic CLI block, web session inspector, and a native web chat transcript (the PTY stays available as a fallback); each adviser note carries its own severity on every surface; and the CLI's verbose tool progress prints each call's result body under its row, with the one-line modes as the fold; and a tool step's reasoning prints above the rows it asked for, never under the final answer; and a plugin callback may declare its own hook budget so a pre-tool gate can wait for one model answer without slowing every other hook. It also lets the minir memory plugin switch off the host's built-in MEMORY.md and USER.md stores through memory.minir.block_builtin_memory (on by default inside its own block), so the two native files are neither loaded nor rendered.",
   "patches": [
     {
       "name": "0001-Add-a-session-scoped-plugin-control-bridge.patch",
@@ -80,6 +80,10 @@
     {
       "name": "0019-Let-a-plugin-callback-declare-its-own-hook-budget.patch",
       "sha256": "0846dd0661a1d7768f41a861369ee4c3b0572ed12de912c67917621368b6f73f"
+    },
+    {
+      "name": "0020-Let-a-memory-plugin-stop-the-host-loading-its-own-memory-files.patch",
+      "sha256": "17abaf658411db6183fbe3d1dabf090801d2dfa83280fb6fbd5e080cbd4a1371"
     }
   ],
   "rebased": "v0.22.5 (bf0203a794). Two merge decisions: the steer buffer holds (ticket, text, kind) triples so the upstream ticket API keeps working while an adviser row stays labeled, and the plugin continuation gate runs before the late-LSP gate (a blocker outranks a note)."

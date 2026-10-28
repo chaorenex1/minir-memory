@@ -223,6 +223,15 @@ def test_config_schema_fields_are_valid(plugin_package):
         assert field["env_var"].startswith("MINIR_")
 
 
+def test_block_builtin_memory_defaults_on(plugin_package):
+    """Host patch 0020 reads this key from ``memory.minir``; the schema is its declaration."""
+    fields = {field["key"]: field for field in plugin_package.MinirMemoryProvider({}).get_config_schema()}
+    field = fields["block_builtin_memory"]
+    assert field["type"] == "boolean"
+    assert field["default"] == "true"
+    assert field["env_var"] == "MINIR_BLOCK_BUILTIN_MEMORY"
+
+
 def test_tool_responses_are_json_strings(plugin_package, provider):
     for tool_name, args in (("minir_stats", {}), ("minir_search", {"query": "anything"}),
                             ("minir_kb_search", {"query": "anything"}),
