@@ -102,21 +102,3 @@ def test_the_clock_starts_and_stops(module):
     assert scheduler.snapshot()["session_extraction"]["every"] == pytest.approx(0.01)
 
 
-def test_a_task_reporting_its_own_degradation_is_not_recorded_as_ok(module):
-    """A migration spinning on an unreachable provider must not read as a healthy run."""
-    scheduler = module.Scheduler()
-    scheduler.add_turn("vector_dim_migration",
-                       lambda session_id, turn_number: {"status": "degraded", "done": 0,
-                                                        "reason": "no API key"})
-    scheduler.on_turn("s-1", 1)
-    row = scheduler.snapshot()["vector_dim_migration"]
-    assert row["last_outcome"] == "degraded"
-    assert "no API key" in row["last_detail"]
-
-
-def test_a_status_dict_without_degradation_still_reads_ok(module):
-    scheduler = module.Scheduler()
-    scheduler.add_turn("vector_dim_migration",
-                       lambda session_id, turn_number: {"status": "none", "done": 0})
-    scheduler.on_turn("s-1", 1)
-    assert scheduler.snapshot()["vector_dim_migration"]["last_outcome"] == "ok"

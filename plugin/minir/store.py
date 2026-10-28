@@ -4,14 +4,14 @@
 ``history.py``) and persists only what it derived from those turns:
 
 * ``conclusions`` — the single memory table. One row per conclusion and ``kind`` is the only
-  type axis: the seven tool kinds (``note``, ``entities``, ``trajectories``, ``experiences``,
-  ``tools``, ``projects``, ``todo``) plus the internal kinds the layers publish (``base.*``,
-  ``dialectic.review``, ``session_summary``, ``window_summary``). A conclusion carries no
+  type axis: the nine conclusion kinds (``CONCLUSION_KINDS``: the todo row, the five published
+  base ``*`` rows, ``dialectic.review``, ``session_summary``, ``window_summary``) plus the five
+  value markers and the retired kinds that only history still uses. A conclusion carries no
   window columns; only ``base_refreshes`` records which span of the conversation a row covers.
   ``conclusions_fts`` is an FTS5 trigram index over the content (CJK-safe); when FTS5 is
-  unavailable, ``search()`` falls back to the token scan. Explicit ``minir_remember`` markers,
-  the mirrored built-in memory-tool writes, the per-session todo row, the calibrated base
-  fields, the dialectic review and the compression chain all live here.
+  unavailable, ``search()`` falls back to the token scan. The per-session todo row, the
+  calibrated base fields, the dialectic review, the compression chain and the chunk summaries
+  all live here; no tool writes a conclusion row.
 * ``jobs`` — one row per layer job the turn counter queued (see ``turn_counter.py``): the
   session and half-open time window ``(from_ts, to_ts]`` the job reasons over, plus the worker's
   claim/outcome state. ``processed_ts`` is the content watermark the worker advances when it
@@ -59,7 +59,7 @@ import threading
 import time
 from uuid import uuid4
 from pathlib import Path
-from typing import Any, Iterable, Mapping, Optional
+from typing import Any, Iterable, Mapping, NamedTuple, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -70,29 +70,82 @@ _MAX_SCAN = 200      # candidate rows fetched per table before scoring
 #: Bumped whenever ``_migrate`` changes the shape of the file. A database already at this
 #: version skips the migration write path on open, so a second process does not rewrite the
 #: schema while the first one is writing.
-_SCHEMA_VERSION = 6
+_SCHEMA_VERSION = 7
 
 #: Requeue budget for a job whose owning process died mid-run. A death is not a failed attempt
 #: (the window is still readable), so the row goes back to ``pending`` with ``attempts``
 #: untouched; this counter only stops a job that kills every process that claims it.
 _MAX_RECLAIMS = 3
 
-#: The five value-marker kinds the base layer merges; ``minir_remember``/``minir_forget`` and
-#: the marker evidence paths use this vocabulary so search and deletion stay type-safe.
+#: The five value-marker kinds the base layer merges. They are a separate axis from the
+#: conclusion kinds: no tool writes one any more (the historical rows stay readable), and the
+#: vocabulary only names what ``base.value_markers`` may carry.
 _MARKER_KINDS: tuple[str, ...] = (
     "entities", "trajectories", "experiences", "tools", "projects")
 
-#: Every kind the tool surface may write through ``minir_remember`` / ``minir_forget`` /
-#: ``minir_search(type=)``. ``note`` is the fallback kind (mirrored memory-tool writes, internal
-#: rows without a better kind) and ``todo`` is the one per-session task list. Internal kinds
-#: (``base.*``, ``dialectic.review``, ``session_summary``, ``window_summary``) are written by the
-#: layers only and are not in this whitelist.
-CONCLUSION_KINDS: tuple[str, ...] = ("note", *_MARKER_KINDS, "todo")
+#: Every marker weighs the same in recall; the base layer calibrates them, not the search.
+_MARKER_WEIGHT = 0.9
+
+
+class _Spec(NamedTuple):
+    """One conclusion kind: what it means, who writes it, and how recall treats it."""
+
+    meaning: str
+    writer: str                     # "operator" | "layer"
+    recall: str                     # "cross_session" | "session"
+    bound: bool                     # scope="all" drops it; reading it without an id raises
+    weight: float
+    live_when_superseded: bool = False
+
+
+#: The conclusions vocabulary — row order is the order ``CONCLUSION_KINDS`` publishes. Every
+#: kind has a named producer (a tool or a layer pass); a kind outside this table is not writable
+#: through a tool. The store itself stays permissive: tests and migrations may write any kind.
+_CONCLUSION_SPECS: dict[str, _Spec] = {
+    "todo": _Spec("the caller's session task list", "operator", "session", False, 1.2),
+    "base.user_representation": _Spec(
+        "the published user representation card", "layer", "cross_session", False, 1.5),
+    "base.user_peer_card": _Spec(
+        "the published user peer card", "layer", "cross_session", False, 1.5),
+    "base.ai_identity_card": _Spec(
+        "the published AI identity card (agent scope)", "layer", "cross_session", False, 1.4),
+    "base.ai_self_representation": _Spec(
+        "the published AI self representation (session scope)", "layer", "session", True, 1.4),
+    "base.value_markers": _Spec(
+        "the published value-marker snapshot (session scope)", "layer", "session", True, 1.0),
+    "dialectic.review": _Spec(
+        "one dialectic-layer revision record", "layer", "session", False, 1.4),
+    "session_summary": _Spec(
+        "one compression summary of the session", "layer", "session", False, 0.8),
+    "window_summary": _Spec(
+        "the canonical chunk summary of one window", "layer", "session", False, 1.0, True),
+}
+
+CONCLUSION_KINDS: tuple[str, ...] = tuple(_CONCLUSION_SPECS)
+
+
+class _Retired(NamedTuple):
+    """A kind no producer writes any more: readable history only."""
+
+    recall: str
+    weight: Optional[float]
+
+
+#: Retired kinds keep the visibility and weight their rows had, so old data reads as it did.
+#: They are not writable, are never offered as a ``type`` filter and carry no vocabulary meaning.
+_RETIRED_SPECS: dict[str, _Retired] = {
+    "note": _Retired("cross_session", 0.7),
+    "base.window_summary": _Retired("session", 1.0),
+    # Both were renamed or expired before this release and hold no row, so neither ever had a
+    # weight; a lookup can never reach them.
+    "session_chunk_summary": _Retired("session", None),
+    "handoff": _Retired("session", None),
+}
 
 
 def _versioned(kind: str) -> bool:
-    """Every conclusion kind except the per-session todo list keeps a history row."""
-    return kind in CONCLUSION_KINDS and kind != "todo"
+    """The value markers keep a history row; no conclusion kind does."""
+    return kind in _MARKER_KINDS
 
 
 def _normalized_subject(text: Any) -> str:
@@ -404,7 +457,6 @@ CREATE TABLE IF NOT EXISTS scheduler_runs (
 );
 CREATE INDEX IF NOT EXISTS ix_sched_task ON scheduler_runs(task, id DESC);
 CREATE INDEX IF NOT EXISTS ix_sched_finished ON scheduler_runs(finished_at);
-CREATE TABLE IF NOT EXISTS vector_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
 """
 
 # The dialectic's pre-overwrite snapshot. Created by ``_migrate`` rather than ``_SCHEMA``: an
@@ -481,13 +533,13 @@ _ADDED_COLUMNS: dict[str, tuple[tuple[str, str], ...]] = {
 # completed turn, which this provider deliberately no longer does.
 _DROPPED_TABLES: tuple[str, ...] = ("turns", "notes")
 
-# Kinds that may be recalled across sessions. Everything else (session summaries, reviews,
-# compression summaries, focus statements) is bound to the session that produced it: injecting
-# another session's review as a high-weight conclusion would be actively wrong.
-_LONG_TERM_KINDS: tuple[str, ...] = (
-    "base.user_representation",
-    "base.user_peer_card",
-    "base.ai_identity_card",
+# Kinds a session-less read may return: the cross-session conclusions, the five value markers
+# and the retired ``note`` rows (nine in all). Derived from the registry: a kind that declares
+# ``recall="session"`` is never listed here by hand.
+_DURABLE_KINDS: tuple[str, ...] = (
+    *(kind for kind, spec in _CONCLUSION_SPECS.items() if spec.recall == "cross_session"),
+    *_MARKER_KINDS,
+    *(kind for kind, spec in _RETIRED_SPECS.items() if spec.recall == "cross_session"),
 )
 
 # Fixed headings -> conclusion kind. The worker validates the same headings; publishing splits
@@ -509,26 +561,17 @@ _BASE_REVISION_COLUMNS: tuple[str, ...] = (
     "ai_identity_card", "window_summary", "value_markers",
 )
 
+# Recall weight per kind: the nine conclusions, the five markers, and the two retired kinds that
+# still carry rows (``window_summary`` inherits the deleted base row's 1.0).
 _KIND_WEIGHT: dict[str, float] = {
-    "base.user_representation": 1.5,
-    "base.user_peer_card": 1.5,
-    "base.ai_self_representation": 1.4,
-    "base.ai_identity_card": 1.4,
-    "dialectic.review": 1.4,
-    "base.window_summary": 1.0,
-    "base.value_markers": 1.0,
-    "session_summary": 0.8,
-    "window_summary": 0.6,
-    "note": 0.7,
-    "entities": 0.9,
-    "trajectories": 0.9,
-    "experiences": 0.9,
-    "tools": 0.9,
-    "projects": 0.9,
-    "todo": 1.2,
+    **{kind: spec.weight for kind, spec in _CONCLUSION_SPECS.items()},
+    **{kind: _MARKER_WEIGHT for kind in _MARKER_KINDS},
+    **{kind: retired.weight for kind, retired in _RETIRED_SPECS.items()
+       if retired.weight is not None},
 }
 
-#: One conclusions kind per calibrated base column, with the scope its key is built for.
+#: One conclusions kind per calibrated base column, with the scope its key is built for. The
+#: window summary is published as the chunk chain's ``window_summary``, not from this table.
 _BASE_CONCLUSION_KINDS: tuple[tuple[str, str, str], ...] = (
     ("user_representation", "base.user_representation", "user"),
     ("user_peer_card", "base.user_peer_card", "user"),
@@ -536,14 +579,18 @@ _BASE_CONCLUSION_KINDS: tuple[tuple[str, str, str], ...] = (
     # produced it, not a cross-session card.
     ("ai_self_representation", "base.ai_self_representation", "session"),
     ("ai_identity_card", "base.ai_identity_card", "agent"),
-    ("window_summary", "base.window_summary", "session"),
     ("value_markers", "base.value_markers", "session"),
 )
 
 #: Kinds whose keys carry the producing session. Reading one without a session id must fail
 #: loudly instead of returning an empty list, and ``scope="all"`` must not leak them.
 _SESSION_BOUND_KINDS: tuple[str, ...] = tuple(
-    kind for _column, kind, scope in _BASE_CONCLUSION_KINDS if scope == "session")
+    kind for kind, spec in _CONCLUSION_SPECS.items() if spec.bound)
+
+#: A superseded row stays searchable only for these kinds — the rolling chunk chain, whose older
+#: windows remain the session's own recall.
+_LIVE_WHEN_SUPERSEDED: tuple[str, ...] = tuple(
+    kind for kind, spec in _CONCLUSION_SPECS.items() if spec.live_when_superseded)
 
 
 def is_session_bound(kinds: Any) -> bool:
@@ -563,6 +610,25 @@ def _session_scope_message(kinds: frozenset[str], scope: str, session_id: str) -
         "session_scope_required: " + f"{label} is session-scoped. Provide the main session id "
         "(minir_search session_id or the provider session) to read it. "
         f"[kind={kind} scope={scope} session_id={session_id or ''}]")
+
+
+def _chunk_body(content: str) -> Optional[str]:
+    """The chunk text of a published base row: JSON-decoded, ``## Window Summary`` removed.
+
+    ``publish_base_conclusions`` stores the calibrated column verbatim, and that column is a
+    JSON string holding the artifact; ``add_chunk_summary`` stores the body alone. A row that
+    does not decode as an artifact is not a window summary and gets no chunk.
+    """
+    try:
+        text = json.loads(content)
+    except (TypeError, ValueError):
+        return None
+    if not isinstance(text, str):
+        return None
+    heading, separator, rest = text.partition("\n")
+    if not separator or heading.strip() != "## Window Summary":
+        return None
+    return rest.strip()
 
 
 def _split_sections(content: str, headings: tuple[tuple[str, str, str], ...]) -> dict[str, str]:
@@ -643,9 +709,6 @@ class MinirStore:
     def __init__(self, db_path: Path | str):
         self.path = Path(db_path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        # Set by the provider: called after every conclusion write, inside the store lock, so it
-        # must only enqueue (never embed or wait on the network).
-        self.on_conclusion_saved: Optional[Callable[[int, str], None]] = None
         self._lock = threading.RLock()
         self._fts = False
         self._base_fts = False
@@ -786,20 +849,64 @@ class MinirStore:
             self._conn.execute("DROP TABLE IF EXISTS conclusions_fts")
         # ``is_latest`` normalization and staged-request recovery are data repairs too; see
         # ``_repair_rows`` (every open, not only on a shape change).
-        # v4 -> v5: one open history row per eligible conclusion that predates the table.
-        placeholders = ",".join("?" * len(CONCLUSION_KINDS))
+        # v4 -> v5: one open history row per eligible marker that predates the table. Conclusions
+        # no longer enter the version table, so the backfill covers the markers alone.
+        placeholders = ",".join("?" * len(_MARKER_KINDS))
         self._conn.execute(
             "INSERT INTO conclusion_versions (conclusion_id, kind, key, session_id, subject, "
             "content, evidence, status, version, valid_from, recorded_at) "
             "SELECT c.id, c.kind, c.key, c.session_id, c.subject, c.content, c.evidence, "
             "c.status, c.version, c.created_at, c.updated_at FROM conclusions AS c "
-            "WHERE c.kind IN (%s) AND c.kind != 'todo' "
+            "WHERE c.kind IN (%s) "
             "AND NOT EXISTS (SELECT 1 FROM conclusion_versions v "
             "                WHERE v.conclusion_id = c.id)" % placeholders,
-            CONCLUSION_KINDS)
+            _MARKER_KINDS)
         # v5 -> v6: fork_stats and fork_ledger. Both are created by ``CREATE TABLE IF NOT
         # EXISTS`` in ``_SCHEMA`` on every open, so the migration only has to claim the version;
         # the rules themselves live in files, never in a column.
+        # v6 -> v7: ``base.window_summary`` folds into the chunk chain, and the vector table
+        # loses its last reader.
+        self._migrate_window_summary_conclusions()
+        self._conn.execute("DROP TABLE IF EXISTS vector_meta")
+
+    def _migrate_window_summary_conclusions(self) -> None:
+        """Fold ``base.window_summary`` rows into the canonical chunk chain (idempotent).
+
+        The base layer published one window twice: once as a ``window_summary`` chunk and once as
+        a ``base.window_summary`` conclusion. A row whose text matches a ``base_refreshes`` row
+        and whose window already holds the same chunk is that duplicate and goes; a row with a
+        window but no chunk becomes the chunk; a row with no refresh row to attribute it to has
+        no window, so it stays as retired history. Only a row that decodes as an artifact is
+        touched — anything else never was a window summary.
+        """
+        rows = self._conn.execute(
+            "SELECT id, session_id, subject, content, created_at FROM conclusions "
+            "WHERE kind = 'base.window_summary'").fetchall()
+        for row in rows:
+            body = _chunk_body(str(row["content"] or ""))
+            if body is None:
+                continue
+            refresh = self._conn.execute(
+                "SELECT window_from_ts FROM base_refreshes WHERE session_id = ? AND subject = ? "
+                "AND window_summary = ? ORDER BY window_from_ts DESC LIMIT 1",
+                (row["session_id"], row["subject"], row["content"])).fetchone()
+            if refresh is None:
+                continue
+            key = f"chunk:{row['session_id']}:{float(refresh['window_from_ts']):.6f}"
+            chunk = self._conn.execute(
+                "SELECT content FROM conclusions WHERE kind = 'window_summary' AND key = ?",
+                (key,)).fetchone()
+            if chunk is not None:
+                if str(chunk["content"] or "").strip() != body:
+                    continue  # this window carries another text: keep the row as history
+                self._conn.execute("DELETE FROM conclusions WHERE id = ?", (int(row["id"]),))
+                continue
+            self._conn.execute(
+                "INSERT INTO conclusions (kind, key, session_id, subject, content, evidence, "
+                "version, status, created_at, updated_at) "
+                "VALUES ('window_summary', ?, ?, 'session', ?, '[]', 0, 'active', ?, ?)",
+                (key, row["session_id"], body, row["created_at"], row["created_at"]))
+            self._conn.execute("DELETE FROM conclusions WHERE id = ?", (int(row["id"]),))
 
     def _migrate_dialectic_refreshes(self) -> None:
         """Rename ``base_revisions`` and drop its dead ``advices`` column (idempotent).
@@ -1068,17 +1175,6 @@ class MinirStore:
             self._conn.commit()
             return True
 
-    def newest_conclusion_by_content(self, kind: str, content: str, *,
-                                     session_id: str = "") -> Optional[dict[str, Any]]:
-        """Newest row of *kind* whose stored text equals *content* (the mirror's undo path)."""
-        with self._lock:
-            row = self._conn.execute(
-                "SELECT * FROM conclusions WHERE kind = ? AND content = ? AND session_id = ? "
-                "ORDER BY created_at DESC, id DESC LIMIT 1",
-                (str(kind or ""), str(content or "")[:_MAX_CONTENT],
-                 str(session_id or ""))).fetchone()
-        return dict(row) if row is not None else None
-
     def conclusions_by_kind(self, session_id: str) -> dict[str, int]:
         """Row counts per kind for one host session; durable rows carry no session id."""
         with self._lock:
@@ -1124,11 +1220,6 @@ class MinirStore:
              evidence or "[]", max(0, int(version)), status, created_at or stamp, stamp))
         row = self._conn.execute(
             "SELECT id, version FROM conclusions WHERE kind = ? AND key = ?", (kind, key)).fetchone()
-        if row is not None and self.on_conclusion_saved is not None:
-            try:
-                self.on_conclusion_saved(int(row["id"]), str(content or ""))
-            except Exception:
-                logger.warning("minir store: conclusion hook failed", exc_info=True)
         if row is not None and _versioned(kind):
             self._conn.execute(
                 "INSERT INTO conclusion_versions (conclusion_id, kind, key, session_id, subject, "
@@ -1140,7 +1231,7 @@ class MinirStore:
         return int(row["id"]) if row is not None else 0
 
     def conclusion_by_id(self, conclusions_id: int) -> Optional[dict[str, Any]]:
-        """One row by primary key (the vector path maps ids back to rows)."""
+        """One row by primary key."""
         with self._lock:
             row = self._conn.execute(
                 "SELECT * FROM conclusions WHERE id = ?", (int(conclusions_id),)).fetchone()
@@ -2411,11 +2502,12 @@ class MinirStore:
         One conclusion per calibrated column (``_BASE_CONCLUSION_KINDS``), content taken
         verbatim from the
         column (a JSON column stays the JSON string it holds). User and agent rows carry no
-        session id so they stay durable; the window rows and the AI self representation carry
-        the session. The guard is
+        session id so they stay durable; the marker snapshot and the AI self representation carry
+        the session. The window summary is not one of these rows: the chunk chain already owns it.
+        The guard is
         ``base_refreshes.conclusions_published_at`` scanned across the whole session, not an
         in-memory flag: a provider restart or a second instance cannot publish twice, and even a
-        losing race only repeats the same six idempotent upserts. Returns the rows written.
+        losing race only repeats the same five idempotent upserts. Returns the rows written.
         """
         with self._lock:
             row = self.latest_base_refresh(session_id)
@@ -3058,14 +3150,14 @@ class MinirStore:
         """SQL predicate + params for the requested recall scope.
 
         ``scope="session"`` (the default) is the current conversation's view: its own rows plus
-        every durable row (no session id) whose kind is cross-session by contract. A new
-        session-level kind is therefore private by default; a new durable kind has to be added
-        to this predicate. ``scope="all"`` drops the isolation; ``search`` then excludes the
-        session-bound kinds itself, because this predicate cannot see the requested ``kinds``.
+        every durable row (no session id) whose kind declares ``recall="cross_session"``. A new
+        session-level kind is therefore private by default, with no list to edit. ``scope="all"``
+        drops the isolation; ``search`` then excludes the session-bound kinds itself, because
+        this predicate cannot see the requested ``kinds``.
         """
         if scope == "all":
             return "1=1", []
-        durable_kinds = (*_LONG_TERM_KINDS, *CONCLUSION_KINDS)
+        durable_kinds = _DURABLE_KINDS
         marks = ",".join("?" * len(durable_kinds))
         durable = f"({alias}.session_id = '' AND {alias}.kind IN ({marks}))"
         if session_id:
@@ -3076,14 +3168,14 @@ class MinirStore:
                scope: str = "session",
                kinds: Optional[frozenset[str]] = None,
                as_of: Optional[float] = None, expand: int = 0,
-               include_superseded: bool = False,
-               vector_ranks: Optional[Mapping[int, int]] = None) -> list[dict[str, Any]]:
+               include_superseded: bool = False) -> list[dict[str, Any]]:
         """Ranked matches across conclusions, scoped to *session_id* or every session.
 
         FTS5 with the trigram tokenizer is the primary index (CJK-safe). A scan over the same
         rows is the fallback when FTS5 is unavailable or the query terms are too short for
         trigram. Returns ``{conclusions_id, kind, key, text, when, author, subject, session_id,
-        ``score, rank}``; there is no window field because a conclusion has none. ``scope="all"``
+        ``score, rank}``, ranked by the lexical overlap plus the kind's weight; there is no
+        window field because a conclusion has none. ``scope="all"``
         searches every session but never returns a session-bound kind; naming only session-bound
         kinds there, or reading one with no session id, raises :class:`SessionScopeError`
         (``session_scope_required``) instead of returning an empty list. ``kinds`` restricts the
@@ -3131,8 +3223,12 @@ class MinirStore:
         rows: list[dict[str, Any]] = []
         # Historical chunk summaries stay recallable inside their own session after a final
         # summary supersedes them; the visibility predicate keeps them from leaking elsewhere.
-        status = ("1=1" if include_superseded
-                  else "(c.status = 'active' OR c.kind = 'window_summary')")
+        if include_superseded:
+            status, status_params = "1=1", []
+        else:
+            marks = ", ".join("?" * len(_LIVE_WHEN_SUPERSEDED))
+            status = f"(c.status = 'active' OR c.kind IN ({marks}))"
+            status_params = list(_LIVE_WHEN_SUPERSEDED)
         fts_terms = [term for term in terms if len(term) >= 3]
         if self._fts and fts_terms:
             match = " OR ".join(f'"{term.replace(chr(34), chr(34) * 2)}"' for term in fts_terms)
@@ -3144,7 +3240,8 @@ class MinirStore:
             try:
                 with self._lock:
                     found = self._conn.execute(
-                        sql, [match, *visible_params, *kind_params, _MAX_SCAN]).fetchall()
+                        sql, [match, *status_params, *visible_params, *kind_params,
+                              _MAX_SCAN]).fetchall()
                 rows = [dict(row) for row in found]
             except sqlite3.OperationalError as exc:
                 logger.debug("Minir FTS query failed, falling back to scan: %s", exc)
@@ -3156,7 +3253,7 @@ class MinirStore:
                 "ORDER BY c.updated_at DESC LIMIT ?")
             with self._lock:
                 found = self._conn.execute(
-                    sql, [*visible_params, *kind_params,
+                    sql, [*status_params, *visible_params, *kind_params,
                           *[f"%{term}%" for term in terms], _MAX_SCAN]).fetchall()
             rows = [dict(row) for row in found]
 
@@ -3183,57 +3280,7 @@ class MinirStore:
         results.sort(key=lambda item: (item["score"], -item["rank"], item["when"],
                                        item["conclusions_id"]), reverse=True)
         results = self._expand_results(results, expand=expand, limit=capped)
-        return self._fuse(results, vector_ranks=vector_ranks, limit=capped)
-
-    _RRF_K = 60.0
-
-    def _fuse(self, results: list[dict[str, Any]], *,
-              vector_ranks: Optional[Mapping[int, int]], limit: int) -> list[dict[str, Any]]:
-        """RRF over the lexical, expansion and vector channels; a missing channel adds 0.
-
-        ``1/(60+lexical) + 0.5/(60+expand) + 0.7/(60+vector)``; raw scores are not comparable
-        across channels, so nothing is normalized. Vector hits outside the requested scope are
-        dropped, and vector-only rows carry no lexical rank.
-        """
-        lexical: dict[int, int] = {}
-        expanded: dict[int, int] = {}
-        for row in results:
-            cid = int(row["conclusions_id"])
-            channel = expanded if row.get("via") else lexical
-            channel.setdefault(cid, len(channel))
-        vector: dict[int, int] = {}
-        by_id = {int(row["conclusions_id"]): row for row in results}
-        for cid, rank in (vector_ranks or {}).items():
-            row = by_id.get(int(cid))
-            if row is None:
-                stored = self.conclusion_by_id(int(cid))
-                if stored is None or str(stored.get("status") or "") != "active":
-                    continue
-                row = {
-                    "conclusions_id": int(cid), "kind": stored.get("kind") or "",
-                    "key": stored.get("key") or "", "text": stored.get("content") or "",
-                    "when": float(stored.get("updated_at") or 0),
-                    "author": stored.get("subject") or stored.get("kind") or "",
-                    "subject": stored.get("subject") or "",
-                    "session_id": stored.get("session_id") or "",
-                    "rank": 0.0,
-                }
-                results.append(row)
-                by_id[int(cid)] = row
-            vector[int(cid)] = int(rank)
-        for row in results:
-            cid = int(row["conclusions_id"])
-            total = 0.0
-            if cid in lexical:
-                total += 1.0 / (self._RRF_K + float(lexical[cid]))
-            if cid in expanded:
-                total += 0.5 / (self._RRF_K + float(expanded[cid]))
-            if cid in vector:
-                total += 0.7 / (self._RRF_K + float(vector[cid]))
-            row["score"] = total
-        results.sort(key=lambda item: (item.get("score") or 0.0, item.get("when") or 0.0,
-                                       item.get("conclusions_id") or 0), reverse=True)
-        return results[:limit]
+        return results[:capped]
 
     def _archive_files(self) -> list[Path]:
         """The dated archive files beside the live database; empty when nothing was archived."""

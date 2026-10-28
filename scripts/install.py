@@ -24,6 +24,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import install_host_patches as host_patches  # noqa: E402  (sibling script)
 
 PLUGIN_NAME = "minir"
+#: Deployed side by side. The provider directory holds the memory system; ``minir-adviser`` is an
+#: ordinary plugin because the host refuses an exclusive (provider-config) plugin at discovery, and
+#: a command registered from the provider path does not exist before the first turn.
+PLUGIN_DIRS = ("minir", "minir-adviser")
 _IGNORE = shutil.ignore_patterns("__pycache__", "*.pyc", ".pytest_cache")
 
 
@@ -36,7 +40,8 @@ def _copy_plugin(source: Path, target: Path, *, check: bool) -> Optional[Path]:
         return None
     backup = None
     if target.exists():
-        backup = target.parent.parent / "minir-memory" / "plugin-backup" / time.strftime("%Y%m%d-%H%M%S")
+        backup = (target.parent.parent / "minir-memory" / "plugin-backup"
+                  / f"{target.name}-{time.strftime('%Y%m%d-%H%M%S')}")
         backup.parent.mkdir(parents=True, exist_ok=True)
         shutil.copytree(target, backup, ignore=_IGNORE)
         print(f"backup: {backup}")
@@ -71,13 +76,16 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: Optional[list[str]] = None) -> int:
     args = build_parser().parse_args(argv)
     hermes_home = args.hermes_home or host_patches.default_hermes_home()
-    source = args.source or host_patches.repo_root() / "plugin" / PLUGIN_NAME
-    target = Path(hermes_home) / "plugins" / PLUGIN_NAME
+    primary = args.source or host_patches.repo_root() / "plugin" / PLUGIN_NAME
+    sources = [args.source] if args.source else [
+        host_patches.repo_root() / "plugin" / name for name in PLUGIN_DIRS
+    ]
     host = host_patches.default_host(hermes_home)
-    patches_dir = source / "host-patches"
+    patches_dir = primary / "host-patches"
     try:
         if not args.no_copy:
-            _copy_plugin(source, target, check=args.check)
+            for source in sources:
+                _copy_plugin(source, Path(hermes_home) / "plugins" / source.name, check=args.check)
         if args.no_patches:
             return host_patches.EXIT_OK
         return host_patches.apply_series(

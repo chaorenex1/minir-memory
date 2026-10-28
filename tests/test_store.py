@@ -27,6 +27,17 @@ def test_creates_parent_directories(plugin_package, tmp_path):
     assert db_path.exists()
 
 
+def test_conclusion_kinds_carry_no_marker_and_no_history(plugin_package):
+    """The vocabulary is the conclusion registry; markers are a separate axis, unversioned."""
+    module = plugin_package.store
+    assert module.CONCLUSION_KINDS == tuple(module._CONCLUSION_SPECS)
+    assert not set(module._MARKER_KINDS) & set(module.CONCLUSION_KINDS)
+    # History follows the markers alone: no conclusion kind keeps a version row.
+    assert module._versioned("experiences") and module._versioned("entities")
+    assert not any(module._versioned(kind) for kind in module.CONCLUSION_KINDS)
+    assert not module._versioned("note")
+
+
 def test_schema_holds_no_transcript(store):
     tables = {row[0] for row in store._conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'")}
     assert "turns" not in tables
@@ -131,14 +142,6 @@ def test_search_kind_filter_applies_before_the_limit(store):
     # the filter runs in SQL before the limit instead of after it.
     assert all(row["kind"] != "tools"
                for row in store.search("zebraword", limit=1, session_id="s1"))
-
-
-def test_newest_conclusion_by_content_is_the_mirror_undo(store):
-    first = store.save_conclusion("note", "mirrored entry", session_id="s1")
-    second = store.save_conclusion("note", "mirrored entry", session_id="s1")
-    store.save_conclusion("note", "mirrored entry", session_id="s2")
-    assert store.newest_conclusion_by_content("note", "mirrored entry",
-                                              session_id="s1")["id"] == second != first
 
 
 def test_stats_counts(store):
@@ -364,8 +367,8 @@ def test_conclusions_are_indexed_and_session_scoped(store):
     """Durable cards recall across sessions; a window row or review never leaks."""
     durable = store.save_conclusion("base.user_peer_card", "prefers terse answers",
                                     key="user:ada", subject="user:ada")
-    summary = store.save_conclusion("base.window_summary", "deploy the Windows build",
-                                    key="session:s1:user:ada", session_id="s1",
+    summary = store.save_conclusion("window_summary", "deploy the Windows build",
+                                    key="chunk:s1:0.000000", session_id="s1",
                                     subject="user:ada")
     store.put_layer_state("dialectic", "agent:default:minir",
                           "## Base Revision\n- user_preferences: skipped the smoke test",
@@ -721,8 +724,8 @@ def test_release_advisories_only_returns_injected_rows(store):
     assert store.reset_staged(ids) == 1
 
 
-def test_publish_base_conclusions_writes_the_six_fields_once(store):
-    """One conclusion per calibrated column; user/agent rows durable, window rows session-bound."""
+def test_publish_base_conclusions_writes_the_five_fields_once(store):
+    """One conclusion per calibrated column; user/agent rows durable, session rows bound."""
     store.add_base_refresh(
         "s1", "user:ada", window_from_ts=0.0, window_to_ts=10.0,
         window_from_turn=1, window_to_turn=2,
@@ -730,20 +733,19 @@ def test_publish_base_conclusions_writes_the_six_fields_once(store):
         ai_self_representation="- [done] x", ai_identity_card="- direct",
         window_summary="- window", value_markers='{"value_markers": []}')
     assert store.publish_base_conclusions(
-        "s1", user_subject="user:ada", ai_subject="agent:default:minir") == 6
+        "s1", user_subject="user:ada", ai_subject="agent:default:minir") == 5
 
     rows = {row["kind"]: dict(row) for row in store._conn.execute(
         "SELECT kind, session_id, key, content FROM conclusions WHERE kind LIKE 'base.%'")}
     assert set(rows) == {"base.user_representation", "base.user_peer_card",
                          "base.ai_self_representation", "base.ai_identity_card",
-                         "base.window_summary", "base.value_markers"}
+                         "base.value_markers"}, "the window summary is the chunk chain's"
     for kind in ("base.user_representation", "base.user_peer_card",
                  "base.ai_identity_card"):
         assert rows[kind]["session_id"] == "", f"{kind} must stay durable"
     # The AI self representation is a ruler for the session that produced it.
     assert rows["base.ai_self_representation"]["session_id"] == "s1"
     assert rows["base.ai_self_representation"]["key"].startswith("session:s1:")
-    assert rows["base.window_summary"]["session_id"] == "s1"
     assert rows["base.value_markers"]["session_id"] == "s1"
     assert rows["base.value_markers"]["content"] == '{"value_markers": []}', \
         "the column value is stored verbatim"
@@ -870,8 +872,8 @@ def test_an_archive_conflict_keeps_the_row_in_the_hot_table(plugin_package, tmp_
     path = tmp_path / "memory.db"
     instance = plugin_package.store.MinirStore(path)
     try:
-        instance.save_conclusion("note", "docker v0", key="d", session_id="s1")
-        instance.save_conclusion("note", "docker v1", key="d", session_id="s1")
+        instance.save_conclusion("entities", "docker v0", key="d", session_id="s1")
+        instance.save_conclusion("entities", "docker v1", key="d", session_id="s1")
         row = instance._conn.execute(
             "SELECT id, valid_from FROM conclusion_versions WHERE content = 'docker v0'"
         ).fetchone()
@@ -904,7 +906,7 @@ def test_an_archive_conflict_keeps_the_row_in_the_hot_table(plugin_package, tmp_
 
 def test_folding_needs_the_age_threshold_and_runs_once(store):
     for index in range(34):
-        store.save_conclusion("note", f"docker v{index}", key="d", session_id="s1")
+        store.save_conclusion("entities", f"docker v{index}", key="d", session_id="s1")
     base = time.time()
 
     assert store.maintain_conclusion_history(now=base + 179 * 86_400)["folded"] == 0
@@ -922,7 +924,7 @@ def test_folding_needs_the_age_threshold_and_runs_once(store):
 def test_v4_backfill_gives_each_eligible_row_one_open_version(plugin_package, tmp_path):
     path = tmp_path / "memory.db"
     instance = plugin_package.store.MinirStore(path)
-    instance.save_conclusion("note", "docker prune", key="n", session_id="s1")
+    instance.save_conclusion("entities", "docker prune", key="n", session_id="s1")
     instance.save_conclusion("todo", "ship it", key="t", session_id="s1")
     instance.close()
     raw = sqlite3.connect(str(path))
@@ -939,7 +941,7 @@ def test_v4_backfill_gives_each_eligible_row_one_open_version(plugin_package, tm
     finally:
         migrated.close()
 
-    assert [(row["kind"], row["n"], row["open"]) for row in rows] == [("note", 1, 1)]
+    assert [(row["kind"], row["n"], row["open"]) for row in rows] == [("entities", 1, 1)]
 
 
 def test_expansion_stops_at_the_fanout_cap(store):
@@ -955,13 +957,13 @@ def test_expansion_stops_at_the_fanout_cap(store):
 
 
 def test_as_of_boundaries_pick_the_version_in_force(store):
-    store.save_conclusion("note", "docker v1", key="d", session_id="s1")
+    store.save_conclusion("entities", "docker v1", key="d", session_id="s1")
     first = time.time()
     time.sleep(0.03)
-    store.save_conclusion("note", "docker v2", key="d", session_id="s1")
+    store.save_conclusion("entities", "docker v2", key="d", session_id="s1")
     second = time.time()
     time.sleep(0.03)
-    store.save_conclusion("note", "docker v3", key="d", session_id="s1")
+    store.save_conclusion("entities", "docker v3", key="d", session_id="s1")
     third = time.time()
 
     assert [row["text"] for row in store.search("docker", session_id="s1", as_of=first)] == [
@@ -995,9 +997,9 @@ def test_link_refuses_missing_endpoints_and_upserts(store):
 
 
 def test_merge_meta_and_unmerge_restore_the_row(store):
-    source = store.save_conclusion("note", "docker prune", key="src", session_id="s1")
-    store.save_conclusion("note", "docker prune images", key="dst", session_id="s1")
-    assert store.merge_into(("note", "src"), ("note", "dst"), score=0.95, now=100.0)
+    source = store.save_conclusion("entities", "docker prune", key="src", session_id="s1")
+    store.save_conclusion("entities", "docker prune images", key="dst", session_id="s1")
+    assert store.merge_into(("entities", "src"), ("entities", "dst"), score=0.95, now=100.0)
 
     meta = json.loads(store._conn.execute(
         "SELECT meta FROM edges WHERE src_key = 'src' AND rel = 'same_as'").fetchone()["meta"])
@@ -1005,9 +1007,9 @@ def test_merge_meta_and_unmerge_restore_the_row(store):
     assert [row["text"] for row in store.search("docker", session_id="s1")] == [
         "docker prune images"]
 
-    result = store.unmerge("note", "src", "wrong merge", now=200.0)
+    result = store.unmerge("entities", "src", "wrong merge", now=200.0)
     assert result["unmerged"] is True and result["restored_status"] == "active"
-    assert store.get_conclusion("note", "src")["status"] == "active"
+    assert store.get_conclusion("entities", "src")["status"] == "active"
     assert store._conn.execute(
         "SELECT COUNT(*) FROM edges WHERE src_key = 'src' AND rel = 'same_as'"
     ).fetchone()[0] == 0
@@ -1016,7 +1018,7 @@ def test_merge_meta_and_unmerge_restore_the_row(store):
         "ORDER BY version DESC LIMIT 1", (source,)).fetchone()
     assert latest["valid_to"] is None and latest["version"] == 1
 
-    assert store.unmerge("note", "src", "again")["unmerged"] is False
+    assert store.unmerge("entities", "src", "again")["unmerged"] is False
     with pytest.raises(ValueError):
         store.unmerge("note", "src", "")
 
@@ -1072,7 +1074,7 @@ def test_default_search_matches_the_first_golden(store):
     """A regression lock on the default ``search`` output, created after the strict alignment.
 
     No pre-change snapshot exists in the repository, so this cannot prove the output matched the
-    old build; it pins what ships from here on: same rows, same order, same RRF scores.
+    old build; it pins what ships from here on: same rows, same order, lexical + kind weights.
     """
     store.save_conclusion("note", "docker system prune removes dangling images", session_id="s1")
     store.save_conclusion("note", "pytest -q keeps the feedback loop short", session_id="s1")
@@ -1083,42 +1085,9 @@ def test_default_search_matches_the_first_golden(store):
 
     note = store.search("docker", session_id="s1", kinds=frozenset({"note"}))[0]
     assert [(row["kind"], row["text"], round(row["score"], 6)) for row in rows] == [
-        ("entities", "Docker is the container runtime", 0.016667),
-        ("note", "docker system prune removes dangling images", 0.016393)]
+        ("entities", "Docker is the container runtime", 1.9),
+        ("note", "docker system prune removes dangling images", 1.7)]
     assert note["key"].startswith("note:")
-
-
-def test_rrf_fuses_the_lexical_and_vector_channels(store):
-    store.save_conclusion("note", "docker prune keeps images", key="a", session_id="s1")
-    second = store.save_conclusion("note", "docker prune removes images", key="b", session_id="s1")
-
-    rows = store.search("docker", session_id="s1", vector_ranks={second: 0})
-
-    assert len(rows) == 2
-    # both rows are lexical hits; the vector hit also carries the vector term at rank 0
-    assert sorted(round(row["score"], 6) for row in rows) == sorted(
-        [round(1 / 60, 6), round(1 / 61 + 0.7 / 60, 6)])
-    assert set(rows[0]) == {"conclusions_id", "kind", "key", "text", "when", "author",
-                            "subject", "session_id", "score", "rank"}
-
-
-def test_a_vector_only_hit_is_fused_in_without_a_lexical_rank(store):
-    hit = store.save_conclusion("note", "kubernetes pod restart policy", key="k",
-                                session_id="s1")
-
-    rows = store.search("docker", session_id="s1", vector_ranks={hit: 0})
-
-    assert [row["key"] for row in rows] == ["k"]
-    assert rows[0]["score"] == pytest.approx(0.7 / 60)
-
-
-def test_a_saved_conclusion_reaches_the_index_hook(store):
-    seen: list[tuple[int, str]] = []
-    store.on_conclusion_saved = lambda cid, text: seen.append((cid, text))
-
-    store.save_conclusion("note", "docker prune removes images", key="d", session_id="s1")
-
-    assert seen and seen[0][1] == "docker prune removes images"
 
 
 def test_a_dangling_edge_is_not_expanded(store):
@@ -1134,11 +1103,12 @@ def test_a_dangling_edge_is_not_expanded(store):
 
 
 def test_as_of_returns_a_row_after_forget(store):
-    store.save_conclusion("note", "docker system prune clears dangling images", session_id="s1")
+    store.save_conclusion("entities", "docker system prune clears dangling images",
+                          session_id="s1")
     hit = store.search("docker", session_id="s1")[0]
     before = time.time()
     time.sleep(0.03)  # the deletion must land strictly after the as-of instant
-    assert store.forget_conclusion("note", hit["conclusions_id"])
+    assert store.forget_conclusion("entities", hit["conclusions_id"])
     assert store.search("docker", session_id="s1") == []
 
     rows = store.search("docker", session_id="s1", as_of=before)
@@ -1161,11 +1131,11 @@ def test_include_superseded_reaches_a_superseded_row(store):
 def test_as_of_reads_a_version_archived_to_a_file(plugin_package, tmp_path):
     instance = plugin_package.store.MinirStore(tmp_path / "memory.db")
     try:
-        instance.save_conclusion("note", "docker prune v1", key="docker", session_id="s1")
+        instance.save_conclusion("entities", "docker prune v1", key="docker", session_id="s1")
         time.sleep(0.03)
         stamp = time.time()
         time.sleep(0.03)  # v2 must be strictly newer than the as-of instant
-        instance.save_conclusion("note", "docker prune v2", key="docker", session_id="s1")
+        instance.save_conclusion("entities", "docker prune v2", key="docker", session_id="s1")
         archive = tmp_path / "conclusion" / "archive"
         later = stamp + 200 * 86_400
         assert instance.maintain_conclusion_history(archive, now=later)["archived"] == 1
@@ -1178,8 +1148,8 @@ def test_as_of_reads_a_version_archived_to_a_file(plugin_package, tmp_path):
 
 
 def test_conclusion_versions_append_and_answer_as_of(store):
-    cid = store.save_conclusion("note", "first text", key="k1")
-    store.save_conclusion("note", "second text", key="k1")
+    cid = store.save_conclusion("entities", "first text", key="k1")
+    store.save_conclusion("entities", "second text", key="k1")
     versions = store.conclusion_versions(cid)
     assert [row["content"] for row in versions] == ["second text", "first text"]
     assert sum(1 for row in versions if row["valid_to"] is None) == 1
@@ -1218,12 +1188,12 @@ def test_scheduler_runs_are_recorded_through_the_store(plugin_package, store):
 
 
 def test_history_maintenance_folds_old_versions_and_archives_them(store, tmp_path):
-    cid = store.save_conclusion("note", "current", key="k1")
+    cid = store.save_conclusion("entities", "current", key="k1")
     old = time.time() - 200 * 86400
     with store._lock:
         store._conn.executemany(
             "INSERT INTO conclusion_versions (conclusion_id, kind, key, content, status, "
-            "version, valid_from, valid_to, recorded_at) VALUES (?, 'note', 'k1', ?, "
+            "version, valid_from, valid_to, recorded_at) VALUES (?, 'entities', 'k1', ?, "
             "'active', ?, ?, ?, ?)",
             [(cid, f"old {index}", index, old + index, old + index + 1, old + index)
              for index in range(40)])

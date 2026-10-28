@@ -1,0 +1,9 @@
+name: minir-adviser
+version: 0.2.0
+description: "Registers /adviser where plugin discovery can see it: the minir memory provider owns the mode switch, but it imports only at the first turn, so the command would be unknown from process start until then."
+author: chaorenex1
+license: MIT
+tags:
+  - commands
+provides_hooks:
+  - pre_llm_call

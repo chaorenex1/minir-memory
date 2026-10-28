@@ -52,9 +52,9 @@ Consistency targets:
   `contradicts`, `duplicates`, `supersedes`, `recall_miss`. Evidence carries `claim_ref`; a derived
   claim can never be a blocker.
 - `ai_self_representation_check`: three live cards, one per kind. `false_claim` against
-  `base.ai_self_representation`; `missing_work` against `base.window_summary` (objective plus
-  current_state); `scope_change` against `base.ai_identity_card`. `stale_card` when the card is
-  older than the event.
+  `base.ai_self_representation`; `missing_work` against the session's newest `window_summary`
+  row (objective plus current_state); `scope_change` against `base.ai_identity_card`.
+  `stale_card` when the card is older than the event.
 - `soul_tool_policy_check`: the session against SOUL `# Precedence`, `# Tool policy`,
   `# Boundaries`. Kind: `tool_policy_breach`.
 - `soul_workflow_check`: the session against SOUL `# Workflow`, `# Verification & failure`,

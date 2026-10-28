@@ -1,13 +1,13 @@
-"""``/adviser``: the mode switch, its per-turn directive, and its wiring into ``register()``.
+"""``/adviser``: the mode switch and the per-turn directive it drives.
 
-The command turn itself runs no model call: the host prints the handler's return value. What the
-mode has to prove is the *next* turn, so the tests check the ``pre_llm_call`` injection — the only
-channel that reaches the model.
+The command surface lives in the sibling ``minir-adviser`` plugin: a provider-config plugin is
+refused by discovery, so a command registered from this directory does not exist before the first
+turn, and ``tests/test_minir_adviser_command.py`` covers registration, forwarding and the
+ready-check delivery. What stays here is the state machine and the ``pre_llm_call`` directive —
+the channel that carries the mode into the model.
 """
 
 from __future__ import annotations
-
-import types
 
 import pytest
 
@@ -18,26 +18,6 @@ def switch(plugin_package):
     modes = plugin_package.adviser_command.ModeSwitch()
     yield modes
     modes.clear_all()
-
-
-class FakeCtx:
-    """The plugin-context surface ``register()`` uses, with the commands recorded."""
-
-    def __init__(self):
-        self.commands: dict[str, types.SimpleNamespace] = {}
-        self.hooks: dict[str, object] = {}
-
-    def register_memory_provider(self, provider):
-        self.provider = provider
-
-    def register_hook(self, name, callback):
-        self.hooks[name] = callback
-
-    def register_tool(self, **kwargs):
-        pass
-
-    def register_command(self, name, handler, **kwargs):
-        self.commands[name] = types.SimpleNamespace(handler=handler, **kwargs)
 
 
 # -- the switch ---------------------------------------------------------------
@@ -103,29 +83,66 @@ def test_an_empty_argument_is_status(plugin_package, switch):
     assert "mode=dispatch" in switch.handle("", session_id="s1")
 
 
-# -- the wiring ---------------------------------------------------------------
+# -- the ready-check turn -----------------------------------------------------
 
 
-def test_register_exposes_the_command(plugin_package):
-    ctx = FakeCtx()
+def test_arming_queues_the_ready_check_turn(plugin_package, switch):
+    queued = []
 
-    plugin_package.register(ctx)
+    line = switch.handle("multagents", session_id="s1", deliver=lambda text: queued.append(text) or True)
 
-    command = ctx.commands["adviser"]
-    assert "multagents" in command.args_hint
-    assert command.handler("multagents", session_id="s9").startswith("adviser: multagents armed")
-    assert ctx.provider._modes.mode("s9") == "multagents"
+    assert queued == [plugin_package.adviser_command.KICKOFF_TEXT]
+    assert "ready-check" in line
+    assert switch.mode("s1") == plugin_package.adviser_command.MODE_MULTIAGENTS
 
 
-def test_register_binds_the_handler_to_the_command_context(plugin_package):
-    """``invoke_plugin_command`` passes only the keywords a handler declares; both must land."""
-    ctx = FakeCtx()
-    plugin_package.register(ctx)
-    command = ctx.commands["adviser"]
+def test_a_refused_inject_leaves_the_mode_armed(plugin_package, switch):
+    line = switch.handle("multagents", session_id="s1", deliver=lambda _text: False)
 
-    command.handler("multagents", session_key="gateway-session")
+    assert "ready-check" not in line
+    assert "armed" in line
+    assert switch.mode("s1") == plugin_package.adviser_command.MODE_MULTIAGENTS
 
-    assert ctx.provider._modes.mode("gateway-session") == "multagents"
+
+def test_a_raising_inject_leaves_the_mode_armed(plugin_package, switch):
+    def boom(_text):
+        raise RuntimeError("no injector")
+
+    line = switch.handle("multagents", session_id="s1", deliver=boom)
+
+    assert "armed" in line
+    assert switch.mode("s1") == plugin_package.adviser_command.MODE_MULTIAGENTS
+
+
+def test_only_arming_queues_a_turn(plugin_package, switch):
+    queued = []
+
+    def deliver(text):
+        queued.append(text)
+        return True
+
+    switch.handle("status", session_id="s1", deliver=deliver)
+    switch.handle("multagents", session_id="s1", deliver=deliver)
+    switch.handle("dispatch", session_id="s1", deliver=deliver)
+
+    assert len(queued) == 1
+
+
+def test_a_second_arm_does_not_queue_another_turn(plugin_package, switch):
+    queued = []
+
+    def deliver(text):
+        queued.append(text)
+        return True
+
+    switch.handle("multagents", session_id="s1", deliver=deliver)
+    line = switch.handle("multagents", session_id="s1", deliver=deliver)
+
+    assert len(queued) == 1
+    assert "already armed" in line
+
+
+# -- the hook ---------------------------------------------------------------
 
 
 def test_pre_llm_call_injects_the_armed_directive(plugin_package, make_provider):

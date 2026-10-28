@@ -1,17 +1,11 @@
 name: minir
-version: 0.18.1
+version: 0.18.2
 description: "Minir — local-first memory plugin: independent base/review layers, four-section user/AI cards with a rolling window summary, a three-day review of four durable card files, knowledge pages with path-hint retrieval, an idle-session summary and knowledge extraction, per-turn token accounting, the minir toolset, FTS5 recall, and a permanent JSONL transcript event store."
 author: chaorenex1
 license: MIT
 tags:
   - memory
   - template
-# Vector recall loads sqlite-vec inside the host runtime. Hermes strips every interpreter
-# site-packages entry from sys.path at boot and keeps only the PM generation, so a package that
-# exists only in the checkout's dev venv is invisible here: without this declaration the plugin
-# logs "sqlite-vec unavailable, bm25 only" on every start.
-python_dependencies:
-  - sqlite-vec>=0.1.9
 # The provider's own surface (MemoryProvider) is reached through memory.provider;
 # these are the plugin-level hooks register(ctx) subscribes to. The host validator fails
 # the manifest when register() adds a hook that is not declared here.

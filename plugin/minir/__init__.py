@@ -48,7 +48,7 @@ import re
 import threading
 import time
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 from agent.memory_provider import (
     INDICATOR_GLYPH,
@@ -76,7 +76,6 @@ from . import scheduler
 from . import session_summary
 from . import window_summary
 from . import tools as plugin_tools
-from . import vector
 from .adviser_mode import AdviserMode
 from .prompting import CONSISTENCY_TARGETS, marker_glossary
 from .store import (CONCLUSION_KINDS, MinirStore, SessionScopeError, format_when,
@@ -422,12 +421,6 @@ class MinirMemoryProvider(MemoryProvider):
         self._state_db = str(Path(hermes_home) / "state.db")
         db_path = Path(hermes_home) / _STORE_DIRNAME / _DB_FILENAME
         self._store = MinirStore(db_path)
-        self._vector = vector.VectorIndex(self._store, self._config.get("vector") or {})
-        self._store.on_conclusion_saved = self._vector.index_async
-        try:
-            self._vector.ensure_table()
-        except Exception as exc:  # a vector table must never block a provider start
-            logger.debug("Minir vector table unavailable at start: %s", exc)
         global _ACTIVE_PROVIDER
         _ACTIVE_PROVIDER = self
         self._session_id = session_id or ""
@@ -510,11 +503,6 @@ class MinirMemoryProvider(MemoryProvider):
                                      self._extraction_scheduler.tick, first_delay=0.0)
         self._scheduler.add_time("conclusion_history_maintenance", 6 * 3600,
                                  self._maintain_conclusion_history, first_delay=60.0)
-        if self._reasoning:
-            self._scheduler.add_time("vector_backfill", 3600,
-                                     self._backfill_vectors, first_delay=120.0)
-            self._scheduler.add_time("vector_dim_migration", 300,
-                                     self._migrate_vectors, first_delay=30.0)
         self._scheduler.start()
         # Configure before opening the session: intervals/mode apply to sessions opened later
         # (an already-running session keeps the cadence it started with).
@@ -718,11 +706,14 @@ class MinirMemoryProvider(MemoryProvider):
             "searches the current session by default; scope=\"all\" searches every session but "
             "not the session-bound base kinds; limit is capped at 20. Search before asking the "
             "user to repeat history.\n"
-            "- minir_remember: record one durable item under a kind (note, entities, "
-            "trajectories, experiences, tools, projects, todo) with its content. Store what "
-            "should outlive this turn, not transient state, and never store secrets or "
+            "- minir_remember: store one durable item. remember_mode=\"knowledge\" queues a "
+            "knowledge page (type is the org, category required); remember_mode=\"card\" "
+            "rewrites one global card part (type is the part, reason required). There is no "
+            "conclusion mode: the layers own the conclusion rows. Never store secrets or "
             "credentials.\n"
-            "- minir_forget: delete one stored conclusion by conclusions_id and kind.\n"
+            "- minir_forget: remember_mode=\"knowledge\" archives a page by path; "
+            "remember_mode=\"card\" clears one card part by type with a reason. Neither "
+            "touches a conclusion row.\n"
             "- minir_todo: replace the caller's todo list (the profile for the main session, the "
             "agent for a dispatched run); it is rendered into the final answer and carried by "
             "every prefetch block for the same owner.\n"
@@ -747,7 +738,7 @@ class MinirMemoryProvider(MemoryProvider):
             "avoid re-litigating a settled decision.\n"
             "3. When a durable fact, correction or lesson appears, store it once under the type "
             "that matches its definition.\n"
-            "4. When a stored item is superseded or wrong, delete it with minir_forget rather "
+            "4. When a stored page or card line is superseded or wrong, rewrite it rather "
             "than storing a contradiction."
         )
 
@@ -789,16 +780,6 @@ class MinirMemoryProvider(MemoryProvider):
         except Exception as exc:
             logger.warning("Minir merge candidates failed: %s", exc)
         return counts
-
-    def _migrate_vectors(self) -> dict[str, Any]:
-        """One resumable migration step; a no-op unless a dim/model change queued one."""
-        if self._vector is None:
-            return {"status": "none"}
-        return self._vector.migrate()
-
-    def _backfill_vectors(self) -> int:
-        """Index conclusions the vector table does not have yet; a no-op without a key."""
-        return self._vector.backfill() if self._vector is not None else 0
 
     def _stale_block(self, session: str) -> tuple[str, int]:
         """Open base-refresh failures, so a silent gap never reads as 'nothing happened'."""
@@ -1147,30 +1128,6 @@ class MinirMemoryProvider(MemoryProvider):
         """``(name, id)`` of the user side of this turn: the host's argument, else the last tick."""
         source = turn_author if isinstance(turn_author, dict) and turn_author else self._authors.get(session) or {}
         return str(source.get("name") or "").strip(), str(source.get("id") or "").strip()
-
-    def on_memory_write(self, action: str, target: str, content: str,
-                        metadata: Optional[dict[str, Any]] = None) -> None:
-        """Mirror built-in memory-tool writes so both stores stay searchable."""
-        logger.info("Minir on_memory_write: action=%s target=%s chars=%d",
-                    action, target, len(content or ""))
-        if self._store is None or not (content or "").strip():
-            return
-        session = self._session_id
-        try:
-            if action in {"add", "replace"}:
-                self._store.save_conclusion(
-                    "note", content.strip(), session_id=session,
-                    subject=f"memory_tool/{target}", version=1)
-            elif action == "remove":
-                # ``metadata["previous_content"]`` may be absent; content itself is the entry.
-                # The mirror writes ``note`` rows, so the undo targets the newest one in this
-                # session; there is no separate notes table to search.
-                row = self._store.newest_conclusion_by_content(
-                    "note", content.strip(), session_id=session)
-                if row is not None:
-                    self._store.forget_conclusion("note", int(row["id"]))
-        except Exception as exc:
-            logger.debug("Minir memory mirror failed: %s", exc)
 
     # -- turn counting (base / dialectic-reasoning layers) ---------------------
 
@@ -1688,8 +1645,6 @@ class MinirMemoryProvider(MemoryProvider):
         self._adviser_mode.session_end(self._session_id)
         self._adviser_mode.stop()  # no review may touch the store after this point
         self._scheduler.stop()     # no scheduled job may touch the store after this point
-        if self._vector is not None:
-            self._vector.stop()    # drain the index queue before the store closes
         if self._knowledge is not None:
             self._knowledge.stop()      # drain queued value markers while the filesystem still exists
         self._transcript.close()        # last writer join: no JSON may be half-written
@@ -1880,9 +1835,11 @@ class MinirMemoryProvider(MemoryProvider):
                                   "backreferences)")
             return json.dumps(payload)
         if tool_name == "minir_remember":
-            mode = str(args.get("remember_mode") or "conclusion").strip().lower()
-            if mode not in ("conclusion", "knowledge", "card"):
-                return tool_error("remember_mode must be conclusion, knowledge or card")
+            mode = str(args.get("remember_mode") or "").strip().lower()
+            if not mode:
+                return tool_error("remember_mode is required: knowledge or card")
+            if mode not in ("knowledge", "card"):
+                return tool_error("remember_mode must be knowledge or card")
             kind = str(args.get("type") or "").strip()
             if not kind:
                 return tool_error("type is required")
@@ -1891,23 +1848,15 @@ class MinirMemoryProvider(MemoryProvider):
                 return tool_error("content is required")
             if mode == "knowledge":
                 return self._remember_knowledge(kind, content, args)
-            if mode == "card":
-                return self._remember_card(kind, content, args)
-            if kind not in CONCLUSION_KINDS:
-                return tool_error(f"type must be one of: {', '.join(CONCLUSION_KINDS)}")
-            conclusions_id = self._store.save_conclusion(
-                kind, content, session_id=self._session_id, subject="tool")
-            return json.dumps({"stored": True, "conclusions_id": conclusions_id,
-                               "type": kind, "session_id": self._session_id,
-                               "remember_mode": mode})
+            return self._remember_card(kind, content, args)
         if tool_name == "minir_forget":
-            mode = str(args.get("remember_mode") or "conclusion").strip().lower()
-            if mode not in ("conclusion", "knowledge", "card"):
-                return tool_error("remember_mode must be conclusion, knowledge or card")
-            kind = str(args.get("type") or "").strip()
-            if not kind:
-                return tool_error("type is required")
+            mode = str(args.get("remember_mode") or "").strip().lower()
+            if not mode:
+                return tool_error("remember_mode is required: knowledge or card")
+            if mode not in ("knowledge", "card"):
+                return tool_error("remember_mode must be knowledge or card")
             if mode == "knowledge":
+                # ``type`` takes no part here: a page is addressed by its path.
                 path = str(args.get("path") or "").strip()
                 if not path:
                     return tool_error("path is required for knowledge mode")
@@ -1915,26 +1864,17 @@ class MinirMemoryProvider(MemoryProvider):
                     knowledge.knowledge_dir(self._hermes_home), path,
                     reason=str(args.get("reason") or ""))
                 return json.dumps(result)
-            if mode == "card":
-                if kind not in card_review.PARTS:
-                    return tool_error(
-                        f"type must be one of: {', '.join(card_review.PARTS)}")
-                reason = str(args.get("reason") or "").strip()
-                if not reason:
-                    return tool_error("reason is required for a card forget")
-                revisions = card_review.write_cards(
-                    self._store, self._hermes_home, self._profile, {kind: ""},
-                    source="operator_edit", parts=(kind,), reason=reason)
-                return json.dumps({"cleared": True, "type": kind, "revisions": revisions})
-            if kind not in CONCLUSION_KINDS:
-                return tool_error(f"type must be one of: {', '.join(CONCLUSION_KINDS)}")
-            try:  # tolerate "5" from models that stringify integers
-                conclusions_id = int(args.get("conclusions_id"))
-            except (TypeError, ValueError):
-                return tool_error("conclusions_id must be an integer")
-            deleted = self._store.forget_conclusion(kind, conclusions_id)
-            return json.dumps({"deleted": deleted, "conclusions_id": conclusions_id,
-                               "type": kind, "remember_mode": mode})
+            kind = str(args.get("type") or "").strip()
+            if kind not in card_review.PARTS:
+                return tool_error(
+                    f"type must be one of: {', '.join(card_review.PARTS)}")
+            reason = str(args.get("reason") or "").strip()
+            if not reason:
+                return tool_error("reason is required for a card forget")
+            revisions = card_review.write_cards(
+                self._store, self._hermes_home, self._profile, {kind: ""},
+                source="operator_edit", parts=(kind,), reason=reason)
+            return json.dumps({"cleared": True, "type": kind, "revisions": revisions})
         if tool_name == "minir_link":
             try:
                 src = _endpoint(args.get("src"))
@@ -1983,7 +1923,6 @@ class MinirMemoryProvider(MemoryProvider):
                                "artifacts": self._store.all_layer_states(),
                                "transcript": self._transcript.stats(),
                                "buffered_messages": len(self._transcript.messages(self._session_id)),
-                               "vector": (self._vector.stats() if self._vector is not None else {}),
                                "prefetch_limit": self._prefetch_limit,
                                "dialectic_depth": self._dialectic_depth,
                                "session_usage": self._store.session_usage(self._session_id),
@@ -2102,14 +2041,10 @@ class MinirMemoryProvider(MemoryProvider):
         except (TypeError, ValueError):
             requested = self._prefetch_limit
         session = session_id or self._session_id
-        ranks: dict[int, int] = {}
-        if self._vector is not None and as_of is None:
-            ranks = self._vector.recall(query, limit=20)
         return self._store.search(query, limit=max(1, min(20, requested)),
                                   session_id=session, scope=scope, kinds=kinds,
                                   as_of=as_of, expand=expand,
-                                  include_superseded=include_superseded,
-                                  vector_ranks=ranks)
+                                  include_superseded=include_superseded)
 
 
 def _skill_description(path: Path) -> str:
@@ -2178,20 +2113,11 @@ def register(ctx) -> None:
         logger.warning("Minir toolset registration failed: %s", exc)
     # The bundled skills (read-only, namespaced ``minir:<name>``) travel with the plugin.
     _register_skills(ctx)
-    # ``/adviser``: the orchestration mode switch (hermes-dispatch <-> hermes-lead). Optional by
-    # design, like the hooks below: a host without a command surface still gets the provider, and
-    # the mode it lost is only the mode, never the memory system.
-    register_command = getattr(ctx, "register_command", None)
-    if callable(register_command):
-        try:
-            register_command(
-                "adviser",
-                adviser_command.command_handler(lambda: _resolve_provider(provider)),
-                description="Switch this session between hermes-dispatch and hermes-lead mode.",
-                args_hint="multagents | dispatch | status",
-            )
-        except Exception as exc:
-            logger.warning("Minir /adviser command registration failed: %s", exc)
+    # ``/adviser`` is registered by the sibling ``minir-adviser`` plugin, not here. The host
+    # refuses an exclusive plugin at discovery, so this module is imported only when the provider
+    # loads — a command registered here is unknown for the whole window between process start and
+    # the first turn. That plugin loads at discovery and answers through ``_minir_adviser_command``
+    # below, which is why the switch stays a provider attribute.
     # The hooks close over the provider instance: only it knows the bound session, the agent
     # context (primary vs subagent) and the cached review. Module-level handlers with no state
     # would inject another session's review or start a model job for every subagent.
@@ -2252,6 +2178,44 @@ def _resolve_provider(provider: Optional[MinirMemoryProvider]) -> Optional[Minir
         return provider
     active = _ACTIVE_PROVIDER
     return active if active is not None and active._store is not None else provider
+
+
+def _minir_adviser_command(raw_args: str, *, session_id: str = "",
+                           deliver: Optional[Callable[[str], bool]] = None) -> Optional[str]:
+    """Cross-plugin seam for the ``minir-adviser`` plugin's ``/adviser`` command.
+
+    That plugin is its own directory, imported as its own package, so it cannot import this
+    module. It finds this function by scanning ``sys.modules`` for the name: keep the name and
+    the signature stable, they are the contract between the two directories.
+
+    Returns the line to print, or None while no provider is initialized. The mode switch lives on
+    the provider (one instance per import, and the hook reads the initialized one), so before the
+    first turn there is no state to switch and the caller has to answer for itself.
+    """
+    provider = _ACTIVE_PROVIDER
+    if provider is None or getattr(provider, "_store", None) is None:
+        return None
+    return adviser_command.command_handler(lambda: provider, inject=deliver)(
+        raw_args, session_id=session_id)
+
+
+def _minir_adviser_verb(raw_args: str) -> str:
+    """Which verb the arguments name: ``arm`` / ``clear`` / ``status`` / ``unknown``.
+
+    Lives here so the companion plugin keeps no copy of the accepted spellings: before a provider
+    is initialized it still has to tell "switch to hermes-lead" (defer and start the turn) from
+    "report" (answer now).
+    """
+    return adviser_command.parse(raw_args)[0]
+
+
+def _minir_adviser_kickoff() -> str:
+    """The ready-check request the command injects when it arms.
+
+    The companion needs it in the window before a provider exists: choosing the mode and loading
+    the skill both happen on that injected turn, where the provider initializes.
+    """
+    return adviser_command.KICKOFF_TEXT
 
 
 def _hook(handler, provider: MinirMemoryProvider):

@@ -15,6 +15,12 @@ Why the directive repeats every turn instead of landing once: a context compress
 hermes-lead body from the window while the session keeps looking normal, and the directive is what
 reloads it. Its length is bounded for the same reason it repeats.
 
+The command turn still runs no model call, so arming alone leaves the skill body absent until the
+user speaks. ``handle`` therefore queues one ready-check turn through the host's ``inject_message``
+when the command surface offers one: that turn arrives with the directive already attached, loads
+the skill, and stops. A host without the injector, or one that refuses it, keeps the mode armed and
+says in the printed line that no turn was queued.
+
 State is in-memory and keyed by session id: a mode belongs to one conversation, not to the
 profile, so a restart or a fresh session lands back in dispatch. ``MAX_SESSIONS`` bounds the map
 because the gateway process lives for weeks and must not accumulate session state forever.
@@ -22,8 +28,11 @@ because the gateway process lives for weeks and must not accumulate session stat
 
 from __future__ import annotations
 
+import logging
 import threading
 from typing import Any, Callable, Optional
+
+logger = logging.getLogger(__name__)
 
 MODE_DISPATCH = "dispatch"
 MODE_MULTIAGENTS = "multagents"
@@ -55,12 +64,55 @@ _ARMED = (
     "adviser: multagents armed for this session. The next message runs the hermes-lead loop; "
     "hermes-dispatch no longer governs. Clear it with /adviser dispatch."
 )
+_ARMED_KICKOFF = (
+    "adviser: multagents armed for this session, and one ready-check turn is queued: it loads "
+    "hermes-lead and stops for your next request. Clear it with /adviser dispatch."
+)
+_ALREADY_ARMED = (
+    "adviser: multagents already armed for this session; no second ready-check turn queued. "
+    "Clear it with /adviser dispatch."
+)
+# What the queued turn asks for. It rides the user-message channel, so it reads as a request rather
+# than as a system instruction, and it stops before doing any work of its own.
+KICKOFF_TEXT = (
+    "[adviser] hermes-lead ready-check: load the hermes-lead skill, confirm the rubric row and the "
+    "role routing you would use for this session, then stop and wait for my next request."
+)
 _RELEASED = (
     "adviser: dispatch restored. hermes-dispatch governs again and the next message dispatches "
     "no role."
 )
 _ARMED_STATUS = "adviser: mode=multagents (hermes-lead governs; hermes-dispatch superseded)."
 _DISPATCH_STATUS = "adviser: mode=dispatch (hermes-dispatch governs)."
+
+
+def _queue_kickoff(deliver: Optional[Callable[[str], bool]]) -> bool:
+    """Queue the ready-check turn; no injector, or one that refuses or raises, leaves the mode on."""
+    if deliver is None:
+        return False
+    try:
+        return bool(deliver(KICKOFF_TEXT))
+    except Exception as exc:  # an injection must never break the command that asked for it
+        logger.debug("adviser ready-check inject failed: %s", exc)
+        return False
+
+
+def parse(raw_args: Any) -> tuple[str, str]:
+    """``(kind, name)`` for one command invocation.
+
+    ``kind`` is ``arm`` / ``clear`` / ``status`` / ``unknown``. The vocabulary lives here only:
+    the companion command plugin asks through ``_minir_adviser_verb`` instead of keeping its own
+    copy of the accepted spellings.
+    """
+    tokens = str(raw_args or "").strip().lower().split()
+    name = tokens[0] if tokens else "status"
+    if name in MULTIAGENTS_NAMES:
+        return "arm", name
+    if name in DISPATCH_NAMES:
+        return "clear", name
+    if name == "status":
+        return "status", name
+    return "unknown", name
 
 
 class ModeSwitch:
@@ -102,17 +154,25 @@ class ModeSwitch:
         """The block ``pre_llm_call`` returns, or None when dispatch governs."""
         return MULTIAGENTS_DIRECTIVE if self.mode(session_id) == MODE_MULTIAGENTS else None
 
-    def handle(self, raw_args: Any, session_id: str = "") -> str:
-        """Run one ``/adviser`` invocation; returns the line the host prints."""
-        tokens = str(raw_args or "").strip().lower().split()
-        name = tokens[0] if tokens else "status"
-        if name in MULTIAGENTS_NAMES:
+    def handle(self, raw_args: Any, session_id: str = "",
+               deliver: Optional[Callable[[str], bool]] = None) -> str:
+        """Run one ``/adviser`` invocation; returns the line the host prints.
+
+        *deliver* is the host's ``inject_message`` when the command surface exposes one: arming
+        queues a ready-check turn through it, so the skill body is in context before the user speaks.
+        Re-arming an already armed session queues nothing, and neither does ``dispatch``/``status``.
+        """
+        kind, name = parse(raw_args)
+        if kind == "arm":
+            already = self.mode(session_id) == MODE_MULTIAGENTS
             self.arm(session_id)
-            return _ARMED
-        if name in DISPATCH_NAMES:
+            if already:
+                return _ALREADY_ARMED
+            return _ARMED_KICKOFF if _queue_kickoff(deliver) else _ARMED
+        if kind == "clear":
             self.clear(session_id)
             return _RELEASED
-        if name == "status":
+        if kind == "status":
             return _ARMED_STATUS if self.mode(session_id) == MODE_MULTIAGENTS else _DISPATCH_STATUS
         return f"adviser: unknown mode {name!r}. {USAGE}"
 
@@ -120,7 +180,8 @@ class ModeSwitch:
 MODES = ModeSwitch()
 
 
-def command_handler(resolve_provider: Callable[[], Any]) -> Callable[..., str]:
+def command_handler(resolve_provider: Callable[[], Any],
+                    inject: Optional[Callable[[str], bool]] = None) -> Callable[..., str]:
     """Build the handler ``register_command`` receives.
 
     ``invoke_plugin_command`` passes the context keywords a handler declares, so ``session_id``
@@ -134,6 +195,6 @@ def command_handler(resolve_provider: Callable[[], Any]) -> Callable[..., str]:
         provider = resolve_provider()
         switch = getattr(provider, "_modes", None) or MODES
         session = session_id or session_key or str(getattr(provider, "_session_id", "") or "")
-        return switch.handle(raw_args, session_id=session)
+        return switch.handle(raw_args, session_id=session, deliver=inject)
 
     return handler

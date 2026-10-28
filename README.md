@@ -4,9 +4,9 @@ A minimal, dependency-free **Hermes memory-provider plugin template** — a work
 reference implementation of the `MemoryProvider` contract that you can fork, rename,
 and grow into a real provider.
 
-It keeps explicit value markers and every derived conclusion in a per-profile SQLite database,
-recalls them through an FTS5 trigram index (CJK-safe, with a token-scan fallback) plus an optional
-sqlite-vec index, and exposes eleven tools (`minir_search`, `minir_kb_search`, `minir_remember`,
+It keeps the published conclusions and the value-marker history in a per-profile SQLite database,
+recalls them through an FTS5 trigram index (CJK-safe, with a token-scan fallback), and exposes
+eleven tools (`minir_search`, `minir_kb_search`, `minir_remember`,
 `minir_forget`, `minir_todo`, `minir_stats`, `minir_agents`, `minir_kb_write`, `minir_link`,
 `minir_unmerge`, `minir_advise`) and one local counter (`minir_content_valid`). On top of that it
 runs two **independent** reasoning layers: the base layer builds the user/AI cards every 24 turns,
@@ -157,7 +157,6 @@ Hermes loads memory providers by **name**, one at a time:
 | `sync_turn(user, assistant, **kw)` | after each turn, background worker | hands the turn to the layer worker (in memory); `messages`, `turn_author` are optional kwargs |
 | `get_tool_schemas()` / `handle_tool_call()` | tool dispatch | handlers **must return a JSON string** |
 | `shutdown()` | teardown | idempotent |
-| `on_memory_write(...)` | built-in memory tool writes | mirror `add`/`replace`/`remove` if you want both stores searchable |
 | `on_session_switch(...)` | `/resume`, `/branch`, `/reset`, `/new`, compression | rebind per-session state; `reset=True` means a new conversation, a non-empty `parent_session_id` marks a branch |
 | `get_config_schema()` | `hermes memory setup` | env-var-only fields keep it simple (see below) |
 | `on_turn_start(turn_number, message, **kw)` | before each user turn | **the counting tick** — the host's own per-session turn number; never fires for a subagent/cron turn |
@@ -204,8 +203,12 @@ process-wide active provider, since the host can construct the plugin twice.
 
 ## Slash command: `/adviser`
 
-`register(ctx)` also calls `ctx.register_command("adviser", ...)`, so the orchestration mode is a
-command the user types, not something described to the model in prose:
+The command is registered by the sibling **`minir-adviser`** plugin, deployed beside this one. The
+host refuses an exclusive plugin (this provider) at discovery, so `register(ctx)` here runs only
+when the provider loads — at the first turn — and a command registered from this directory would
+answer `unknown command` for the whole window between process start and that turn. `minir-adviser`
+loads at discovery, holds no state, and forwards each call through the `_minir_adviser_command`
+seam into the provider's switch:
 
 | Command | Effect |
 | --- | --- |
@@ -213,11 +216,28 @@ command the user types, not something described to the model in prose:
 | `/adviser dispatch` | Release it: hermes-dispatch governs again (`off` and `default` are accepted spellings). |
 | `/adviser status` | Report the mode. No argument means `status`; an unknown mode changes nothing. |
 
+The switch itself lives on the provider, so before an agent build has initialized one the command
+cannot arm directly: it queues the request for that session and injects one ready-check turn. That
+turn builds the agent (initializing the provider), the companion's `pre_llm_call` hook applies the
+queued request to the now-live switch, and the directive `minir` returns for the same turn makes
+the model load `minir:hermes-lead`, confirm the rubric row and stop — the next message is the
+user's request. `status` and `dispatch` answer immediately in either case.
+
 The command turn runs no model call: the host prints the handler's return value and never feeds it
-to the model, so the arming cannot ride the reply. The mode lives per session in
-`adviser_command.MODES`, and while it is on the `pre_llm_call` hook returns
-`MULTIAGENTS_DIRECTIVE` — the host injects a hook's string into the **next** turn's user message,
-which is exactly the "run the command first, act on the next input" contract. That block tells the
+to the model. Arming therefore queues one ready-check turn through the host's
+`ctx.inject_message` rather than waiting for the user's next message: that turn carries the
+directive, loads `minir:hermes-lead`, reports the rubric and role routing it would use, then
+stops, and `KICKOFF_TEXT` is the request it receives. Delivery is best-effort and never blocks
+the arming — a host without an injector, or one that refuses it
+(`plugins.entries.minir-adviser.allow_gateway_injection` false, no live gateway, a TUI session the slot
+does not own), leaves the mode armed and the printed line says no turn was queued; re-arming an
+already armed session queues nothing.
+
+The mode lives per session on the provider's `adviser_command.ModeSwitch` (`_modes`;
+`adviser_command.MODES` is the fallback for a caller with no provider), and while it is on the
+`pre_llm_call` hook returns
+`MULTIAGENTS_DIRECTIVE` — the host injects a hook's string into that turn's user message. That
+block tells the
 main agent to load `minir:hermes-lead` and stop treating hermes-dispatch as the governing loop; it
 repeats every turn because a context compression can drop the skill body from the window while the
 session keeps looking normal. `/adviser dispatch`, `on_session_reset` and `on_session_finalize`
@@ -234,20 +254,18 @@ be granted them explicitly (see "The `minir` toolset" below).
 | --- | --- | --- |
 | `minir_search` | `query` (required), `limit`, `scope`, `type`, `session_id` | Ranked FTS5 recall. Default `scope="session"`: the current session plus durable cards and markers. `scope="all"` searches every session; `session_id` targets one explicitly. `limit` defaults to `prefetch_limit` and is capped at 20; `type` keeps only that conclusion kind. Each result carries `conclusions_id`, `kind`, `key`, `text` (600-char excerpt), `when`, `author`, `subject`, `session_id`, `score` and `rank`. |
 | `minir_kb_search` | `query` (required), `org`, `category`, `limit` | Read-only search of the knowledge directory the hint block points at. `query` is a ripgrep (Rust regex) pattern matched case-insensitively; `org`/`category` filter front-matter; `limit` defaults to 8, capped at 25. A result carries `path` (absolute), `relative`, `org`, `category`, `topic`, `summary`, `revisions`, `updated_at` and up to two matched body lines (`line` + `text`); `total` counts every matching page, so `total > count` means "narrow the pattern". Hits outside `<org>/<page>.md` under the knowledge root are never reported. |
-| `minir_remember` | `type` (required), `content` (required) | Stores one conclusion of that kind (`note`, `entities`, `trajectories`, `experiences`, `tools`, `projects`, `todo`) in the single memory table, bound to the current session and indexed for FTS. Returns `{stored, conclusions_id, type, session_id}`. |
-| `minir_forget` | `type` (required), `conclusions_id` (required) | Deletes that row only when its stored kind matches. Returns `{deleted, conclusions_id, type}`; a wrong kind or unknown id yields `deleted: false`. |
+| `minir_remember` | `remember_mode` (required), `type` (required), `content` (required) | `remember_mode="knowledge"` queues a page unit for the writer (`type` is the org, `category` required); `remember_mode="card"` overlays one global card part (`type` is the part, `reason` required). There is no conclusion mode: no tool writes a conclusions row. |
+| `minir_forget` | `remember_mode` (required), `type`, `path`, `reason` | `remember_mode="knowledge"` archives a page by `path`; `remember_mode="card"` clears one card part by `type` with a `reason`. No conclusion row is deletable through a tool. |
 | `minir_todo` | `todos` (required) | Replaces the caller's todo list, at most two levels deep (`parent` names a top-level id) and 256 items. The owner is the profile for the main session and `(agent name, run session id)` for a dispatched run, so each agent tracks its own steps without touching its dispatcher's list. It is stored as one row (`kind="todo"`), rendered as a markdown table into the final answer, and carried by every prefetch block for the same owner. An empty list deletes the row. |
 | `minir_stats` | none | Store counts (with `conclusions_by_kind` for this session), layer counters, the scheduler ledger, published artifacts, buffered messages, in-memory tool metrics, the session's token usage and its newest turn rows, and the database path. |
 | `minir_agents` | `agent_name` (required), `user_prompts` (required), `skill_name`, `model`, `system_prompts`, `context_files`, `project_dir`, `tool_sets`, `background`, `skip_memory`, `skip_context_files`, `skip_background_review`, `load_soul_identity` | Runs a named in-process agent, in the background by default: the call returns a job handle and the answer arrives as a completion notification. `background=false` waits for the answer. Omitting `tool_sets` grants every host tool. `model` is `provider:model`. The system prompt is the first prompt file found under `HERMES_HOME` (see "Custom agents"); `system_prompts` is the last fallback, and `system_prompt_source` reports which one won. The full run is flushed to `sessions/<agent_name>/<layer_session_id>.jsonl`. |
 | `minir_content_valid` | `content` (required), `limit` (required), `mode` | Local deterministic length check. `mode="string"` (default) counts Unicode code points; `mode="token"` applies `rules.estimate_tokens` (CJK one token per character, otherwise four characters per token, plus a 10% margin). Returns `{ok, mode, unit, measured, limit, over, remaining}` and, in token mode, `estimator`. It never truncates, rewrites or stores, and it answers before the provider is initialized. |
 
-Explicit markers are separate from the base layer's automatic value markers: the worker keeps
-merging its own five-key inventory per refresh, while a remembered marker is a session-bound,
-kind-tagged conclusions row that search can recall and `minir_forget` can remove. Writes mirrored
-from the host's built-in memory tools (`on_memory_write`) land under `kind="note"`; they are
-recallable in both public scopes. That mirror only fires while the built-in tool exists, so with
-the default `block_builtin_memory: true` (host patch 0020) there is nothing to mirror; set it to
-`false` to keep both stores.
+The five value-marker kinds are read-only history now: the worker keeps merging its own five-key
+inventory per refresh, and the six marker rows an older release wrote stay searchable, but no tool
+writes or deletes one. A durable write goes to a knowledge page or a global card. Host memory-tool
+writes are not mirrored: that mirror was the only producer of `kind="note"` rows, and the twelve it
+left stay readable.
 
 Two further tools exist only in the agent-facing `minir` registry toolset (not in the provider's
 main-agent surface):
@@ -482,10 +500,11 @@ The base row keeps `user_representation` for `user_self_representation`, `user_p
 `{"value_markers": [units], "page_writes": [...]}`. A unit is `{id, category, org, topic, content,
 summary, epistemic, time, objects, relations, anchor}`; the marker pass writes the page through
 `minir_kb_write` and reports each write result in `page_writes`. The same data is
-rendered into the four-section artifact, and every column is published once per session as its own
-conclusion (`base.user_representation`, `base.user_peer_card`, `base.ai_self_representation`,
-`base.ai_identity_card`, `base.window_summary`, `base.value_markers`) through
-`publish_base_conclusions`, guarded by `base_refreshes.conclusions_published_at`. `is_latest=1` marks the row with the
+rendered into the four-section artifact, and every column except the window summary is published
+once per session as its own conclusion (`base.user_representation`, `base.user_peer_card`,
+`base.ai_self_representation`, `base.ai_identity_card`, `base.value_markers`) through
+`publish_base_conclusions`, guarded by `base_refreshes.conclusions_published_at`; the window
+summary is the `window_summary` chunk the same refresh writes, not a second `base.*` row. `is_latest=1` marks the row with the
 greatest `window_to_ts` per `(session_id, subject)` — window order, not write order, so a slow
 older window that finishes late is history, never "latest". `window_from_turn`/`window_to_turn`
 record the session turns the window actually covered (one user message is one turn), extending
@@ -1246,7 +1265,9 @@ first one that conflicts without writing anything.
 `plugin/minir` as a top-level `minir` package and declares the `hermes_agent.memory_providers`
 entry point, so discovery resolves it without a directory copy. The context engine
 (`context.engine: minir`) resolves only from `$HERMES_HOME/plugins/<name>`, so keep the
-directory install for that surface. Use exactly one install visible on the discovery path.
+directory install for that surface. `/adviser` needs the directory install too: its command lives
+in the sibling `minir-adviser` plugin, which the wheel does not ship. Use exactly one install
+visible on the discovery path.
 
 ```yaml
 # $HERMES_HOME/config.yaml
@@ -1413,15 +1434,15 @@ package is `plugin/minir`, so it is never collected as a test module.
   changing them mid-session only affects sessions opened later, because moving a watermark
   retroactively would re-queue windows that already dispatched.
 
-## Conclusion history, edges and vector recall
+## Conclusion history and edges
 
-Every eligible conclusion (`note` plus the five marker kinds, never `todo`) appends a row to
-`conclusion_versions`: an open interval for the current version and a closed one for the previous.
-`minir_search as_of=<epoch>` ranks the version in force at that instant; `include_superseded`
-widens the live path. A history row is folded after 180 days and more than 32 versions, and closed
-rows older than 180 days move to a dated SQLite archive under
-`$HERMES_HOME/minir-memory/conclusion/archive/`. `forget` closes the open row as `deleted` and keeps
-the history.
+Only the five value-marker kinds append a row to `conclusion_versions`: an open interval for the
+current version and a closed one for the previous. No conclusion kind is versioned, so a layer
+rewrite updates its row in place. `minir_search as_of=<epoch>` ranks the marker version in force at
+that instant; `include_superseded` widens the live path. A history row is folded after 180 days and
+more than 32 versions, and closed rows older than 180 days move to a dated SQLite archive under
+`$HERMES_HOME/minir-memory/conclusion/archive/`. `forget_conclusion` closes the open row as
+`deleted` and keeps the history.
 
 `edges` stores directed relations between `(kind, key)` endpoints. `minir_link` refuses a missing
 endpoint; `minir_search expand=1|2` adds 1-2 hop neighbours of the top hits. `merge_into` folds a row
@@ -1429,19 +1450,10 @@ into a reversible `same_as` alias, and `minir_unmerge(kind, key, reason)` restor
 status and appends a new open version. The idle extraction tick compares active marker subjects by
 trigram: ≥0.92 is auto-merged, 0.85–0.92 writes a `merge_candidate` advisory, below that is ignored.
 
-Vector recall is optional and fail-open: `sqlite-vec` plus an OpenAI-compatible embedding endpoint
-(`memory.minir.vector.*`, default `BAAI/bge-m3` at 1024 dimensions). `plugin.yaml` declares
-`python_dependencies: sqlite-vec>=0.1.9`, so the host's PM installs it into the runtime generation:
-a Hermes runtime strips every interpreter `site-packages` entry from `sys.path` at boot and keeps
-only that generation, so a copy living solely in a dev venv is invisible to the plugin. The key
-comes from the environment variable named by `memory.minir.vector.key_env` (default
-`SILICONFLOW_API_KEY`), never from `config.yaml`. With no key, no package or a failed call, search
-stays on bm25; a background task indexes missing rows and the table is rebuilt when the configured
-dimension no longer matches it.
-
-`minir_remember` routes on `remember_mode`: `conclusion` (default) writes the conclusions row,
-`knowledge` queues a page unit for the writer, and `card` overlays one global card part through
-`card_review.write_cards` with `source=operator_edit` and a required reason.
+`minir_remember` routes on the required `remember_mode`: `knowledge` queues a page unit for the
+writer, and `card` overlays one global card part through `card_review.write_cards` with
+`source=operator_edit` and a required reason. There is no conclusion mode: the layer passes own the
+conclusion rows, and no tool writes or deletes one.
 
 ## Claim selection (adviser)
 

@@ -47,12 +47,14 @@ def test_the_minir_toolset_registers_every_tool(make_provider, plugin_package):
     assert registered == list(plugin_package.plugin_tools.TOOL_NAMES)
     assert "minir_link" in registered and "minir_unmerge" in registered
     assert {toolset for toolset, _schema, _handler in ctx.tools.values()} == {"minir"}
-    assert ctx.tools["minir_remember"][1]["parameters"]["required"] == ["type", "content"]
+    assert ctx.tools["minir_remember"][1]["parameters"]["required"] == [
+        "type", "content", "remember_mode"]
     result = json.loads(ctx.tools["minir_remember"][2](
-        {"type": "tools", "content": "gopass backs secrets"}))
-    assert result["stored"] is True
+        {"type": "tools", "remember_mode": "knowledge", "category": "METHOD",
+         "content": "1. read the store.\n2. write the page.\n3. verify it."}))
+    assert result["queued"] is True
     stats = json.loads(ctx.tools["minir_stats"][2]({}))
-    assert stats["conclusions_by_kind"] == {"tools": 1}
+    assert stats["conclusions_by_kind"] == {}, "no tool writes a conclusion row"
     assert "session_usage" in stats and "turn_usage" in stats
 
 
@@ -120,8 +122,8 @@ def test_session_end_finalises_each_turns_token_usage(make_provider):
 
 def test_session_end_arms_the_idle_timer_with_the_sessions_markers(make_provider):
     provider = make_provider({"knowledge_idle_hours": 24})
-    provider.handle_tool_call("minir_remember", {
-        "type": "tools", "category": "KNOWLEDGE", "content": "gopass backs the secrets store"})
+    provider._store.save_conclusion(
+        "tools", "gopass backs the secrets store", session_id=provider._session_id)
     provider._reasoning = True  # enable the timer path without starting the layer worker
 
     provider.on_session_end([])
@@ -159,8 +161,8 @@ def test_the_marker_snapshot_is_shrunk_without_breaking_json(plugin_package):
 
 def test_a_new_user_turn_cancels_the_idle_timer(make_provider):
     provider = make_provider({"knowledge_idle_hours": 24})
-    provider.handle_tool_call("minir_remember", {
-        "type": "tools", "category": "KNOWLEDGE", "content": "the timer needs a marker"})
+    provider._store.save_conclusion(
+        "tools", "the timer needs a marker", session_id=provider._session_id)
     provider._reasoning = True
     provider.on_session_end([])
     assert provider._store.extraction("session-test")["status"] == "pending"

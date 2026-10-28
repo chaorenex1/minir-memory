@@ -67,15 +67,18 @@ try:
     assert module.turn_counter.TRACKER.snapshot("verify-session")["mode"] == "verify", \
         "memory.minir.session_mode was not read from config.yaml"
 
-    # A note round-trips through the store and comes back through prefetch. The conversation
-    # itself must NOT: it lives in the JSONL event store under minir-memory/sessions, never in
-    # a SQLite table, and recall never reads it.
+    # A conclusion row round-trips through the store and comes back through minir_search. The
+    # conversation itself must NOT: it lives in the JSONL event store under minir-memory/sessions,
+    # never in a SQLite table, and prefetch never reads it.
     told = "The verification probe stores this distinctive sentence"
     provider.sync_turn(told, "acknowledged")
-    provider.handle_tool_call("minir_remember",
-                                  {"type": "entities", "category": "KNOWLEDGE", "content": told})
+    provider._store.save_conclusion(
+        "entities", told, session_id="verify-session", subject="tool")
+    found = json.loads(provider.handle_tool_call(
+        "minir_search", {"query": "distinctive sentence"}))
+    assert found["count"] >= 1, "minir_search did not recall the stored row: %%r" %% found
     block = provider.prefetch("distinctive sentence")
-    assert "distinctive sentence" in block, "prefetch did not recall the stored note: %%r" %% block
+    assert "distinctive sentence" not in block, "prefetch injected stored recall: %%r" %% block
     import sqlite3
     connection = sqlite3.connect(str(provider._store.path))
     try:
@@ -85,13 +88,13 @@ try:
         for table in tables:
             if table.startswith(("sqlite_", "conclusions_fts")):
                 continue  # FTS shadow tables index conclusions; they are checked via the base table
-            if table == "conclusions":
-                # An explicit minir_remember marker is this table's job, whatever its kind:
-                # conclusions is the only memory table. Derived rows must never carry it.
-                marks = ",".join("?" * len(module.CONCLUSION_KINDS))
+            if table in ("conclusions", "conclusion_versions"):
+                # A marker row is this table's job, whatever its kind, and it keeps its history
+                # row. Derived rows must never carry the conversation.
+                marks = ",".join("?" * len(module.store._MARKER_KINDS))
                 rows = str(connection.execute(
-                    "SELECT * FROM conclusions WHERE kind NOT IN (%%s)" %% marks,
-                    module.CONCLUSION_KINDS).fetchall())
+                    "SELECT * FROM %%s WHERE kind NOT IN (%%s)" %% (table, marks),
+                    module.store._MARKER_KINDS).fetchall())
             else:
                 rows = str(connection.execute("SELECT * FROM %%s" %% table).fetchall())
             assert "acknowledged" not in rows, "conversation content reached %%s" %% table

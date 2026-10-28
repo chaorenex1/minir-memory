@@ -91,9 +91,10 @@ _TOOL_SEARCH = _tool_schema(
                     "capped at 20).", "integer"),
      "scope": _prop("Recall scope: 'session' (default) or 'all' for cross-session search.",
                     "string", enum=["session", "all"]),
-     "type": _prop("Only return conclusions of this kind; omitted searches every kind. A "
-                   "session-bound kind needs a session id, and scope='all' drops it unless it "
-                   "is the only kind requested, which raises session_scope_required.",
+     "type": _prop("Only return conclusions of this kind; omitted searches every kind, "
+                   "markers and retired kinds included. A session-bound kind needs a session "
+                   "id, and scope='all' drops it unless it is the only kind requested, which "
+                   "raises session_scope_required.",
                    "string", enum=list(CONCLUSION_KINDS)),
      "session_id": _prop("Optional session to search instead of the current one "
                          "(ignored when scope='all')."),
@@ -121,33 +122,29 @@ _TOOL_KB_SEARCH = _tool_schema(
     ("query",))
 _TOOL_REMEMBER = _tool_schema(
     "minir_remember",
-    "Record one durable item. remember_mode='conclusion' (default) writes a conclusions row "
-    "and its history; 'knowledge' only queues a page unit for the B4 writer (kind is the org, "
-    "category is required); 'card' overlays one global card part through card_review.write_cards "
-    "(kind is one of the four part names, and reason is required). The row is searchable by "
-    "minir_search and deletable by minir_forget.",
-    {"type": _prop("Conclusion kind, org, or card part name, depending on remember_mode."),
+    "Record one durable item. remember_mode='knowledge' queues a page unit for the B4 writer "
+    "(type is the org, category is required); 'card' overlays one global card part through "
+    "card_review.write_cards (type is one of the four part names, and reason is required). "
+    "There is no conclusion mode: the layer passes own the conclusion rows.",
+    {"type": _prop("Org name (knowledge mode) or card part name (card mode)."),
      "content": _prop("The value-output marker to remember."),
-     "remember_mode": _prop("Where it goes.", "string",
-                            enum=["conclusion", "knowledge", "card"]),
+     "remember_mode": _prop("Where it goes.", "string", enum=["knowledge", "card"]),
      "category": _prop("knowledge mode only: KNOWLEDGE | VALUE | INTENT | METHOD | GOVERNANCE.",
                        "string", enum=list(CATEGORIES)),
      "epistemic": _prop("knowledge mode on KNOWLEDGE only: fact | inference | hypothesis | "
                         "prediction."),
      "reason": _prop("card mode only: why this operator write is happening.")},
-    ("type", "content"))
+    ("type", "content", "remember_mode"))
 _TOOL_FORGET = _tool_schema(
     "minir_forget",
-    "Delete one stored conclusion by conclusions_id and kind (default), archive one knowledge "
-    "page by path (remember_mode='knowledge'), or clear one global card part by kind and reason "
-    "(remember_mode='card'). A wrong kind deletes nothing.",
-    {"type": _prop("Conclusion kind, or card part name in card mode."),
-     "conclusions_id": _prop("Id of the conclusion to delete (conclusion mode).", "integer"),
-     "remember_mode": _prop("Where to forget.", "string",
-                            enum=["conclusion", "knowledge", "card"]),
+    "Archive one knowledge page by path (remember_mode='knowledge') or clear one global card "
+    "part by type and reason (remember_mode='card'). No conclusion row is deletable through a "
+    "tool: the layer passes own them.",
+    {"type": _prop("Card part name (card mode); ignored in knowledge mode."),
+     "remember_mode": _prop("Where to forget.", "string", enum=["knowledge", "card"]),
      "path": _prop("knowledge mode: relative page path, e.g. tools/METHOD-x.md."),
      "reason": _prop("card mode only: evidence for the change.")},
-    ("type",))
+    ("remember_mode",))
 _TOOL_TODO = _tool_schema(
     "minir_todo",
     "Replace your own todo list. The list belongs to the caller: a dispatched run (explorer, "

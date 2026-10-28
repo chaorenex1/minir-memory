@@ -93,16 +93,18 @@ def test_initialize_creates_profile_scoped_store(provider, tmp_path):
     assert (tmp_path / "minir-memory" / "memory.db").exists()
 
 
-def test_notes_survive_a_new_instance(plugin_package, make_provider):
+def test_conclusion_rows_survive_a_new_instance(plugin_package, make_provider):
     first = make_provider({})
-    first.handle_tool_call("minir_remember", {"type": "tools", "content": "We standardized on SQLite for the store"})
+    first._store.save_conclusion(
+        "session_summary", "We standardized on SQLite for the store",
+        session_id=first._session_id, subject="session")
     first.shutdown()
 
     second = make_provider({})  # same tmp home -> same db file
     block = second.prefetch("SQLite store")
     assert block == "", "prefetch injects layer state only, never explicit recall"
     found = json.loads(second.handle_tool_call("minir_search", {"query": "SQLite store"}))
-    assert found["count"] >= 1, "the note is still reachable through minir_search"
+    assert found["count"] >= 1, "the row is still reachable through minir_search"
 
 
 def test_no_conversation_content_is_persisted_anywhere(plugin_package, make_provider, monkeypatch):
@@ -228,18 +230,18 @@ def test_reasoning_can_be_enabled_by_env(make_provider, monkeypatch):
 
 def test_an_unknown_remember_mode_is_an_error(provider):
     payload = json.loads(provider.handle_tool_call("minir_remember", {
-        "type": "note", "content": "docker prune", "remember_mode": "page"}))
+        "type": "tools", "content": "docker prune", "remember_mode": "page"}))
 
     assert "error" in payload
 
 
-def test_session_extraction_writes_a_page_and_leaves_the_note_row_alone(
+def test_session_extraction_writes_a_page_and_leaves_the_conclusion_row_alone(
         plugin_package, make_provider, monkeypatch):
     provider = make_provider({})
     session = provider._session_id
-    stored = json.loads(provider.handle_tool_call("minir_remember", {
-        "type": "note", "content": "prefer pytest over unittest" * 3}))
-    note_id = int(stored["conclusions_id"])
+    note_id = provider._store.save_conclusion(
+        "session_summary", "prefer pytest over unittest" * 3,
+        session_id=session, subject="session")
     before = dict(provider._store.conclusion_by_id(note_id))
     before_versions = provider._store._conn.execute(
         "SELECT COUNT(*) FROM conclusion_versions WHERE conclusion_id = ?",
@@ -369,28 +371,24 @@ def test_the_ai_self_cap_is_400(provider):
     assert len(body) == 400
 
 
-def test_tools_roundtrip(provider):
-    stored = json.loads(provider.handle_tool_call(
-        "minir_remember", {"type": "experiences", "content": "prefers terse output"}))
-    assert stored["stored"] is True and stored["type"] == "experiences"
+def test_a_marker_row_is_searchable_but_no_tool_writes_or_deletes_it(provider):
+    row_id = provider._store.save_conclusion(
+        "experiences", "prefers terse output", session_id=provider._session_id)
     found = json.loads(provider.handle_tool_call("minir_search", {"query": "terse output"}))
     assert found["count"] >= 1 and found["scope"] == "session"
     marker = next(row for row in found["results"] if row["kind"] == "experiences")
-    conclusions_id = marker["conclusions_id"]
-    assert conclusions_id == stored["conclusions_id"]
-    # A wrong kind must not delete the row.
-    assert json.loads(provider.handle_tool_call(
-        "minir_forget", {"type": "tools", "conclusions_id": conclusions_id}))["deleted"] is False
-    assert json.loads(provider.handle_tool_call(
-        "minir_forget", {"type": "experiences",
-                         "conclusions_id": conclusions_id}))["deleted"] is True
-    assert json.loads(provider.handle_tool_call(
-        "minir_forget", {"type": "experiences",
-                         "conclusions_id": str(conclusions_id)}))["deleted"] is False
+    assert marker["conclusions_id"] == row_id
+    assert "error" in json.loads(provider.handle_tool_call(
+        "minir_remember", {"type": "experiences", "content": "prefers terse output"})), \
+        "there is no conclusion mode"
+    assert "error" in json.loads(provider.handle_tool_call(
+        "minir_forget", {"type": "experiences", "conclusions_id": row_id})), \
+        "no mode deletes a conclusion row"
     stats = json.loads(provider.handle_tool_call("minir_stats", {}))
-    assert "notes" not in stats and "markers" not in stats and "db_path" in stats
+    assert "notes" not in stats and "markers" not in stats and "vectors" not in stats
+    assert "db_path" in stats
     assert len(stats["targets"]) == 7, "one row per consistency target"
-    assert stats["conclusions_by_kind"] == {}, "every row of this session is gone"
+    assert stats["conclusions_by_kind"] == {"experiences": 1}
 
 
 def test_search_identifies_every_row_by_kind_and_conclusions_id(provider):
@@ -401,8 +399,8 @@ def test_search_identifies_every_row_by_kind_and_conclusions_id(provider):
     assert note["conclusions_id"] == row_id
     assert "marker_type" not in note and "category" not in note
     assert "note_id" not in note and "id" not in note
-    assert json.loads(provider.handle_tool_call(
-        "minir_forget", {"type": "tools", "conclusions_id": row_id}))["deleted"] is False
+    assert "error" in json.loads(provider.handle_tool_call(
+        "minir_forget", {"conclusions_id": row_id})), "conclusions_id has no mode left"
 
 
 def test_tool_argument_validation(provider):
@@ -484,8 +482,8 @@ def test_kb_write_creates_a_page_through_the_tool(provider, plugin_package):
 
 
 def test_search_scope_all_crosses_sessions(provider):
-    provider.handle_tool_call(
-        "minir_remember", {"type": "projects", "content": "cross session fact"})
+    provider._store.save_conclusion(
+        "projects", "cross session fact", session_id=provider._session_id)
     provider.on_session_switch("other-session")
     current = json.loads(provider.handle_tool_call(
         "minir_search", {"query": "cross session fact"}))
@@ -496,20 +494,9 @@ def test_search_scope_all_crosses_sessions(provider):
     assert across["results"][0]["kind"] == "projects"
 
 
-def test_on_memory_write_mirrors_and_removes(provider):
-    session = provider._session_id
-    provider.on_memory_write("add", "user", "user profile entry")
-    assert provider._store.conclusions_by_kind(session) == {"note": 1}
-    provider.on_memory_write("replace", "memory", "user profile entry v2")
-    assert provider._store.conclusions_by_kind(session) == {"note": 2}
-    provider.on_memory_write("remove", "user", "user profile entry")
-    assert provider._store.conclusions_by_kind(session) == {"note": 1}, \
-        "the remove branch deletes the newest mirror row by content"
-
-
 def test_on_session_switch_rebinds_and_reset_clears_cache(provider):
-    provider.handle_tool_call(
-        "minir_remember", {"type": "experiences", "content": "switch test fact"})
+    provider._store.save_conclusion(
+        "experiences", "switch test fact", session_id=provider._session_id)
     provider.on_session_switch("session-2")
     assert provider._session_id == "session-2"
     provider.on_session_switch("session-3", reset=True)
@@ -527,7 +514,8 @@ def test_shutdown_is_idempotent(plugin_package, make_provider):
 
 
 def test_search_results_are_excerpted(provider):
-    provider.handle_tool_call("minir_remember", {"type": "experiences", "content": "long " * 400})
+    provider._store.save_conclusion(
+        "experiences", "long " * 400, session_id=provider._session_id)
     payload = json.loads(provider.handle_tool_call("minir_search", {"query": "long"}))
     assert payload["results"]
     assert all(len(row["text"]) <= 601 for row in payload["results"])
@@ -1079,7 +1067,7 @@ def test_layers_reason_from_host_history_and_publish_searchable_sections(
     assert provider._store.layer_state("base", "user:default") is not None
     assert provider._store.layer_state("dialectic", "agent:default:minir") is not None
     hits = provider._store.search("deploy on Windows", session_id="session-test")
-    assert hits and any(row["kind"] == "base.window_summary" for row in hits)
+    assert hits and any(row["kind"] == "window_summary" for row in hits)
     assert not any("not user intent" in row["text"] for row in hits)
     review = provider._store.layer_state("dialectic", "agent:default:minir")
     assert "user_preferences" in str((review or {}).get("content") or "")
@@ -1094,8 +1082,8 @@ def test_search_exposes_one_id_field_for_base_and_tool_rows(plugin_package, prov
     assert "id" not in base_row and "note_id" not in base_row
     assert "conclusion_id" not in base_row
 
-    row_id = json.loads(provider.handle_tool_call(
-        "minir_remember", {"type": "experiences", "content": "a forgettable note"}))["conclusions_id"]
+    row_id = provider._store.save_conclusion(
+        "experiences", "a forgettable note", session_id=provider._session_id)
     found = json.loads(provider.handle_tool_call("minir_search", {"query": "forgettable"}))
     marker = next(row for row in found["results"] if row["kind"] == "experiences")
     assert marker["conclusions_id"] == row_id
@@ -1212,14 +1200,18 @@ def test_an_oversized_user_preference_is_capped(plugin_package, make_provider, t
 # -- conclusions only: type filter, todo surface, final-answer injection -------
 
 def test_search_type_returns_only_that_kind(provider):
-    provider.handle_tool_call("minir_remember", {"type": "tools", "content": "zebraword tool fact"})
-    provider.handle_tool_call("minir_remember", {"type": "projects",
-                                                 "content": "zebraword project fact"})
+    provider._store.save_conclusion(
+        "session_summary", "zebraword session fact", key="session_summary:1",
+        session_id=provider._session_id)
+    provider._store.save_conclusion(
+        "dialectic.review", "zebraword review fact", key="review:1",
+        session_id=provider._session_id)
     only = json.loads(provider.handle_tool_call(
-        "minir_search", {"query": "zebraword", "type": "tools"}))
-    assert [row["kind"] for row in only["results"]] == ["tools"]
+        "minir_search", {"query": "zebraword", "type": "dialectic.review"}))
+    assert [row["kind"] for row in only["results"]] == ["dialectic.review"]
     everything = json.loads(provider.handle_tool_call("minir_search", {"query": "zebraword"}))
-    assert {row["kind"] for row in everything["results"]} == {"tools", "projects"}
+    assert {row["kind"] for row in everything["results"]} == {"session_summary",
+                                                              "dialectic.review"}
 
 
 def test_inject_order_puts_known_types_first_then_first_queued(plugin_package, provider):

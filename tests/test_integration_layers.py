@@ -64,8 +64,8 @@ def test_prefetch_never_injects_knowledge_paths_or_recall(plugin_package, make_p
             "time": "2026-10-21", "relations": [], "objects": ["tools:docker", "tools:restart"]}
     plugin_package.knowledge.write_unit(
         unit, root=plugin_package.knowledge.knowledge_dir(provider._hermes_home))
-    provider.handle_tool_call(
-        "minir_remember", {"type": "tools", "content": "docker restart policy note"})
+    provider._store.save_conclusion(
+        "tools", "docker restart policy note", session_id=provider._session_id)
     block = provider.prefetch("how do I set a docker restart policy")
     assert block == "", "neither knowledge paths nor explicit recall ride the turn"
     assert provider.handle_tool_call("minir_kb_search", {"query": "Docker restart policy"})
