@@ -60,6 +60,7 @@ from agent.memory_provider import (
 from tools.registry import tool_error
 
 from . import adviser
+from . import adviser_command
 from . import agent_history
 from . import agent_watch
 from . import card_review
@@ -386,6 +387,11 @@ class MinirMemoryProvider(MemoryProvider):
         # Per-turn side channel: event ring + reviewer worker + llm_request delivery. Constructed
         # before initialize (the host may register hooks first); every path guards on the store.
         self._adviser_mode = AdviserMode(self)
+        # ``/adviser``'s mode switch. It lives on the provider, not in a module-level singleton:
+        # the plugin directory is imported once per surface (memory provider, context engine), and
+        # a registry each import owned could be armed by one instance while the hook that injects
+        # the directive reads the other. Both seams resolve the live provider instead.
+        self._modes = adviser_command.ModeSwitch()
         # The fork dispatcher sits beside the adviser, not inside it: it answers the cheap
         # question (is there a rule for this branch?) and hands only the expensive one over.
         self._fork = fork_dispatch.ForkDispatcher(self)
@@ -2172,6 +2178,20 @@ def register(ctx) -> None:
         logger.warning("Minir toolset registration failed: %s", exc)
     # The bundled skills (read-only, namespaced ``minir:<name>``) travel with the plugin.
     _register_skills(ctx)
+    # ``/adviser``: the orchestration mode switch (hermes-dispatch <-> hermes-lead). Optional by
+    # design, like the hooks below: a host without a command surface still gets the provider, and
+    # the mode it lost is only the mode, never the memory system.
+    register_command = getattr(ctx, "register_command", None)
+    if callable(register_command):
+        try:
+            register_command(
+                "adviser",
+                adviser_command.command_handler(lambda: _resolve_provider(provider)),
+                description="Switch this session between hermes-dispatch and hermes-lead mode.",
+                args_hint="multagents | dispatch | status",
+            )
+        except Exception as exc:
+            logger.warning("Minir /adviser command registration failed: %s", exc)
     # The hooks close over the provider instance: only it knows the bound session, the agent
     # context (primary vs subagent) and the cached review. Module-level handlers with no state
     # would inject another session's review or start a model job for every subagent.
@@ -2277,10 +2297,14 @@ def _on_session_reset(session_id: str = "", old_session_id: str = "",
     so this is the idempotent second half: ``begin`` never resets progress it did not create.
     """
     try:
+        resolved = _resolve_provider(provider)
+        modes = getattr(resolved, "_modes", None) or adviser_command.MODES
         if old_session_id:
             TRACKER.stop(old_session_id)
+            # A mode belongs to the conversation that armed it; the new session starts in dispatch.
+            modes.clear(old_session_id)
+        modes.clear(session_id)
         TRACKER.begin(session_id)
-        resolved = _resolve_provider(provider)
         if resolved is not None and old_session_id:
             # The session that ended is the old one; the new one has no calibration yet.
             resolved.publish_base_conclusions(old_session_id)
@@ -2296,6 +2320,7 @@ def _on_session_finalize(session_id: str = "", provider: Optional[MinirMemoryPro
     try:
         TRACKER.stop(session_id)
         resolved = _resolve_provider(provider)
+        (getattr(resolved, "_modes", None) or adviser_command.MODES).clear(session_id)
         if resolved is not None:
             resolved.publish_base_conclusions(session_id)
             resolved._adviser_mode.session_end(session_id)
@@ -2365,7 +2390,11 @@ def _on_pre_llm_call(session_id: str = "", turn_id: str = "",
         # Turn-boundary channel: advice below the mid-turn floor (nits) rides this turn's user
         # message once. It is marked injected, so the next boundary does not repeat it.
         aside = provider._adviser_mode.aside_block(session_id)
-        return "\n\n".join(part for part in (brief, aside) if part) or None
+        # The orchestration mode leads: ``/adviser multagents`` armed it in an earlier turn, and
+        # this block is what tells the model which contract the rest of the message serves.
+        modes = getattr(provider, "_modes", None) or adviser_command.MODES
+        mode = modes.directive(session_id or provider._session_id)
+        return "\n\n".join(part for part in (mode, brief, aside) if part) or None
     except Exception as exc:  # injection must never break a turn
         logger.debug("Minir review injection skipped: %s", exc)
         return None

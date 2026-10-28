@@ -416,6 +416,15 @@ def _clean_watch_registry(plugin_package):
     plugin_package.agent_watch.clear()
 
 
+@pytest.fixture(autouse=True)
+def _clean_orchestration_modes(plugin_package):
+    """``/adviser`` modes are process-wide (see adviser_command.MODES): a test that arms one
+    must not leave the next test's ``pre_llm_call`` looking at a different contract."""
+    plugin_package.adviser_command.MODES.clear_all()
+    yield
+    plugin_package.adviser_command.MODES.clear_all()
+
+
 @pytest.fixture()
 def provider(make_provider):
     """Default provider: keyword recall over notes, layer reasoning off."""

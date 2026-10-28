@@ -179,7 +179,7 @@ both surfaces:
 | `on_session_start(session_id=, model=, platform=)` | record the session; queue one cold-start *base* job when history exists, gated to the bound primary session |
 | `on_session_reset(session_id=, old_session_id=, reason=)` | `/new`, `/reset`: stop the old counters, initialize the new session |
 | `on_session_finalize(session_id=)` | process teardown: stop counting, expire adviser-mode advice, flush tool metrics |
-| `pre_llm_call` | record the turn's user goal; inject the `adviser_only` brief and below-floor advice (one-shot aside). Advice has a single producer (the live reviewer); nothing is staged here |
+| `pre_llm_call` | record the turn's user goal; inject the `/adviser` mode directive (above), the `adviser_only` brief and below-floor advice (one-shot aside). Advice has a single producer (the live reviewer); nothing is staged here |
 | `post_llm_call` / `post_tool_call` | per-turn logging; `post_tool_call` also aggregates tool counters and feeds the adviser-mode event ring |
 | `pre_tool_call` | `adviser_only` enforcement, the `file_guard` scope for peer-agent file tools, plus the opt-in blocker gate: refuse mutating tools before execution and hand the model the reason |
 | `on_interim_message` | record the assistant's mid-loop intent for the adviser-mode reviewer |
@@ -201,6 +201,28 @@ session boundary, so the real boundary uses the memory-provider method. Observer
 `adviser_only`. `on_session_finalize` must stay empty because the host sends a non-empty result to
 the chat. `register()` closes the hooks over the provider instance and falls back to the
 process-wide active provider, since the host can construct the plugin twice.
+
+## Slash command: `/adviser`
+
+`register(ctx)` also calls `ctx.register_command("adviser", ...)`, so the orchestration mode is a
+command the user types, not something described to the model in prose:
+
+| Command | Effect |
+| --- | --- |
+| `/adviser multagents` | Arm the hermes-lead contract for this session (`multiagents` and `lead` are accepted spellings). |
+| `/adviser dispatch` | Release it: hermes-dispatch governs again (`off` and `default` are accepted spellings). |
+| `/adviser status` | Report the mode. No argument means `status`; an unknown mode changes nothing. |
+
+The command turn runs no model call: the host prints the handler's return value and never feeds it
+to the model, so the arming cannot ride the reply. The mode lives per session in
+`adviser_command.MODES`, and while it is on the `pre_llm_call` hook returns
+`MULTIAGENTS_DIRECTIVE` — the host injects a hook's string into the **next** turn's user message,
+which is exactly the "run the command first, act on the next input" contract. That block tells the
+main agent to load `minir:hermes-lead` and stop treating hermes-dispatch as the governing loop; it
+repeats every turn because a context compression can drop the skill body from the window while the
+session keeps looking normal. `/adviser dispatch`, `on_session_reset` and `on_session_finalize`
+drop the mode, and nothing is persisted: a restart or a new session starts back in dispatch, since
+a mode belongs to one conversation.
 
 ## Tools
 
