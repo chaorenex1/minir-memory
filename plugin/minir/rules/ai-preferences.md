@@ -1,6 +1,6 @@
 ---
 id: ai-preferences
-version: 1
+version: 2
 applies_to: [base:B2, dialectic, card_review]
 slot: body
 max_tokens: 500
@@ -37,3 +37,4 @@ BOUNDARIES
 - A rule the operator never declared, or one that widens what the assistant may do.
 - The same line repeated in ai-identity and ai-preferences.
 - A rule that cannot change the next action.
+- A line was removed or reworded without an explicit request from the operator to remove it.

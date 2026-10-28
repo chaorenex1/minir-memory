@@ -900,20 +900,26 @@ def test_register_wires_the_provider_and_its_hooks(plugin_package):
     assert isinstance(ctx.provider, plugin_package.MinirMemoryProvider)
     assert set(ctx.hooks) == {"on_session_start", "on_session_reset", "on_session_finalize",
                               "pre_llm_call", "post_llm_call", "post_tool_call",
-                              "pre_tool_call", "pre_verify", "transform_llm_output",
-                              "on_interim_message", "on_stream_delta", "post_api_request",
-                              "api_request_error"}
+                              "pre_tool_call", "transform_tool_result", "pre_verify",
+                              "transform_llm_output", "on_interim_message", "on_stream_delta",
+                              "post_api_request", "api_request_error"}
     # A non-None result would be injected into the user message (pre_llm_call) or sent to
-    # the chat (on_session_finalize), so every handler must return None. The answer transform
-    # is the one hook whose return value replaces the answer, so it is checked separately.
+    # the chat (on_session_finalize), so those handlers must return None. The two transforms are
+    # the hooks whose return value replaces text, so they are checked separately.
     for name, callback in ctx.hooks.items():
-        if name == "transform_llm_output":
+        if name in {"transform_llm_output", "transform_tool_result"}:
             continue
         assert callback(session_id="s", old_session_id="o", reason="new_session", turn_id="t",
                         model="m", platform="cli", tool_name="terminal", duration_ms=3,
                         provider=object()) is None
     assert ctx.hooks["transform_llm_output"](
         response_text="answer", session_id="s", provider=object()) is None
+    # No rule matches this call: the replacement path must leave the result alone.
+    quiet = types.SimpleNamespace(_store=object(), _session_id="s",
+                                  _fork=types.SimpleNamespace(transform=lambda *a, **k: None))
+    assert ctx.hooks["transform_tool_result"](
+        tool_name="terminal", args={"command": "ls"}, result="x" * 9000, session_id="s",
+        status="ok", provider=quiet) is None
 
 
 def test_registered_middleware_accepts_the_host_provider_payload(plugin_package):
@@ -1131,37 +1137,16 @@ def test_another_sessions_window_is_not_injected_and_search_still_sees_cards(pro
     assert "base.user_peer_card" in kinds, "minir_search still exposes the durable cards"
 
 
-def test_system_prompt_block_gates_adviser_sections(plugin_package, make_provider):
-    off = make_provider({"adviser_mode": {"enabled": False}})
-    assert "# Advisers" not in off.system_prompt_block()
-    assert "ADVICE SEVERITY" not in off.system_prompt_block()
-    assert "# Craft Rules" in off.system_prompt_block()
-    assert "anti-overengineering" in off.system_prompt_block()
-
-    on = make_provider({"adviser_mode": {"enabled": True, "mode": "watch"}})
-    block = on.system_prompt_block()
-    assert "# Advisers" in block
-    assert block.index("# Craft Rules") < block.index("# Advisers")
-    for section in ("ADVICE SEVERITY", "ADVICE TARGETS", "ADVICE HANDLING",
-                    "NIT REPORTING", "ADVICE LANGUAGE"):
-        assert section in block
-    for name, _, _ in plugin_package.prompting.ADVICE_TARGETS:
-        assert name in block, name
-    for severity, _ in plugin_package.prompting.ADVICE_SEVERITIES:
-        for target in plugin_package.prompting.DELIVERED_TARGETS:
-            assert plugin_package.prompting.ADVICE_HANDLING[severity][target] in block
-    assert "| Nit | Status | Note |" in block
-    assert "Advice text follows the user's language" in block
-    assert "[adviser-only mode" not in block
-    assert "## adviser_consult" not in block
-
-    only = make_provider({"adviser_mode": {"enabled": True, "mode": "adviser_only"}})
-    assert "[adviser-only mode" in only.system_prompt_block()
-
-    disabled = make_provider({"adviser_mode": {"enabled": False}})
-    disabled_block = disabled.system_prompt_block()
-    assert "# Advisers" not in disabled_block
-    assert "## adviser_consult" not in disabled_block
+def test_system_prompt_block_carries_only_memory_and_the_user_cards(make_provider):
+    """Craft rules and the adviser contract used to ride the block; both were removed."""
+    for mode in ({"enabled": False}, {"enabled": True, "mode": "watch"},
+                 {"enabled": True, "mode": "adviser_only"}):
+        block = make_provider({"adviser_mode": mode}).system_prompt_block()
+        assert block.startswith("# Minir Memory")
+        for absent in ("# Craft Rules", "# Advisers", "ADVICE SEVERITY", "ADVICE TARGETS",
+                       "ADVICE HANDLING", "NIT REPORTING", "ADVICE LANGUAGE",
+                       "[adviser-only mode", "## adviser_consult"):
+            assert absent not in block, absent
 
 
 def test_system_prompt_block_includes_the_global_user_preference(
@@ -1219,7 +1204,7 @@ def test_an_oversized_user_preference_is_capped(plugin_package, make_provider, t
     card.write_text("x" * (plugin_package._MAX_PREFERENCE_CHARS + 500), encoding="utf-8")
 
     block = provider.system_prompt_block()
-    section = block.split("# User Preferences", 1)[1].split("# Craft Rules", 1)[0]
+    section = block.split("# User Preferences", 1)[1]
     assert section.count("x") == plugin_package._MAX_PREFERENCE_CHARS
     assert "truncated" in section
 
@@ -1294,22 +1279,54 @@ def test_todo_validation_refuses_bad_lists_without_storing(provider):
     duplicate = json.loads(provider.handle_tool_call("minir_todo", {"todos": [
         {"id": "a", "content": "one"}, {"id": "a", "content": "two"}]}))
     assert "error" in duplicate and "duplicate" in duplicate["error"]
-    assert provider._store.get_conclusion("todo", f"session:{session}:todo") is None
+    assert provider._store.get_conclusion("todo", f"todo:default:{session}") is None
 
 
-def test_todo_keeps_one_row_per_session_and_clears_it(provider):
+def test_todo_keeps_one_row_per_owner_and_clears_it(provider):
     session = provider._session_id
     provider.handle_tool_call("minir_todo", {"todos": [{"id": "t1", "content": "first"}]})
     provider.handle_tool_call("minir_todo", {"todos": [
         {"id": "t2", "content": "second", "status": "completed"}]})
-    row = provider._store.get_conclusion("todo", f"session:{session}:todo")
+    row = provider._store.get_conclusion("todo", f"todo:default:{session}")
     assert json.loads(row["content"])["todos"] == [
         {"id": "t2", "content": "second", "status": "completed"}]
     assert provider._store.conclusions_by_kind(session) == {"todo": 1}
 
     cleared = json.loads(provider.handle_tool_call("minir_todo", {"todos": []}))
     assert cleared["deleted"] is True
-    assert provider._store.get_conclusion("todo", f"session:{session}:todo") is None
+    assert provider._store.get_conclusion("todo", f"todo:default:{session}") is None
+
+
+def test_todo_isolates_a_dispatched_run_from_its_dispatcher(plugin_package, provider):
+    """A child run's list is keyed by the agent's name and the run's own id.
+
+    The provider serving the tool call belongs to the session that dispatched the run, so keying
+    on its bound session alone would let the child overwrite the lead's list.
+    """
+    session = provider._session_id
+    provider.handle_tool_call("minir_todo", {"todos": [{"id": "lead", "content": "lead step"}]})
+
+    run = f"{session}:minir:explorer:minir-explorer-1-1"
+    tokens = plugin_package.agent_history.layer_context("explorer", session, run)
+    try:
+        child = json.loads(provider.handle_tool_call("minir_todo", {"todos": [
+            {"id": "c1", "content": "trace the call", "status": "in_progress"}]}))
+        assert (child["name"], child["session_id"]) == ("explorer", run)
+        assert run in provider._injects, "the table is queued for the run's own answer"
+        block = provider.prefetch("nothing matches this")
+        assert "trace the call" in block and "lead step" not in block
+    finally:
+        plugin_package.agent_history.reset_layer(tokens)
+
+    main = json.loads(provider.handle_tool_call("minir_todo", {"todos": [
+        {"id": "lead", "content": "lead step", "status": "completed"}]}))
+    assert (main["name"], main["session_id"]) == ("default", session)
+    block = provider.prefetch("nothing matches this")
+    assert "lead step" in block and "trace the call" not in block
+    lead_row = provider._store.get_conclusion("todo", f"todo:default:{session}")
+    assert [item["id"] for item in json.loads(lead_row["content"])["todos"]] == ["lead"]
+    child_row = provider._store.get_conclusion("todo", f"todo:explorer:{run}")
+    assert [item["id"] for item in json.loads(child_row["content"])["todos"]] == ["c1"]
 
 
 def test_todo_renders_in_prefetch_and_in_the_answer(plugin_package, provider):
@@ -1333,6 +1350,22 @@ def test_todo_renders_in_prefetch_and_in_the_answer(plugin_package, provider):
     assert "| 1.1 | 先跑 unit | pending | t1 |" in answer
     assert "| 2 | 写迁移说明 | completed |  |" in answer
     assert answer.rstrip().endswith("Todo: 1/3 done, 1 in progress, 1 pending.")
+
+def test_todo_accepts_blocked_as_a_separate_status(plugin_package, provider):
+    session = provider._session_id
+    stored = json.loads(provider.handle_tool_call("minir_todo", {"todos": [
+        {"id": "t1", "content": "waiting on access", "status": "blocked"},
+        {"id": "t2", "content": "done", "status": "completed"}]}))
+    assert (stored["count"], stored["open"]) == (2, 1)
+
+    block = provider.prefetch("nothing matches this")
+    assert "[Todos] 1 open / 2 total" in block
+    assert "  [!] t1 waiting on access  (blocked)" in block
+
+    answer = plugin_package._on_transform_llm_output(
+        response_text="done", session_id=session, provider=provider)
+    assert "| 1 | waiting on access | blocked |  |" in answer
+    assert answer.rstrip().endswith("Todo: 1/2 done, 0 in progress, 0 pending. 1 blocked.")
 
 def test_remember_knowledge_queues_a_page_and_writes_no_conclusion(provider, plugin_package):
     before = provider._store.conclusions_by_kind(provider._session_id).get("tools", 0)

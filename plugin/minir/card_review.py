@@ -4,7 +4,10 @@ The base layer keeps a session snapshot of the cards; this layer merges what sev
 proved into four profile-global files, and records every write as a revision. The file is the
 current state, the database is its history. The merge runs as four single-file passes: the global
 user identity, user preference, AI identity and AI preference files each have their own rule and
-output contract, and code joins the four results.
+output contract, and code joins the four results. The review is additive: a pass returns the
+current card plus the lines it adds, and removes a line only when the evidence carries an
+explicit, strong request to remove that exact item. Contradiction, one-offness, duplication and
+budget pressure are not removal authority.
 
 Two rules shape the module:
 
@@ -50,7 +53,7 @@ _CARD_TRANSCRIPT_SESSIONS = 3
 _CARD_TRANSCRIPT_CHARS = 4_000
 
 # Every card file is front-matter plus one markdown body. Nothing here is field-structured: the
-# model writes the body, the code frames it, and an empty body is a valid empty card.
+# model returns the body, the code frames it, and a review may only empty a card that is empty.
 USER_SELF = "user_self_representation"
 USER_PREFERENCE = "user_preferences"
 AI_IDENTITY = "ai_identity"
@@ -301,33 +304,41 @@ def _changed_body(old_text: str, new_text: str) -> list[str]:
 OUTPUT_USER_IDENTITY = """OUTPUT
 Return exactly one JSON object:
 {"user_self_representation": "<markdown body>"}
-The value is the final global identity card body: complete markdown, not an object, not a patch.
-An empty string is a valid empty card. No audit arrays, no front-matter, no code fence, no extra
-key. Code records the change history itself.
+The value is the complete global identity card body: the current card plus the lines this review
+adds, not a patch and not a rewrite of existing lines. Keep every existing line as written; remove
+a line only when the evidence contains an explicit, strong user request to remove that exact item.
+An empty string is valid only when the current card is empty. No audit arrays, no front-matter, no
+code fence, no extra key. Code records the change history itself.
 """
 
 OUTPUT_USER_PREFERENCE = """OUTPUT
 Return exactly one JSON object:
 {"user_preferences": "<markdown body>"}
-The value is the final global preference card body: complete markdown, not an object, not a patch.
-An empty string is a valid empty card. No audit arrays, no front-matter, no code fence, no extra
-key. Code records the change history itself.
+The value is the complete global preference card body: the current card plus the lines this review
+adds, not a patch and not a rewrite of existing lines. Keep every existing line as written; remove
+a line only when the evidence contains an explicit, strong user request to remove that exact item.
+An empty string is valid only when the current card is empty. No audit arrays, no front-matter, no
+code fence, no extra key. Code records the change history itself.
 """
 
 OUTPUT_AI_IDENTITY = """OUTPUT
 Return exactly one JSON object:
 {"ai_identity": "<markdown body>"}
-The value is the final global identity card body: complete markdown, not an object, not a patch.
-An empty string is a valid empty card. No audit arrays, no front-matter, no code fence, no extra
-key. Code records the change history itself.
+The value is the complete global identity card body: the current card plus the lines this review
+adds, not a patch and not a rewrite of existing lines. Keep every existing line as written; remove
+a line only when the evidence contains an explicit, strong operator request to remove that exact item.
+An empty string is valid only when the current card is empty. No audit arrays, no front-matter, no
+code fence, no extra key. Code records the change history itself.
 """
 
 OUTPUT_AI_PREFERENCE = """OUTPUT
 Return exactly one JSON object:
 {"ai_preference": "<markdown body>"}
-The value is the final global preference card body: complete markdown, not an object, not a patch.
-An empty string is a valid empty card. No audit arrays, no front-matter, no code fence, no extra
-key. Code records the change history itself.
+The value is the complete global preference card body: the current card plus the lines this review
+adds, not a patch and not a rewrite of existing lines. Keep every existing line as written; remove
+a line only when the evidence contains an explicit, strong operator request to remove that exact item.
+An empty string is valid only when the current card is empty. No audit arrays, no front-matter, no
+code fence, no extra key. Code records the change history itself.
 """
 
 CARD_SCOPE_OUTPUT: dict[str, str] = {
@@ -553,18 +564,26 @@ class CardReviewScheduler:
 
     def due(self, now: Optional[float] = None) -> bool:
         now = time.time() if now is None else float(now)
+        state = self._state()
+        attempts = int(state.get("attempts") or 0)
+        next_attempt = float(state.get("next_attempt_at") or 0.0)
+        if attempts and next_attempt and now + 1e-6 < next_attempt:
+            # A failed run scheduled this retry; a missing card does not override it.
+            return False
+        missing = False
         if self._files_present is not None:
             try:
-                if not self._files_present():
-                    return True
+                missing = not self._files_present()
             except Exception as exc:
                 logger.debug("Minir card presence check failed: %s", exc)
-        state = self._state()
-        anchor = state.get("last_success_at") or state.get("started_at")
-        if anchor is None:
+        if missing:
+            return True  # never seeded, or a card was deleted: run as soon as allowed
+        if not state:
             return True
-        return now + 1e-6 >= float(state.get("next_attempt_at") or
-                            float(anchor) + self._period)
+        if next_attempt:
+            return now + 1e-6 >= next_attempt
+        anchor = state.get("last_success_at") or state.get("started_at")
+        return anchor is None or now + 1e-6 >= float(anchor) + self._period
 
     def tick(self, now: Optional[float] = None) -> bool:
         """Run one due review synchronously; returns True when it succeeded."""
@@ -585,6 +604,7 @@ class CardReviewScheduler:
             self._save({**state, "attempts": attempts, "next_attempt_at": next_at,
                         "last_error": str(exc)[:400]})
             return False
-        self._save({"last_success_at": now, "attempts": 0,
+        started_at = float(state.get("started_at") or now)
+        self._save({"started_at": started_at, "last_success_at": now, "attempts": 0,
                     "next_attempt_at": now + self._period})
         return True

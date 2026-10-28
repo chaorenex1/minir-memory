@@ -69,7 +69,8 @@ def test_the_class_is_a_context_engine_subclass(plugin_package):
     engine = plugin_package.MinirContextEngine()
     assert engine.name == "minir"
     for attribute in ("last_prompt_tokens", "last_completion_tokens", "last_total_tokens",
-                      "threshold_tokens", "context_length", "compression_count",
+                      "last_real_prompt_tokens", "threshold_tokens", "context_length",
+                      "compression_count",
                       "protect_first_n", "protect_last_n"):
         assert hasattr(engine, attribute), attribute
     assert engine.emit_automatic_compaction_status is False
@@ -102,6 +103,7 @@ def test_update_from_response_tracks_usage(plugin_package):
                                  "total_tokens": 1_540})
     assert (engine.last_prompt_tokens, engine.last_completion_tokens, engine.last_total_tokens) \
         == (1500, 40, 1540)
+    assert engine.last_real_prompt_tokens == 1500, "mirrors the real reading, never a rough seed"
     assert engine.threshold_tokens == int(200_000 * 0.75)
     assert engine.get_status()["engine"] == "minir"
 
@@ -135,6 +137,17 @@ def test_preflight_defers_while_the_last_request_fit(plugin_package):
     assert engine.should_defer_preflight_to_real_usage(90) is True
     engine.last_prompt_tokens = 100
     assert engine.should_defer_preflight_to_real_usage(100) is False
+
+
+def test_real_prompt_tokens_is_formattable_on_the_deferred_preflight_branch(plugin_package):
+    """The host formats this field unguarded when preflight defers (turn_context_compaction.py:291)."""
+    engine = plugin_package.MinirContextEngine()
+    engine.threshold_tokens = 100
+    engine.last_prompt_tokens = 50
+    assert engine.should_defer_preflight_to_real_usage(90) is True
+    assert f"{engine.last_real_prompt_tokens:,}" == "0"
+    engine.update_from_response({"prompt_tokens": 60})
+    assert f"{engine.last_real_prompt_tokens:,}" == "60"
 
 
 # -- slice --------------------------------------------------------------------

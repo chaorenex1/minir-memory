@@ -129,3 +129,46 @@ def test_the_registry_tool_forwards_to_the_live_provider(history, plugin_package
     assert payload["success"] is True
     assert payload["data"]["layer"] == "base"
     assert payload["data"]["rows"][0]["seq"] == 1
+
+
+# -- a watched run's trace ----------------------------------------------------
+
+_CHILD = "session-test:minir:researcher:job-1"
+
+
+def test_a_child_trace_reads_the_runs_own_stream(history):
+    """The child id names its layer, so the reader does not have to be run inside that layer."""
+    buffer, provider, module, bound = history
+    buffer.append_event("researcher", _CHILD, "user", text="scan the repo",
+                        profile="default", run_id="job-1")
+    buffer.append_event("researcher", _CHILD, "tool", kind="msg", name="search_files",
+                        result="42 files", profile="default", run_id="job-1")
+
+    with bound("base"):  # the caller's own layer is a different one
+        payload = _call(module, provider, {"mode": "messages", "session_id": _CHILD})
+
+    rows = payload["data"]["rows"]
+    assert payload["data"]["layer"] == "researcher"
+    assert [row["role"] for row in rows] == ["user", "tool"]
+    assert {row["run_id"] for row in rows} == {"job-1"}
+    assert "a dialectic secret" not in json.dumps(payload["data"])
+
+
+def test_a_finished_run_falls_back_to_the_final_stream_by_run_id(history):
+    """No realtime stream (or it was pruned): the parent's stream holds the run, under its id."""
+    buffer, provider, module, bound = history
+    child = "session-test:minir:researcher:job-2"
+    buffer.record_aux("researcher", "session-test", [
+        {"role": "user", "content": "the run prompt"},
+        {"role": "assistant", "content": "the run answer"}],
+        system_message="sys", run_id="job-2", profile="default")
+    buffer.record_aux("researcher", "session-test", [
+        {"role": "user", "content": "another run's prompt"}],
+        system_message="sys", run_id="job-1", profile="default")
+
+    with bound("base"):
+        payload = _call(module, provider, {"mode": "messages", "session_id": child})
+
+    texts = [row.get("text") for row in payload["data"]["rows"] if row.get("role") == "user"]
+    assert texts == ["the run prompt"], "run_id separates this run from the agent's other runs"
+    assert all(row["run_id"] == "job-2" for row in payload["data"]["rows"])

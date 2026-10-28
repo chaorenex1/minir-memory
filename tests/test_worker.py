@@ -328,7 +328,7 @@ def test_base_layer_publishes_one_artifact_for_the_profile_user(store, transcrip
     assert "user (Bo)" in worker.calls[0]["prompt"]
 
 
-def test_an_anonymous_turn_falls_back_to_the_profile_user(plugin_package, store, transcript):
+def test_the_host_user_id_is_ignored(plugin_package, store, transcript):
     def complete(task, system, prompt, **kwargs):
         return _reply_for(prompt)
 
@@ -337,7 +337,8 @@ def test_an_anonymous_turn_falls_back_to_the_profile_user(plugin_package, store,
     instance = plugin_package.worker.LayerWorker(store, transcript, complete=complete,
                                                 user_id="profile-user")
     assert instance.run_once() == 1
-    assert store.layer_state(BASE, "user:profile-user") is not None
+    assert store.layer_state(BASE, "user:default") is not None
+    assert store.layer_state(BASE, "user:profile-user") is None
 
 
 def test_merge_bumps_the_version_and_feeds_the_previous_artifact_forward(store, transcript, worker):

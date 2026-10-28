@@ -28,7 +28,7 @@ import re
 import time
 from typing import Any, Callable, Optional
 
-from . import agent_loop, knowledge, layers, tools
+from . import accounting, agent_loop, knowledge, layers, tools
 from . import rules as layer_rules
 from .prompting import data_block
 
@@ -195,7 +195,7 @@ def build_prompt(*, session_id: str, summary: str, markers: Any,
 
 
 def extract_pages(*, session_id: str, summary: str, markers: Any = None,
-                  usage: Any = None, hermes_home: str = "",
+                  usage: Any = None, hermes_home: str = "", state_db: str = "",
                   timeout: float = 120.0, transcript: Any = None, profile: str = "",
                   window_end: float = 0.0) -> list[dict[str, Any]]:
     """Run the extraction agent; returns validated pages (``[]`` on any failure)."""
@@ -207,13 +207,15 @@ def extract_pages(*, session_id: str, summary: str, markers: Any = None,
         from . import adviser
 
         cfg = adviser.load_config(adviser.KNOWLEDGE_TASK)
-        result = agent_loop.run(
-            prompt, model=str(cfg.get("model") or ""),
-            provider=str(cfg.get("provider") or ""),
-            api_mode=str(cfg.get("api_mode") or ""),
-            toolsets=tools.agent_toolsets(cfg.get("toolsets")),
-            system_message=f"{system_prompt(hermes_home)}\n\n{_OUTPUT_RULE}",
-            layer="extraction", history_session=session_id)
+        with accounting.accounting_scope(state_db, session_id):
+            result = agent_loop.run(
+                prompt, model=str(cfg.get("model") or ""),
+                provider=str(cfg.get("provider") or ""),
+                api_mode=str(cfg.get("api_mode") or ""),
+                toolsets=tools.agent_toolsets(cfg.get("toolsets")),
+                system_message=f"{system_prompt(hermes_home)}\n\n{_OUTPUT_RULE}",
+                layer="extraction", history_session=session_id,
+                account_task=accounting.KNOWLEDGE_TASK)
         return str(result.answer or "")
 
     try:

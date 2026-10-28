@@ -1,6 +1,6 @@
 ---
 id: advice_target
-version: 2
+version: 3
 applies_to: [adviser:review]
 slot: body
 max_tokens: 2000
@@ -26,6 +26,9 @@ Action targets:
 - `user_intent`: the reading of what the user asked. blocker: re-read, clarify only if the action
   changes. concern: re-check, ask only if the action changes. nit: optional.
 - `general`: none of the above. blocker: stop and verify. concern: decide. nit: optional.
+- `delegation`: the handoff to a subagent and the acceptance of its result. blocker: do not hand
+  off or accept the child's claim, verify with a named check. concern: narrow the context and
+  name the acceptance. nit: optional.
 
 Artifact targets:
 - `output_surface`: the wording, formatting, or interface being produced. blocker: do not send,
@@ -89,6 +92,10 @@ CHOOSING
   inside a sendable answer fails the craft rules.
 - `code_economy` must name the existing capability being duplicated (git, the license, the
   framework, the stdlib) or the threshold crossed.
+- `delegation` covers the handoff itself: what context the child received, what acceptance the
+  parent stated, and whether the child's claim was verified before it was repeated. A wrong
+  `delegate_task` argument is `tool_choice`; "do the work via a child" as the next step is
+  `current_step`.
 - Use `general` when none fits. Never invent or misspell a token to force precision.
 
 REFERENCE MATERIAL

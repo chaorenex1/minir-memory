@@ -870,11 +870,234 @@ def test_knowledge_citation_suffix_is_validated(plugin_package, make_provider):
     assert notes[1]["content"] == "plain"
 
 
-def test_consistency_targets_are_delivered_and_handled(plugin_package):
+def test_consistency_targets_are_delivered(plugin_package):
     prompting = plugin_package.prompting
     assert set(prompting.CONSISTENCY_TARGETS) <= set(prompting.DELIVERED_TARGETS)
+    rule = plugin_package.rules.rule_text("advice_target")
     for target in prompting.CONSISTENCY_TARGETS:
-        assert target in prompting.ADVICE_HANDLING["blocker"]
-        assert target in prompting.ADVICE_HANDLING["concern"]
-    # The existing seven columns and the five consistency columns are two tables.
-    assert prompting.advice_handling_section().count("| severity |") == 2
+        assert f"`{target}`" in rule
+
+
+# -- watched background runs --------------------------------------------------
+
+def _watch(plugin_package, *, parent: str = "session-test", agent: str = "researcher",
+           job: str = "job-1", capabilities: dict | None = None):
+    """Register one background run the adviser may observe."""
+    return plugin_package.agent_watch.register(
+        parent=parent, agent=agent, job_id=job,
+        capabilities=(capabilities if capabilities is not None
+                      else {"soul": True, "memory": True, "file": True}))
+
+
+def test_a_watched_child_run_is_recorded_and_reviewed(plugin_package, make_provider, monkeypatch):
+    provider = _mode_provider(make_provider, cadence=2)
+    calls: list = []
+    monkeypatch.setattr(plugin_package.agent_loop, "run", _run(_advice(), calls))
+    watch = _watch(plugin_package)
+    mode = provider._adviser_mode
+
+    for path in ("a.py", "b.py"):
+        mode.on_post_tool_call(session_id=watch.session, turn_id="t1", tool_name="read_file",
+                               status="ok", args={"path": path}, result="contents")
+    assert mode.wait_idle(2.0)
+
+    assert len(calls) == 1, "cadence=2: the second batch is the review"
+    assert "\n\n[background agent review]" in calls[0]["system_message"], (
+        "the child brief is its own paragraph, not glued to the rule body")
+    assert "(researcher, job job-1)" in calls[0]["system_message"]
+    assert [event["kind"] for event in mode._rings[watch.session]] == ["tool", "tool"]
+    assert mode._rings.get("session-test") is None, "a child never writes the parent's ring"
+
+
+def test_a_child_event_reaches_the_runs_own_stream(plugin_package, make_provider):
+    provider = _mode_provider(make_provider, cadence=99)
+    watch = _watch(plugin_package)
+
+    provider._adviser_mode.on_post_tool_call(
+        session_id=watch.session, turn_id="t1", tool_name="read_file", status="ok",
+        args={"path": "a.py"}, result="contents")
+
+    rows = provider._transcript.read_events(
+        "default", "researcher", watch.session, kinds=["msg"])["rows"]
+    assert [row["role"] for row in rows] == ["tool"]
+    assert rows[0]["name"] == "read_file" and rows[0]["result"] == "contents"
+    assert rows[0]["run_id"] == "job-1"
+
+
+def test_the_child_review_uses_the_parent_digest(plugin_package, make_provider, monkeypatch):
+    provider = _mode_provider(make_provider, cadence=99)
+    watch = _watch(plugin_package)
+    mode = provider._adviser_mode
+    seen: list = []
+    monkeypatch.setattr(mode, "_digest",
+                        lambda session: seen.append(session) or "- User representation: parent")
+
+    prompt = mode._prompt(watch.session, "t1", "manual", [
+        {"seq": 1, "kind": "tool", "tool": "read_file", "args": "{}"}])
+
+    assert seen == ["session-test"], "the digest belongs to the session that dispatched the run"
+    assert "parent" in prompt and "<parent_context>" in prompt
+
+
+def test_child_advice_is_steered_and_never_queued(plugin_package, make_provider, monkeypatch):
+    provider = _mode_provider(make_provider, cadence=99)
+    watch = _watch(plugin_package)
+    mode = provider._adviser_mode
+    calls: list = []
+    bridge = plugin_package.host_bridge
+    monkeypatch.setattr(bridge, "available", lambda: True)
+    monkeypatch.setattr(bridge, "live", lambda session: True)
+    for name in ("interrupt", "continue_turn", "queue_post_turn", "preserve_handle"):
+        monkeypatch.setattr(
+            bridge, name,
+            lambda *args, _name=name, **kwargs: (calls.append((_name, args[0])), {"ok": True})[1])
+    monkeypatch.setattr(bridge, "steer",
+                        lambda session, text: (calls.append(("steer", session, text)),
+                                               {"ok": True})[1])
+    ids = provider._store.add_advisories(watch.session, [{
+        "severity": "concern", "target": "current_step", "text": "rerun the failing test",
+        "evidence": ["#2"]}], source="adviser_mode")
+
+    delivered = mode._deliver_host(watch.session, ids, mode._cfg())
+
+    assert delivered == 1
+    assert [call[0] for call in calls] == ["steer"], (
+        "a child has no continuation, no fresh turn and no card slot")
+    assert calls[0][1] == watch.session
+    assert watch.advice and "rerun the failing test" in watch.advice[0]
+
+
+def test_every_tool_batch_emits_one_progress_line(plugin_package, make_provider, monkeypatch):
+    provider = _mode_provider(make_provider, cadence=99)  # no review: only the mirror runs
+    watch = _watch(plugin_package)
+    mode = provider._adviser_mode
+    steers: list = []
+    bridge = plugin_package.host_bridge
+    monkeypatch.setattr(bridge, "live", lambda session: True)
+    monkeypatch.setattr(bridge, "steer",
+                        lambda session, text: (steers.append((session, text)), {"ok": True})[1])
+
+    for index in range(3):
+        mode.on_post_tool_call(session_id=watch.session, turn_id="t1", tool_name="read_file",
+                               status="ok", args={"path": f"{index}.py"}, result="ok")
+
+    assert len(watch.steps) == 3, "every batch is kept, whatever the window does"
+    assert len(steers) == 1, "the window merges the burst into one push"
+    assert steers[0][0] == "session-test", "progress goes to the parent session"
+    assert "read_file" in steers[0][1] and "0.py" in steers[0][1]
+
+    watch.last_push_at = 0.0  # the window is open again: this line is not held back
+    monkeypatch.setattr(bridge, "live", lambda session: False)
+    mode.on_post_tool_call(session_id=watch.session, turn_id="t1", tool_name="read_file",
+                           status="ok", args={"path": "a.py"}, result="ok")
+
+    assert len(steers) == 1, "an idle parent gets no push"
+    assert len(watch.steps) == 4, "but the step is still recorded"
+
+
+def test_a_grandchild_is_not_recorded(plugin_package, make_provider):
+    provider = _mode_provider(make_provider, cadence=99)
+    mode = provider._adviser_mode
+    grandchild = "session-test:minir:a:j"
+
+    assert plugin_package.agent_watch.register(
+        parent="session-test", agent="a", job_id="j", depth=2) is None
+    mode.on_post_tool_call(session_id=grandchild, turn_id="t1", tool_name="read_file",
+                           status="ok", result="contents")
+
+    assert grandchild not in mode._rings
+
+
+def test_disabled_records_nothing(plugin_package, make_provider, monkeypatch):
+    provider = make_provider({"adviser_mode": {"enabled": False, "cadence": 1}})
+    calls: list = []
+    monkeypatch.setattr(plugin_package.agent_loop, "run", _run(_advice(), calls))
+    watch = _watch(plugin_package)
+    mode = provider._adviser_mode
+
+    mode.on_post_tool_call(session_id=watch.session, turn_id="t1", tool_name="read_file",
+                           status="ok", result="contents")
+    assert mode.wait_idle(0.3)
+
+    assert watch.session not in mode._rings
+    assert calls == []
+    assert provider._transcript.read_events(
+        "default", "researcher", watch.session, kinds=["msg"])["rows"] == []
+
+
+def test_a_watch_from_another_profile_is_not_observed(plugin_package, make_provider):
+    """One process can serve more than one profile; a run belongs to the one that dispatched it."""
+    provider = _mode_provider(make_provider, cadence=99)
+    watch = plugin_package.agent_watch.register(
+        parent="session-test", agent="researcher", job_id="job-9", profile="work")
+    mode = provider._adviser_mode
+
+    mode.on_post_tool_call(session_id=watch.session, turn_id="t1", tool_name="read_file",
+                           status="ok", result="contents")
+
+    assert watch.session not in mode._rings
+
+
+def test_a_blocked_tool_records_a_blocked_event(plugin_package, make_provider):
+    provider = _mode_provider(make_provider, mode="adviser_only")
+    watch = _watch(plugin_package)
+    mode = provider._adviser_mode
+
+    reason = mode.block_reason(watch.session, "write_file", {"path": "a.py"})
+
+    assert reason and "adviser_only mode" in reason
+    blocked = [event for event in mode._rings[watch.session] if event["kind"] == "tool"]
+    assert blocked[-1]["status"] == "blocked" and blocked[-1]["tool"] == "write_file"
+    assert blocked[-1]["reason"] == reason
+
+
+def test_the_child_policy_follows_the_configured_mode(plugin_package, make_provider):
+    strict = _mode_provider(make_provider, mode="adviser_only")
+    watch = _watch(plugin_package)
+
+    assert strict._adviser_mode.block_reason(watch.session, "write_file", {}) is not None
+    assert strict._adviser_mode.block_reason(watch.session, "read_file", {}) is None
+
+    watcher = _mode_provider(make_provider, mode="watch")
+    assert watcher._adviser_mode.block_reason(watch.session, "write_file", {}) is None
+
+
+def test_target_needs_drops_what_the_child_cannot_do(plugin_package, make_provider, monkeypatch):
+    provider = _mode_provider(make_provider, floor="nit")
+    watch = _watch(plugin_package,
+                   capabilities={"soul": False, "memory": False, "file": False})
+    mode = provider._adviser_mode
+    answer = json.dumps({"action": "advise", "advices": [
+        {"severity": "concern", "target": "soul_workflow_check",
+         "text": "follow the delivery contract", "evidence": ["#1"]},
+        {"severity": "concern", "target": "code_economy", "text": "reuse the helper",
+         "evidence": ["#1"]},
+        {"severity": "concern", "target": "current_step", "text": "rerun the failing test",
+         "evidence": ["#1"]},
+    ]})
+    calls: list = []
+    monkeypatch.setattr(plugin_package.agent_loop, "run", _run(answer, calls))
+
+    mode.record_tool(watch.session, "read_file", turn_id="t1", status="ok", result="contents")
+    assert mode.review_once(watch.session, "test") is True
+
+    assert "<unavailable_targets>" in calls[0]["message"]
+    for target in ("soul_workflow_check", "code_economy"):
+        assert target in calls[0]["message"], "the reviewer is told what it cannot judge"
+    pending = provider._store.pending_advisories(watch.session, source="adviser_mode")
+    assert [row["target"] for row in pending] == ["current_step"], "only the judgeable note lands"
+    review = provider._store.adviser_reviews(watch.session)[0]
+    assert "unavailable_target" in str(review.get("drop_detail") or "")
+    assert json.loads(review.get("coverage") or "{}").get("soul_workflow_check") == "n/a"
+
+
+def test_a_child_prompt_is_bounded_more_tightly_than_the_primary(plugin_package, make_provider):
+    provider = _mode_provider(make_provider)
+    watch = _watch(plugin_package)
+    events = [{"seq": index, "kind": "tool", "tool": "read_file",
+               "args": "x" * 4000, "result": "y" * 8000} for index in range(6)]
+
+    prompt = provider._adviser_mode._prompt(watch.session, "t1", "manual", events)
+
+    assert len(prompt) <= plugin_package.adviser_mode.CHILD_PROMPT_CHARS
+    assert "events cut at" in prompt, "the cut is visible, not silent"

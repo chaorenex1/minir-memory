@@ -62,6 +62,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Callable, Mapping, Optional, Sequence
 
+from . import accounting
 from . import adviser
 from . import card_review
 from . import history as host_history
@@ -639,6 +640,8 @@ def _chunk_prompt(chunks: list[dict[str, Any]], max_chars: int = 4_000) -> str:
 class LayerWorker:
     """Drains queued layer jobs and publishes merged artifacts. One worker per provider."""
 
+    # ``user_id`` stays in the signature for callers that still pass it; it is ignored.
+    # One profile serves one user, so the profile name keys every row (see user_subject).
     def __init__(self, store: MinirStore, transcript: TranscriptBuffer, *, enabled: bool = True,
                  agent_identity: str = "", user_id: str = "", state_db: str = "",
                  identity_source: str = "", preference_source: str = "",
@@ -651,7 +654,6 @@ class LayerWorker:
         self._transcript = transcript
         self._enabled = bool(enabled)
         self._agent_identity = str(agent_identity or "")
-        self._user_id = str(user_id or "")
         self._profile = str(profile or "default")
         self._state_db = str(state_db or "")
         self._identity = str(identity or "")
@@ -699,8 +701,12 @@ class LayerWorker:
         return f"agent:{self._profile}:{self._agent_identity or 'minir'}"
 
     def user_subject(self) -> str:
-        """The subject the base layer models: this profile's user (no per-author split)."""
-        return f"user:{self._user_id or 'default'}"
+        """The subject the base layer models: the profile itself (no per-user split).
+
+        The host's ``user_id`` is accepted at the boundary and ignored; rows written before
+        that rule may still carry ``user:<user_id>`` and are left untouched.
+        """
+        return f"user:{self._profile}"
 
     # -- base refresh ---------------------------------------------------------
 
@@ -1277,14 +1283,17 @@ class LayerWorker:
             return
         refreshes: list[dict[str, Any]] = []
         publications: list[tuple[str, str]] = []
-        if layer == BASE_LAYER:
-            publications, refreshes = self._merge_base(
-                rows, session, start, end, turns=int(job.get("turns") or 0))
-        else:
-            result = self._merge_dialectic(
-                rows, cold=cold, session=session, from_ts=float(job["from_ts"]),
-                to_ts=end, job_id=job_id)
-            publications = result["publications"]
+        # Every model call this job makes bills to this conversation under its own layer task,
+        # so the host ledger answers "what did the base layer cost" per session.
+        with accounting.accounting_scope(self._state_db, session):
+            if layer == BASE_LAYER:
+                publications, refreshes = self._merge_base(
+                    rows, session, start, end, turns=int(job.get("turns") or 0))
+            else:
+                result = self._merge_dialectic(
+                    rows, cold=cold, session=session, from_ts=float(job["from_ts"]),
+                    to_ts=end, job_id=job_id)
+                publications = result["publications"]
         for subject, content in publications:
             version = self._store.put_layer_state(layer, subject, content,
                                                   session_id=session,

@@ -6,12 +6,12 @@ and grow into a real provider.
 
 It keeps explicit value markers and every derived conclusion in a per-profile SQLite database,
 recalls them through an FTS5 trigram index (CJK-safe, with a token-scan fallback) plus an optional
-sqlite-vec index, and exposes ten tools (`minir_search`, `minir_kb_search`, `minir_remember`,
+sqlite-vec index, and exposes eleven tools (`minir_search`, `minir_kb_search`, `minir_remember`,
 `minir_forget`, `minir_todo`, `minir_stats`, `minir_agents`, `minir_kb_write`, `minir_link`,
-`minir_unmerge`) and one local counter (`minir_content_valid`). On top of that it runs
-two **independent** reasoning layers: the base layer builds the user/AI cards every 24 turns, the
-dialectic reviews them every 8 turns against its own evidence window, and corrects the newest base
-artifact (a pre-overwrite snapshot and an FTS index are kept). The review publishes a short
+`minir_unmerge`, `minir_advise`) and one local counter (`minir_content_valid`). On top of that it
+runs two **independent** reasoning layers: the base layer builds the user/AI cards every 24 turns,
+the dialectic reviews them every 8 turns against its own evidence window, and corrects the newest
+base artifact (a pre-overwrite snapshot and an FTS index are kept). The review publishes a short
 `## Base Revision` note naming the fields it changed and emits no advice.
 
 Three file-backed layers sit on top: a **three-day global card review** merges sessions into four
@@ -104,7 +104,7 @@ plugin/minir/          the deployable plugin directory (copy this to plugins/min
   rgtool.py            managed ripgrep: facts.json discovery + the selection's search call
   tools.py             the minir toolset: store tools + agent transcript search; file/skills grant
   agent_history.py     minir_aiagent_search: the caller's own layer stream, layer from contextvar
-  minir_agents.py      run one named custom agent and flush its transcript under sessions/
+  minir_agents.py      run one named custom agent in the background; notify the session, flush a transcript
   session_summary.py   end-of-session summary agent (its own template; the compression record is input)
   extraction.py        idle-timer due-row runner + knowledge-page extraction agent
   file_guard.py        pre-tool-call scope for the plugin agents' file tools
@@ -214,9 +214,9 @@ be granted them explicitly (see "The `minir` toolset" below).
 | `minir_kb_search` | `query` (required), `org`, `category`, `limit` | Read-only search of the knowledge directory the hint block points at. `query` is a ripgrep (Rust regex) pattern matched case-insensitively; `org`/`category` filter front-matter; `limit` defaults to 8, capped at 25. A result carries `path` (absolute), `relative`, `org`, `category`, `topic`, `summary`, `revisions`, `updated_at` and up to two matched body lines (`line` + `text`); `total` counts every matching page, so `total > count` means "narrow the pattern". Hits outside `<org>/<page>.md` under the knowledge root are never reported. |
 | `minir_remember` | `type` (required), `content` (required) | Stores one conclusion of that kind (`note`, `entities`, `trajectories`, `experiences`, `tools`, `projects`, `todo`) in the single memory table, bound to the current session and indexed for FTS. Returns `{stored, conclusions_id, type, session_id}`. |
 | `minir_forget` | `type` (required), `conclusions_id` (required) | Deletes that row only when its stored kind matches. Returns `{deleted, conclusions_id, type}`; a wrong kind or unknown id yields `deleted: false`. |
-| `minir_todo` | `todos` (required) | Replaces this session's todo list, at most two levels deep (`parent` names a top-level id) and 256 items. It is stored as one row (`kind="todo"`), rendered as a markdown table into the final answer, and carried by every prefetch block for the session. An empty list deletes the row. |
+| `minir_todo` | `todos` (required) | Replaces the caller's todo list, at most two levels deep (`parent` names a top-level id) and 256 items. The owner is the profile for the main session and `(agent name, run session id)` for a dispatched run, so each agent tracks its own steps without touching its dispatcher's list. It is stored as one row (`kind="todo"`), rendered as a markdown table into the final answer, and carried by every prefetch block for the same owner. An empty list deletes the row. |
 | `minir_stats` | none | Store counts (with `conclusions_by_kind` for this session), layer counters, the scheduler ledger, published artifacts, buffered messages, in-memory tool metrics, the session's token usage and its newest turn rows, and the database path. |
-| `minir_agents` | `agent_name` (required), `user_prompts` (required), `skill_name`, `model`, `system_prompts`, `context_files`, `project_dir`, `tool_sets`, `skip_memory`, `skip_context_files`, `skip_background_review`, `load_soul_identity` | Runs a named in-process agent; omitting `tool_sets` grants every host tool. `model` is `provider:model`. The system prompt is the first prompt file found under `HERMES_HOME` (see "Custom agents"); `system_prompts` is the last fallback, and `system_prompt_source` reports which one won. The full run is flushed to `sessions/<agent_name>/<layer_session_id>.jsonl`. |
+| `minir_agents` | `agent_name` (required), `user_prompts` (required), `skill_name`, `model`, `system_prompts`, `context_files`, `project_dir`, `tool_sets`, `background`, `skip_memory`, `skip_context_files`, `skip_background_review`, `load_soul_identity` | Runs a named in-process agent, in the background by default: the call returns a job handle and the answer arrives as a completion notification. `background=false` waits for the answer. Omitting `tool_sets` grants every host tool. `model` is `provider:model`. The system prompt is the first prompt file found under `HERMES_HOME` (see "Custom agents"); `system_prompts` is the last fallback, and `system_prompt_source` reports which one won. The full run is flushed to `sessions/<agent_name>/<layer_session_id>.jsonl`. |
 | `minir_content_valid` | `content` (required), `limit` (required), `mode` | Local deterministic length check. `mode="string"` (default) counts Unicode code points; `mode="token"` applies `rules.estimate_tokens` (CJK one token per character, otherwise four characters per token, plus a 10% margin). Returns `{ok, mode, unit, measured, limit, over, remaining}` and, in token mode, `estimator`. It never truncates, rewrites or stores, and it answers before the provider is initialized. |
 
 Explicit markers are separate from the base layer's automatic value markers: the worker keeps
@@ -259,6 +259,19 @@ the provider path cannot drift.
 agent's own file tools, with relative paths resolved against `project_dir` (at most 20 files and
 200 KB in total).
 
+By default the run is in the background: the call returns a job handle (`job_id`, `status`,
+`queue_position`, `transcript_path`) and the finished run is pushed onto the host's
+background-completion queue (`process_registry.completion_queue`) as an `async_delegation` event,
+so the session is woken with the same `[ASYNC DELEGATION COMPLETE]` turn a background process
+gets. `status` is `running`, or `queued` when the caps are full; `queue_position` is the job's
+1-based place in the process-wide waiting line at the moment it was queued. `background: false`
+keeps the blocking form and puts the answer in the tool result. Caps: 3 running per session and 8
+process-wide, then FIFO waiting (16 per session, 64 in total) and only past those a `tool_error`.
+A run that holds its slot past `MAX_RUN_SECONDS` (30 minutes) is reported as `stalled` and its slot
+is released, so a wedged run cannot refuse every later call; the thread is not killed, so a late
+answer is only in the transcript. The reported answer is cut at 2000 characters, and the summary
+then names the transcript.
+
 - `model` pins the route as `provider:model` (split at the first colon, so
   `openrouter:anthropic/claude-sonnet-4` keeps its namespaced model id). A bare model name pins
   only the model and keeps the gateway's provider; omitted, the gateway route is used.
@@ -278,8 +291,13 @@ agent's own file tools, with relative paths resolved against `project_dir` (at m
   The name is the identity: the same agent name never loads twice, and a file found at an earlier
   step is not merged with a later one. A leading YAML front-matter block (the shape
   `hermes import-agent` writes: `name`, `description`, `tools`, `model`) is metadata and is
-  stripped; its `tools` and `model` do not override `tool_sets` or `model`. The payload's
-  `system_prompt_source` is the winning path, `"argument"`, or `""` when neither supplied one.
+  stripped; its `tools` and `model` do not override `tool_sets` or `model`. The winning file is
+  then rendered once: `$NAME` caps this code owns (`$MAX_UNIT_TOPIC`, `$MAX_TOTAL_CHARS`, …) are
+  filled from `layers.prompt_vars()`, so a shipped pass core such as B3 or B4 reaches the model
+  with numbers instead of placeholders, while a `$NAME` the code does not own (`$HERMES_HOME` in a
+  runnable command) is left as written. The `system_prompts` argument is the caller's text and is
+  not rendered. The payload's `system_prompt_source` is the winning path, `"argument"`, or `""`
+  when neither supplied one.
 - `tool_sets` omitted, empty or `["*"]` grants every host tool; an explicit list is passed to the
   agent unchanged.
 - `skip_memory=False`, `skip_context_files=False`, `skip_background_review=True` and
@@ -287,9 +305,17 @@ agent's own file tools, with relative paths resolved against `project_dir` (at m
   extraction and adviser agents use the opposite posture: no host memory, no context files, no
   soul identity.
 - The run's `AgentRun.messages` are recorded with `TranscriptBuffer.record_aux` and flushed
-  before the tool returns, at
+  before the run reports back (the tool result or the completion notification), at
   `<HERMES_HOME>/minir-memory/sessions/<agent_name>/<layer_session_id>.jsonl`. The path is
-  returned as `transcript_path`; `transcript_written` says whether the flush reached disk.
+  returned as `transcript_path` and exists only once the run ends; the blocking form also returns
+  `transcript_written`, whether the flush reached disk. The background handle is returned before
+  the file exists, so it makes no claim about the flush.
+- The run's identity is its own: it runs under
+  `<parent session>:minir:<agent_name>:<job_id>`, and that id plus the agent name are what the
+  run's `[run-meta]` system block names (`agent:`, `session:`) and what per-run state keys on.
+  `minir_todo` therefore keeps a dispatched run's list separate from the list of the session that
+  dispatched it, whose name in the same key is the profile. `history_session` still selects the
+  stream `minir_aiagent_search` reads, so the run finds its own rows under the caller's session.
 - `minir_agents` may recurse when the custom agent is granted the `minir` toolset; the tool caps
   the depth at three.
 
@@ -472,7 +498,8 @@ reads later turns. It reviews whole parts: the user card, the AI card and the wi
 system prompt is assembled from the layer core plus the four card **review checks** in
 `plugin/minir/rules/`, so the reviewer reads the same contract the writer was given. It lists a
 part in `base_changed.fields` only when it changed it, and a listed part is replaced in full;
-`prunings` must stay empty because only the three-day review may delete durable content. The
+`prunings` must stay empty: only the three-day card review may delete durable card content, and
+only on an explicit user request. The
 dialectic writes no advices: advice has a single producer, the live reviewer.
 
 When `base_changed.fields` is non-empty, the corrected parts overwrite the base row **in one
@@ -569,7 +596,8 @@ content (the content watermark never moved).
 ### Durable card files and the three-day review
 
 Four files under `$HERMES_HOME/minir-memory/` are the profile's durable card state. They are the
-first baseline for a base refresh and the only place a durable item may be deleted:
+first baseline for a base refresh and the only place a durable item may be deleted, and only when
+the evidence carries an explicit user request to remove that exact item:
 
 | File | Content |
 | --- | --- |
@@ -579,11 +607,13 @@ first baseline for a base refresh and the only place a durable item may be delet
 | `agents/<profile>/preference.md` | `ai_preference` markdown body: voice and conduct, permissions, prohibitions |
 
 Each file is front-matter (`schema: minir-card/v1`, scope, part, generated_at, source, evidence,
-reviewer) plus one markdown body. There is no field list and no JSON body: the body is the card,
-and an empty body is a valid empty card. `card_review.py` is the only writer: the merge runs as
+reviewer) plus one markdown body. There is no field list and no JSON body: the body is the card;
+the review only appends newly proven lines, so an empty body is valid only while the card is
+empty. `card_review.py` is the only writer: the merge runs as
 **four single-file passes**, one for each global card file. The two user files share
 `card_review_user`; the two AI files share `card_review_ai`. Each pass reads one rule file and
-returns one final card body and nothing else: the database is the change history. The four passes
+returns the current body plus the lines it adds, and nothing else; a line is removed only on an
+explicit user request, never because it is stale, one-off, duplicated or over budget. The four passes
 are joined into one write, and the write validates all four bodies, enforces the per-file
 `card_token_budget` (2000 by default) and requires markdown text; one invalid file fails the whole
 review and leaves all four files untouched.
@@ -897,6 +927,16 @@ adviser_mode:
   history_messages: 60      # model-facing adviser history cap
   history_chars: 120000
   roster: []                # empty = one `default` adviser; no fixed cap; see below
+  # Fork dispatch (doc/jev-fork-dispatch-draft.md §7). Off by default: with every key at its
+  # default the plugin behaves exactly as it did before this layer existed.
+  forks: off                # off | shadow (classify and ledger only) | on
+  fork_rules_max: 500       # cap on learned.json; the least recently hit go first
+  fork_compress_chars: 4000 # above this a compress rule may distill a tool result
+  fork_retry_limit: 2       # identical failures after which the retry guard refuses the call
+  fork_ttl_days: 14         # a learned rule older than this is expired by the review
+  gates: off                # off | shadow | merge (merge needs host patch 0019)
+  gate_timeout_s: 90        # adviser budget for one gate consult; the callback declares 120 s
+  advise_tool: on           # expose minir_advise (provider surface, never the adviser toolset)
 ```
 
 A roster pays for one review per member. There is no fixed cap; a member with `paused: true`
@@ -913,6 +953,56 @@ model, instructions and persistent runtime, and its name is stamped on every row
 ```
 
 Changes are read when the provider opens a session; restart Hermes to apply them to a running one.
+
+### Fork dispatch
+
+A *fork* is one tool-level branch with an action the main model does not have to decide: fix an
+argument, refuse a third identical failure, distill an oversized result, or pick an executor for
+an orchestrator node. `fork.py` answers that question on three budgets, because the host gives
+each one a different one:
+
+| path | where | cost | can it block? |
+| --- | --- | --- | --- |
+| `resolve_now` | `pre_tool_call`, `transform_tool_result` | memory lookup only | no |
+| `resolve_gate` | `pre_tool_call`, `git merge`/`rebase`/`cherry-pick`/`apply`, `patch -p`, `gh pr merge` | one adviser consult | yes, fail-closed |
+| `judge` | worker threads only | one adviser consult | no |
+
+`pre_tool_call` is fail-closed in the host, so the hot path never calls a model and never touches
+the disk. Rules live in `<HERMES_HOME>/minir-memory/forks/static.json` (hand-written, read-only)
+and `learned.json` (written by the review worker, atomic replace); SQLite holds only `fork_stats`
+counters and the `fork_ledger` audit rows. A rule whose decision is `block` is dropped at load:
+blocking stays with the operator claim gate, the retry guard and the operator-authorized gate.
+
+Strength ladder, the same one `claims.apply_ceiling` uses: `low` is a single adviser verdict and
+only writes the ledger (shadow); at two hits and zero overturns the review promotes it to
+`medium`, one overturn sends it back to `low`, two or a passed TTL delete it.
+
+`forks: shadow` classifies and ledgers without changing a call: that is the P0 measurement mode
+from the draft. `gates: shadow` runs the merge consult and records the verdict without blocking;
+`gates: merge` blocks on `no-go`, on an empty answer and on timeout, which needs host patch 0019
+(a callback declaring `__hook_timeout__ = 120`). Without that patch the gate still works but the
+callback keeps the host's global `plugins.hook_callback_timeout` (30 s default), so a slow consult
+is cut short and therefore refuses. `minir_advise(phase, question)` is the pull version for plan
+and ship: read-only, provider-surface only, and deliberately absent from the `minir` toolset every
+adviser run receives.
+
+Delegation advice is the one vocabulary change: target `delegation` covers the handoff to a
+subagent and the acceptance of its result (wrong `delegate_task` arguments stay `tool_choice`).
+
+### Background runs
+
+With `enabled: true`, each `minir_agents` run is also watched, under its own host session id
+(`<parent>:minir:<agent>:<job>`, returned as `child_session_id`). The same reviewer covers it: tool
+batches are reviewed on the same cadence and against the same per-turn cap, advice is steered into
+the run after its next tool batch, and the parent session gets one merged progress line per
+two-second window (`steps` keeps the raw lines). A run is never reviewed at its end: its answer is
+the completion notification. The reviewer reads the run's own events while borrowing the parent
+session's cards, statistics and history, under their own caps: 6k of parent context, 12k of events,
+18k of prompt. `mode: adviser_only` applies to a watched run exactly as it does to the main agent.
+A run dispatched without the SOUL, memory or file input does not get the targets that need it (the
+`soul_*`, `user_*_check`, `knowledge_claim_check`, `ai_self_representation_check` and
+`code_economy` tokens), and those targets are recorded as `n/a`. `minir_aiagent_search` reads a
+run's live stream from its child id and falls back to the finished transcript filtered by run id.
 
 The main adviser runs on the same `auxiliary.adviser` route with a five-iteration tool budget.
 Its input is a bounded transcript delta: `pre_llm_call` records the user goal,

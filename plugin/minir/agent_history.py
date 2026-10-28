@@ -38,6 +38,13 @@ CURRENT_LAYER: contextvars.ContextVar[str] = contextvars.ContextVar(
 CURRENT_SESSION: contextvars.ContextVar[str] = contextvars.ContextVar(
     "minir_agent_session", default="")
 
+#: The run's own session id: ``watch.session`` for a ``minir_agents`` child, the peer's own id for
+#: a layer pass, empty for a run the host never gave one. State a tool keeps per run (the todo
+#: list) keys on this, because the provider a tool call lands on is bound to the session that
+#: dispatched the run, not to the run itself.
+CURRENT_RUN: contextvars.ContextVar[str] = contextvars.ContextVar(
+    "minir_agent_run", default="")
+
 _MODES = ("auto", "messages", "search", "around", "stats")
 _DEFAULT_LIMIT = 20
 _MAX_LIMIT = 100
@@ -48,19 +55,26 @@ def current_layer() -> str:
     return str(CURRENT_LAYER.get() or "")
 
 
-def layer_context(layer: str, session: str = "") -> tuple[contextvars.Token, contextvars.Token]:
-    """Bind the caller's layer (and its stream session) for one run."""
-    return CURRENT_LAYER.set(str(layer or "")), CURRENT_SESSION.set(str(session or ""))
+def layer_context(layer: str, session: str = "",
+                  run: str = "") -> tuple[contextvars.Token, ...]:
+    """Bind the caller's layer, its stream session and its own run id for one run."""
+    return (CURRENT_LAYER.set(str(layer or "")), CURRENT_SESSION.set(str(session or "")),
+            CURRENT_RUN.set(str(run or "").strip()))
 
 
-def reset_layer(tokens: tuple[contextvars.Token, contextvars.Token]) -> None:
-    layer_token, session_token = tokens
+def reset_layer(tokens: tuple[contextvars.Token, ...]) -> None:
+    layer_token, session_token, run_token = tokens
+    CURRENT_RUN.reset(run_token)
     CURRENT_SESSION.reset(session_token)
     CURRENT_LAYER.reset(layer_token)
 
 
 def current_session() -> str:
     return str(CURRENT_SESSION.get() or "")
+
+
+def current_run() -> str:
+    return str(CURRENT_RUN.get() or "")
 
 
 class AgentHistoryError(Exception):
@@ -162,6 +176,25 @@ def _clip(row: dict[str, Any], limit: int) -> dict[str, Any]:
     return out
 
 
+def _child_stream(child_session: str) -> tuple[str, str, str]:
+    """``(layer, parent, job_id)`` from a watched run's id; empty parts when it is not one.
+
+    The id is self-describing (``<parent>:minir:<agent>:<job>``), so a reader does not need the
+    registry (or the run) to find its stream. An ordinary session id carries no such marker.
+    """
+    parent, sep, rest = str(child_session or "").partition(":minir:")
+    if not sep:
+        return "", "", ""
+    agent, _, job = rest.partition(":")
+    return agent, parent, job
+
+
+def _final_stream(buffer: Any, profile: str, layer: str, session: str, *,
+                  roles: Optional[list[str]], kinds: Optional[list[str]]) -> dict[str, Any]:
+    """The newest rows of one layer stream, for the run's finished transcript."""
+    return buffer.read_events(profile, layer, session, roles=roles, kinds=kinds, last_n=2_000)
+
+
 def query(args: dict[str, Any], *, buffer: Any, profile: str, layer: str,
           session_id: str = "") -> dict[str, Any]:
     """Run one shape against the caller's layer; raises :class:`AgentHistoryError`."""
@@ -201,11 +234,17 @@ def query(args: dict[str, Any], *, buffer: Any, profile: str, layer: str,
     coverages: list[list[int]] = []
     dropped: list[int] = []
     truncated = False
+    read_layer = layer
     for session in sessions:
+        # A watched run's id names the layer its own stream was written under, so a caller who
+        # holds the id can read that run without widening its own layer.
+        child_layer, parent, job = _child_stream(session)
+        stream_layer = child_layer or layer
+        read_layer = stream_layer
         if mode == "around":
             anchor = _int(args.get("seq"), 0, low=0, high=2 ** 62, name="seq")
             distance = _int(args.get("window"), 5, low=1, high=50, name="window")
-            result = buffer.read_events(profile, layer, session,
+            result = buffer.read_events(profile, stream_layer, session,
                                         cursor=max(0, anchor - distance - 1),
                                         limit=distance * 2 + 1,
                                         roles=roles, kinds=kinds)
@@ -213,18 +252,25 @@ def query(args: dict[str, Any], *, buffer: Any, profile: str, layer: str,
             # One part's worth of events, newest first: a search must not materialize a whole
             # permanent stream of multi-megabyte tool results. ``dropped_before`` says the scan
             # was bounded when it was.
-            result = buffer.read_events(profile, layer, session, roles=roles, kinds=kinds,
+            result = buffer.read_events(profile, stream_layer, session, roles=roles, kinds=kinds,
                                         last_n=2_000)
         else:
             turn = args.get("turn")
             if str(turn or "").strip() in {"", "0"}:
                 turn = None  # 0 means "every turn" in the schema
             result = buffer.read_events(
-                profile, layer, session, cursor=args.get("cursor"),
+                profile, stream_layer, session, cursor=args.get("cursor"),
                 last_n=args.get("last_n"), since=args.get("since"), until=args.get("until"),
                 turn=turn, step=args.get("step"),
                 roles=roles, kinds=kinds, limit=args.get("limit"), page=args.get("page"))
         page_rows = list(result.get("rows") or ())
+        if not page_rows and parent and job and mode != "around":
+            # The run's own stream is empty or gone: its final transcript is the parent session's
+            # stream, and ``run_id`` is what separates that run's rows from the parent's own.
+            result = _final_stream(buffer, profile, stream_layer, parent,
+                                   roles=roles, kinds=kinds)
+            page_rows = [row for row in (result.get("rows") or ())
+                         if str(row.get("run_id") or "") == job][:limit]
         if mode == "search":
             terms = [term for term in str(args.get("query") or "").casefold().split() if term]
             page_rows = [row for row in page_rows
@@ -244,7 +290,7 @@ def query(args: dict[str, Any], *, buffer: Any, profile: str, layer: str,
               else "mixed" if any(item == "buffer" for item in sources) else "disk")
     coverage = ([min(item[0] for item in coverages), max(item[1] for item in coverages)]
                 if coverages else [0, 0])
-    return {"mode": mode, "layer": layer, "profile": profile, "sessions": sessions,
+    return {"mode": mode, "layer": read_layer, "profile": profile, "sessions": sessions,
             "rows": rows, "count": len(rows), "coverage": coverage, "source": source,
             "dropped_before": max(dropped) if dropped else 0, "truncated": truncated}
 

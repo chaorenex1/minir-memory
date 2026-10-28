@@ -30,6 +30,9 @@ OBJECTIVE AND STATE
 - objective is the session's complete goal set: every goal the user stated, big or small, one
   line per goal, including a goal introduced mid-turn. No ids, no status, no source, no numbering.
   At most $MAX_GOAL_CHARS characters per line, and no item cap: never drop a goal to fit a budget.
+- A request that enumerates items becomes one goal line per item, never one line for the whole
+  request. A sub-requirement inside one goal is its own line; a qualifier on how to do the work
+  stays a constraint, not a goal.
 - current_state groups exactly those same goals under Done, Doing and Todo. Each goal appears in
   one group only. Write the goal as a goal, never a progress note, and keep the wording close to
   its objective line.

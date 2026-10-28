@@ -1,6 +1,6 @@
 ---
 id: user-self
-version: 2
+version: 3
 applies_to: [base:B1, dialectic, card_review]
 slot: body
 max_tokens: 400
@@ -43,3 +43,4 @@ QUALITY
 - A count, a version, a project state or an expiry date that will drift out of date.
 - The same fact appears in the identity and preference bodies.
 - A line is too vague to act on.
+- A line was removed or reworded without an explicit user request to remove it.

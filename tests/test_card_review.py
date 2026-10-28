@@ -383,3 +383,48 @@ def test_a_legacy_anchor_is_cleared_and_the_first_review_lands_within_a_day(
     assert "last_success_at" not in state and state["started_at"] == start + 20
     assert scheduler.due(start + 20 + 3600) is False
     assert scheduler.due(start + 20 + 86_400) is True
+
+
+def test_a_restart_keeps_the_last_success_anchor(plugin_package, store):
+    module = plugin_package.card_review
+    scheduler = module.CardReviewScheduler(
+        store, lambda since: [], subject="user:default", period=3 * 86400,
+        files_present=lambda: True)
+    now = 1_000_000.0
+    scheduler.ensure_anchor(now)
+    first = now + 86_401
+    assert scheduler.tick(first) is True
+
+    restarted = module.CardReviewScheduler(
+        store, lambda since: [], subject="user:default", period=3 * 86400,
+        files_present=lambda: True)
+    assert restarted.ensure_anchor(first + 60) == now
+    state = restarted._state()
+    assert state["last_success_at"] == pytest.approx(first)
+    assert restarted.due(first + 3600) is False
+    assert restarted.due(first + 3 * 86400 + 1) is True
+
+
+def test_a_failed_review_backs_off_even_when_a_card_is_missing(plugin_package, store):
+    module = plugin_package.card_review
+    calls = []
+
+    def failing(since):
+        calls.append(since)
+        raise module.CardReviewError("model down")
+
+    scheduler = module.CardReviewScheduler(
+        store, failing, subject="user:default", period=3 * 86400,
+        files_present=lambda: False)
+    now = 1_000_000.0
+    scheduler.ensure_anchor(now)
+    assert scheduler.due(now) is True
+    assert scheduler.tick(now) is False
+    state = scheduler._state()
+    assert state["attempts"] == 1
+    retry_at = state["next_attempt_at"]
+    assert retry_at == pytest.approx(now + 1800)
+    assert scheduler.due(now + 600) is False
+    assert scheduler.due(now + 1799) is False
+    assert scheduler.due(retry_at + 1) is True
+    assert len(calls) == 1

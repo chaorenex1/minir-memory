@@ -131,6 +131,10 @@ class MinirContextEngine(ContextEngine):
     """Audited summary compression for the host's context window."""
 
     emit_automatic_compaction_status = False
+    # The host formats this field unguarded when preflight defers
+    # (turn_context_compaction.py:291). This engine has no rough display seed, so it always
+    # mirrors the last real provider reading instead of a preflight estimate.
+    last_real_prompt_tokens: int = 0
 
     def __init__(self, *, hermes_home: str = "", state_db: str = "",
                  recall: bool = True, interval: int = 0, **kwargs: Any) -> None:
@@ -197,6 +201,7 @@ class MinirContextEngine(ContextEngine):
         self.last_prompt_tokens = prompt
         self.last_completion_tokens = completion
         self.last_total_tokens = total
+        self.last_real_prompt_tokens = prompt
 
     # -- trigger --------------------------------------------------------------
 

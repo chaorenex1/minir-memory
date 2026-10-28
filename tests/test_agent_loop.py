@@ -205,6 +205,32 @@ def test_no_system_message_means_the_host_default(loop, host):
     assert agent.system_message is None, "metadata alone never creates a system prompt"
 
 
+def test_the_run_id_is_bound_beside_the_layer(loop, host, plugin_package, monkeypatch):
+    """A tool that keeps state per run reads the run's own id, not the stream session.
+
+    The provider serving a child's tool call is bound to the session that dispatched the run, so
+    ``minir_todo`` needs an identity the run itself owns.
+    """
+    seen = {}
+    original = FakeAgent.run_conversation
+
+    def spy(self, prompt, system_message=None, **kwargs):
+        seen["layer"] = plugin_package.agent_history.current_layer()
+        seen["session"] = plugin_package.agent_history.current_session()
+        seen["run"] = plugin_package.agent_history.current_run()
+        return original(self, prompt, system_message=system_message, **kwargs)
+
+    monkeypatch.setattr(FakeAgent, "run_conversation", spy)
+    loop.run("q", system_message="brief", layer="explorer", history_session="host-session",
+             session_id="host-session:minir:explorer:job-1")
+
+    assert seen == {"layer": "explorer", "session": "host-session",
+                    "run": "host-session:minir:explorer:job-1"}
+    (agent,) = FakeAgent.instances
+    assert "session: host-session:minir:explorer:job-1" in agent.system_message
+    assert plugin_package.agent_history.current_run() == "", "the binding is reset afterwards"
+
+
 def test_only_the_intended_constructor_kwargs_are_passed(loop, host):
     """A peer run must not inherit session identity, callbacks, checkpoints or budgets."""
     loop.run("q")

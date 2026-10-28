@@ -70,7 +70,7 @@ _MAX_SCAN = 200      # candidate rows fetched per table before scoring
 #: Bumped whenever ``_migrate`` changes the shape of the file. A database already at this
 #: version skips the migration write path on open, so a second process does not rewrite the
 #: schema while the first one is writing.
-_SCHEMA_VERSION = 5
+_SCHEMA_VERSION = 6
 
 #: Requeue budget for a job whose owning process died mid-run. A death is not a failed attempt
 #: (the window is still readable), so the row goes back to ``pending`` with ``attempts``
@@ -260,6 +260,30 @@ CREATE TABLE IF NOT EXISTS adviser_reviews (
 );
 CREATE INDEX IF NOT EXISTS idx_adviser_reviews_session
     ON adviser_reviews(session_id, created_at DESC);
+CREATE TABLE IF NOT EXISTS fork_stats (
+    rule_id TEXT PRIMARY KEY,
+    scope TEXT NOT NULL DEFAULT '',
+    hits INTEGER NOT NULL DEFAULT 0,
+    overturns INTEGER NOT NULL DEFAULT 0,
+    last_hit REAL,
+    updated_at REAL NOT NULL
+);
+CREATE TABLE IF NOT EXISTS fork_ledger (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id TEXT NOT NULL DEFAULT '',
+    turn_id TEXT NOT NULL DEFAULT '',
+    kind TEXT NOT NULL,
+    key TEXT NOT NULL,
+    decision TEXT NOT NULL,
+    source TEXT NOT NULL DEFAULT '',
+    strength TEXT NOT NULL DEFAULT '',
+    rule_id TEXT NOT NULL DEFAULT '',
+    applied INTEGER NOT NULL DEFAULT 0,
+    outcome TEXT NOT NULL DEFAULT '',
+    note TEXT NOT NULL DEFAULT '',
+    created_at REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS fork_ledger_session ON fork_ledger(session_id, created_at);
 CREATE TABLE IF NOT EXISTS metrics (
     tool TEXT PRIMARY KEY,
     count INTEGER NOT NULL DEFAULT 0,
@@ -448,6 +472,9 @@ _ADDED_COLUMNS: dict[str, tuple[tuple[str, str], ...]] = {
                         # P0/P1: the claims the selector offered and the reviewer's coverage.
                         ("selected_claims", "TEXT NOT NULL DEFAULT '[]'"),
                         ("claim_coverage", "TEXT NOT NULL DEFAULT '{}'")),
+    # A ledger row names the rule that produced it, so an overturned row can demote or expire
+    # exactly that rule in ``learned.json``.
+    "fork_ledger": (("rule_id", "TEXT NOT NULL DEFAULT ''"),),
 }
 
 # Tables a previous release wrote that this one must not keep: earlier versions persisted every
@@ -770,6 +797,9 @@ class MinirStore:
             "AND NOT EXISTS (SELECT 1 FROM conclusion_versions v "
             "                WHERE v.conclusion_id = c.id)" % placeholders,
             CONCLUSION_KINDS)
+        # v5 -> v6: fork_stats and fork_ledger. Both are created by ``CREATE TABLE IF NOT
+        # EXISTS`` in ``_SCHEMA`` on every open, so the migration only has to claim the version;
+        # the rules themselves live in files, never in a column.
 
     def _migrate_dialectic_refreshes(self) -> None:
         """Rename ``base_revisions`` and drop its dead ``advices`` column (idempotent).
@@ -1445,6 +1475,126 @@ class MinirStore:
                     "SELECT * FROM scheduler_runs ORDER BY id DESC LIMIT ?",
                     (max(1, int(limit)),)).fetchall()
         return [dict(row) for row in rows]
+
+    # -- fork ledger ----------------------------------------------------------
+    # The rule text lives in ``<hermes_home>/minir-memory/forks/*.json``; these two tables keep
+    # only what a file cannot: which rule hit how often, and what was applied when. A fork that
+    # decided nothing is never written here — that would turn a session's dozens of calls into a
+    # ledger nobody reads.
+
+    def record_fork(self, kind: str, key: str, decision: str, source: str, strength: str, *,
+                    session_id: str = "", turn_id: str = "", applied: bool = False,
+                    outcome: str = "", note: str = "", rule_id: str = "") -> int:
+        """Append one fork outcome; returns the ledger id (0 when the store is closed)."""
+        with self._lock:
+            if self._conn is None:
+                return 0
+            cur = self._conn.execute(
+                "INSERT INTO fork_ledger (session_id, turn_id, kind, key, decision, source, "
+                "strength, rule_id, applied, outcome, note, created_at) VALUES (?, ?, ?, ?, ?, "
+                "?, ?, ?, ?, ?, ?, ?)",
+                (str(session_id or ""), str(turn_id or ""), str(kind), str(key)[:400],
+                 str(decision), str(source or ""), str(strength or ""), str(rule_id or ""),
+                 1 if applied else 0, str(outcome or ""), str(note or "")[:2000], time.time()))
+            self._conn.commit()
+            return int(cur.lastrowid)
+
+    def record_fork_hit(self, rule_id: str, scope: str = "") -> dict[str, int]:
+        """``hits += 1`` for one rule; returns the counters after the write."""
+        return self._fork_stat_write(rule_id, scope, hits=1)
+
+    def record_fork_overturn(self, rule_id: str, scope: str = "") -> dict[str, int]:
+        """``overturns += 1`` for one rule; returns the counters after the write."""
+        return self._fork_stat_write(rule_id, scope, overturns=1)
+
+    def _fork_stat_write(self, rule_id: str, scope: str, *, hits: int = 0,
+                         overturns: int = 0) -> dict[str, int]:
+        stamp = time.time()
+        with self._lock:
+            if self._conn is None:
+                return {"hits": 0, "overturns": 0}
+            self._conn.execute(
+                "INSERT INTO fork_stats (rule_id, scope, hits, overturns, last_hit, updated_at) "
+                "VALUES (?, ?, ?, ?, ?, ?) "
+                "ON CONFLICT(rule_id) DO UPDATE SET hits = hits + excluded.hits, "
+                "overturns = overturns + excluded.overturns, last_hit = excluded.last_hit, "
+                "updated_at = excluded.updated_at",
+                (str(rule_id), str(scope or ""), int(hits), int(overturns),
+                 stamp if hits else None, stamp))
+            self._conn.commit()
+            row = self._conn.execute(
+                "SELECT hits, overturns FROM fork_stats WHERE rule_id = ?",
+                (str(rule_id),)).fetchone()
+        return {"hits": int(row["hits"]), "overturns": int(row["overturns"])} if row else {
+            "hits": 0, "overturns": 0}
+
+    def fork_stats(self, rule_ids: Iterable[str] = ()) -> dict[str, dict[str, int]]:
+        """Counters for the given rules (all of them when none is named)."""
+        with self._lock:
+            if self._conn is None:
+                return {}
+            ids = [str(rule_id) for rule_id in rule_ids if str(rule_id or "")]
+            if ids:
+                marks = ",".join("?" * len(ids))
+                rows = self._conn.execute(
+                    f"SELECT * FROM fork_stats WHERE rule_id IN ({marks})", ids).fetchall()
+            else:
+                rows = self._conn.execute("SELECT * FROM fork_stats").fetchall()
+        return {str(row["rule_id"]): {"hits": int(row["hits"]),
+                                      "overturns": int(row["overturns"]),
+                                      "last_hit": float(row["last_hit"] or 0.0)}
+                for row in rows}
+
+    def fork_ledger(self, session_id: str = "", *, limit: int = 20,
+                    applied_only: bool = False, ungraded_only: bool = False) -> list[dict[str, Any]]:
+        """Newest fork rows, optionally for one session or only what acted."""
+        clauses: list[str] = []
+        values: list[Any] = []
+        if session_id:
+            clauses.append("session_id = ?")
+            values.append(str(session_id))
+        if applied_only:
+            clauses.append("applied = 1")
+        if ungraded_only:
+            clauses.append("outcome = ''")
+        where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
+        values.append(max(1, int(limit)))
+        with self._lock:
+            if self._conn is None:
+                return []
+            rows = self._conn.execute(
+                f"SELECT * FROM fork_ledger{where} ORDER BY id DESC LIMIT ?", values).fetchall()
+        return [dict(row) for row in rows]
+
+    def set_fork_outcome(self, ledger_id: int, outcome: str, note: str = "") -> bool:
+        """Stamp the reviewer's grade onto one applied row; ``False`` when it does not exist."""
+        with self._lock:
+            if self._conn is None:
+                return False
+            cur = self._conn.execute(
+                "UPDATE fork_ledger SET outcome = ?, note = ? WHERE id = ?",
+                (str(outcome or "")[:40], str(note or "")[:2000], int(ledger_id)))
+            self._conn.commit()
+            return cur.rowcount > 0
+
+    def fork_ledger_entry(self, ledger_id: int) -> Optional[dict[str, Any]]:
+        """One ledger row, for the reviewer's grade and the rule it names."""
+        with self._lock:
+            if self._conn is None:
+                return None
+            row = self._conn.execute(
+                "SELECT * FROM fork_ledger WHERE id = ?", (int(ledger_id),)).fetchone()
+        return dict(row) if row is not None else None
+
+    def prune_fork_ledger(self, days: int = 7, *, now: Optional[float] = None) -> int:
+        """Drop ledger rows older than *days*; the counters and the rules stay."""
+        cutoff = float(now if now is not None else time.time()) - max(1, int(days)) * 86_400.0
+        with self._lock:
+            if self._conn is None:
+                return 0
+            cur = self._conn.execute("DELETE FROM fork_ledger WHERE created_at < ?", (cutoff,))
+            self._conn.commit()
+            return int(cur.rowcount or 0)
 
     def maintain_conclusion_history(self, archive_dir: Any = None, *,
                                     now: Optional[float] = None, retain_days: int = 180,

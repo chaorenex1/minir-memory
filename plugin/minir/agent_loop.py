@@ -49,7 +49,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import Any, Callable, Optional, Sequence
 
-from . import agent_history, file_guard
+from . import accounting, agent_history, file_guard
 
 logger = logging.getLogger(__name__)
 
@@ -242,20 +242,40 @@ def _system_segments(system_message: Any) -> list[str]:
 
 
 def _run_meta(*, layer: str, meta: Optional[Mapping[str, Any]], provider: str, model: str,
-              route_source: str) -> str:
-    """The trailing ``[run-meta]`` segment: identifiers only, never credentials."""
+              route_source: str, session_id: str = "") -> str:
+    """The trailing ``[run-meta]`` segment: identifiers only, never credentials.
+
+    ``session`` is the run's own id, not the session that dispatched it: a tool that keeps state
+    per run (``minir_todo``) resolves its owner from this, so the agent can see which list is its
+    own.
+    """
     data = dict(meta or {})
     return "\n".join((
         "[run-meta]",
         _RUN_META_NOTE,
         f"layer: {layer or 'unknown'}",
         f"agent: {data.get('agent') or layer or 'unknown'}",
+        f"session: {str(session_id or '').strip() or 'none'}",
         f"provider: {provider or 'unknown'}",
         f"model: {model or 'unknown'}",
         f"parent: {data.get('parent') or 'none'}",
         f"depth: {data.get('depth', 0)}",
         f"route_source: {route_source}",
     ))
+
+
+def _account(run: AgentRun, layer: str, task: str = "") -> None:
+    """Bill this run to the conversation its caller scoped, under the layer's task name.
+
+    Only a caller that opened :func:`accounting.accounting_scope` gets a ledger row: an
+    unscoped run has no conversation to charge.
+    """
+    scope = accounting.current()
+    if scope is None:
+        return
+    accounting.record(scope[0], scope[1], task or accounting.layer_task(layer),
+                      model=run.model, provider=run.provider, usage=run.usage,
+                      api_calls=run.api_calls)
 
 
 def run(message: str, *, context: str = "", model: str = "", provider: str = "",
@@ -265,6 +285,7 @@ def run(message: str, *, context: str = "", model: str = "", provider: str = "",
         read_only: bool = False,
         history: Optional[Sequence[Mapping[str, Any]]] = None,
         session_id: str = "", layer: str = "", history_session: str = "",
+        account_task: str = "",
         skip_memory: bool = True, skip_context_files: bool = True,
         skip_background_review: bool = True,
         load_soul_identity: bool = False,
@@ -347,10 +368,13 @@ def run(message: str, *, context: str = "", model: str = "", provider: str = "",
         segments = _system_segments(system_message)
         if segments:
             segments.append(_run_meta(layer=layer, meta=meta, provider=final_provider,
-                                      model=final_model, route_source=route_source))
+                                      model=final_model, route_source=route_source,
+                                      session_id=session_id))
         system = "\n\n".join(segments) or None
         root = project_dir if project_dir is not None else str(file_guard.project_root() or "")
-        token = (agent_history.layer_context(layer, history_session)
+        # The run's own id is bound beside its layer: a tool that keeps state per run keys on it,
+        # and the provider serving that call is bound to the session that dispatched the run.
+        token = (agent_history.layer_context(layer, history_session, session_id)
                  if str(layer or "").strip() else None)
         try:
             with file_guard.aux_scope(root):
@@ -362,7 +386,7 @@ def run(message: str, *, context: str = "", model: str = "", provider: str = "",
                 agent_history.reset_layer(token)
         messages = _with_reasoning(
             _transcript(result), result.get("reasoning_content") or result.get("reasoning"))
-        return AgentRun(
+        peer = AgentRun(
             answer=(result.get("final_response") or "").strip(),
             api_calls=result.get("api_calls", 0),
             model=final_model,
@@ -371,6 +395,8 @@ def run(message: str, *, context: str = "", model: str = "", provider: str = "",
             messages=messages,
             usage=_usage(result),
         )
+        _account(peer, layer, account_task)
+        return peer
     finally:
         # One agent per run in a long-lived host: close() releases tool subprocesses and HTTP
         # clients, otherwise every run leaks them (same reason as the Feishu comment agent).
@@ -385,6 +411,7 @@ async def run_async(message: str, *, context: str = "", model: str = "", provide
                     read_only: bool = False,
                     history: Optional[Sequence[Mapping[str, Any]]] = None,
                     session_id: str = "", layer: str = "", history_session: str = "",
+                    account_task: str = "",
                     skip_memory: bool = True, skip_context_files: bool = True,
                     skip_background_review: bool = True,
                     load_soul_identity: bool = False,
@@ -395,7 +422,7 @@ async def run_async(message: str, *, context: str = "", model: str = "", provide
         toolsets=toolsets, system_message=system_message, max_iterations=max_iterations,
         project_dir=project_dir, all_tools=all_tools, read_only=read_only,
         history=history, session_id=session_id, layer=layer,
-        history_session=history_session,
+        history_session=history_session, account_task=account_task,
         skip_memory=skip_memory,
         skip_context_files=skip_context_files, skip_background_review=skip_background_review,
         load_soul_identity=load_soul_identity, meta=meta)

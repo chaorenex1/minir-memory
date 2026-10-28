@@ -16,9 +16,10 @@ It also registers ``minir_aiagent_search`` (the caller's own transcript stream) 
 ``minir_hermes_session_search`` is registered by ``adviser.register`` into the same toolset.
 
 One schema source, two delivery paths: :data:`SCHEMAS` is what ``get_tool_schemas`` returns and
-what :func:`register` puts in the registry. The handlers delegate to the live provider's
-``handle_tool_call`` so there is one implementation of every tool and no drift between the two
-surfaces.
+what :func:`register` puts in the registry — with one exception, ``minir_advise``, which exists
+on the provider surface only (see :data:`ADVISE_TOOL`). The handlers delegate to the live
+provider's ``handle_tool_call`` so there is one implementation of every tool and no drift
+between the two surfaces.
 
 :func:`agent_toolsets` also grants the host's ``file`` toolset. Those four tools are not
 re-registered here: the plugin runs the host's handlers and ``file_guard`` scopes their paths
@@ -38,12 +39,17 @@ from tools.registry import tool_error
 from .store import CONCLUSION_KINDS
 from .knowledge import DEFAULT_SEARCH_LIMIT
 from .layers import CATEGORIES, ORGS
-from . import agent_history, content_valid, kb_write
+from . import agent_history, content_valid, kb_write, minir_agents
 
 logger = logging.getLogger(__name__)
 
 TOOLSET = "minir"
 SKILL_TOOLSET= "skills"
+#: The pull consult. It is declared on the provider surface (``SCHEMAS``) and deliberately NOT
+#: registered under ``TOOLSET``: every adviser run is granted that toolset, so registering it
+#: there would let the reviewer consult itself. Excluding it from the toolset is a set-membership
+#: guarantee, not a runtime guess.
+ADVISE_TOOL = "minir_advise"
 #: The host's four file tools (``read_file``, ``write_file``, ``patch``, ``search_files``).
 #: This plugin does not re-register them: it grants the host toolset to every in-process
 #: agent it runs, and ``file_guard`` scopes the calls while that agent runs.
@@ -144,18 +150,20 @@ _TOOL_FORGET = _tool_schema(
     ("type",))
 _TOOL_TODO = _tool_schema(
     "minir_todo",
-    "Replace this session's todo list. At most two levels: a top-level item, and a child item "
-    "naming its parent's id. The whole list is stored as one row and rendered into the final "
-    "answer as a markdown table, and every prefetch block for the session carries the list. An "
-    "empty list deletes the row.",
+    "Replace your own todo list. The list belongs to the caller: a dispatched run (explorer, "
+    "researcher, worker) keeps its own, separate from the session that dispatched it, and the main "
+    "session keeps one per profile. The runtime supplies the identity; there is no session argument. "
+    "At most two levels: a top-level item, and a child item naming its parent's id. The whole list "
+    "is stored as one row and rendered into the final answer as a markdown table, and every "
+    "prefetch block for the same caller carries the list. An empty list deletes the row.",
     {"todos": _prop("The complete list; sending [] clears it.", "array",
                     items={"type": "object",
                            "properties": {
                                "id": _prop("Stable id, unique in this list (<=64 chars)."),
                                "content": _prop("What the item is (<=2000 chars)."),
                                "status": _prop("Item state.", "string",
-                                               enum=["pending", "in_progress", "completed",
-                                                     "cancelled"]),
+                                               enum=["pending", "in_progress", "blocked",
+                                                     "completed", "cancelled"]),
                                "parent": _prop("Id of the top-level item this belongs to.")},
                            "required": ["id", "content"]})},
     ("todos",))
@@ -176,7 +184,14 @@ _TOOL_AGENTS = _tool_schema(
     "last fallback. Omit "
     "tool_sets to grant every host tool. Unlike the plugin's own layer passes, this agent keeps "
     "host memory and context files and loads the operator soul by default; all four knobs can be "
-    "overridden.",
+    "overridden. By default the agent runs in the background: the result is a job handle (job_id "
+    "plus status running or queued) and the answer comes back later as a completion notification "
+    "in this conversation, so a long run does not block the turn. Pass background=false to wait "
+    f"for the answer here. At most {minir_agents.MAX_BACKGROUND_PER_SESSION} runs per session and "
+    f"{minir_agents.MAX_BACKGROUND_TOTAL} process-wide execute at once; extra jobs wait in line, "
+    f"at most {minir_agents.MAX_QUEUED_PER_SESSION} per session and "
+    f"{minir_agents.MAX_QUEUED_TOTAL} overall, and a run that holds its slot past "
+    f"{int(minir_agents.MAX_RUN_SECONDS)}s is reported as stalled with its slot released.",
     {"agent_name": _prop("Stable name for this agent; also its transcript folder and the prompt "
                          "file's name."),
      "skill_name": _prop("Skill whose agents/ folder may define the prompt (the two "
@@ -187,6 +202,12 @@ _TOOL_AGENTS = _tool_schema(
      "system_prompts": _prop("System prompt for the agent. Used only when no prompt file is "
                              "found."),
      "user_prompts": _prop("User message or task for the agent."),
+     "background": _prop("Run in the background and return a job handle immediately (default "
+                         "true). The answer arrives later as a completion notification in this "
+                         "conversation; pass false to wait for it in the tool result. A queued "
+                         "job's queue_position is its 1-based place in the process-wide waiting "
+                         "line when it was queued.",
+                         "boolean"),
      "context_files": _prop("Files to read and append as context; relative paths resolve "
                             "against project_dir (at most 20 files, 200 KB total).", "array",
                             items={"type": "string"}),
@@ -234,9 +255,22 @@ _TOOL_UNMERGE = _tool_schema(
      "reason": _prop("Why the merge is being undone.")},
     ("kind", "key", "reason"))
 
+_TOOL_ADVISE = _tool_schema(
+    ADVISE_TOOL,
+    "Ask the adviser one question synchronously about the step in progress. phase='plan' judges "
+    "the next step, 'merge' the command about to land, 'ship' the answer about to be sent. "
+    "Read-only: it writes nothing, changes no plan and blocks nothing — the merge gate is a "
+    "separate push path, so a pull consult never replaces it. Returns {verdict: go|no-go|"
+    "concern, target, advice}; a consult that answers nothing returns an error instead of a "
+    "verdict. Requires adviser_mode.enabled.",
+    {"phase": _prop("Which step to judge.", "string", enum=["plan", "merge", "ship"]),
+     "question": _prop("Optional: the specific question. Omitted asks the phase's default.")},
+    ("phase",))
+
 SCHEMAS: tuple[dict[str, Any], ...] = (
     _TOOL_SEARCH, _TOOL_KB_SEARCH, _TOOL_REMEMBER, _TOOL_FORGET, _TOOL_TODO, _TOOL_STATS,
-    _TOOL_AGENTS, _TOOL_CONTENT_VALID, _TOOL_LINK, _TOOL_UNMERGE, kb_write.SCHEMA)
+    _TOOL_AGENTS, _TOOL_CONTENT_VALID, _TOOL_LINK, _TOOL_UNMERGE, kb_write.SCHEMA,
+    _TOOL_ADVISE)
 
 
 def agent_toolsets(base: Any = None) -> list[str]:
@@ -275,6 +309,10 @@ def register(ctx: Any, provider: Any = None,
     registered: list[str] = []
     for schema in SCHEMAS:
         name = str(schema["name"])
+        if name == ADVISE_TOOL:
+            # Provider surface only. Every adviser run is granted ``TOOLSET``, so this tool must
+            # not be in it, or the reviewer could consult itself.
+            continue
 
         def handler(args: dict[str, Any], _name: str = name, **_kwargs: Any) -> str:
             # The length check reads no store, so it answers even before initialization; every

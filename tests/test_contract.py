@@ -58,8 +58,8 @@ def test_register_captures_provider(plugin_package):
     assert ctx.hooks
 
 
-def test_register_publishes_the_bundled_data_layout_skill(plugin_package):
-    """The data-layout skill ships with the plugin, so it must resolve as ``minir:data-layout``."""
+def test_register_publishes_the_bundled_skills(plugin_package):
+    """Bundled skills ship with the plugin, so they must resolve as ``minir:<name>``."""
 
     class FakeContext:
         def __init__(self):
@@ -81,13 +81,19 @@ def test_register_publishes_the_bundled_data_layout_skill(plugin_package):
     ctx = FakeContext()
     plugin_package.register(ctx)
 
-    assert [name for name, _path, _description in ctx.skills] == ["data-layout"]
-    _name, path, description = ctx.skills[0]
-    assert path.is_file() and path.name == "SKILL.md"
-    assert description.startswith("Use when")
-    text = path.read_text(encoding="utf-8")
+    assert [name for name, _path, _description in ctx.skills] == ["data-layout", "hermes-lead"]
+    for _name, path, description in ctx.skills:
+        assert path.is_file() and path.name == "SKILL.md"
+        assert description.startswith("Use when")
+
+    data_layout = ctx.skills[0][1].read_text(encoding="utf-8")
     for token in ("memory.db", "sessions/<profile>", "knowledge/<org>", "user/preference.md"):
-        assert token in text, token
+        assert token in data_layout, token
+
+    lead = ctx.skills[1][1].read_text(encoding="utf-8")
+    for token in ("minir_explorer", "minir_researcher", "minir_worker", "Scoped change",
+                  "Acceptance gate"):
+        assert token in lead, token
 
 
 def test_discovery_markers_present(plugin_package):

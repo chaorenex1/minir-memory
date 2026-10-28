@@ -102,6 +102,17 @@ def load_core(name: str) -> str:
         raise AgentPromptError(f"agent prompt {path} has a bad placeholder: {exc}") from exc
 
 
+def render_prompt(text: str) -> str:
+    """Fill ``$NAME`` placeholders from :func:`prompt_vars`; an unknown one is left as written.
+
+    Agent definitions may be operator-written files, and those legitimately quote shell variables
+    (``$HERMES_HOME`` inside a runnable command). Rendering the caps this code owns and leaving
+    every other ``$NAME`` alone keeps such a file usable. :func:`load_core` stays strict instead:
+    a packaged core with an unknown placeholder is a bug, not an operator's shell line.
+    """
+    return Template(text).safe_substitute(prompt_vars())
+
+
 OUTPUT_B1 = """OUTPUT
 Return exactly one JSON object:
 {

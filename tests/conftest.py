@@ -408,6 +408,14 @@ def _clean_tracker(plugin_package):
     _reset()
 
 
+@pytest.fixture(autouse=True)
+def _clean_watch_registry(plugin_package):
+    """The watched-run table is process-wide (see agent_watch.REGISTRY), so isolate tests."""
+    plugin_package.agent_watch.clear()
+    yield
+    plugin_package.agent_watch.clear()
+
+
 @pytest.fixture()
 def provider(make_provider):
     """Default provider: keyword recall over notes, layer reasoning off."""

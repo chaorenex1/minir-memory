@@ -61,10 +61,12 @@ from tools.registry import tool_error
 
 from . import adviser
 from . import agent_history
+from . import agent_watch
 from . import card_review
 from . import content_valid
 from . import extraction
 from . import file_guard
+from . import fork as fork_dispatch
 from . import history as host_history
 from . import kb_write
 from . import knowledge
@@ -75,16 +77,7 @@ from . import window_summary
 from . import tools as plugin_tools
 from . import vector
 from .adviser_mode import AdviserMode
-from .prompting import (
-    CONSISTENCY_TARGETS,
-    advice_handling_section,
-    advice_language_line,
-    advice_nit_report_section,
-    advice_severity_section,
-    advice_target_section,
-    craft_rules_section,
-    marker_glossary,
-)
+from .prompting import CONSISTENCY_TARGETS, marker_glossary
 from .store import (CONCLUSION_KINDS, MinirStore, SessionScopeError, format_when,
                     is_session_bound)
 # The same stored-text bound the store truncates at: a longer todo payload must be refused
@@ -133,6 +126,10 @@ _MAX_AUTHOR_CACHE = 64            # per-session last-seen author, bounded like t
 _COMPRESSION_GATE_TTL = 300.0     # seconds a crashed compression may pause periodic scheduling
 _PRE_COMPRESS_TIMEOUT = 120.0     # synchronous base -> dialectic budget before compress()
 _LAYER_DRAIN_SECONDS = 60.0       # background drain cadence when turns stop arriving
+#: Wall-clock budget the ``pre_tool_call`` callback declares for the merge gate consult (90 s) and
+#: the digest/parse around it. Host patch 0019 reads ``__hook_timeout__``; an unpatched host
+#: ignores it and the callback keeps the global ``plugins.hook_callback_timeout`` (30 s default).
+_GATE_CALLBACK_BUDGET = 120.0
 # Final-answer injection. ``transform_llm_output_inject`` queues markdown for the answer the
 # model is finishing; the host hook pops the whole session queue, so one turn cannot inherit the
 # previous turn's block. Known types render in this declaration order, unknown types after them
@@ -143,11 +140,11 @@ INJECT_STATEFUL = frozenset({"todo"})
 _MAX_INJECT_ITEMS = 20
 _MAX_INJECT_CHARS = 32 * 1024
 
-# The host's todo item shape (``tools/todo_tool.py``): two levels, four states.
-_TODO_STATUSES: tuple[str, ...] = ("pending", "in_progress", "completed", "cancelled")
-_TODO_OPEN_STATUSES = frozenset({"pending", "in_progress"})
-_TODO_PREFIX: dict[str, str] = {"pending": " ", "in_progress": "~", "completed": "x",
-                                "cancelled": "-"}
+# The host's todo item shape (``tools/todo_tool.py``): two levels. ``blocked`` is added here.
+_TODO_STATUSES: tuple[str, ...] = ("pending", "in_progress", "blocked", "completed", "cancelled")
+_TODO_OPEN_STATUSES = frozenset({"pending", "in_progress", "blocked"})
+_TODO_PREFIX: dict[str, str] = {"pending": " ", "in_progress": "~", "blocked": "!",
+                                "completed": "x", "cancelled": "-"}
 _MAX_TODO_ITEMS = 256
 _MAX_TODO_ID = 64
 _MAX_TODO_CONTENT = 2000
@@ -209,7 +206,7 @@ def _excerpt(text: str) -> str:
 def _todo_line(item: dict[str, Any], *, indent: int) -> str:
     """One prompt line: ``[x] id content`` with the state as a one-character prefix."""
     status = str(item.get("status") or "pending")
-    suffix = f"  ({status})" if status == "in_progress" else ""
+    suffix = f"  ({status})" if status in ("in_progress", "blocked") else ""
     return (f"{' ' * indent}[{_TODO_PREFIX.get(status, ' ')}] "
             f"{item.get('id')} {item.get('content')}{suffix}")
 
@@ -357,7 +354,6 @@ class MinirMemoryProvider(MemoryProvider):
             os.environ.get("MINIR_BUFFER_BYTES") or self._config.get("buffer_bytes"),
             256 * 1024 * 1024)
         self._agent_context = "primary"
-        self._user_id = ""
         self._agent_identity = ""
         self._hermes_home = ""
         self._state_db = ""
@@ -390,6 +386,9 @@ class MinirMemoryProvider(MemoryProvider):
         # Per-turn side channel: event ring + reviewer worker + llm_request delivery. Constructed
         # before initialize (the host may register hooks first); every path guards on the store.
         self._adviser_mode = AdviserMode(self)
+        # The fork dispatcher sits beside the adviser, not inside it: it answers the cheap
+        # question (is there a rule for this branch?) and hands only the expensive one over.
+        self._fork = fork_dispatch.ForkDispatcher(self)
         # One clock for every recurring decision: turn tasks tick on the host's turn thread,
         # time tasks (card review, idle extraction) run on this single daemon.
         self._scheduler = scheduler.Scheduler(
@@ -407,7 +406,11 @@ class MinirMemoryProvider(MemoryProvider):
         return True
 
     def initialize(self, session_id: str, **kwargs) -> None:
-        """Open the store. ``hermes_home`` is profile-scoped and must be used as given."""
+        """Open the store. ``hermes_home`` is profile-scoped and must be used as given.
+
+        The host's ``user_id`` kwarg is accepted and ignored: this plugin has no multi-user
+        dimension, so one profile serves one user and the profile name keys every layer row.
+        """
         hermes_home = kwargs.get("hermes_home") or self._fallback_home()
         self._hermes_home = str(hermes_home)
         self._state_db = str(Path(hermes_home) / "state.db")
@@ -425,9 +428,19 @@ class MinirMemoryProvider(MemoryProvider):
         # The host passes its surface on initialize; a bare caller gets ``cli``.
         self._platform = str(kwargs.get("platform") or self._platform or "cli")
         self._adviser_mode.session_started(self._session_id)
+        # Rules are read once per session and again after every review commit; the files are the
+        # authority, this is the cache the hot path reads. Loading here (not in the first hook)
+        # keeps a pre_tool_call off the disk.
+        self._fork.load()
+        if (self._fork.mode() == "on" or self._fork.gate_mode() != "off") and not \
+                self._adviser_mode.enabled(self._session_id):
+            logger.warning(
+                "Minir forks: %s with the adviser disabled — the static rules still act, but "
+                "nothing is learned, no gate can answer and no consult is possible",
+                self._fork.mode())
         self._agent_context = str(kwargs.get("agent_context") or "primary")
-        # Identity the host hands us: drives which subject each layer's artifact belongs to.
-        self._user_id = str(kwargs.get("user_id") or "")
+        # ``user_id`` is part of the host's kwargs and is ignored on purpose: one profile is
+        # one user, so the profile name is the subject key for every layer.
         self._agent_identity = str(kwargs.get("agent_identity") or "")
         self._profile = (host_history.profile_name(self._state_db, self._session_id)
                          or str(kwargs.get("profile") or kwargs.get("profile_name") or "default"))
@@ -453,7 +466,7 @@ class MinirMemoryProvider(MemoryProvider):
             on_written=self._index_page_edges)
         self._worker = LayerWorker(
             self._store, self._transcript, enabled=self._reasoning,
-            agent_identity=self._agent_identity, user_id=self._user_id,
+            agent_identity=self._agent_identity,
             state_db=self._state_db, profile=self._profile,
             identity=self._identity, preference=self._preference,
             identity_source=self._identity_source,
@@ -595,16 +608,56 @@ class MinirMemoryProvider(MemoryProvider):
              "env_var": "MINIR_KNOWLEDGE_IDLE_HOURS"},
             {"key": "session_mode", "description": "Mode stamped on each newly opened session",
              "type": "text", "default": DEFAULT_SESSION_MODE, "env_var": "MINIR_SESSION_MODE"},
+            # -- fork dispatch (adviser_mode.forks) -------------------------------------------
+            # Off by default: with every key at its default the provider behaves exactly as it
+            # did before this layer existed.
+            {"key": "forks",
+             "description": "Fork dispatch: off, shadow (classify and record only) or on",
+             "type": "text", "default": "off", "choices": ["off", "shadow", "on"],
+             "env_var": "MINIR_FORKS"},
+            {"key": "fork_rules_max",
+             "description": "Cap on learned fork rules; the least recently hit are dropped",
+             "type": "integer", "default": "500", "minimum": 1,
+             "env_var": "MINIR_FORK_RULES_MAX"},
+            {"key": "fork_compress_chars",
+             "description": "Result size above which a compress rule may distill the output",
+             "type": "integer", "default": "4000", "minimum": 400,
+             "env_var": "MINIR_FORK_COMPRESS_CHARS"},
+            {"key": "fork_retry_limit",
+             "description": "Identical failures after which the retry guard refuses the call",
+             "type": "integer", "default": "2", "minimum": 1,
+             "env_var": "MINIR_FORK_RETRY_LIMIT"},
+            {"key": "fork_ttl_days",
+             "description": "Days a learned fork rule lives before the review expires it",
+             "type": "integer", "default": "14", "minimum": 0,
+             "env_var": "MINIR_FORK_TTL_DAYS"},
+            {"key": "gates",
+             "description": "Integration gate: off, shadow (judge and record, never block) or "
+                            "merge (block on no-go; needs host patch 0019)",
+             "type": "text", "default": "off", "choices": ["off", "shadow", "merge"],
+             "env_var": "MINIR_GATES"},
+            {"key": "gate_timeout_s",
+             "description": "Adviser budget for one gate consult (the callback declares 120 s)",
+             "type": "integer", "default": "90", "minimum": 1, "maximum": 120,
+             "env_var": "MINIR_GATE_TIMEOUT_S"},
+            {"key": "advise_tool",
+             "description": "Expose minir_advise, the pull consult for plan/merge/ship",
+             "type": "boolean", "default": "true", "choices": ["true", "false"],
+             "env_var": "MINIR_ADVISE_TOOL"},
         ]
 
     # -- prompt + layer state -------------------------------------------------
 
     def system_prompt_block(self) -> str:
-        """Session-static prompt text: memory, the user's preferences, craft, adviser contract."""
+        """Session-static prompt text: the memory contract and the two user cards.
+
+        Craft rules and the adviser contract do not ride this block: the craft routing lives in
+        the skills the host loads by name, and the adviser-side vocabulary lives in that agent's
+        own rules and review prompt.
+        """
         logger.info("Minir system_prompt_block (built once per session)")
         return "\n\n".join(part for part in (
-            self._memory_prompt_block(), self._cards_prompt_block(),
-            self._craft_prompt_block(), self._adviser_prompt_block()) if part)
+            self._memory_prompt_block(), self._cards_prompt_block()) if part)
 
     def _cards_prompt_block(self) -> str:
         """The two global user cards: identity and standing preferences.
@@ -660,9 +713,24 @@ class MinirMemoryProvider(MemoryProvider):
             "should outlive this turn, not transient state, and never store secrets or "
             "credentials.\n"
             "- minir_forget: delete one stored conclusion by conclusions_id and kind.\n"
-            "- minir_todo: replace this session's todo list; it is rendered into the final "
-            "answer and carried by every prefetch block for the session.\n"
+            "- minir_todo: replace the caller's todo list (the profile for the main session, the "
+            "agent for a dispatched run); it is rendered into the final answer and carried by "
+            "every prefetch block for the same owner.\n"
             "- minir_stats: inspect the store and the published layer artifacts.\n"
+            "\nGLOBAL CARDS\n"
+            "- The global cards outlive the store: the user card (minir-memory/user/identity.md, "
+            "minir-memory/user/preference.md) is rendered into every session's system prompt, and "
+            "this profile's AI card (minir-memory/agents/<profile>/identity.md, "
+            "minir-memory/agents/<profile>/preference.md) is the durable record the review pass "
+            "rewrites and the adviser reads.\n"
+            "- Memory management is not finished until the card says it: a standing preference, a "
+            "correction to who the operator is, or a stable fact about yourself goes into the "
+            "matching card part in the same turn with minir_remember(remember_mode=\"card\", "
+            "type=<part>, content=<full body>, reason=<why>), and a card line that has become "
+            "wrong is cleared with minir_forget(remember_mode=\"card\", type=<part>, "
+            "reason=<why>). A conclusion alone leaves the rendered card stale.\n"
+            "- Card content is that part's whole new body, not a patch: the other parts stay as "
+            "they are, and the write is global, not scoped to this session.\n"
             "\nWORKFLOW\n"
             "1. Search before asking the user to repeat history.\n"
             "2. Answer from the current conversation; reach for memory only to fill a gap or to "
@@ -672,44 +740,6 @@ class MinirMemoryProvider(MemoryProvider):
             "4. When a stored item is superseded or wrong, delete it with minir_forget rather "
             "than storing a contradiction."
         )
-
-    @staticmethod
-    def _craft_prompt_block() -> str:
-        """Static craft contract; emitted regardless of adviser_mode and consult gating."""
-        return craft_rules_section()
-
-    def _adviser_prompt_block(self) -> str:
-        """Dynamic adviser contract, gated on the configured surface."""
-        try:
-            enabled = self._adviser_mode.enabled(self._session_id)
-            adviser_only = enabled and self._adviser_mode.mode(self._session_id) == "adviser_only"
-        except Exception:
-            return ""
-        if not enabled:
-            return ""
-        parts = [
-            "# Advisers",
-            "Advice from the main adviser is advice, never authority. You own the decision and "
-            "the verification.",
-        ]
-        if enabled:
-            parts.extend([
-                "Live advice may arrive mid-turn as:\n"
-                "- `[adviser — advisory only] ... [end adviser]`\n"
-                "The adviser sees events, not your full brief. Do not restate or thank it.",
-                advice_severity_section(),
-                advice_target_section(heading="ADVICE TARGETS", grouped=True),
-                advice_handling_section(),
-                advice_nit_report_section(),
-                advice_language_line(),
-                "Advice is injected only when it clears the severity floor; do not wait for a "
-                "turn-boundary advice block.",
-            ])
-        if adviser_only:
-            brief = self._adviser_mode.mode_brief(self._session_id)
-            if brief:
-                parts.append(brief)
-        return "\n\n".join(parts)
 
     def prefetch(self, query: str = "", *, session_id: str = "") -> str:
         """The live layer state and the todo list; nothing else rides the turn.
@@ -723,7 +753,7 @@ class MinirMemoryProvider(MemoryProvider):
         session = session_id or self._session_id
         state, state_items = self._layer_block(session)
         stale, stale_items = self._stale_block(session)
-        todo, todo_items = self._todo_block(session)
+        todo, todo_items = self._todo_block()
         block = "\n\n".join(part for part in (state, stale, todo) if part)
         count = state_items + stale_items + todo_items if block else 0
         self._last_recall = (RecallStatus(provider_label=_PROVIDER_LABEL, count=count,
@@ -819,17 +849,30 @@ class MinirMemoryProvider(MemoryProvider):
 
     # -- todo list -------------------------------------------------------------
 
-    @staticmethod
-    def _todo_key(session: str) -> str:
-        """The one row per session that holds the whole list."""
-        return f"session:{session}:todo"
+    def _todo_owner(self) -> tuple[str, str]:
+        """Who owns the todo list right now: ``(name, session)``.
 
-    def _todo_items(self, session: str) -> list[dict[str, Any]]:
-        """The stored list for one session; ``[]`` when it has none or the row is unreadable."""
+        The main session's name is its profile. A dispatched run binds its own layer and run id
+        (``agent_loop.layer_context``), so its list is keyed by the agent's name and the run's own
+        session id: the provider serving the call belongs to the session that dispatched the run,
+        and keying on that session alone would overwrite the parent's list.
+        """
+        name = agent_history.current_layer().strip() or str(self._profile or "").strip()
+        session = agent_history.current_run().strip() or str(self._session_id or "").strip()
+        return name, session
+
+    @staticmethod
+    def _todo_key(name: str, session: str) -> str:
+        """The one row per owner that holds the whole list."""
+        return f"todo:{name or 'unknown'}:{session}"
+
+    def _todo_items(self, owner: tuple[str, str]) -> list[dict[str, Any]]:
+        """The stored list for one owner; ``[]`` when it has none or the row is unreadable."""
+        name, session = owner
         if self._store is None or not session:
             return []
         try:
-            row = self._store.get_conclusion("todo", self._todo_key(session))
+            row = self._store.get_conclusion("todo", self._todo_key(name, session))
             if not row:
                 return []
             payload = json.loads(str(row.get("content") or ""))
@@ -855,9 +898,9 @@ class MinirMemoryProvider(MemoryProvider):
                     lines.append(_todo_line(child, indent=4))
         return lines
 
-    def _todo_block(self, session: str) -> tuple[str, int]:
+    def _todo_block(self) -> tuple[str, int]:
         """The todo list as a prefetch block; never routed through query recall."""
-        items = self._todo_items(session)
+        items = self._todo_items(self._todo_owner())
         if not items:
             return "", 0
         return "\n".join(self._todo_lines(items)), len(items)
@@ -876,6 +919,8 @@ class MinirMemoryProvider(MemoryProvider):
                   for status in _TODO_STATUSES}
         summary = (f"Todo: {counts['completed']}/{len(items)} done, "
                    f"{counts['in_progress']} in progress, {counts['pending']} pending.")
+        if counts["blocked"]:
+            summary += f" {counts['blocked']} blocked."
         if counts["cancelled"]:
             summary += f" {counts['cancelled']} cancelled."
         return "\n".join(rows) + "\n\n" + summary
@@ -922,23 +967,29 @@ class MinirMemoryProvider(MemoryProvider):
         return items, ""
 
     def _handle_todo(self, args: dict[str, Any]) -> str:
-        """Replace the session's todo list and queue the table for this answer."""
-        session = self._session_id
+        """Replace the caller's todo list and queue the table for this answer.
+
+        The caller is the main session (name: the profile) or a dispatched run (name: the agent,
+        session: the run's own id). Both parts come from the run context the host binds, so a
+        child never edits the list of the session that dispatched it.
+        """
+        name, session = self._todo_owner()
         if not session:
-            return tool_error("no session id: the todo list is per session")
+            return tool_error("no session id: the todo list is per run")
         raw = args.get("todos")
         if not isinstance(raw, list):
             return tool_error("todos must be a list")
         items, error = self._validate_todos(raw)
         if error:
             return tool_error(error)
-        key = self._todo_key(session)
+        key = self._todo_key(name, session)
+        owner = {"name": name, "session_id": session}
         if not items:
             row = self._store.get_conclusion("todo", key)
             deleted = bool(row is not None
                            and self._store.forget_conclusion("todo", int(row["id"])))
             return json.dumps({"stored": False, "deleted": deleted, "count": 0, "open": 0,
-                               "session_id": session})
+                               **owner})
         payload = json.dumps({"todos": items}, ensure_ascii=False)
         if len(payload) > _MAX_CONCLUSION_CHARS:
             return tool_error(f"todo_too_large: {len(payload)} chars "
@@ -946,11 +997,11 @@ class MinirMemoryProvider(MemoryProvider):
         conclusions_id = self._store.save_conclusion(
             "todo", payload, key=key, session_id=session, subject="tool")
         # The answer being composed gets the table; the next turn's prefetch gets the counts.
-        self.transform_llm_output_inject("todo", self._todo_table(items))
+        self.transform_llm_output_inject("todo", self._todo_table(items), session_id=session)
         open_count = sum(1 for item in items
                          if str(item.get("status")) in _TODO_OPEN_STATUSES)
         return json.dumps({"stored": True, "conclusions_id": conclusions_id,
-                           "count": len(items), "open": open_count, "session_id": session})
+                           "count": len(items), "open": open_count, **owner})
 
     # -- final-answer injection ------------------------------------------------
 
@@ -1467,6 +1518,7 @@ class MinirMemoryProvider(MemoryProvider):
         pages = extraction.extract_pages(
             session_id=session, summary=summary_text,
             markers=snapshot, usage=usage, hermes_home=self._hermes_home,
+            state_db=self._state_db,
             transcript=self._transcript, profile=self._profile, window_end=window_end)
         written = 0
         results = knowledge.run_value_markers(
@@ -1725,6 +1777,20 @@ class MinirMemoryProvider(MemoryProvider):
             return kb_write.handle(
                 args or {}, hermes_home=self._hermes_home, language=self._language,
                 source_session=str(getattr(self, "_session_id", "") or ""))
+        if tool_name == plugin_tools.ADVISE_TOOL:
+            # A read-only consult: no store write, so it answers before the store opens too.
+            if not _coerce_bool(self._config.get("advise_tool"), True):
+                return tool_error("minir_advise is off (adviser_mode.advise_tool: false)")
+            if not self._adviser_mode.enabled(self._session_id):
+                return tool_error("the adviser is off; there is nobody to consult")
+            if agent_watch.is_child(self._session_id):
+                # A dispatched run asking the adviser is the adviser asking itself one remove
+                # later: the review already owns that judgement.
+                return tool_error("minir_advise is not available to a dispatched child run")
+            return json.dumps(
+                self._fork.advise(self._session_id, str((args or {}).get("phase") or ""),
+                                  str((args or {}).get("question") or "").strip()),
+                ensure_ascii=False)
         if self._store is None:
             return tool_error("Minir is not initialized")
         args = args or {}
@@ -2112,7 +2178,13 @@ def register(ctx) -> None:
     ctx.register_hook("post_llm_call", _hook(_on_post_llm_call, provider))
     ctx.register_hook("post_tool_call", _hook(_on_post_tool_call, provider))
     # ``adviser_only`` is enforced before execution; returning action=block wins the gate.
-    ctx.register_hook("pre_tool_call", _hook(_on_pre_tool_call, provider))
+    # The callback declares a longer budget for the synchronous merge gate; host patch 0019 is
+    # what reads it, and without the patch the attribute is inert (the global timeout applies).
+    pre_tool_call = _hook(_on_pre_tool_call, provider)
+    pre_tool_call.__hook_timeout__ = _GATE_CALLBACK_BUDGET
+    ctx.register_hook("pre_tool_call", pre_tool_call)
+    # Result distillation: additive and fail-open, so a timeout there just keeps the original.
+    ctx.register_hook("transform_tool_result", _hook(_on_transform_tool_result, provider))
     # Verify-on-stop gate: a live blocker may keep a code-editing turn going once.
     ctx.register_hook("pre_verify", _hook(_on_pre_verify, provider))
     # Final-answer injection: the host hands the rendered answer here, the last point where a
@@ -2270,7 +2342,11 @@ def _on_pre_llm_call(session_id: str = "", turn_id: str = "",
     try:
         if kwargs.get("parent_session_id"):
             return None
-        if session_id and provider._session_id and session_id != provider._session_id:
+        # A watched background run is observed under its own session id, so the recorder call
+        # and the ``adviser_only`` brief below are what this adapter is here for.
+        watched = bool(session_id) and agent_watch.is_child(session_id)
+        if (session_id and provider._session_id and session_id != provider._session_id
+                and not watched):
             return None
         # The adviser-mode event ring needs the user's goal for this turn; the advice delivery
         # below is the existing turn-boundary channel (both sources share the ledger).
@@ -2311,6 +2387,12 @@ def _on_post_tool_call(tool_name: str = "", session_id: str = "",
     if resolved is not None:
         resolved.record_metric(tool_name, duration_ms,
                                error=bool(kwargs.get("error") or kwargs.get("is_error")))
+        # The retry guard needs the failure, not the advice ring: fed before the adviser call so
+        # it also counts when adviser mode would return early.
+        resolved._fork.observe_tool(
+            session_id, tool_name, kwargs.get("args"),
+            error=kwargs.get("error_message") or ("" if not (
+                kwargs.get("error") or kwargs.get("is_error")) else "failed"))
         resolved._adviser_mode.on_post_tool_call(
             session_id=session_id, turn_id=str(kwargs.get("turn_id") or ""),
             tool_name=tool_name, status=str(kwargs.get("status") or ""),
@@ -2319,20 +2401,63 @@ def _on_post_tool_call(tool_name: str = "", session_id: str = "",
             error=kwargs.get("error"), is_error=kwargs.get("is_error"))
 
 
-def _on_pre_tool_call(tool_name: str = "", session_id: str = "",
-                      provider: Optional[MinirMemoryProvider] = None,
-                      **kwargs) -> Optional[dict[str, str]]:
-    """``adviser_only`` enforcement plus the blocker gate (``adviser_mode.block_tools``)."""
+def _on_transform_tool_result(tool_name: str = "", args: Any = None, result: Any = None,
+                              session_id: str = "", status: str = "",
+                              provider: Optional[MinirMemoryProvider] = None,
+                              **kwargs) -> Optional[str]:
+    """Distill an oversized result when a compress rule covers this call.
+
+    ``transform_tool_result`` is fail-open (a timeout drops the replacement and keeps the
+    original), so this path may do arithmetic but must never be the thing a decision depends on.
+    """
     resolved = _resolve_provider(provider)
     if resolved is None:
         return None
+    try:
+        return resolved._fork.transform(
+            session_id or resolved._session_id, tool_name, args, str(result or ""),
+            status=status)
+    except Exception as exc:  # a broken replacement must never cost the tool result
+        logger.warning("Minir transform_tool_result failed: %s", exc)
+        return None
+
+
+def _on_pre_tool_call(tool_name: str = "", session_id: str = "",
+                      provider: Optional[MinirMemoryProvider] = None,
+                      **kwargs) -> Optional[dict[str, Any]]:
+    """``adviser_only`` enforcement, the operator gate, then the fork decisions.
+
+    Order is priority: a scope refusal outranks the operator claim gate, which outranks the
+    retry guard, which outranks the integration gate, which outranks a rule rewrite. A rule can
+    never block (``normalize_rule`` drops ``block``), and a learned rule can never reach the
+    ``block`` branch — only the two fixed guards and the operator-authorized gate can.
+    """
+    resolved = _resolve_provider(provider)
+    if resolved is None:
+        return None
+    args = kwargs.get("args")
     if file_guard.aux_active():
-        reason = file_guard.check(tool_name, kwargs.get("args") or {}, resolved._hermes_home)
+        reason = file_guard.check(tool_name, args or {}, resolved._hermes_home)
         if reason:
             return {"action": "block", "message": reason}
-    reason = resolved._adviser_mode.block_reason(session_id, tool_name,
-                                                 args=kwargs.get("args"))
-    return {"action": "block", "message": reason} if reason else None
+    reason = resolved._adviser_mode.block_reason(session_id, tool_name, args=args)
+    if reason:
+        return {"action": "block", "message": reason}
+    fork = resolved._fork
+    guard = fork.retry_guard(tool_name, args, session=session_id)
+    if guard is not None:
+        return {"action": "block", "message": f"jev: {guard.reason}"}
+    if fork.is_integration(tool_name, args):
+        gate = fork.resolve_gate(session_id, tool_name, args)
+        if gate is not None:
+            return {"action": "block", "message": f"jev gate: {gate.reason}"}
+    rewrite = fork.resolve_now("arg", tool_name, args=args, hook="pre_tool", session=session_id)
+    if rewrite is not None and rewrite.decision == "rewrite":
+        patch = dict(rewrite.payload.get("args") or {})
+        if patch:
+            # The host shallow-merges these keys into the original arguments.
+            return {"action": "modify", "args": patch}
+    return None
 
 
 def _on_pre_verify(session_id: str = "", changed_paths: Any = None,

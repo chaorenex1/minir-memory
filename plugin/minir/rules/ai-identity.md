@@ -1,6 +1,6 @@
 ---
 id: ai-identity
-version: 2
+version: 3
 applies_to: [base:B2, dialectic, card_review]
 slot: body
 max_tokens: 500
@@ -42,3 +42,4 @@ BOUNDARIES
 - A version number, a lifecycle list or a project state that will drift out of date.
 - The same fact appears in the identity and preference bodies.
 - A line describes the task or the user instead of the assistant.
+- A line was removed or reworded without an explicit request from the operator to remove it.

@@ -7,6 +7,13 @@
 - 同时给出主提示词中“如何与主 adviser 交互”的章节，以及实现记录
 - 代码基线：`plugin/minir/adviser.py`、`adviser_mode.py`、`__init__.py`、`prompting.py`、`store.py`
 
+> 2026-10-28 更新：`system_prompt_block()` 不再拼 `_craft_prompt_block()` 与
+> `_adviser_prompt_block()`；两个方法及只服务它们的渲染器（`craft_rules_section()`、
+> `advice_target_section()`、`advice_severity_section()`、`advice_handling_section()`、
+> `advice_nit_report_section()`、`advice_language_line()`）与 `ADVICE_SEVERITIES`、
+> `ADVICE_HANDLING`、`ADVICE_TARGET_GROUPS` 一并删除。本文 §2.1 的 block 草稿、§3.1 的
+> 11/13/15 条与 §4 的相关条目是历史记录；当前行为见 §2.1.1。
+
 ## 0. 设计边界
 
 一个主 adviser，两个入口。两者共用同一身份、同一 `auxiliary.adviser` 路由、同一 CORE 与证据纪律；只有触发方式与输出契约不同：
@@ -51,7 +58,7 @@ dialectic candidates ───────────┘
 | Artifact | 所有者 | 何时加载 | 放什么 |
 |---|---|---|---|
 | `SOUL.md` | 操作者 | 主会话 / gateway / cron / minir adviser | 通用立场：建议是建议，不是授权；不写插件标记、工具名、模式名 |
-| minir `system_prompt_block()` | 插件 | provider 激活时 | 记忆工具 + **主 adviser 建议标记** + `adviser_only` 策略（按配置门控）+ `adviser_consult` 用法（按工具注册门控） |
+| minir `system_prompt_block()` | 插件 | provider 激活时 | 记忆工具 + 两张用户卡（identity / preference）；craft 与 adviser 段已于 2026-10-28 移出（§2.1.1） |
 | 主 adviser `CORE + MODE_*` | 插件 | consult / review 调用 | 一个顾问身份、证据纪律、候选分级、两个输出契约 |
 | `adviser.py` tool adapter | 插件 | 注册时 | `adviser_consult` schema；handler 转发到主 adviser 的 `consult()` |
 | `adviser_only` brief | 插件 | `mode == adviser_only` | 只读策略块 |
@@ -395,9 +402,9 @@ review_prompt = "\n\n".join([CORE, MODE_REVIEW, REVIEW_BUDGET, ADVICE_TARGETS])
 
 ## 2. 主提示词交互
 
-### 2.1 Provider block 草稿（`system_prompt_block()`）
+### 2.1 Provider block 草稿（`system_prompt_block()`，已撤销）
 
-以下内容放在 minir 的 `system_prompt_block()`，不是 SOUL。`[...]` 是构建时的门控注释，不进入最终文本。
+以下内容曾放在 minir 的 `system_prompt_block()`，不是 SOUL。`[...]` 是构建时的门控注释，不进入最终文本。2026-10-28 起这段草稿不再生效，当前拼接见 §2.1.1。
 
 ```text
 # Craft Rules
@@ -501,32 +508,26 @@ turns — for a second opinion on a decision, design, diagnosis, or a plan with 
   evidence, evidence wins.
 ```
 
-### 2.1.1 动态拼接
+### 2.1.1 当前拼接
 
-`system_prompt_block()` 不手写上面的段落；构建时从 `prompting.py` 生成：
+`system_prompt_block()` 只拼两段，顺序固定：
 
-- `craft_rules_section()` → `# Craft Rules`（静态文本，不受 adviser 门控）
-- `ADVICE_SEVERITIES` → `ADVICE SEVERITY`
-- `ADVICE_TARGETS`（全量 13 个：`name`, `definition`, `usage`）→ `ADVICE TARGETS`；action 与 artifact 直接投递，memory 标 candidate-only
-- `advice_handling_section()` → `ADVICE HANDLING`
-- `advice_nit_report_section()` → `NIT REPORTING`
-- `advice_language_line()` → `ADVICE LANGUAGE`
+1. `_memory_prompt_block()` → `# Minir Memory`
+2. `_cards_prompt_block()` → `# User Identity` / `# User Preferences`（空卡不输出）
 
-分组由 `ADVICE_TARGET_GROUPS` 定义，顺序固定为 action / artifact / memory；`advice_target_section(grouped=True)` 按组渲染，不再假设只有两组。
+`_craft_prompt_block()` 与 `_adviser_prompt_block()` 已删除（2026-10-28），连同只服务它们的
+`prompting.craft_rules_section()`、`advice_target_section()`、`advice_severity_section()`、
+`advice_handling_section()`、`advice_nit_report_section()`、`advice_language_line()`、
+`ADVICE_SEVERITIES`、`ADVICE_HANDLING`、`ADVICE_TARGET_GROUPS`。
 
-`_adviser_prompt_block()` 仍只返回 `# Advisers` 及之后的段；craft 由独立的 `_craft_prompt_block()` 返回，两者在 `system_prompt_block()` 中按 memory → craft → adviser 合并。
-
-拼接顺序（memory 块之后）与门控：
-
-1. `# Craft Rules`：始终输出，不看 `adviser_mode` 与 consult 注册状态。它是主 agent 的输出契约，不是建议通道。
-2. `# Advisers` 通用句：`adviser_mode.enabled` 或 consult 已注册时输出。
-3. `[if adviser_mode.enabled(session)]`：live marker + SEVERITY + TARGETS + HANDLING + NIT REPORTING + LANGUAGE。
-4. `[if mode(session) == "adviser_only"]`：policy brief。
-5. `[if adviser_consult is registered]`：consult 用法。
-
-craft 块放在 adviser 块之前，因为"产物该不该存在、该怎么写"先于"建议如何处理"。两个块之间不共享状态；`advice_target_section()` 与 craft block 都从 `prompting.py` 取词，避免同一规则出现两份措辞。
-
-`adviser_mode` 关闭时不输出 severity/targets/handling；consult 返回 prose，不依赖这些 token。
+- craft 路由由 SOUL 的 `# Craft` 与按名加载的 `antislop` / `anti-overengineering` 技能承担。
+- adviser 侧的词表与判级仍由 `rules/advice_target.md`、`rules/advice_judgment.md` 与
+  `prompts/adviser/review.md` 承担；`ADVICE_TARGETS`、`ACTION_TARGETS`、`ARTIFACT_TARGETS`、
+  `CONSISTENCY_TARGETS`、`DELIVERED_TARGETS`、`TARGET_NEEDS` 留在 `prompting.py`，
+  `adviser_mode` 的解析与 `fork` 的 target 校验继续使用它们。
+- 主 agent 的 system prompt 不再出现 advice 标记说明、severity/targets/handling 表或
+  `adviser_only` brief。`adviser_only` 的写保护仍由 `pre_tool_call` 强制，brief 仍由
+  `pre_llm_call` 按回合注入；两者都不依赖这一段静态文本。
 
 ### 2.2 SOUL 只保留通用句
 
@@ -629,7 +630,8 @@ craft block 与 SOUL 的分工：
 
 ### 3.1 本次新增（已落地）
 
-以下为本次实现记录；回归测试在 `tests/test_adviser_mode.py` 与 `tests/test_provider.py`。
+以下为本次实现记录；回归测试在 `tests/test_adviser_mode.py` 与 `tests/test_provider.py`。craft 与
+adviser 两段已在 2026-10-28 从 provider block 撤销（见 §2.1.1），下面 11/13/15 条保留为历史记录。
 
 11. **craft block**：`prompting.craft_rules_section()` 保存静态文本；`MinirProvider._craft_prompt_block()` 返回它；`system_prompt_block()` 按 `memory → craft → adviser` 顺序拼接。craft 不受 `adviser_mode` 与 consult 门控。
 12. **artifact targets**：`ADVICE_TARGETS` 增加 `output_surface` 与 `code_economy`；新增 `ARTIFACT_TARGETS`、`DELIVERED_TARGETS = ACTION_TARGETS + ARTIFACT_TARGETS` 与 `ADVICE_TARGET_GROUPS = (action, artifact, memory)`；`advice_target_section(grouped=True)` 按组渲染。
@@ -659,8 +661,8 @@ craft block 与 SOUL 的分工：
 - 候选读取上限 `candidate_limit` 默认 6；consume 状态为 `consumed` + `review_id`；legacy review 注入已删除；`candidate_id` 写入 `evidence`（`candidate:<id>`）。
 - 主 adviser 是唯一建议投递通道：已确认。`[adviser — advisory only]` + `[adviser-only mode]` 两个标记。
 - advice 分级：`blocker` / `concern` / `nit`；候选按 live 证据重新分级、合并或丢弃。
-- system block 动态拼接 advice 分级/分类/处理矩阵：已确认。`prompting.py` 是唯一源；`system_prompt_block()` 按 §2.1.1 门控拼接，不手写重复表。
-- Advice targets 全量覆盖：已确认。`ADVICE_TARGETS` 为 `(name, definition, usage)`，13 个已落地，见 §3.1；system block 与 REVIEW 动态生成。
+- system block 动态拼接 advice 分级/分类/处理矩阵：已撤销（2026-10-28，见 §2.1.1）。
+- Advice targets 全量覆盖：已确认。`ADVICE_TARGETS` 为 `(name, definition, usage)`，13 个已落地，见 §3.1；REVIEW 动态生成，provider block 不再携带（§2.1.1）。
 - 两个 craft 技能的角色：已确认。`antislop` 是表面过滤器（文字、界面、移动布局、无障碍、注释）；`anti-overengineering` 是代码体量刹车（防御层、抽象、版本文件、校验、测试、模块规模）。两者互不替代。
 - 配合顺序：已确认。先刹车后表面；清理任务先做结构删除，最后做注释卫生。理由：被删掉的代码不需要再打磨文案与注释。
 - 冲突优先级：已确认。用户明确指令 > 工具证据 > craft rules；craft rules 内部按功能正确性 > 代码体量 > 表面呈现排序。
@@ -679,6 +681,6 @@ craft block 与 SOUL 的分工：
 
 - `adviser_mode` 关闭时是否需要可选的边界兜底：当前无；候选只保留为审计数据。若需要，单独加配置，不恢复为默认行为。
 - consult 是否读取完整 live event ring：当前只读 long-term digest + pending candidates，不复制事件环。
-- craft block 是否需要在技能缺失时降级：当前不降级。该块只做路由与优先级，不含判级清单；技能缺失时路由仍成立，但 blocker/concern 的判定只剩 review prompt 与技能里的版本。
+- craft block 是否需要在技能缺失时降级：不再适用。craft 段已从 provider block 撤销（§2.1.1），路由由技能与 SOUL 承担。
 - artifact advice 每轮 1+1 的预算是否按模型能力调整：当前固定 1+1，防止风格建议刷屏。
 - 是否把两个技能改为 `skills.auto_load` 常驻：当前不采用。`antislop` 核心 57 KB，常驻成本高；路由加按需 `skill_view` 已够。

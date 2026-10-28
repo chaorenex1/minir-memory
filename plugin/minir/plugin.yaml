@@ -23,6 +23,7 @@ provides_hooks:
   - post_llm_call
   - post_tool_call
   - pre_tool_call
+  - transform_tool_result
   - pre_verify
   - transform_llm_output
   - on_interim_message

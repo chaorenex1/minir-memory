@@ -200,7 +200,35 @@ try:
     assert minir_entry is not None, "minir_search was not registered in the tool registry"
     assert minir_entry.toolset == "minir", "unexpected toolset: %%r" %% minir_entry.toolset
     from toolsets import resolve_toolset
-    assert set(tools) <= set(resolve_toolset("minir")), "the minir toolset does not resolve the provider's tools"
+    # ``minir_advise`` is provider-surface only: every adviser run is granted the ``minir``
+    # toolset, so the pull consult must not be in it (it would let the reviewer consult itself).
+    registered_toolset = set(resolve_toolset("minir"))
+    assert set(tools) - {"minir_advise"} <= registered_toolset, \
+        "the minir toolset does not resolve the provider's tools"
+    assert "minir_advise" not in registered_toolset, \
+        "minir_advise must not be reachable through the toolset an adviser run receives"
+
+    # Host capability the merge gate depends on: host patch 0019 lets one callback declare its own
+    # budget. On a host without it the gate still runs and keeps the global 30 s, so its absence is
+    # reported instead of failing the probe; a present implementation is asserted to behave.
+    from hermes_cli import plugins_dispatch
+
+    callback_budget = bool(getattr(plugins_dispatch, "_CALLBACK_TIMEOUT_ATTR", ""))
+    if callback_budget:
+        def _declared(**_kwargs):
+            return None
+
+        _declared.__hook_timeout__ = 120
+        assert plugins_dispatch._callback_budget(_declared, 30.0) == 120.0, \
+            "a declared callback budget is not honoured"
+        _declared.__hook_timeout__ = 100000
+        assert (plugins_dispatch._callback_budget(_declared, 30.0)
+                <= plugins_dispatch._MAX_HOOK_CALLBACK_TIMEOUT_SECS), "the budget is not clamped"
+        _declared.__hook_timeout__ = 0
+        assert plugins_dispatch._callback_budget(_declared, 30.0) == 30.0, \
+            "a disabled budget must fall back to the global value"
+    else:
+        print("NOTE: host patch 0019 is not installed; the pre_tool callback keeps the global budget")
 
     print(json.dumps({
         "discovered": len(names),
@@ -214,6 +242,7 @@ try:
         "engine": {"loaded": engine.name, "folded_messages": len(history) - len(folded)},
         "adviser": {"aux_tasks": aux_keys, "session_search": session_entry.toolset,
                     "agent_search": agent_entry.toolset},
+        "forks": {"advise_tool": "minir_advise" in tools, "callback_budget": callback_budget},
         "queue": [{"layer": job["layer"], "session": job["session_id"], "turns": job["turns"],
                    "window": [round(job["from_ts"], 3), round(job["to_ts"], 3)], "status": job["status"]}
                   for job in provider._store.pending_jobs()],

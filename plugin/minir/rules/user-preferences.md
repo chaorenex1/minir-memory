@@ -1,6 +1,6 @@
 ---
 id: user-preferences
-version: 2
+version: 3
 applies_to: [base:B1, dialectic, card_review]
 slot: body
 max_tokens: 400
@@ -42,3 +42,4 @@ QUALITY
 - A taboo line has no trigger word or scenario.
 - A line conflicts with the operator-declared material.
 - A line is too vague to guide the next action.
+- A line was removed or reworded without an explicit user request to remove it.
