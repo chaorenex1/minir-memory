@@ -13,7 +13,8 @@ SCHEMA = {
     "name": TOOL_NAME,
     "description": (
         "Create or edit one Minir knowledge page at the file level. `create` writes the page "
-        "header once; every other op addresses the body by line or by exact text. Each call "
+        "header once; every other op addresses the body by line or by exact text. The body has "
+        "no line count, line length or character cap: write the claims the page needs. Each call "
         "re-reads the file, verifies the change, and returns {status, file, path, org, category, "
         "topic, lines, bytes, sha256, verified, warnings, error}. A failed verification restores "
         "the previous bytes. Pass expect_sha from a search result to refuse a stale write."),
@@ -57,7 +58,7 @@ def handle(args: dict, *, hermes_home: str, language: str = "en",
             position=str((args or {}).get("position") or "after"),
             expect_sha=str((args or {}).get("expect_sha") or ""),
             language=language,
-            budget=int(budget or knowledge.DEFAULT_BUDGET),
+            budget=int(budget),
             source_session=str(source_session or ""),
         )
     except Exception as exc:

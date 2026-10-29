@@ -483,6 +483,21 @@ def test_kb_write_creates_a_page_through_the_tool(provider, plugin_package):
     assert page.is_file() and "docker system prune -af" in page.read_text(encoding="utf-8")
 
 
+def test_kb_write_carries_a_page_past_the_old_body_caps(provider, plugin_package):
+    """The tool path takes no page-size budget: a long page lands byte for byte."""
+    body = "\n".join(f"{index}. claim {index} " + "filler " * 40 for index in range(16))
+    payload = json.loads(provider.handle_tool_call(
+        "minir_kb_write",
+        {"path": "tools/METHOD-long-page.md", "op": "create", "topic": "long page",
+         "summary": "a page past the old body caps", "content": body}))
+
+    assert payload["status"] == "created" and payload["verified"] is True, payload
+    assert payload["lines"] == 16 and payload["warnings"] == []
+    page = (plugin_package.knowledge.knowledge_dir(provider._hermes_home)
+            / "tools" / "METHOD-long-page.md")
+    assert page.read_text(encoding="utf-8").count("claim ") == 16
+
+
 def test_search_scope_all_crosses_sessions(provider):
     provider._store.save_conclusion(
         "projects", "cross session fact", session_id=provider._session_id)

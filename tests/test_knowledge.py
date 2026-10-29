@@ -374,6 +374,22 @@ def test_edit_page_creates_then_edits_by_line_and_text(knowledge, tmp_path):
     assert "first line" not in target.read_text(encoding="utf-8")
 
 
+def test_create_has_no_line_count_length_or_token_cap(knowledge, tmp_path):
+    path = "tools/METHOD-long-page.md"
+    body = "\n".join(f"{index}. claim {index} " + "filler " * 40 for index in range(14))
+    assert len(body.splitlines()) > 8 and len(body) > 1200 and max(map(len, body.splitlines())) > 200
+    created = knowledge.edit_page(
+        root=tmp_path, path=path, op="create", budget=0,
+        header={"topic": "long page", "summary": "a page past the old body caps"},
+        content=body)
+    assert created["status"] == "created" and created["verified"], created
+    assert created["warnings"] == []
+    _meta, page_body = knowledge._read_document(tmp_path / path)
+    _heading, page_content = knowledge._split_heading(page_body)
+    claim_lines = page_content.splitlines()
+    assert len(claim_lines) == 14 and claim_lines[-1].startswith("13. claim 13")
+
+
 def test_a_failed_verification_restores_the_previous_bytes(knowledge, tmp_path, monkeypatch):
     path = "tools/METHOD-restore.md"
     knowledge.edit_page(root=tmp_path, path=path, op="create",

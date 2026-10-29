@@ -60,10 +60,7 @@ MAX_BLOCK_CHARS = 700
 QUEUE_MAX = 512
 RECENCY_DAYS = 30.0
 SUMMARY_MAX = 120
-PAGE_BODY_MAX = 1200          # the same cap the B4 prompt states; points, not prose
-PAGE_BODY_MIN_LINES = 3
-PAGE_BODY_MAX_LINES = 8
-PAGE_LINE_MAX = 200
+PREVIEW_CHARS = 1200          # bounds a search read-back only; page length is the writer's call
 _FRONT_MATTER_READ = 16_384
 
 BLOCK_HEADER = "[knowledge — retrieve on demand]"
@@ -691,14 +688,14 @@ def _write_unit(unit: Any, *, root: Path, language: str, budget: int,
     revisions = stored_revisions + 1 if existing else 1
     updated_at = _now()
     produced_at = str(existing_meta.get("produced_at") or "") or updated_at
-    limit = max(1, int(budget))
+    limit = int(budget)  # 0 or less means the caller set no page cap
 
     def compose(candidate: str) -> str:
         return _compose(category=category, org=org, topic=topic, unit=unit, body=candidate,
                         revisions=revisions, updated_at=updated_at, produced_at=produced_at)
 
     text = compose(body)
-    if estimate_tokens(text) > limit:
+    if limit > 0 and estimate_tokens(text) > limit:
         trimmed = _fit_by_dropping_evidence(body, compose, limit)
         if trimmed is None:
             raise KnowledgeError(
@@ -764,11 +761,6 @@ def _set_front_matter(text: str, updates: Mapping[str, Any]) -> str:
 
 def _page_warnings(lines: Sequence[str]) -> list[str]:
     warnings: list[str] = []
-    if len(lines) > PAGE_BODY_MAX_LINES:
-        warnings.append(f"body has {len(lines)} lines; the page contract allows at most "
-                        f"{PAGE_BODY_MAX_LINES}")
-    if any(len(line) > PAGE_LINE_MAX for line in lines):
-        warnings.append(f"a line is longer than {PAGE_LINE_MAX} characters")
     if any(line.lstrip().startswith(("本页", "我们", "本次")) for line in lines[:1]):
         warnings.append("the body opens with a preamble instead of a claim")
     return warnings
@@ -992,12 +984,8 @@ def _create_page(root: Path, target: Path, rel: str, org: str, category: str, sl
         return _edit_failure(root, category, topic, "create", rel,
                             "the file stem must equal slugify(topic)")
     lines = content.strip("\n").splitlines() if content.strip("\n") else []
-    if len(lines) < PAGE_BODY_MIN_LINES or len(lines) > PAGE_BODY_MAX_LINES:
-        return _edit_failure(root, category, topic, "create", rel,
-                            f"body must be {PAGE_BODY_MIN_LINES}..{PAGE_BODY_MAX_LINES} lines")
-    if len(content.strip("\n")) > PAGE_BODY_MAX:
-        return _edit_failure(root, category, topic, "create", rel,
-                            f"body exceeds {PAGE_BODY_MAX} characters")
+    if not lines:
+        return _edit_failure(root, category, topic, "create", rel, "content is empty")
     summary = " ".join(str(header.get("summary") or "").split())
     if not summary or len(summary) > SUMMARY_MAX:
         return _edit_failure(root, category, topic, "create", rel,
@@ -1228,10 +1216,10 @@ def _page_row(path: Path, relative: str, category: str) -> Optional[dict[str, An
     _meta, body = _read_document(path)
     _heading, content = _split_heading(body)
     body_lines = content.splitlines()
-    truncated = len(content) > PAGE_BODY_MAX or len(body_lines) > 40
+    truncated = len(content) > PREVIEW_CHARS or len(body_lines) > 40
     shown = body_lines[:40]
-    if len(content) > PAGE_BODY_MAX:
-        content = content[:PAGE_BODY_MAX].rstrip() + "…"
+    if len(content) > PREVIEW_CHARS:
+        content = content[:PREVIEW_CHARS].rstrip() + "…"
     return {"file": path.name, "path": relative, "org": relative.split("/")[0],
             "category": page_category, "topic": topic,
             "summary": str(meta.get("summary") or ""), "revisions": _revisions(meta),
