@@ -117,13 +117,10 @@ OUTPUT_B1 = """OUTPUT
 Return exactly one JSON object:
 {
   "user_self_representation": "<markdown body>",
-  "user_preferences": "<markdown body>",
-  "window_summary": "<the B3 child's markdown, copied verbatim>",
-  "value_markers": [<the B4 child's marker objects, copied verbatim>],
-  "page_writes": [<the B4 child's write results, copied verbatim>]
+  "user_preferences": "<markdown body>"
 }
-The card values are markdown text, not objects; an empty string is a valid empty card. A failed
-child leaves its key as "" or []. No code fence, no extra keys.
+Both values are markdown text, not objects; an empty string is a valid empty card. No code fence,
+no extra keys.
 """
 
 OUTPUT_B2 = """OUTPUT
@@ -136,24 +133,12 @@ Both values are markdown text, not objects: the body as you want it in the file.
 a valid empty card. No code fence, no extra keys.
 """
 
-OUTPUT_B3 = """OUTPUT
-Return exactly one JSON object:
-{"window_summary": "<the section as one string, newlines escaped as \\n>"}
-No prose, no code fence, no extra keys.
-"""
-
-OUTPUT_B4 = """OUTPUT
-Return exactly one JSON object with the units you wrote and the write results you observed:
-{"value_markers": [<units>], "page_writes": [<minir_kb_write results, topic added>]}
-No prose, no code fence, no extra keys.
-"""
-
 OUTPUT_DIALECTIC = """OUTPUT
 Return exactly one JSON object:
 {
   "user_card": {"user_self_representation": "<markdown body>", "user_preferences": "<markdown body>"},
   "ai_card": {"ai_self_representation": "<markdown body>", "ai_identity": "<markdown body>"},
-  "window_summary": "## Window Summary ... the same template as the base pass, filled in",
+  "window_summary": "<the window summary BODY: the template filled in, without the '## Window Summary' heading>",
   "base_changed": {"changed": false, "fields": []},
   "changes": [{"scope": "user_card", "part": "user_self_representation", "op": "update",
                "reason": "", "sessions": []}],
@@ -251,28 +236,6 @@ def validate_user_preferences(value: Any) -> str:
 def validate_user_card(value: Any) -> dict[str, str]:
     data = _keys(value, "user_card", USER_PARTS)
     return {part: validate_card_body(data[part], f"user_card.{part}") for part in USER_PARTS}
-
-
-def validate_base_pass(value: Any) -> dict[str, Any]:
-    """B1's reply: cards and summary keep their contracts, markers are data.
-
-    ``page_writes`` is optional because a run whose page tool failed still has markers worth
-    publishing; an unknown extra key there would kill the same window the marker tolerance is
-    meant to save.
-    """
-    data = _keys(value, "base_pass",
-                 ("user_self_representation", "user_preferences", "window_summary"),
-                 optional=("value_markers", "page_writes"))
-    card = validate_user_card({
-        "user_self_representation": data["user_self_representation"],
-        "user_preferences": data["user_preferences"]})
-    summary = validate_summary_pass({"window_summary": data["window_summary"]})["window_summary"]
-    markers = coerce_value_markers(data.get("value_markers"))
-    writes = data.get("page_writes")
-    if not isinstance(writes, list):
-        writes = []
-    return {**card, "window_summary": summary, "value_markers": markers,
-            "page_writes": [dict(item) for item in writes[:MAX_UNITS] if isinstance(item, dict)]}
 
 
 def validate_ai_card(value: Any) -> dict[str, str]:
@@ -493,7 +456,7 @@ def render_artifact(*, user_self_representation: dict[str, Any], user_preference
                     summary: str, value_markers: list[dict[str, Any]]) -> str:
     """The four-section artifact, in the order the parser and the cross-session rules expect."""
     try:
-        summary_md = summary_template.validate(summary)
+        summary_md = summary_template.render_section(summary)
     except WindowSummaryError as exc:
         raise LayerContractError(str(exc)) from exc
     return "\n\n".join([

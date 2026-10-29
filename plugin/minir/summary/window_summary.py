@@ -114,16 +114,35 @@ def validate_nonempty(text: Any) -> str:
     return value
 
 
-def missing_section_heading(text: Any) -> bool:
-    """True when the section heading the merge matches is absent from a summary.
+def render_section(body: Any) -> str:
+    """The section with its code-owned heading.
 
-    ``layers.is_artifact`` matches ``## Window Summary`` verbatim, so a model that translates it
-    ("## 窗口摘要") produces a summary the merge can only reject after every child pass ran.
-    Checking at the pass boundary turns that into the format error it is and lets the pass retry
-    the child. The eight field headings are the template's content shape, not a merge condition,
-    so they are not checked here: a section the model left thin costs quality, not the window.
+    The model writes the body; ``## Window Summary`` is added here, so a translated heading can
+    no longer invalidate a window. A stored section that already opens with the heading (a row
+    written before this rule, or the template itself) is returned unchanged -- the check is the
+    first non-empty line, not a substring, so a body that merely mentions the phrase keeps it.
     """
-    return SECTION_HEADING not in {line.strip() for line in str(text or "").splitlines()}
+    text = validate(body)
+    if not text:
+        return SECTION_HEADING
+    first = next((line.strip() for line in text.splitlines() if line.strip()), "")
+    return text if first == SECTION_HEADING else f"{SECTION_HEADING}\n\n{text}"
+
+
+def body_text(text: Any) -> str:
+    """The section without its heading line: what the chunk chain stores.
+
+    A section written before the heading moved into code still opens with ``## Window
+    Summary``; this is the one place that strips it, so a legacy row and a body-only row reach
+    the chunk chain in the same shape.
+    """
+    value = validate(text)
+    lines = value.splitlines()
+    while lines and not lines[0].strip():
+        lines.pop(0)
+    if lines and lines[0].strip() == SECTION_HEADING:
+        lines = lines[1:]
+    return "\n".join(lines).strip()
 
 
 def empty_summary() -> str:

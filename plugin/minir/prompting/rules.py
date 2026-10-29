@@ -62,9 +62,13 @@ def _body(text: str) -> str:
     return "\n".join(lines[end + 1:]).strip()
 
 
-def rule_text(rule_id: str, *, override_dir: Optional[Path | str] = None,
-              hermes_home: str = "") -> str:
-    """One rule's body: the operator override if it exists, then the packaged file."""
+def rule_path(rule_id: str, *, override_dir: Optional[Path | str] = None,
+              hermes_home: str = "") -> Path:
+    """The file ``rule_text`` would read: a readable operator override, else the packaged copy.
+
+    A locator that names a rule must point at the file the code itself would use; an override
+    that exists but cannot be read is skipped here for the same reason ``rule_text`` skips it.
+    """
     packaged = PACKAGE_RULES_DIR / f"{rule_id}.md"
     if not packaged.exists():
         raise RulesError(f"rule {rule_id!r} missing from {PACKAGE_RULES_DIR}")
@@ -73,10 +77,26 @@ def rule_text(rule_id: str, *, override_dir: Optional[Path | str] = None,
         path = override / f"{rule_id}.md"
         if path.exists():
             try:
-                return _body(path.read_text(encoding="utf-8-sig"))
-            except (OSError, UnicodeError) as exc:
-                logger.warning("Minir rule override %s unreadable (%s); using the packaged file",
-                               path, exc)
+                path.read_text(encoding="utf-8-sig")
+                return path
+            except (OSError, UnicodeError):
+                pass
+    return packaged
+
+
+def rule_text(rule_id: str, *, override_dir: Optional[Path | str] = None,
+              hermes_home: str = "") -> str:
+    """One rule's body: the operator override if it exists, then the packaged file.
+
+    ``rule_path`` already verified the override is readable; a file that disappears between
+    that check and this read still falls back, because one bad override must not stop every pass.
+    """
+    path = rule_path(rule_id, override_dir=override_dir, hermes_home=hermes_home)
+    try:
+        return _body(path.read_text(encoding="utf-8-sig"))
+    except (OSError, UnicodeError) as exc:
+        logger.warning("Minir rule file %s unreadable (%s)", path, exc)
+    packaged = PACKAGE_RULES_DIR / f"{rule_id}.md"
     try:
         return _body(packaged.read_text(encoding="utf-8-sig"))
     except (OSError, UnicodeError) as exc:

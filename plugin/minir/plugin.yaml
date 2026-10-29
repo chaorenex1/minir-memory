@@ -43,3 +43,6 @@ provides_tools:
   - minir_kb_write
   - minir_link
   - minir_unmerge
+  - minir_get
+  - minir_state
+  - minir_window

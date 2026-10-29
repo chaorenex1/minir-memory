@@ -380,6 +380,12 @@ def _no_real_adviser_route(plugin_package, monkeypatch, request):
 
     monkeypatch.setattr(worker.LayerWorker, "_adviser_consult", _consult)
 
+    def _run_child(self, name, prompt, session, tool_sets):
+        """B3/B4 are child agents; a unit test must not launch one either."""
+        return self._consult(plugin_package.layers.load_core(name), prompt)
+
+    monkeypatch.setattr(worker.LayerWorker, "_run_child", _run_child)
+
 
 @pytest.fixture(autouse=True)
 def _clean_minir_env(monkeypatch):

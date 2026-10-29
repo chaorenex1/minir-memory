@@ -36,7 +36,7 @@ from typing import Any, Callable, Optional
 
 from tools.registry import tool_error
 
-from ..store.store import CONCLUSION_KINDS
+from ..store.store import CONCLUSION_KINDS, REFRESH_COLUMNS
 from ..knowledge.knowledge import DEFAULT_SEARCH_LIMIT
 from ..passes.layers import CATEGORIES, ORGS
 from ..agentrun import agent_history
@@ -60,13 +60,15 @@ FILE_TOOLSET = "file"
 TOOL_NAMES: tuple[str, ...] = (
     "minir_search", "minir_kb_search", "minir_remember", "minir_forget", "minir_todo",
     "minir_stats", "minir_agents", content_valid.TOOL_NAME,
-    "minir_link", "minir_unmerge", kb_write.TOOL_NAME, "minir_aiagent_search")
+    "minir_link", "minir_unmerge", kb_write.TOOL_NAME,
+    "minir_get", "minir_state", "minir_window", "minir_aiagent_search")
 
 _EMOJI: dict[str, str] = {
     "minir_search": "🔎", "minir_kb_search": "📚", "minir_remember": "📌", "minir_forget": "🗑️",
     "minir_todo": "✅", "minir_stats": "📊", "minir_agents": "🧩",
     content_valid.TOOL_NAME: "📏", "minir_link": "🔗", "minir_unmerge": "↩️",
-    kb_write.TOOL_NAME: "📝",
+    kb_write.TOOL_NAME: "📝", "minir_get": "📄", "minir_state": "🗃️",
+    "minir_window": "🪟",
 }
 
 
@@ -255,6 +257,65 @@ _TOOL_UNMERGE = _tool_schema(
      "reason": _prop("Why the merge is being undone.")},
     ("kind", "key", "reason"))
 
+_TOOL_GET = _tool_schema(
+    "minir_get",
+    "Read one conclusion row by its exact kind and key — the locator form every layer pass is "
+    "given. Unlike minir_search this is not ranked: the key must match exactly, and a missing "
+    "row returns found=false instead of an empty string. projection='paths' returns the page "
+    "paths and markdown headings inside the content instead of the whole text (use it to see "
+    "which pages a markers row already covers before writing one). Superseded rows are refused "
+    "unless include_superseded=true.",
+    {"kind": _prop("Conclusion kind, e.g. base.user_representation, base.ai_identity_card, "
+                   "base.value_markers, dialectic.review, window_summary."),
+     "key": _prop("Exact conclusion key, e.g. user:default or agent:default:minir."),
+     "projection": _prop("'text' (default, the whole row content) or 'paths' (only the .md "
+                         "paths and headings the content mentions).",
+                         "string", enum=["text", "paths"]),
+     "include_superseded": _prop("Return a row whose status is superseded; default false.",
+                                 "boolean")},
+    ("kind", "key"))
+
+_TOOL_STATE = _tool_schema(
+    "minir_state",
+    "Read the current published artifact of one layer for one subject — the locator form a pass "
+    "uses instead of being handed the artifact inline. layer_state holds one row per "
+    "(layer, subject), so this is the current version only; history lives in minir_window.",
+    {"layer": _prop("Layer name.", "string", enum=["base", "dialectic", "card_review",
+                                                   "identity_meta"]),
+     "subject": _prop("Subject key, e.g. user:default or agent:default:minir.")},
+    ("layer", "subject"))
+
+_TOOL_WINDOW = _tool_schema(
+    "minir_window",
+    "Read base-layer refresh rows by locator. A row is identified by "
+    "(session_id, subject, window_from_ts) and carries six parts: "
+    + ", ".join(REFRESH_COLUMNS) + ". Exactly one of window_from_ts / before_ts / after_ts / "
+    "latest usually applies. Draft rows (a refresh still being assembled) are invisible unless "
+    "include_drafts=true; they never count as published. format='parts' returns the columns as "
+    "a JSON-decoded dict, format='text' returns them rendered in artifact order. max_chars caps "
+    "each column (0 = no cap) and the reply sets truncated=true when it cut something.",
+    {"session_id": _prop("Session to read; defaults to this session."),
+     "subject": _prop("Subject key; defaults to user:<profile>."),
+     "window_from_ts": _prop("Exact window start (microsecond tolerance) — the unique key with "
+                             "session_id and subject.", "number"),
+     "window_to_ts": _prop("Window end to verify; a row whose end differs is reported as not "
+                           "found (a fixed window never drifts).", "number"),
+     "before_ts": _prop("The newest row whose window starts before this epoch.", "number"),
+     "after_ts": _prop("The oldest row whose window starts after this epoch.", "number"),
+     "latest": _prop("Only the current published row (is_latest=1).", "boolean"),
+     "include_drafts": _prop("Also return rows a refresh has not published yet; default false.",
+                             "boolean"),
+     "parts": _prop("Columns to return; unknown column names are an error, not ignored.",
+                    "array", items={"type": "string", "enum": list(REFRESH_COLUMNS)}),
+     "order": _prop("Order across rows; 'newest' (default) or 'oldest'.", "string",
+                    enum=["newest", "oldest"]),
+     "limit": _prop("Rows to return, 1..10 (default 1).", "integer", minimum=1, maximum=10),
+     "max_chars": _prop("Per-column cap in characters, 0 for none (default 4000).", "integer",
+                        minimum=0),
+     "format": _prop("'parts' (default) for decoded columns, 'text' for artifact-order "
+                     "markdown.", "string", enum=["parts", "text"])},
+    ())
+
 _TOOL_ADVISE = _tool_schema(
     ADVISE_TOOL,
     "Ask the adviser one question synchronously about the step in progress. phase='plan' judges "
@@ -270,7 +331,7 @@ _TOOL_ADVISE = _tool_schema(
 SCHEMAS: tuple[dict[str, Any], ...] = (
     _TOOL_SEARCH, _TOOL_KB_SEARCH, _TOOL_REMEMBER, _TOOL_FORGET, _TOOL_TODO, _TOOL_STATS,
     _TOOL_AGENTS, _TOOL_CONTENT_VALID, _TOOL_LINK, _TOOL_UNMERGE, kb_write.SCHEMA,
-    _TOOL_ADVISE)
+    _TOOL_GET, _TOOL_STATE, _TOOL_WINDOW, _TOOL_ADVISE)
 
 
 def agent_toolsets(base: Any = None) -> list[str]:

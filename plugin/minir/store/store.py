@@ -63,14 +63,13 @@ from typing import Any, Iterable, Mapping, NamedTuple, Optional
 
 logger = logging.getLogger(__name__)
 
-_MAX_CONTENT = 12000  # stored text is truncated to this many chars
 _MAX_TERMS = 8       # query tokens considered per search
 _MAX_SCAN = 200      # candidate rows fetched per table before scoring
 
 #: Bumped whenever ``_migrate`` changes the shape of the file. A database already at this
 #: version skips the migration write path on open, so a second process does not rewrite the
 #: schema while the first one is writing.
-_SCHEMA_VERSION = 7
+_SCHEMA_VERSION = 8
 
 #: Requeue budget for a job whose owning process died mid-run. A death is not a failed attempt
 #: (the window is still readable), so the row goes back to ``pending`` with ``attempts``
@@ -500,7 +499,10 @@ _ADDED_COLUMNS: dict[str, tuple[tuple[str, str], ...]] = {
     "base_refreshes": (("value_markers", "TEXT NOT NULL DEFAULT ''"),
                        # Set once per session when the six calibrated conclusions were
                        # published; the guard the four boundary hooks share.
-                       ("conclusions_published_at", "REAL")),
+                       ("conclusions_published_at", "REAL"),
+                       # When this window's row was published. A row written segment by
+                       # segment stays NULL (a draft) and no reader may see it.
+                       ("published_at", "REAL")),
     "advisories": (("review_id", "INTEGER NOT NULL DEFAULT 0"),
                    ("delivered_at", "REAL"),
                    ("request_id", "TEXT NOT NULL DEFAULT ''"),
@@ -560,6 +562,10 @@ _BASE_REVISION_COLUMNS: tuple[str, ...] = (
     "user_representation", "user_peer_card", "ai_self_representation",
     "ai_identity_card", "window_summary", "value_markers",
 )
+
+#: The six refresh columns as a public name: the read tools and the segment writer both name
+#: them, and one tuple is what keeps those names from drifting.
+REFRESH_COLUMNS: tuple[str, ...] = _BASE_REVISION_COLUMNS
 
 # Recall weight per kind: the nine conclusions, the five markers, and the two retired kinds that
 # still carry rows (``window_summary`` inherits the deleted base row's 1.0).
@@ -646,6 +652,11 @@ def _split_sections(content: str, headings: tuple[tuple[str, str, str], ...]) ->
         end = positions[index + 1][0] if index + 1 < len(positions) else len(content)
         sections[heading] = content[start:end].strip()
     return sections
+
+
+def scope_key(scope: str, subject: str, session_id: str, ai_subject: str = "") -> str:
+    """The conclusion-key rule, public: a pass builds its locators from the same function."""
+    return _scope_key(scope, subject, session_id, ai_subject)
 
 
 def _scope_key(scope: str, subject: str, session_id: str, ai_subject: str = "") -> str:
@@ -791,12 +802,17 @@ class MinirStore:
             "UPDATE advisories SET status = 'pending', request_id = '' WHERE status = 'staged'")
         # An older release flagged the row written last. Restore the invariant now that
         # ``is_latest`` means the greatest window: clear, then promote one row per subject.
-        self._conn.execute("UPDATE base_refreshes SET is_latest = 0")
+        # A draft row (``published_at`` NULL) must never be promoted: its segments are
+        # written by a job that has not finished.
+        self._conn.execute(
+            "UPDATE base_refreshes SET is_latest = 0 WHERE published_at IS NOT NULL")
         self._conn.execute(
             "UPDATE base_refreshes SET is_latest = 1 WHERE id IN ("
-            "SELECT b.id FROM base_refreshes AS b WHERE b.id = ("
+            "SELECT b.id FROM base_refreshes AS b "
+            "WHERE b.published_at IS NOT NULL AND b.id = ("
             "SELECT x.id FROM base_refreshes AS x "
             "WHERE x.session_id = b.session_id AND x.subject = b.subject "
+            "AND x.published_at IS NOT NULL "
             "ORDER BY x.window_to_ts DESC, x.window_from_ts DESC, x.id DESC LIMIT 1))")
         self._conn.commit()
 
@@ -847,6 +863,10 @@ class MinirStore:
             for trigger in ("conclusions_ai", "conclusions_ad", "conclusions_au"):
                 self._conn.execute(f"DROP TRIGGER IF EXISTS {trigger}")
             self._conn.execute("DROP TABLE IF EXISTS conclusions_fts")
+        # v7 -> v8: every row written before this release was published by definition; the
+        # column is what lets a partially written draft stay invisible to every reader.
+        self._conn.execute(
+            "UPDATE base_refreshes SET published_at = created_at WHERE published_at IS NULL")
         # ``is_latest`` normalization and staged-request recovery are data repairs too; see
         # ``_repair_rows`` (every open, not only on a shape change).
         # v4 -> v5: one open history row per eligible marker that predates the table. Conclusions
@@ -1216,7 +1236,7 @@ class MinirStore:
             "session_id = excluded.session_id, subject = excluded.subject, "
             "evidence = excluded.evidence, version = conclusions.version + 1, "
             "status = excluded.status, updated_at = excluded.updated_at",
-            (kind, key, session_id or "", subject or "", (content or "")[:_MAX_CONTENT],
+            (kind, key, session_id or "", subject or "", content or "",
              evidence or "[]", max(0, int(version)), status, created_at or stamp, stamp))
         row = self._conn.execute(
             "SELECT id, version FROM conclusions WHERE kind = ? AND key = ?", (kind, key)).fetchone()
@@ -1226,7 +1246,7 @@ class MinirStore:
                 "content, evidence, status, version, valid_from, recorded_at) "
                 "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (int(row["id"]), kind, key, session_id or "", subject or "",
-                 (content or "")[:_MAX_CONTENT], evidence or "[]", status,
+                 content or "", evidence or "[]", status,
                  int(row["version"]), stamp, stamp))
         return int(row["id"]) if row is not None else 0
 
@@ -2276,7 +2296,7 @@ class MinirStore:
                 "ON CONFLICT(layer, subject) DO UPDATE SET "
                 "version = version + 1, content = excluded.content, "
                 "session_id = excluded.session_id, updated_at = excluded.updated_at",
-                (layer, subject, content[:_MAX_CONTENT], session_id or "", time.time()),
+                (layer, subject, content, session_id or "", time.time()),
             )
             row = self._conn.execute(
                 "SELECT version FROM layer_state WHERE layer = ? AND subject = ?", (layer, subject)).fetchone()
@@ -2343,66 +2363,173 @@ class MinirStore:
         one is retained as history with ``is_latest = 0``. ``BEGIN IMMEDIATE`` serializes the
         read-then-write across provider instances, so two workers cannot both promote a row.
         """
-        now = time.time()
-        session_key = session_id or ""
-        subject_key = subject or ""
-        values = (session_key, subject_key, float(window_from_ts), float(window_to_ts),
-                  window_from_turn, window_to_turn, user_representation or "",
-                  user_peer_card or "", ai_self_representation or "", ai_identity_card or "",
-                  window_summary or "", value_markers or "", now)
+        columns = {
+            "user_representation": user_representation,
+            "user_peer_card": user_peer_card,
+            "ai_self_representation": ai_self_representation,
+            "ai_identity_card": ai_identity_card,
+            "window_summary": window_summary,
+            "value_markers": value_markers,
+        }
         with self._lock:
             if not self._conn.in_transaction:
                 self._conn.execute("BEGIN IMMEDIATE")
             try:
-                current = self._conn.execute(
-                    "SELECT id, window_to_ts FROM base_refreshes "
-                    "WHERE session_id = ? AND subject = ? AND is_latest = 1 LIMIT 1",
-                    (session_key, subject_key)).fetchone()
-                existing = self._conn.execute(
-                    "SELECT id, is_latest, window_to_ts FROM base_refreshes "
-                    "WHERE session_id = ? AND subject = ? AND window_from_ts = ?",
-                    (session_key, subject_key, float(window_from_ts))).fetchone()
-                # A retry may extend the same window; never shrink it.
-                effective_to = float(window_to_ts)
-                if existing is not None:
-                    effective_to = max(effective_to, float(existing["window_to_ts"]))
-                current_to = float(current["window_to_ts"]) if current is not None else None
-                if existing is not None and int(existing["is_latest"]) == 1:
-                    is_latest = 1
-                elif current_to is None or effective_to > current_to:
-                    is_latest = 1
-                else:
-                    is_latest = 0
-                if is_latest:
-                    self._conn.execute(
-                        "UPDATE base_refreshes SET is_latest = 0 "
-                        "WHERE session_id = ? AND subject = ? AND is_latest = 1 "
-                        "AND window_from_ts <> ?",
-                        (session_key, subject_key, float(window_from_ts)))
-                self._conn.execute(
-                    "INSERT INTO base_refreshes (session_id, subject, window_from_ts, window_to_ts, "
-                    "window_from_turn, window_to_turn, user_representation, user_peer_card, "
-                    "ai_self_representation, ai_identity_card, window_summary, "
-                    "value_markers, is_latest, created_at) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
-                    "ON CONFLICT(session_id, subject, window_from_ts) DO UPDATE SET "
-                    "window_to_ts = MAX(base_refreshes.window_to_ts, excluded.window_to_ts), "
-                    "window_from_turn = excluded.window_from_turn, "
-                    "window_to_turn = excluded.window_to_turn, "
-                    "user_representation = excluded.user_representation, "
-                    "user_peer_card = excluded.user_peer_card, "
-                    "ai_self_representation = excluded.ai_self_representation, "
-                    "ai_identity_card = excluded.ai_identity_card, "
-                    "window_summary = excluded.window_summary, "
-                    "value_markers = excluded.value_markers, "
-                    "is_latest = excluded.is_latest, created_at = excluded.created_at",
-                    (*values[:12], is_latest, values[12]))
-                row = self._conn.execute(
-                    "SELECT id FROM base_refreshes WHERE session_id = ? AND subject = ? "
-                    "AND window_from_ts = ?",
-                    values[:3]).fetchone()
+                row_id = self._write_base_row(
+                    session_id or "", subject or "", window_from_ts=window_from_ts,
+                    window_to_ts=window_to_ts, window_from_turn=window_from_turn,
+                    window_to_turn=window_to_turn, columns=columns, published=True)
                 self._conn.commit()
-                return int(row["id"]) if row is not None else 0
+                return row_id
+            except Exception:
+                self._conn.rollback()
+                raise
+
+    def _write_base_row(self, session_key: str, subject_key: str, *, window_from_ts: float,
+                        window_to_ts: float, window_from_turn: Optional[int],
+                        window_to_turn: Optional[int], columns: Mapping[str, str],
+                        published: bool) -> int:
+        """Insert or update one refresh row; caller holds the lock and the transaction.
+
+        ``published`` decides visibility: a draft keeps ``is_latest = 0`` and a NULL
+        ``published_at``, never demotes the current row and never overwrites a column an
+        earlier segment already wrote. A published write replaces all six columns, sets the
+        turn range and decides ``is_latest`` by window order.
+
+        A retry may extend the same window but never shrinks it. The six columns default to the
+        empty string, so "not produced yet" and "produced empty" would otherwise be the same
+        bytes: a segment stores its payload as JSON, and an empty body occupies two characters.
+        A draft write therefore leaves every column alone; a published write replaces all six
+        with what it was given.
+        """
+        now = time.time()
+        existing = self._conn.execute(
+            "SELECT id, is_latest, published_at, window_to_ts FROM base_refreshes "
+            "WHERE session_id = ? AND subject = ? AND window_from_ts = ?",
+            (session_key, subject_key, float(window_from_ts))).fetchone()
+        # A retry may extend the same window; never shrink it.
+        effective_to = float(window_to_ts)
+        if existing is not None:
+            effective_to = max(effective_to, float(existing["window_to_ts"]))
+        is_latest = 0
+        if published:
+            current = self._conn.execute(
+                "SELECT window_to_ts FROM base_refreshes "
+                "WHERE session_id = ? AND subject = ? AND is_latest = 1 "
+                "AND published_at IS NOT NULL LIMIT 1",
+                (session_key, subject_key)).fetchone()
+            current_to = float(current["window_to_ts"]) if current is not None else None
+            if (existing is not None and existing["published_at"] is not None
+                    and int(existing["is_latest"]) == 1):
+                is_latest = 1
+            elif current_to is None or effective_to > current_to:
+                is_latest = 1
+            if is_latest:
+                self._conn.execute(
+                    "UPDATE base_refreshes SET is_latest = 0 "
+                    "WHERE session_id = ? AND subject = ? AND is_latest = 1 "
+                    "AND window_from_ts <> ?",
+                    (session_key, subject_key, float(window_from_ts)))
+        merged = {name: str(columns.get(name) or "") for name in _BASE_REVISION_COLUMNS}
+        self._conn.execute(
+            "INSERT INTO base_refreshes (session_id, subject, window_from_ts, window_to_ts, "
+            "window_from_turn, window_to_turn, user_representation, user_peer_card, "
+            "ai_self_representation, ai_identity_card, window_summary, "
+            "value_markers, is_latest, created_at, published_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
+            "ON CONFLICT(session_id, subject, window_from_ts) DO UPDATE SET "
+            "window_to_ts = MAX(base_refreshes.window_to_ts, excluded.window_to_ts), "
+            "window_from_turn = COALESCE(excluded.window_from_turn, "
+            "                            base_refreshes.window_from_turn), "
+            "window_to_turn = COALESCE(excluded.window_to_turn, base_refreshes.window_to_turn), "
+            "user_representation = CASE WHEN excluded.published_at IS NULL "
+            "  THEN base_refreshes.user_representation ELSE excluded.user_representation END, "
+            "user_peer_card = CASE WHEN excluded.published_at IS NULL "
+            "  THEN base_refreshes.user_peer_card ELSE excluded.user_peer_card END, "
+            "ai_self_representation = CASE WHEN excluded.published_at IS NULL "
+            "  THEN base_refreshes.ai_self_representation "
+            "  ELSE excluded.ai_self_representation END, "
+            "ai_identity_card = CASE WHEN excluded.published_at IS NULL "
+            "  THEN base_refreshes.ai_identity_card ELSE excluded.ai_identity_card END, "
+            "window_summary = CASE WHEN excluded.published_at IS NULL "
+            "  THEN base_refreshes.window_summary ELSE excluded.window_summary END, "
+            "value_markers = CASE WHEN excluded.published_at IS NULL "
+            "  THEN base_refreshes.value_markers ELSE excluded.value_markers END, "
+            "is_latest = CASE WHEN excluded.published_at IS NULL "
+            "  THEN base_refreshes.is_latest ELSE excluded.is_latest END, "
+            "published_at = COALESCE(base_refreshes.published_at, excluded.published_at)",
+            (session_key, subject_key, float(window_from_ts), effective_to,
+             window_from_turn, window_to_turn, merged["user_representation"],
+             merged["user_peer_card"], merged["ai_self_representation"],
+             merged["ai_identity_card"], merged["window_summary"],
+             merged["value_markers"], is_latest, now, now if published else None))
+        row = self._conn.execute(
+            "SELECT id FROM base_refreshes WHERE session_id = ? AND subject = ? "
+            "AND window_from_ts = ?", (session_key, subject_key, float(window_from_ts))).fetchone()
+        return int(row["id"]) if row is not None else 0
+
+    def save_base_draft(self, session_id: str, subject: str, *, window_from_ts: float,
+                        window_to_ts: float) -> int:
+        """Create (or keep) the draft row a segmented refresh fills in.
+
+        The row is invisible to every reader: ``is_latest = 0``, ``published_at`` NULL. Its
+        identity is ``(session_id, subject, window_from_ts)``, so a retry lands on the same
+        row and reuses whatever segments already wrote a column.
+        """
+        with self._lock:
+            if not self._conn.in_transaction:
+                self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                row_id = self._write_base_row(
+                    session_id or "", subject or "", window_from_ts=window_from_ts,
+                    window_to_ts=window_to_ts, window_from_turn=None,
+                    window_to_turn=None, columns={}, published=False)
+                self._conn.commit()
+                return row_id
+            except Exception:
+                self._conn.rollback()
+                raise
+
+    def save_base_segment(self, session_id: str, subject: str, *, window_from_ts: float,
+                          columns: Mapping[str, str]) -> int:
+        """Write the columns one segment produced; returns how many rows were updated.
+
+        Refuses a published row: a segment never edits history, only the draft a retry will
+        publish.
+        """
+        allowed = {name: str(value) for name, value in columns.items()
+                   if name in _BASE_REVISION_COLUMNS}
+        if not allowed:
+            return 0
+        assignments = ", ".join(f"{name} = ?" for name in allowed)
+        with self._lock:
+            cursor = self._conn.execute(
+                f"UPDATE base_refreshes SET {assignments} "
+                "WHERE session_id = ? AND subject = ? AND window_from_ts = ? "
+                "AND published_at IS NULL",
+                (*allowed.values(), session_id or "", subject or "", float(window_from_ts)))
+            self._conn.commit()
+            return int(cursor.rowcount or 0)
+
+    def publish_base_refresh(self, session_id: str, subject: str, *, window_from_ts: float,
+                             window_to_ts: float, window_from_turn: Optional[int],
+                             window_to_turn: Optional[int],
+                             columns: Mapping[str, str]) -> int:
+        """Publish the draft row: all six columns, the turn range and ``is_latest``.
+
+        ``published_at`` is set in the same write, which is what makes the row visible to
+        every reader and exempt from the next segment overwrite.
+        """
+        with self._lock:
+            if not self._conn.in_transaction:
+                self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                row_id = self._write_base_row(
+                    session_id or "", subject or "", window_from_ts=window_from_ts,
+                    window_to_ts=window_to_ts, window_from_turn=window_from_turn,
+                    window_to_turn=window_to_turn, columns=columns, published=True)
+                self._conn.commit()
+                return row_id
             except Exception:
                 self._conn.rollback()
                 raise
@@ -2414,10 +2541,12 @@ class MinirStore:
             if subject:
                 row = self._conn.execute(
                     "SELECT * FROM base_refreshes WHERE session_id = ? AND subject = ? "
-                    "AND is_latest = 1 LIMIT 1", (session_id, subject)).fetchone()
+                    "AND is_latest = 1 AND published_at IS NOT NULL LIMIT 1",
+                    (session_id, subject)).fetchone()
             else:
                 row = self._conn.execute(
                     "SELECT * FROM base_refreshes WHERE session_id = ? AND is_latest = 1 "
+                    "AND published_at IS NOT NULL "
                     "ORDER BY window_to_ts DESC, window_from_ts DESC, id DESC LIMIT 1",
                     (session_id,)).fetchone()
         return dict(row) if row is not None else None
@@ -2432,6 +2561,7 @@ class MinirStore:
         with self._lock:
             row = self._conn.execute(
                 "SELECT * FROM base_refreshes WHERE subject = ? "
+                "AND is_latest = 1 AND published_at IS NOT NULL "
                 "ORDER BY window_to_ts DESC, window_from_ts DESC, id DESC LIMIT 1",
                 (subject or "",)).fetchone()
         return dict(row) if row is not None else None
@@ -2444,11 +2574,13 @@ class MinirStore:
             if subject:
                 rows = self._conn.execute(
                     "SELECT * FROM base_refreshes WHERE session_id = ? AND subject = ? "
+                    "AND published_at IS NOT NULL "
                     "ORDER BY window_to_ts DESC, id DESC LIMIT ?",
                     (session_id, subject, limit)).fetchall()
             else:
                 rows = self._conn.execute(
                     "SELECT * FROM base_refreshes WHERE session_id = ? "
+                    "AND published_at IS NOT NULL "
                     "ORDER BY window_to_ts DESC, id DESC LIMIT ?",
                     (session_id, limit)).fetchall()
         return [dict(row) for row in rows]
@@ -2459,7 +2591,8 @@ class MinirStore:
         limit = max(1, min(500, int(max_sessions) * max(1, int(per_session)) * 5))
         with self._lock:
             rows = self._conn.execute(
-                "SELECT * FROM base_refreshes WHERE window_to_ts >= ? "
+                "SELECT * FROM base_refreshes WHERE published_at IS NOT NULL "
+                "AND window_to_ts >= ? "
                 "ORDER BY window_to_ts DESC, id DESC LIMIT ?",
                 (float(since_ts), limit)).fetchall()
         kept: list[dict[str, Any]] = []
@@ -2494,6 +2627,47 @@ class MinirStore:
                 "AND window_from_ts = ? LIMIT 1",
                 (session_id, subject, float(window_from_ts))).fetchone()
         return dict(row) if row is not None else None
+
+    def base_refresh_windows(self, session_id: str, subject: str = "", *,
+                             window_from_ts: Optional[float] = None,
+                             before_ts: Optional[float] = None,
+                             after_ts: Optional[float] = None,
+                             latest: bool = False, include_drafts: bool = False,
+                             order: str = "newest", limit: int = 1) -> list[dict[str, Any]]:
+        """Refresh rows a locator names, newest first unless *order* says otherwise.
+
+        Drafts are excluded unless *include_drafts*, and a caller that asks for them gets the
+        drafts **in addition to** published rows (a retry must see the segment it already
+        produced; a history reader must not see it). ``window_from_ts`` matches with a
+        microsecond tolerance: the value travels through a prompt, where a float may be
+        re-printed with fewer digits than it was stored.
+        """
+        clauses = ["session_id = ?"]
+        params: list[Any] = [session_id or ""]
+        if subject:
+            clauses.append("subject = ?")
+            params.append(subject)
+        if window_from_ts is not None:
+            clauses.append("ABS(window_from_ts - ?) < 1e-6")
+            params.append(float(window_from_ts))
+        if before_ts is not None:
+            clauses.append("window_from_ts < ?")
+            params.append(float(before_ts))
+        if after_ts is not None:
+            clauses.append("window_from_ts > ?")
+            params.append(float(after_ts))
+        if latest:
+            clauses.append("is_latest = 1")
+        if not include_drafts:
+            clauses.append("published_at IS NOT NULL")
+        direction = "ASC" if str(order or "newest") == "oldest" else "DESC"
+        capped = max(1, min(10, int(limit or 1)))
+        with self._lock:
+            rows = self._conn.execute(
+                f"SELECT * FROM base_refreshes WHERE {' AND '.join(clauses)} "
+                f"ORDER BY window_from_ts {direction}, id {direction} LIMIT ?",
+                (*params, capped)).fetchall()
+        return [dict(row) for row in rows]
 
     def publish_base_conclusions(self, session_id: str, *, user_subject: str = "",
                                  ai_subject: str = "") -> int:
@@ -3095,6 +3269,7 @@ class MinirStore:
         if session_id:
             filters.append("b.session_id = ?")
             filter_params.append(session_id)
+        filters.append("b.published_at IS NOT NULL")
         if latest_only:
             filters.append("b.is_latest = 1")
         where = (" AND " + " AND ".join(filters)) if filters else ""

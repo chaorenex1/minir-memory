@@ -95,20 +95,23 @@ def test_the_window_uses_the_message_timestamp_when_the_host_supplies_one(buffer
     assert "old question" in in_window and "new question" not in in_window
 
 
-def test_the_prompt_assets_declare_the_blocks_the_builders_emit(plugin_package):
+def test_the_prompt_assets_declare_the_materials_the_passes_read(plugin_package):
     from pathlib import Path
 
     base = Path(plugin_package.__file__).parent / "agents"
+    # The layer passes read the window themselves, so what an asset must declare is the tool that
+    # answers the transcript question, not a block the worker used to paste in.
     expected = {
-        "b1_user_card.md": "<base_user_transcript>",
-        "b2_ai_card.md": "<base_ai_transcript>",
+        "b1_user_card.md": "<window transcript>",
+        "b2_ai_card.md": "<window transcript>",
         "b3_window_summary.md": "<window_summary_transcript>",
-        "b4_value_markers.md": "<value_markers_transcript>",
-        "dialectic.md": "<dialectic_transcript>",
+        "b4_value_markers.md": "<window transcript>",
+        "dialectic.md": "<window transcript>",
     }
     for name, block in expected.items():
         text = (base / name).read_text(encoding="utf-8")
         assert block in text, name
+        assert "minir_hermes_session_search" in text, name
         if name != "b4_value_markers.md":
             assert "coverage" in text, name
     assert "<session_transcript>" in (base / "knowledge_render.md").read_text(encoding="utf-8")

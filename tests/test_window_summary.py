@@ -12,14 +12,22 @@ def summary(plugin_package):
     return importlib.reload(plugin_package.window_summary)
 
 
-def test_a_translated_section_heading_is_reported_before_the_merge(summary):
-    """The merge matches '## Window Summary' verbatim; a localized heading must fail here."""
-    translated = "## 窗口摘要\n\n### Objective\nRestart docker\n"
-    assert summary.missing_section_heading(translated) is True
-    assert summary.missing_section_heading("") is True
-    assert summary.missing_section_heading(_filled()) is False
-    # A heading that only appears inside a sentence is not a heading.
-    assert summary.missing_section_heading("see ## Window Summary above") is True
+def test_the_heading_is_written_by_code_not_by_the_model(summary):
+    """A body gets the heading; a stored section that already has it is not doubled."""
+    body = "### Objective\nRestart docker"
+    assert summary.render_section(body) == "## Window Summary\n\n" + body
+    assert summary.render_section(_filled()) == _filled()
+    assert summary.render_section("") == "## Window Summary"
+    # A body that merely mentions the phrase keeps it: only the first line is the heading.
+    mentioned = "### References\n- see ## Window Summary above"
+    assert summary.render_section(mentioned).startswith("## Window Summary\n")
+    assert summary.render_section(mentioned) != mentioned
+
+
+def test_body_text_strips_only_the_heading(summary):
+    assert summary.body_text(_filled()).startswith("### Objective")
+    assert "## Window Summary" not in summary.body_text(_filled())
+    assert summary.body_text("### Objective\n- x") == "### Objective\n- x"
 
 
 def _filled() -> str:

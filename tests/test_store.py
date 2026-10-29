@@ -170,9 +170,12 @@ def test_next_session_summary_index_counts_one_session(store):
     assert store.next_session_summary_index("s2") == 1, "another session starts at one"
 
 
-def test_stored_content_is_truncated(store):
+def test_stored_content_is_kept_whole(store):
+    """A stored row is what its writer wrote: a silent cut publishes a different artifact."""
     store.save_conclusion("note", "x" * 15_000)
-    assert len(store.search("x" * 10)[0]["text"]) <= 12_000
+    assert len(store.search("x" * 10)[0]["text"]) == 15_000
+    store.put_layer_state("base", "user:ada", "y" * 15_000)
+    assert len(store.layer_state("base", "user:ada")["content"]) == 15_000
 
 
 def test_layer_state_versions_increment_and_keep_the_latest_content(store):
@@ -453,6 +456,67 @@ def test_the_same_refresh_window_updates_in_place(store):
     assert again == first
     assert len(store.base_refreshes("s1")) == 1
     assert store.latest_base_refresh("s1")["window_summary"] == "retried attempt"
+
+
+def test_a_draft_row_is_invisible_until_it_is_published(store):
+    """A refresh still being assembled must not be readable as history or as a baseline."""
+    published = _refresh(store, from_ts=0.0, to_ts=10.0)
+    draft = store.save_base_draft("s1", "user:ada", window_from_ts=10.0, window_to_ts=20.0)
+    assert draft != published
+    assert store.save_base_segment("s1", "user:ada", window_from_ts=10.0,
+                                   columns={"user_representation": '"half"'}) == 1
+
+    assert store.latest_base_refresh_for_subject("user:ada")["id"] == published
+    assert [row["id"] for row in store.base_refreshes("s1", "user:ada")] == [published]
+    assert [row["id"] for row in store.base_refreshes_since(0.0)] == [published]
+    assert store.search_base_refreshes("half") == []
+    assert store.base_refresh_windows("s1", "user:ada", window_from_ts=10.0) == []
+    drafted = store.base_refresh_windows("s1", "user:ada", window_from_ts=10.0,
+                                         include_drafts=True)
+    assert drafted and drafted[0]["user_representation"] == '"half"'
+
+
+def test_publishing_promotes_the_draft_and_demotes_the_previous_window(store):
+    first = _refresh(store, from_ts=0.0, to_ts=10.0)
+    row_id = store.save_base_draft("s1", "user:ada", window_from_ts=10.0, window_to_ts=20.0)
+    columns = {"user_representation": json.dumps("- second"),
+               "user_peer_card": json.dumps("p"),
+               "ai_self_representation": json.dumps("a"),
+               "ai_identity_card": json.dumps("i"),
+               "window_summary": json.dumps("### Objective\n- second"),
+               "value_markers": json.dumps({"value_markers": []})}
+
+    assert store.publish_base_refresh(
+        "s1", "user:ada", window_from_ts=10.0, window_to_ts=20.0,
+        window_from_turn=3, window_to_turn=4, columns=columns) == row_id
+
+    latest = store.latest_base_refresh("s1", "user:ada")
+    assert latest["id"] == row_id and latest["is_latest"] == 1
+    assert latest["published_at"] is not None
+    assert store.base_refresh_for_window("s1", "user:ada", 0.0)["is_latest"] == 0
+    assert [row["id"] for row in store.base_refreshes("s1", "user:ada")] == [row_id, first]
+    # A published row is history: a stray segment write cannot rewrite it.
+    assert store.save_base_segment("s1", "user:ada", window_from_ts=10.0,
+                                   columns={"user_representation": '"later"'}) == 0
+
+
+def test_window_reads_are_exact_and_ordered(store):
+    first = _refresh(store, from_ts=0.0, to_ts=10.0)
+    second = _refresh(store, from_ts=10.0, to_ts=20.0)
+
+    assert [row["id"] for row in store.base_refresh_windows("s1", "user:ada", latest=True)] \
+        == [second]
+    assert [row["id"] for row in store.base_refresh_windows("s1", "user:ada", before_ts=10.0)] \
+        == [first]
+    assert [row["id"] for row in store.base_refresh_windows("s1", "user:ada", before_ts=10.5)] \
+        == [second], "before_ts with the default order is the nearest row before it"
+    assert [row["id"] for row in store.base_refresh_windows("s1", "user:ada", after_ts=0.5)] \
+        == [second]
+    assert [row["id"] for row in store.base_refresh_windows(
+        "s1", "user:ada", window_from_ts=10.0000005)] == [second]
+    assert store.base_refresh_windows("s1", "user:ada", window_from_ts=30.0) == []
+    assert [row["id"] for row in store.base_refresh_windows(
+        "s1", "user:ada", order="oldest", limit=5)] == [first, second]
 
 
 def test_claims_are_fifo_within_a_session(store):

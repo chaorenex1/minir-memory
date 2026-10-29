@@ -54,22 +54,24 @@ def _summary_json():
     return json.dumps({"window_summary": _summary_section()})
 
 
-def _base_pass_json(*, summary: str | None = None, markers=None) -> str:
-    """B1's orchestration reply: the user card plus both child artifacts."""
+def _units_json(*, markers=None) -> str:
+    """B4's reply: this window's units (one by default)."""
     marker = {"id": "k1", "category": "METHOD", "org": "tools", "topic": "pytest verification",
               "content": "run the project's verify command\nread its exit code",
               "summary": "verify with pytest", "relations": [], "objects": [],
               "anchor": {"from_ts": 0.0, "to_ts": 1e12, "message_ids": []}}
-    return json.dumps({**json.loads(_base_user_json()),
-                       "window_summary": _summary_section() if summary is None else summary,
-                       "value_markers": [marker] if markers is None else markers})
+    return json.dumps({"value_markers": [marker] if markers is None else markers})
 
 
 def _base_reply(prompt):
-    """Which base pass the worker is running, picked by the block its message carries."""
-    if "<window_template>" in prompt:
-        return _base_pass_json()
-    return _base_ai_json()
+    """Which base segment the worker is running, picked by the PASS line it carries."""
+    if "PASS: b3_window_summary" in prompt:
+        return _summary_json()
+    if "PASS: b4_value_markers" in prompt:
+        return _units_json()
+    if "PASS: b2_ai_card" in prompt:
+        return _base_ai_json()
+    return _base_user_json()
 
 
 def _dialectic_json(*, changed=False, fields=None, peer=None):
@@ -843,6 +845,8 @@ def test_layer_reasoning_runs_end_to_end(plugin_package, make_provider, monkeypa
         _dialectic_json(peer=["no emoji"], changed=True, fields=["user_preferences"])
         if "dialectic reviewer" in system else
         _base_reply(prompt)))
+    monkeypatch.setattr(plugin_package.minir_agents, "run", lambda provider, args: json.dumps(
+        {"answer": _base_reply(args["user_prompts"])}))
 
     provider = make_provider({"base_interval": 1, "dialectic_interval": 1}, agent_identity="Masía")
     provider.on_turn_start(1, "m")
@@ -1041,6 +1045,8 @@ def test_layers_reason_from_host_history_and_publish_searchable_sections(
                         fields=["user_preferences"])
         if "dialectic reviewer" in system else
         _base_reply(prompt)))
+    monkeypatch.setattr(plugin_package.minir_agents, "run", lambda provider, args: json.dumps(
+        {"answer": _base_reply(args["user_prompts"])}))
     provider = make_provider({"base_interval": 1, "dialectic_interval": 1})
     state_path = tmp_path / "state.db"
     connection = sqlite3.connect(str(state_path))
@@ -1071,6 +1077,102 @@ def test_layers_reason_from_host_history_and_publish_searchable_sections(
     assert not any("not user intent" in row["text"] for row in hits)
     review = provider._store.layer_state("dialectic", "agent:default:minir")
     assert "user_preferences" in str((review or {}).get("content") or "")
+
+
+def test_minir_get_reads_one_exact_key_and_reports_a_miss(provider):
+    """A locator is exact: the ranked search must not be able to stand in for it."""
+    store = provider._store
+    store.save_conclusion("base.user_representation", "## Self\n- Engineer",
+                          key="user:default", subject="user:default")
+    store.save_conclusion("base.user_representation", "## Self\n- Someone else",
+                          key="user:basic:zzh", subject="user:basic:zzh")
+
+    found = json.loads(provider.handle_tool_call(
+        "minir_get", {"kind": "base.user_representation", "key": "user:default"}))
+    assert found["found"] is True and found["text"].startswith("## Self")
+    assert "Someone else" not in found["text"]
+
+    missing = json.loads(provider.handle_tool_call(
+        "minir_get", {"kind": "base.user_representation", "key": "user:nobody"}))
+    assert missing["found"] is False and missing["text"] == "" and missing["lines"] == []
+
+    refused = json.loads(provider.handle_tool_call(
+        "minir_get", {"kind": "base.user_representation", "key": "user:default",
+                      "projection": "whole"}))
+    assert "error" in refused
+
+
+def test_minir_get_paths_projects_pages_without_their_bodies(provider):
+    markers = {"value_markers": [
+        {"path": "tools/KNOWLEDGE-a.md", "topic": "a", "content": "body one"},
+        {"path": "projects/METHOD-b.md", "topic": "b", "content": "body two"}]}
+    provider._store.save_conclusion(
+        "base.value_markers", json.dumps(markers), key="session:s:user:default",
+        subject="session:s:user:default")
+
+    payload = json.loads(provider.handle_tool_call(
+        "minir_get", {"kind": "base.value_markers", "key": "session:s:user:default",
+                      "projection": "paths"}))
+    assert payload["found"] is True and payload["text"] == ""
+    assert payload["lines"][:2] == ["tools/KNOWLEDGE-a.md", "projects/METHOD-b.md"]
+    assert all("body one" not in line for line in payload["lines"])
+
+
+def test_minir_state_returns_the_current_artifact_only(provider):
+    provider._store.put_layer_state("base", "user:default", "## User Card\n- one")
+    payload = json.loads(provider.handle_tool_call(
+        "minir_state", {"layer": "base", "subject": "user:default"}))
+    assert payload["found"] is True and payload["version"] == 1
+    assert payload["content"].startswith("## User Card")
+
+    missing = json.loads(provider.handle_tool_call(
+        "minir_state", {"layer": "base", "subject": "user:nobody"}))
+    assert missing["found"] is False and missing["content"] == ""
+    refused = json.loads(provider.handle_tool_call(
+        "minir_state", {"layer": "everything", "subject": "user:default"}))
+    assert "error" in refused
+
+
+def test_minir_window_hides_drafts_unless_asked_and_pins_the_window(provider):
+    store = provider._store
+    session = provider._session_id
+    store.add_base_refresh(
+        session, "user:default", window_from_ts=0.0, window_to_ts=10.0,
+        window_from_turn=1, window_to_turn=1,
+        user_representation=json.dumps("- first"), user_peer_card=json.dumps(""),
+        ai_self_representation=json.dumps(""), ai_identity_card=json.dumps(""),
+        window_summary=json.dumps("### Objective\n- first"), value_markers="")
+    store.save_base_draft(session, "user:default", window_from_ts=10.0, window_to_ts=20.0)
+    store.save_base_segment(session, "user:default", window_from_ts=10.0,
+                            columns={"window_summary": json.dumps("### Objective\n- half")})
+
+    visible = json.loads(provider.handle_tool_call(
+        "minir_window", {"session_id": session, "subject": "user:default",
+                         "window_from_ts": 10.0}))
+    assert visible["found"] is False, "a draft is not a published window"
+
+    drafted = json.loads(provider.handle_tool_call(
+        "minir_window", {"session_id": session, "subject": "user:default",
+                         "window_from_ts": 10.0, "include_drafts": True,
+                         "parts": ["window_summary"]}))
+    assert drafted["found"] is True and drafted["rows"][0]["draft"] is True
+    assert drafted["rows"][0]["parts"]["window_summary"] == "### Objective\n- half"
+
+    latest = json.loads(provider.handle_tool_call(
+        "minir_window", {"session_id": session, "subject": "user:default", "latest": True,
+                         "format": "text"}))
+    assert latest["rows"][0]["window_from_ts"] == 0.0
+    assert latest["rows"][0]["text"].startswith("## User Card")
+
+    drifted = json.loads(provider.handle_tool_call(
+        "minir_window", {"session_id": session, "subject": "user:default",
+                         "window_from_ts": 10.0, "window_to_ts": 99.0,
+                         "include_drafts": True}))
+    assert drifted["found"] is False, "a fixed window whose end moved is not the row asked for"
+
+    refused = json.loads(provider.handle_tool_call(
+        "minir_window", {"session_id": session, "parts": ["nope"]}))
+    assert "error" in refused
 
 
 def test_search_exposes_one_id_field_for_base_and_tool_rows(plugin_package, provider):

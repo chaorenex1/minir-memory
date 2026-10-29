@@ -246,9 +246,9 @@ a mode belongs to one conversation.
 
 ## Tools
 
-The provider exposes eight tools; every response is a JSON string (errors are `{"error": ...}`).
-The same schemas are registered as the `minir` **registry toolset**, so the plugin's own agents can
-be granted them explicitly (see "The `minir` toolset" below).
+The provider exposes one schema list (`tools.SCHEMAS`); every response is a JSON string (errors are
+`{"error": ...}`). The same schemas are registered as the `minir` **registry toolset**, so the
+plugin's own agents can be granted them explicitly (see "The `minir` toolset" below).
 
 | Tool | Parameters | Behaviour |
 | --- | --- | --- |
@@ -260,6 +260,10 @@ be granted them explicitly (see "The `minir` toolset" below).
 | `minir_stats` | none | Store counts (with `conclusions_by_kind` for this session), layer counters, the scheduler ledger, published artifacts, buffered messages, in-memory tool metrics, the session's token usage and its newest turn rows, and the database path. |
 | `minir_agents` | `agent_name` (required), `user_prompts` (required), `skill_name`, `model`, `system_prompts`, `context_files`, `project_dir`, `tool_sets`, `background`, `skip_memory`, `skip_context_files`, `skip_background_review`, `load_soul_identity` | Runs a named in-process agent, in the background by default: the call returns a job handle and the answer arrives as a completion notification. `background=false` waits for the answer. Omitting `tool_sets` grants every host tool. `model` is `provider:model`. The system prompt is the first prompt file found under `HERMES_HOME` (see "Custom agents"); `system_prompts` is the last fallback, and `system_prompt_source` reports which one won. The full run is flushed to `sessions/<agent_name>/<layer_session_id>.jsonl`. |
 | `minir_content_valid` | `content` (required), `limit` (required), `mode` | Local deterministic length check. `mode="string"` (default) counts Unicode code points; `mode="token"` applies `rules.estimate_tokens` (CJK one token per character, otherwise four characters per token, plus a 10% margin). Returns `{ok, mode, unit, measured, limit, over, remaining}` and, in token mode, `estimator`. It never truncates, rewrites or stores, and it answers before the provider is initialized. |
+
+| `minir_get` | `kind` (required), `key` (required), `projection`, `include_superseded` | One conclusion row by **exact** kind and key — the locator form the layer passes use. `projection="paths"` returns the `.md` paths and headings the content mentions instead of the body. A missing key returns `found: false` with empty text, never an empty string that looks like content. |
+| `minir_state` | `layer` (required), `subject` (required) | The current published artifact of one layer for one subject (`layer_state` holds one row per pair, so this is the live version only; history is `minir_window`). |
+| `minir_window` | `session_id`, `subject`, `window_from_ts`, `window_to_ts`, `before_ts`, `after_ts`, `latest`, `include_drafts`, `parts`, `order`, `limit`, `max_chars`, `format` | Reads `base_refreshes` by locator. Drafts are invisible unless `include_drafts=true`; `window_to_ts` verifies the fixed end; unknown `parts` names are an error; `format="text"` renders the selected columns in artifact order. |
 
 The five value-marker kinds are read-only history now: the worker keeps merging its own five-key
 inventory per refresh, and the six marker rows an older release wrote stay searchable, but no tool
@@ -277,7 +281,7 @@ main-agent surface):
 
 ## The `minir` toolset
 
-The eight tools have two delivery paths. The memory-provider surface (`get_tool_schemas`)
+The same schemas have two delivery paths. The memory-provider surface (`get_tool_schemas`)
 injects them into a main agent that has the host's `memory` toolset enabled. For the plugin's own
 agents — the adviser, the layer worker, the session-summary and knowledge-extraction agents — the
 same schemas are registered through the plugin context under a registry toolset
@@ -428,7 +432,7 @@ rows are reachable only through `minir_search(scope="all")`, never by automatic 
 
 | Layer | Models | Artifact sections | Subject key |
 | --- | --- | --- | --- |
-| base | this profile's user: B1 writes the user card, starts B3 (summary) and B4 (markers) through `minir_agents`, then B2 writes the AI card on `auxiliary.minir_dialectic` | `## User Card`, `## AI Card`, `## Window Summary`, `## Value Markers` | `user:<id>` |
+| base | this profile's user, in four segments run by the worker on `auxiliary.minir_dialectic`: B1 writes the user card, B3 (summary) and B4 (markers) run as child agents, then B2 writes the AI card | `## User Card`, `## AI Card`, `## Window Summary`, `## Value Markers` | `user:<id>` |
 | dialectic | the live base artifact + its own evidence window; reviews drift and replaces whole parts | `## Base Revision` only (cards stay on the base layer, no advice) | `agent:<profile>:<identity>` |
 
 The review's **evidence** window starts at its own watermark and ends at the live edge; the base
@@ -447,41 +451,48 @@ reconcile, capped by `dialectic_depth`. A failed or malformed pass falls back to
 one. `layer_state.version` counts refreshes; `prefetch` reads the live base row's two columns, and
 the newest review note stays searchable.
 
-A base refresh is **one orchestration pass (B1), two child agents (B3, B4), then one AI-card pass
-(B2)** on the `auxiliary.minir_dialectic` route. Each system prompt is
-built at call time from the pass's core asset under `plugin/minir/agents/`, the rule texts that
-pass reads and the output contract; the
-rule files in `plugin/minir/rules/*.md` are passed as text (`rules.rule_text`), untransformed. An
-operator override under `$HERMES_HOME/minir-memory/rules/` replaces a packaged file and falls back
-with a warning when it is unreadable. The worker writes the window digest and the previous markers
-to scratch files and gives B1 their paths; B1 calls `minir_agents` for B3 (`tool_sets` file +
-session_search) and B4 (file + minir + session_search), copying B3's markdown verbatim and B4's
-JSON array. A failed child leaves its key empty; the worker retries that one child once and fails
-the refresh if the summary still cannot be produced. B2 runs last, so the six `ai_self` fields see
-this window's ledger. Each pass returns **one JSON object** whose card values are markdown bodies
-(no code fence, no front-matter); the worker validates it against the same rules the reviewer
-reads, and only a validated object is rendered into the artifact. The `minir` toolset is attached
-on this route, and the tool hint carries the window bounds: a pass may call
-`minir_hermes_session_search` with `after`/`before` for evidence inside `(from_ts, to_ts]`, but
-must not read later turns. The first user message is the only allowed outside-window evidence, and
-only on the first refresh.
+A base refresh is **four segments the worker runs in order**: B1 (user card), B3 (summary), B4
+(markers), B2 (AI card). The worker owns the orchestration — a pass never starts another pass. Each
+system prompt is built at call time from the pass's core asset under `plugin/minir/agents/`, the
+rule texts that pass reads and the output contract; the rule files in `plugin/minir/rules/*.md` are
+read from disk by the pass itself (an operator override under `$HERMES_HOME/minir-memory/rules/`
+wins, and the prompt names the file that `rules.rule_path` would actually read).
 
-1. **B1 user card** — the previous user card + this window (+ the first user message as intent
-   anchor on bootstrap) → `{"user_self_representation", "user_preferences", "window_summary",
-   "value_markers", "page_writes"}`, where the last three are the children's answers copied
-   verbatim; `page_writes` is optional;
-2. **B3 window summary** — the window digest + the previous summary of *this session* → the
-   eight-section markdown. `objective` is the complete goal ledger (one goal per line, no ids, no
-   status); `Current State` groups those goals under Done/Doing/Todo. The prompt is the only
-   enforcement: `window_summary.validate` checks that the value is a string;
-3. **B4 value markers** — the digest + the previous markers + the marker rules → the units plus
-   the `minir_kb_write` results. Each unit is `{id, category, org, topic, content, summary,
-   epistemic, time, objects, relations, anchor}`. B4 searches, creates or edits each page itself
-   and returns `{"value_markers": [...], "page_writes": [...]}`; `anchor` is required;
-4. **B2 AI card** — B1's user card + this window's summary + the previous AI card + the operator
-   SOUL + the prior review cards + `plugin.yaml` → `{"ai_self_representation", "ai_identity"}`. The
-   identity is written first; the six AI-self fields (positioning, current task, current goal,
-   1-3 state facts, state, uncertainty) cite the summary's goal lines instead of restating them.
+**The user prompt carries locators, not material.** It states the pass, target, session, window,
+refresh kind, language and the output shape, then a `MATERIALS` list in which every line is a tool
+call (`minir_hermes_session_search(...)`, `minir_window(...)`, `minir_get(...)`, `minir_state(...)`)
+or a file path. The pass reads what it needs with the `file` and `minir` toolsets; no transcript,
+card, summary or rule body is pasted into the prompt. Because the material lives in the store, a
+prompt has no size budget: the caps that remain are the card body limit and the summary's own
+prompt target.
+
+**Segment retry, not window retry.** Each segment writes its columns into the window's
+`base_refreshes` draft row (`is_latest = 0`, `published_at` NULL) as soon as it finishes. When a
+segment fails the job fails with `segment=<name>` in `jobs.error`; the next claim re-runs only the
+missing segment and reuses every column an earlier attempt wrote. A retrying job also keeps the
+window it started with (the draft row records its end), so the retry reasons over the same turns.
+The four segments:
+
+1. **B1 user card** — the previous/global card by locator + this window (+ the first user message
+   as intent anchor on bootstrap, and the code-written preset on the first refresh) →
+   `{"user_self_representation", "user_preferences"}`;
+2. **B3 window summary** — the template file + the previous summary of *this session* + the
+   window → the eight-section markdown **body**. `objective` is the complete goal ledger (one goal
+   per line, no ids, no status); `Current State` groups those goals under Done/Doing/Todo. Code
+   adds the `## Window Summary` heading, so a translated heading can no longer invalidate a window;
+3. **B4 value markers** — the window + the previous marker inventory as *paths and headings*
+   (`projection="paths"`) + the two rule files → the units plus the `minir_kb_write` results. Each
+   unit is `{id, category, org, topic, content, summary, epistemic, time, objects, relations,
+   anchor}`. B4 searches, creates or edits each page itself and returns `{"value_markers": [...],
+   "page_writes": [...]}`; `anchor` is required;
+4. **B2 AI card** — this window's user card and summary from the draft row + the published AI
+   identity/self cards by key + the operator files and one manifest line →
+   `{"ai_self_representation", "ai_identity"}`. The identity is written first; the six AI-self
+   fields cite the summary's goal lines instead of restating them.
+
+Each pass returns **one JSON object** whose card values are markdown bodies (no code fence, no
+front-matter); the worker validates it against the same rules the reviewer reads, and only a
+validated object is rendered into the artifact.
 
 The baseline order is **global card files -> newest row for the subject -> preset**. The four
 files under `$HERMES_HOME/minir-memory/` (see below) are the durable state once they exist; the
@@ -497,47 +508,58 @@ refreshing the same window twice.
 The base row keeps `user_representation` for `user_self_representation`, `user_peer_card` for
 `user_preferences`, the same-named `ai_self_representation` and `ai_identity_card` for `ai_identity`,
 `window_summary` for the summary section, and `value_markers` for
-`{"value_markers": [units], "page_writes": [...]}`. A unit is `{id, category, org, topic, content,
-summary, epistemic, time, objects, relations, anchor}`; the marker pass writes the page through
-`minir_kb_write` and reports each write result in `page_writes`. The same data is
-rendered into the four-section artifact, and every column except the window summary is published
-once per session as its own conclusion (`base.user_representation`, `base.user_peer_card`,
-`base.ai_self_representation`, `base.ai_identity_card`, `base.value_markers`) through
-`publish_base_conclusions`, guarded by `base_refreshes.conclusions_published_at`; the window
-summary is the `window_summary` chunk the same refresh writes, not a second `base.*` row. `is_latest=1` marks the row with the
-greatest `window_to_ts` per `(session_id, subject)` — window order, not write order, so a slow
-older window that finishes late is history, never "latest". `window_from_turn`/`window_to_turn`
-record the session turns the window actually covered (one user message is one turn), extending
-past the dispatch stamp when the newest job drained newer messages. Older windows stay queryable as
-history (`base_refreshes()` / `latest_base_refresh()` in `store.py`). A
-`(session, subject, from_ts)` retry updates the same row/chunk; the retry reuses the chunk's turn
-range and never treats its own chunk as the previous window.
+`{"value_markers": [units]}`. Every column holds a JSON payload, so an empty card is stored as
+`""` and a column that is the empty string means "this segment has not run yet" — the retry
+depends on that distinction. A unit is `{id, category, org, topic, content, summary, epistemic,
+time, objects, relations, anchor}`; the marker pass writes the page through `minir_kb_write` and
+reports each write result on its own stream. The same data is rendered into the four-section
+artifact, and every column except the window summary is published once per session as its own
+conclusion (`base.user_representation`, `base.user_peer_card`, `base.ai_self_representation`,
+`base.ai_identity_card`, `base.value_markers`) through `publish_base_conclusions`, guarded by
+`base_refreshes.conclusions_published_at`; the window summary is the `window_summary` chunk the
+same refresh writes, not a second `base.*` row.
+
+Two flags decide visibility. `published_at` marks a row whose four segments finished and whose
+artifact was rendered: every history reader (`base_refreshes()`, `base_refreshes_since()`,
+`search_base_refreshes()`, `latest_base_refresh*`) filters on it, so a half-filled draft is
+invisible. `is_latest=1` marks the published row with the greatest `window_to_ts` per
+`(session_id, subject)` — window order, not write order, so a slow older window that finishes late
+is history, never "latest". `window_from_turn`/`window_to_turn` record the session turns the window
+actually covered (one user message is one turn), extending past the dispatch stamp when the newest
+job drained newer messages. A `(session, subject, from_ts)` retry updates the same row/chunk; the
+retry reuses the stored window end, the chunk's turn range and every column an earlier attempt
+wrote, and never treats its own chunk as the previous window. `minir_window` is the locator read
+over this table: exact key, selected columns, `latest`/`before_ts`/`after_ts`, and
+`include_drafts` for the pass that is assembling the row.
 
 `base_refreshes` also has its own external-content FTS5 table over the six columns
 (`base_refreshes_fts`, trigram). `search_base_refreshes()` supports session/history filtering and
-`latest_only`; like `minir_search`, it falls back to `LIKE` when FTS5 is unavailable **and when all
-query terms are shorter than three characters** (common Chinese queries such as `工具`, which
-trigram cannot match). The `conclusions_fts` index remains the recall index for the rendered
+`latest_only`, and never returns a draft row; like `minir_search`, it falls back to `LIKE` when FTS5
+is unavailable **and when all query terms are shorter than three characters** (common Chinese
+queries such as `工具`, which trigram cannot match). The `conclusions_fts` index remains the recall index for the rendered
 sections; `base.value_markers` is indexed there too.
 
-The window summary is a **rolling state, not a log**: pass 3 receives the previous section as
-markdown and returns the whole new section following `templates/window_summary.md` (its prompt
-states the caps; `window_summary.validate` only checks the value is a string). The section is
-stored as written and appended to the canonical chunk chain for recall; the next pass 3 reads that
-same text. Older chunks stay independent rows with their turn range and remain searchable inside
-their own session, unless an explicit session-final summary supersedes them (a compression fold
-never does). The dialectic worker reads the active chain up to its review window and may correct
-the summary as a whole part; when the chunk row cannot be updated, the correction is not claimed.
-Pass 4 is separate: it reads the same window plus the recorded value marker inventory and returns
-`{"value_markers": [...]}` only, so a malformed marker set cannot cost the summary and vice versa.
+The window summary is a **rolling state, not a log**: pass 3 reads the previous section body by
+locator and returns the whole new body following `templates/window_summary.md` (its prompt states
+the caps; `window_summary.validate` only checks the value is a string). The heading is code-owned:
+`window_summary.render_section` adds `## Window Summary` unless the first line already is it, so a
+legacy row written with the heading is not doubled and a translated heading cannot invalidate a
+window. The body is stored as written and appended to the canonical chunk chain for recall; the
+next pass 3 reads that same text. Older chunks stay independent rows with their turn range and
+remain searchable inside their own session, unless an explicit session-final summary supersedes
+them (a compression fold never does). The dialectic worker reads the active chain up to its review
+window (as keys it can dereference) and may correct the summary as a whole part; when the chunk row
+cannot be updated, the correction is not claimed. Pass 4 is separate: it reads the same window plus
+the recorded value marker inventory and returns `{"value_markers": [...]}` only, so a malformed
+marker set cannot cost the summary and vice versa.
 
 ### Dialectic review, base corrections, and advices
 
-The dialectic prompt receives the session's **live** base artifact (the newest published row; a
-catch-up drain may have moved past its own window), the previous review note, the operator files,
-the chunk chain up to that window, and the window's messages (tool rows included). It may call
-`minir_hermes_session_search` with `before=<window end>` to inspect earlier history for drift; it never
-reads later turns. It reviews whole parts: the user card, the AI card and the window summary. Its
+The dialectic prompt carries locators too: `minir_state` for the session's **live** base artifact
+(the newest published row; a catch-up drain may have moved past its own window), `minir_get` for
+the previous review note, the operator files by path, the chunk chain's keys up to that window, and
+`minir_hermes_session_search` for the window's messages (tool rows included). It may inspect
+earlier history for drift; it never reads later turns. It reviews whole parts: the user card, the AI card and the window summary. Its
 system prompt is assembled from the layer core plus the four card **review checks** in
 `plugin/minir/rules/`, so the reviewer reads the same contract the writer was given. It lists a
 part in `base_changed.fields` only when it changed it, and a listed part is replaced in full;
@@ -569,15 +591,16 @@ The model may be told who the assistant is from
 provider's bound primary session and is skipped for subagents/cron, which fire the same plugin
 hook.
 
-Both layers are strict on purpose: base passes must return their staged JSON object and the
+Both layers are strict on purpose: base segments must return their staged JSON object and the
 dialectic must return the three parts plus `base_changed`. Any missing key, extra key, wrong enum
-or placeholder fails the object; a failed object is retried once with the format rule restated, and
-a second failure fails the job and leaves the previous artifact in place. A review may not empty a
-part the base row carried: a listed empty part fails the job rather than clearing durable content.
-A part the base already had empty is a faithful copy, not a broken reply; the base pass accepts
-sparse cards, so the review must be allowed to echo them. A failed job is retried once (the cached
-content is still there) and, if it fails again, the next job of that layer re-covers the same
-content (the content watermark never moved).
+or placeholder fails that segment, and the failure names it (`segment=b3_window_summary: ...`). The
+job attempt is the retry: a finished segment is never re-run, so one failed segment costs one call
+on the next claim instead of the whole window. A second failure fails the job and leaves the
+previous artifact in place; the next job of that layer then re-covers the content (the content
+watermark never moved). A review may not empty a part the base row carried: a listed empty part
+fails the job rather than clearing durable content. A part the base already had empty is a faithful
+copy, not a broken reply; the base pass accepts sparse cards, so the review must be allowed to echo
+them.
 
 * **Tick** — `on_turn_start` advances both counters with the host's turn number
   (`max(local + 1, host)`, so a `/resume` that rehydrates the host count moves forward instead of
@@ -718,18 +741,19 @@ nothing is replayed. `minir_stats` reports the stream table with row and byte co
 
 ### Where the model call comes from
 
-Base and dialectic passes run through `agent_loop.run` on the `auxiliary.minir_dialectic` route
-with a **fixed** toolset built by `tools.agent_toolsets(...)`: the host's `file` toolset, this
-plugin's `minir` toolset (which carries `minir_hermes_session_search` and `minir_aiagent_search`)
-and `skills`. Operator-configured toolsets are additive defaults, never a widening: the list is
-never `None`, because `agent_loop.run` passes the list it was given, so an empty list means no
-tools while `None` would mean every tool.
+Base passes B1/B2 and the dialectic run through `agent_loop.run` on the
+`auxiliary.minir_dialectic` route with a **fixed** toolset built by `tools.agent_toolsets(...)`:
+the host's `file` toolset, this plugin's `minir` toolset (which carries
+`minir_hermes_session_search`, `minir_aiagent_search`, `minir_get`, `minir_state` and
+`minir_window`) and `skills`. Operator-configured toolsets are additive defaults, never a widening:
+the list is never `None`, because `agent_loop.run` passes the list it was given, so an empty list
+means no tools while `None` would mean every tool. B3/B4 run as child agents through
+`minir_agents` on the route the parent actually got.
 `agent_loop.run` marks every peer run with `file_guard.aux_scope()` and passes the project root
 (the nearest `.git` above the cwd), so a `pre_tool_call` guard scopes the file tools for every
 plugin agent: reads stay under `$HERMES_HOME` and the project root, minus secret files and
-`.git` metadata; writes only under `minir-memory/scratch/`. Each pass is prompted to call
-`minir_hermes_session_search` with the session id and window from its prompt when it needs more
-evidence:
+`.git` metadata; writes only under `minir-memory/scratch/`. Every pass is told to read its
+material with the tools its prompt names:
 
 ```yaml
 auxiliary:
@@ -739,10 +763,13 @@ auxiliary:
     toolsets: [file]        # file/minir/skills are always appended
 ```
 
-If the agent route cannot run (host module absent, bad config, provider outage), the pass falls
-back to `worker.call_model`, which imports `agent.auxiliary_client.call_llm` lazily, under the
-same key. Base and dialectic share one route on purpose: one model serves both, and only the
-prompt and the output cap differ. The three routes are pinned independently:
+If the agent route cannot run (host module absent, bad config, provider outage), the segment
+fails and the window is retried later. There is deliberately **no one-shot fallback** for a layer
+pass: its prompt carries locators, and a call without tools would answer from nothing. The
+one-shot client (`worker.call_model`, importing `agent.auxiliary_client.call_llm` lazily) remains
+for the no-tool card review and for tests that inject `complete=`. Base and dialectic share one
+route on purpose: one model serves both, and only the prompt differs. The three routes are pinned
+independently:
 
 ```yaml
 auxiliary:
@@ -759,27 +786,25 @@ thread, a layer refresh never raises into a turn, and `reasoning_enabled: false`
 ### Prompt contract
 
 Every model call uses the same split: the **system message** owns the role, trust order and output
-contract; the **user message** owns task metadata and labeled data blocks. This keeps instructions
-stable across windows and leaves the evidence replaceable.
+contract; the **user message** owns task metadata and the locator list. This keeps instructions
+stable across windows and leaves the material in the store.
 
 - **Trust order** — operator-authored identity/preferences (trusted) > the raw conversation
   window (untrusted evidence) > previous cards, reviews, chunk summaries and drafts (derived
   drafts). A derived item is never evidence for itself; current evidence beats a previous item.
-- **Data, not instructions** — `prompting.data_block()` wraps every non-system input in a named
-  tag (`<base_user_transcript>`, `<base_ai_transcript>`, `<window_summary_transcript>`,
-  `<value_markers_transcript>`, `<dialectic_transcript>`, `<previous_user_cards>`,
-  `<base_layer_artifact>`,
-  `<live_turn_events>`, …). Reserved tags appearing inside a payload are rewritten as literal
-  text, so a message cannot close its block early or forge another block. Adviser-mode events are
-  JSONL: one event per line, with newlines escaped, so event text cannot create prompt structure.
-- **Exact output shape** — base passes return their staged JSON keys and the dialectic pass
-  returns the same parts; pass 3's `window_summary` is one markdown section, and the B3 prompt
-  states its caps. Cards state the display-safe item counts and character limits (a
-  fixed-size card section would otherwise truncate a long list); the worker keeps a wider
-  hard cap and truncates anything that exceeds it. Arrays may be empty when a sparse window
-  proves nothing. A dialectic reply that leaves a field as `[unknown] …` placeholders is not a
-  correction; `[]` on a listed representation card empties it. The window record and the marker
-  inventory are merged, never cleared.
+- **Data, not instructions** — `prompting.data_block()` wraps the few inputs that stay inline
+  (the first user message, the code-written preset, and a dialectic pass's own draft) in a named
+  tag. Reserved tags appearing inside a payload are rewritten as literal text, so a message cannot
+  close its block early or forge another block. Adviser-mode events are JSONL: one event per line,
+  with newlines escaped, so event text cannot create prompt structure.
+- **Exact output shape** — each segment returns its own JSON object (B1 the user card, B3 the
+  summary body, B4 the markers, B2 the AI card) and the dialectic pass returns the whole review.
+  Pass 3's `window_summary` is the section **body**: code adds the heading. Cards state the
+  display-safe item counts and character limits; a body over `CARD_TEXT_LIMIT` fails its segment
+  rather than being cut, and an assembled artifact has no whole-document cap. Arrays may be empty
+  when a sparse window proves nothing. A dialectic reply that leaves a field as `[unknown] …`
+  placeholders is not a correction; `[]` on a listed representation card empties it. The window
+  record and the marker inventory are merged, never cleared.
 - **One vocabulary per concept** — `prompting.MARKER_TYPES` defines the five value markers and
   `prompting.ADVICE_TARGETS` defines the advice targets; the base, dialectic, provider and
   adviser prompts are composed from those tables, so a stored item and the pass that later judges
@@ -790,9 +815,11 @@ stable across windows and leaves the evidence replaceable.
   dialectic pass separates drift review per field from the advice policy
   (`nit`/`concern`/`blocker`), and `base_changed.changed` is true exactly when `fields` is
   non-empty.
-- **Bounded inputs** — the window keeps the newest messages under its character budget with an
-  omission marker; the previous artifact and value markers are fed back only where the merge
-  needs them (the base `## Window Summary` projection is deliberately recomputed, not fed back).
+- **Bounded material, unbounded prompt** — the tools carry the bounds: `minir_hermes_session_search`
+  takes `limit`/`max_chars`, `minir_window` takes `parts`/`max_chars` and reports `truncated`, and
+  `minir_get(projection="paths")` returns addresses instead of a 15k-character marker body. The
+  prompt itself is bounded by structure, not by a character budget: a pass is never handed a
+  silently shortened material.
 
 ## The adviser auxiliary (optional agent loop)
 
@@ -1421,9 +1448,10 @@ package is `plugin/minir`, so it is never collected as a test module.
   over config.yaml. Override
   `save_config(values, hermes_home)` only if your values need a native format the host cannot
   write.
-* **Everything injected is bounded** — stored conclusions and artifacts are truncated on write
-  (4000 chars), the recall block is capped at 2000, and the layer block at 1200, so nothing
-  unbounded reaches the prompt.
+* **Everything injected is bounded** — the recall block is capped at 2000 characters and the layer
+  block at 1200, so nothing unbounded reaches the prompt. Stored rows are kept whole: the write
+  path no longer truncates, and a reader that needs a shorter view asks the tool for it
+  (`max_chars`).
 * **Counting is off the bounded-hook path** — the counters run on `on_turn_start` /
   `on_session_end`, which the host never abandons on a timeout. Plugin hooks stay cheap:
   `pre_llm_call` reads a cached review and returns one bounded block (once per turn id),

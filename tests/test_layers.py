@@ -115,7 +115,7 @@ def test_the_preset_is_a_markdown_seed_and_placeholders_are_refused(layers):
 def test_the_b3_core_is_a_text_asset(layers):
     """A missing prompt asset fails the pass; there is no empty-prompt fallback."""
     core = layers.load_core("b3_window_summary")
-    assert core.startswith("PROMPT_VERSION: 1.0.0\n")
+    assert core.startswith("PROMPT_VERSION: 2.0.0\n")
     assert "You close one base refresh" in core
     assert "<window_template>" in core
     assert "value_markers" not in core and "value_markers" not in core.lower(), \

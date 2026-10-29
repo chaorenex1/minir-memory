@@ -36,15 +36,18 @@ def test_a_base_publish_hands_its_units_to_the_knowledge_pipeline(plugin_package
     def complete(task, system, prompt, **kwargs):
         if "dialectic reviewer" in system:
             return "{}"
-        if "<window_template>" in prompt:
+        if "PASS: b3_window_summary" in prompt:
             return json.dumps({
-                "user_self_representation": "# Who this person is\n\nAn Engineer.\n",
-                "user_preferences": "# How they want answers\n\n- Terse first.\n",
-                "window_summary": "## Window Summary\n\n### Objective\n- restart docker\n\n"
-                                  "### Current State\n#### Done\n- read the restart policy",
-                "value_markers": [marker]})
-        return json.dumps({"ai_self_representation": "# What this task is\n\nidle.\n",
-                           "ai_identity": "# Who the assistant is\n\nminir 0.8.0.\n"})
+                "window_summary": "### Objective\n- restart docker\n\n"
+                                  "### Current State\n#### Done\n- read the restart policy"})
+        if "PASS: b4_value_markers" in prompt:
+            return json.dumps({"value_markers": [marker]})
+        if "PASS: b2_ai_card" in prompt:
+            return json.dumps({"ai_self_representation": "# What this task is\n\nidle.\n",
+                               "ai_identity": "# Who the assistant is\n\nminir 0.8.0.\n"})
+        return json.dumps({
+            "user_self_representation": "# Who this person is\n\nAn Engineer.\n",
+            "user_preferences": "# How they want answers\n\n- Terse first.\n"})
 
     transcript.add("s1", "user", "restart docker", created_at=10.0)
     store.record_job("base", "s1", 0.0, 20.0)

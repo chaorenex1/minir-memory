@@ -78,11 +78,8 @@ from .summary import window_summary
 from .runtime import tools as plugin_tools
 from .adviser.adviser_mode import AdviserMode
 from .prompting.prompting import CONSISTENCY_TARGETS, marker_glossary
-from .store.store import (CONCLUSION_KINDS, MinirStore, SessionScopeError, format_when,
-                    is_session_bound)
-# The same stored-text bound the store truncates at: a longer todo payload must be refused
-# rather than silently cut into invalid JSON.
-from .store.store import _MAX_CONTENT as _MAX_CONCLUSION_CHARS
+from .store.store import (CONCLUSION_KINDS, REFRESH_COLUMNS, MinirStore, SessionScopeError,
+                          format_when, is_session_bound)
 from .store.transcript import HOST_LAYER, TranscriptBuffer, fingerprint
 from .passes.turn_counter import (
     BASE_LAYER,
@@ -128,6 +125,7 @@ logger = logging.getLogger(__name__)
 _PROVIDER_LABEL = "Minir"
 _STORE_DIRNAME = "minir-memory"   # under $HERMES_HOME
 _DB_FILENAME = "memory.db"
+_MAX_TODO_CHARS = 12_000          # one todo list is a turn's plan, not a stored document
 _MAX_PREFERENCE_CHARS = 4_000     # system-prompt share of the operator's user preference card
 _MAX_IDENTITY_CARD_CHARS = 1_200  # the user identity card is an orientation, not a dossier
 _DEFAULT_PREFETCH_LIMIT = 5
@@ -214,6 +212,67 @@ def _excerpt(text: str) -> str:
     flat = " ".join((text or "").split())
     return flat if len(flat) <= _MAX_TOOL_EXCERPT else flat[:_MAX_TOOL_EXCERPT] + "…"
 
+
+
+_CONTENT_PATH_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._/-]*\.md")
+_CONTENT_HEADING_RE = re.compile(r"^#{1,6} +(.+)$", re.MULTILINE)
+
+
+def _content_index(text: str) -> list[str]:
+    """Page paths then markdown headings a stored content mentions, in order, deduped.
+
+    ``minir_get(projection="paths")`` answers one question — which pages does this row already
+    cover — so it reports addresses, never the body: a 15,843-character markers row must not be
+    pasted into a prompt just to learn its paths.
+    """
+    lines: list[str] = []
+    seen: set[str] = set()
+    for match in _CONTENT_PATH_RE.finditer(text or ""):
+        value = match.group(0)
+        if value not in seen:
+            seen.add(value)
+            lines.append(value)
+    for match in _CONTENT_HEADING_RE.finditer(text or ""):
+        value = match.group(1).strip()
+        if value and value not in seen:
+            seen.add(value)
+            lines.append(value)
+    return lines
+
+
+def _decode_part(raw: Any) -> Any:
+    """A refresh column -> its JSON value; a legacy non-JSON string stays a string."""
+    if not isinstance(raw, str):
+        return raw
+    try:
+        return json.loads(raw)
+    except (json.JSONDecodeError, TypeError):
+        return raw
+
+
+def _part_text(value: Any) -> str:
+    return value if isinstance(value, str) else json.dumps(value, ensure_ascii=False)
+
+
+def _window_text(parts: dict[str, Any]) -> str:
+    """The selected refresh parts in artifact order, skipping what the row has not produced."""
+    blocks: list[str] = []
+    if parts.get("user_representation") or parts.get("user_peer_card"):
+        blocks.append(layers.render_user_card(
+            _part_text(parts.get("user_representation") or ""),
+            _part_text(parts.get("user_peer_card") or "")))
+    if parts.get("ai_self_representation") or parts.get("ai_identity_card"):
+        blocks.append(layers.render_ai_card(
+            _part_text(parts.get("ai_self_representation") or ""),
+            _part_text(parts.get("ai_identity_card") or "")))
+    if str(parts.get("window_summary") or "").strip():
+        blocks.append(window_summary.render_section(parts["window_summary"]))
+    markers = parts.get("value_markers")
+    if isinstance(markers, dict):
+        markers = markers.get("value_markers")
+    if isinstance(markers, list) and markers:
+        blocks.append(layers.render_markers(markers))
+    return "\n\n".join(block for block in blocks if block.strip())
 
 
 def _todo_line(item: dict[str, Any], *, indent: int) -> str:
@@ -995,9 +1054,9 @@ class MinirMemoryProvider(MemoryProvider):
             return json.dumps({"stored": False, "deleted": deleted, "count": 0, "open": 0,
                                **owner})
         payload = json.dumps({"todos": items}, ensure_ascii=False)
-        if len(payload) > _MAX_CONCLUSION_CHARS:
+        if len(payload) > _MAX_TODO_CHARS:
             return tool_error(f"todo_too_large: {len(payload)} chars "
-                              f"(limit {_MAX_CONCLUSION_CHARS})")
+                              f"(limit {_MAX_TODO_CHARS})")
         conclusions_id = self._store.save_conclusion(
             "todo", payload, key=key, session_id=session, subject="tool")
         # The answer being composed gets the table; the next turn's prefetch gets the counts.
@@ -1746,6 +1805,128 @@ class MinirMemoryProvider(MemoryProvider):
         return json.dumps({"stored": True, "type": part, "revisions": revisions,
                            "remember_mode": "card"})
 
+    # -- locator reads --------------------------------------------------------
+
+    def _handle_get(self, args: dict[str, Any]) -> str:
+        """One conclusion row by exact kind and key; never a ranked approximation."""
+        kind = str(args.get("kind") or "").strip()
+        key = str(args.get("key") or "").strip()
+        if not kind or not key:
+            return tool_error("kind and key are required")
+        if kind not in CONCLUSION_KINDS:
+            return tool_error(f"kind must be one of: {', '.join(CONCLUSION_KINDS)}")
+        projection = str(args.get("projection") or "text").strip().lower()
+        if projection not in {"text", "paths"}:
+            return tool_error("projection must be text or paths")
+        row = self._store.get_conclusion(kind, key)
+        status = str((row or {}).get("status") or "")
+        if row is None or (status == "superseded"
+                           and not _coerce_bool(args.get("include_superseded"), False)):
+            return json.dumps({"found": False, "kind": kind, "key": key, "text": "",
+                               "lines": [], "status": status, "updated_at": None})
+        content = str(row.get("content") or "")
+        payload = {"found": True, "kind": kind, "key": key, "status": status,
+                   "updated_at": row.get("updated_at"),
+                   "session_id": row.get("session_id") or "",
+                   "text": content, "lines": []}
+        if projection == "paths":
+            payload["text"] = ""
+            payload["lines"] = _content_index(content)
+        return json.dumps(payload, ensure_ascii=False)
+
+    def _handle_state(self, args: dict[str, Any]) -> str:
+        """The current published artifact of one layer for one subject."""
+        layer = str(args.get("layer") or "").strip()
+        subject = str(args.get("subject") or "").strip()
+        if layer not in ("base", "dialectic", "card_review", "identity_meta"):
+            return tool_error("layer must be base, dialectic, card_review or identity_meta")
+        if not subject:
+            return tool_error("subject is required")
+        row = self._store.layer_state(layer, subject)
+        return json.dumps({
+            "found": row is not None, "layer": layer, "subject": subject,
+            "version": int((row or {}).get("version") or 0),
+            "content": str((row or {}).get("content") or ""),
+            "session_id": str((row or {}).get("session_id") or ""),
+            "updated_at": (row or {}).get("updated_at")}, ensure_ascii=False)
+
+    def _handle_window(self, args: dict[str, Any]) -> str:
+        """Refresh rows by locator: the row key, the columns and how to render them."""
+        session_id = str(args.get("session_id") or self._session_id or "").strip()
+        if not session_id:
+            return tool_error("session_id is required (no session is bound)")
+        subject = str(args.get("subject") or f"user:{self._profile}").strip()
+        parts = args.get("parts")
+        if parts in (None, "", []):
+            parts = list(REFRESH_COLUMNS)
+        if not isinstance(parts, list) or not all(isinstance(name, str) for name in parts):
+            return tool_error("parts must be an array of column names")
+        unknown = [name for name in parts if name not in REFRESH_COLUMNS]
+        if unknown:
+            return tool_error(f"unknown part(s): {', '.join(unknown)}; "
+                              f"known: {', '.join(REFRESH_COLUMNS)}")
+        stamps: dict[str, Any] = {}
+        for name in ("window_from_ts", "window_to_ts", "before_ts", "after_ts"):
+            value = args.get(name)
+            if value in (None, ""):
+                stamps[name] = None
+                continue
+            try:
+                stamps[name] = float(value)
+            except (TypeError, ValueError):
+                return tool_error(f"{name} must be an epoch timestamp")
+        order = str(args.get("order") or "newest").strip().lower()
+        if order not in {"newest", "oldest"}:
+            return tool_error("order must be newest or oldest")
+        fmt = str(args.get("format") or "parts").strip().lower()
+        if fmt not in {"parts", "text"}:
+            return tool_error("format must be parts or text")
+        try:
+            limit = max(1, min(10, int(args.get("limit") or 1)))
+            max_chars = int(args.get("max_chars") if args.get("max_chars") is not None else 4_000)
+        except (TypeError, ValueError):
+            return tool_error("limit and max_chars must be integers")
+        if max_chars < 0 or max_chars > 100_000:
+            return tool_error("max_chars must be between 0 (no cap) and 100000")
+        rows = self._store.base_refresh_windows(
+            session_id, subject, window_from_ts=stamps["window_from_ts"],
+            before_ts=stamps["before_ts"], after_ts=stamps["after_ts"],
+            latest=_coerce_bool(args.get("latest"), False),
+            include_drafts=_coerce_bool(args.get("include_drafts"), False),
+            order=order, limit=limit)
+        if stamps["window_to_ts"] is not None:
+            # The window is fixed once a refresh starts; a row whose end moved is not the one
+            # the caller meant, and reporting it as found would hide the drift.
+            wanted = float(stamps["window_to_ts"])
+            rows = [row for row in rows
+                    if abs(float(row.get("window_to_ts") or 0) - wanted) <= 1e-6]
+        out: list[dict[str, Any]] = []
+        truncated = False
+        for row in rows:
+            selected: dict[str, Any] = {}
+            for name in parts:
+                value = _decode_part(row.get(name) or "")
+                text = _part_text(value)
+                if max_chars and len(text) > max_chars:
+                    truncated = True
+                    value = text[:max_chars]
+                selected[name] = value
+            entry = {"session_id": str(row.get("session_id") or ""),
+                     "subject": str(row.get("subject") or ""),
+                     "window_from_ts": float(row.get("window_from_ts") or 0),
+                     "window_to_ts": float(row.get("window_to_ts") or 0),
+                     "turns": {"from": row.get("window_from_turn"),
+                               "to": row.get("window_to_turn")},
+                     "is_latest": bool(row.get("is_latest")),
+                     "draft": row.get("published_at") is None,
+                     "conclusions_published_at": row.get("conclusions_published_at"),
+                     "parts": selected}
+            if fmt == "text":
+                entry["text"] = _window_text(selected)
+            out.append(entry)
+        return json.dumps({"found": bool(out), "count": len(out), "truncated": truncated,
+                           "rows": out}, ensure_ascii=False)
+
     def handle_tool_call(self, tool_name: str, args: dict[str, Any], **kwargs) -> str:
         """Dispatch one of this provider's tools. Must return a JSON string."""
         if tool_name == content_valid.TOOL_NAME:
@@ -1772,6 +1953,12 @@ class MinirMemoryProvider(MemoryProvider):
         if self._store is None:
             return tool_error("Minir is not initialized")
         args = args or {}
+        if tool_name == "minir_get":
+            return self._handle_get(args)
+        if tool_name == "minir_state":
+            return self._handle_state(args)
+        if tool_name == "minir_window":
+            return self._handle_window(args)
         if tool_name == "minir_search":
             query = str(args.get("query") or "").strip()
             if not query:

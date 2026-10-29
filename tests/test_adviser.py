@@ -183,4 +183,5 @@ def test_provider_registration_survives_a_refused_auxiliary_key(plugin_package):
     assert [call[1]["name"] for call in ctx.calls if call[0] == "tool"] == [
         "minir_search", "minir_kb_search", "minir_remember", "minir_forget", "minir_todo",
         "minir_stats", "minir_agents", "minir_content_valid", "minir_link", "minir_unmerge",
-        "minir_kb_write", "minir_aiagent_search", "minir_hermes_session_search"]
+        "minir_kb_write", "minir_get", "minir_state", "minir_window", "minir_aiagent_search",
+        "minir_hermes_session_search"]
