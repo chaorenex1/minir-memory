@@ -68,8 +68,10 @@ _MAX_SCAN = 200      # candidate rows fetched per table before scoring
 
 #: Bumped whenever ``_migrate`` changes the shape of the file. A database already at this
 #: version skips the migration write path on open, so a second process does not rewrite the
-#: schema while the first one is writing.
-_SCHEMA_VERSION = 9
+#: schema while the first one is writing. That also means appending a column to
+#: ``_ADDED_COLUMNS`` is not enough on its own: a file already stamped here never runs the
+#: migration again, so the new column must come with a bump.
+_SCHEMA_VERSION = 10
 
 #: Requeue budget for a job whose owning process died mid-run. A death is not a failed attempt
 #: (the window is still readable), so the row goes back to ``pending`` with ``attempts``
@@ -308,6 +310,11 @@ CREATE TABLE IF NOT EXISTS adviser_reviews (
     adviser TEXT NOT NULL DEFAULT '',
     notes_dropped INTEGER NOT NULL DEFAULT 0,
     drop_detail TEXT NOT NULL DEFAULT '{}',
+    prompt_chars INTEGER NOT NULL DEFAULT 0,
+    prompt_tokens INTEGER NOT NULL DEFAULT 0,
+    cache_read_tokens INTEGER NOT NULL DEFAULT 0,
+    evicted_chars INTEGER NOT NULL DEFAULT 0,
+    cache_epoch INTEGER NOT NULL DEFAULT 0,
     created_at REAL NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_adviser_reviews_session
@@ -530,6 +537,10 @@ _ADDED_COLUMNS: dict[str, tuple[tuple[str, str], ...]] = {
                         ("acks", "TEXT NOT NULL DEFAULT '{}'"),
                         # Context cost and eviction, priced per review (eviction draft §5.2).
                         ("prompt_chars", "INTEGER NOT NULL DEFAULT 0"),
+                        # Billed tokens for the review, next to the delta-prompt chars: the
+                        # chars alone under-report a run by an order of magnitude.
+                        ("prompt_tokens", "INTEGER NOT NULL DEFAULT 0"),
+                        ("cache_read_tokens", "INTEGER NOT NULL DEFAULT 0"),
                         ("evicted_chars", "INTEGER NOT NULL DEFAULT 0"),
                         # Bumped when the model-facing history start moves: a cache epoch
                         # boundary, so an eviction that invalidates the prefix is visible.
@@ -3193,17 +3204,20 @@ class MinirStore:
                               error: str = "", notes_dropped: int = 0,
                               drop_detail: str = "", coverage: str = "",
                               acks: str = "", prompt_chars: int = 0,
+                              prompt_tokens: int = 0, cache_read_tokens: int = 0,
                               evicted_chars: int = 0, cache_epoch: int = 0) -> None:
         with self._lock:
             self._conn.execute(
                 "UPDATE adviser_reviews SET status = ?, model = ?, api_calls = ?, "
                 "latency_ms = ?, error = ?, notes_dropped = ?, drop_detail = ?, coverage = ?, "
-                "acks = ?, prompt_chars = ?, evicted_chars = ?, cache_epoch = ? "
+                "acks = ?, prompt_chars = ?, prompt_tokens = ?, cache_read_tokens = ?, "
+                "evicted_chars = ?, cache_epoch = ? "
                 "WHERE id = ?",
                 (status, model or "", int(api_calls or 0), float(latency_ms or 0.0),
                  (error or "")[:500], int(notes_dropped or 0),
                  (drop_detail or "{}")[:2000], (coverage or "{}")[:2000],
                  (acks or "{}")[:2000], int(prompt_chars or 0),
+                 int(prompt_tokens or 0), int(cache_read_tokens or 0),
                  int(evicted_chars or 0), int(cache_epoch or 0), int(review_id)))
             self._conn.commit()
 

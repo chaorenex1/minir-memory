@@ -62,7 +62,9 @@ def test_roster_runs_each_adviser_with_its_own_cursor(plugin_package, make_provi
     assert len(calls) == 2
     rows = provider._store.pending_advisories("session-test", source="adviser_mode")
     assert sorted(row["adviser"] for row in rows) == ["cost", "quality"]
-    assert "look for robustness" in calls[0]["message"]
+    assert "look for robustness" in calls[0]["system_message"], "roster instructions ride the system message"
+    assert calls[0]["system_message"].rstrip().endswith("look for robustness")
+    assert "# Adviser instructions" in calls[0]["system_message"]
     assert "adviser: quality" in calls[0]["message"]
 
     # Both cursors advanced: the next review sees only the new event.
@@ -111,7 +113,9 @@ def test_review_interval_counts_tool_updates(plugin_package, make_provider, monk
 
 # -- perception ---------------------------------------------------------------
 
-def test_prompt_carries_project_instructions(plugin_package, make_provider, monkeypatch, tmp_path):
+def test_the_system_message_carries_project_instructions(plugin_package, make_provider,
+                                                       monkeypatch, tmp_path):
+    """T9.1: segment 2 is the file text in the system message; the user message is the turn."""
     (tmp_path / "AGENTS.md").write_text("Always run the verify script.", encoding="utf-8")
     monkeypatch.chdir(tmp_path)
     provider = _provider(make_provider)
@@ -120,8 +124,12 @@ def test_prompt_carries_project_instructions(plugin_package, make_provider, monk
 
     _review_event(provider)
     provider._adviser_mode.review_once("session-test", "test")
-    assert "Always run the verify script." in calls[0]["message"]
-    assert "<project_context>" in calls[0]["message"]
+
+    system = calls[0]["system_message"]
+    assert "<project-context>" in system
+    assert str(tmp_path / "AGENTS.md") in system
+    assert "Always run the verify script." in system
+    assert "<project_context>" not in calls[0]["message"]
 
 
 def test_prompt_is_passed_through_the_host_redactor(plugin_package, make_provider, monkeypatch):
@@ -148,7 +156,7 @@ def test_recorded_events_drop_injected_advisory_blocks(plugin_package, make_prov
         "session-test", f"before\n{block}\nafter", turn_id="t1")
     ring = list(provider._adviser_mode._ring("session-test"))
     assert "check the diff" not in ring[-1]["text"]
-    assert ring[-1]["text"].strip() == "before after"
+    assert ring[-1]["text"].strip() == "before\nafter", "line breaks are kept, the block is cut"
 
 
 # -- emission guard -----------------------------------------------------------
@@ -272,6 +280,66 @@ def test_immune_window_suppresses_concerns_but_not_blockers(plugin_package, make
     assert provider._adviser_mode.handle_llm_request(
         request=request, session_id="session-test", api_request_id="r2", turn_id="t2")
     assert "stop before deleting" in request["messages"][-1]["content"]
+
+
+def _host(plugin_package, monkeypatch, *, live: bool, streaming: bool = False,
+          tool_batch: bool = False, aborting: bool = False) -> list:
+    """Install a fake host bridge and return the channel calls it receives."""
+    calls: list = []
+
+    def _ok(name):
+        def _call(session, block, **kwargs):
+            calls.append(name)
+            return {"ok": True, "mode": name}
+        return _call
+
+    monkeypatch.setattr(plugin_package.host_bridge, "available", lambda: True)
+    monkeypatch.setattr(plugin_package.host_bridge, "flags", lambda session: {})
+    monkeypatch.setattr(plugin_package.host_bridge, "live_state", lambda session: {
+        "capability": "plugin_runtime_v3", "live": live, "streaming": streaming,
+        "aborting": aborting, "tool_batch": tool_batch,
+        "terminal_idle": live and not (streaming or aborting or tool_batch)})
+    monkeypatch.setattr(plugin_package.host_bridge, "interrupt", _ok("interrupt"))
+    monkeypatch.setattr(plugin_package.host_bridge, "continue_turn", _ok("continuation"))
+    monkeypatch.setattr(plugin_package.host_bridge, "steer", _ok("steer"))
+    monkeypatch.setattr(plugin_package.host_bridge, "queue_post_turn", _ok("post_turn"))
+    return calls
+
+
+def test_a_queued_tool_batch_keeps_a_terminal_turn_live(plugin_package, make_provider,
+                                                        monkeypatch):
+    """T2.2: terminalAnswerNoQueuedWork — an answered turn that still owns a batch is live."""
+    provider = _provider(make_provider)
+    mode = provider._adviser_mode
+    mode._turn_index("session-test", "t1")
+    provider._store.add_advisories("session-test", [{
+        "severity": "concern", "text": "read the failing test before retrying",
+    }], source="adviser_mode")
+    ids = [row["id"] for row in provider._store.pending_advisories(
+        "session-test", source="adviser_mode")]
+    mode._terminal["session-test"] = "t1"
+    calls = _host(plugin_package, monkeypatch, live=True, tool_batch=True)
+
+    mode._deliver_host("session-test", ids, mode._cfg())
+
+    assert calls == ["continuation"], "the answer does not make a batch-owning turn terminal"
+
+
+def test_a_terminal_idle_turn_may_start_a_new_turn(plugin_package, make_provider, monkeypatch):
+    """T2.2: only terminal_idle reaches the post-turn trigger (omp's terminalIdle)."""
+    provider = _provider(make_provider)
+    mode = provider._adviser_mode
+    mode._turn_index("session-test", "t1")
+    provider._store.add_advisories("session-test", [{
+        "severity": "concern", "text": "the migration never ran",
+    }], source="adviser_mode")
+    ids = [row["id"] for row in provider._store.pending_advisories(
+        "session-test", source="adviser_mode")]
+    mode._terminal["session-test"] = "t1"
+    calls = _host(plugin_package, monkeypatch, live=True)
+
+    assert mode._deliver_host("session-test", ids, mode._cfg()) == 1
+    assert calls == ["post_turn"]
 
 
 # -- gateway preserve ---------------------------------------------------------

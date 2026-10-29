@@ -90,10 +90,6 @@
       "sha256": "8153781706705ea0beb9d0196ef2b4b1cb498621f2be7da929bd6bb5575d7694"
     },
     {
-      "name": "0022-Kill-in-flight-tool-processes-on-a-plugin-interrupt.patch",
-      "sha256": "6cdf8dadb28ca78975f18efc556586baed01028357723706f9547de0940bddd8"
-    },
-    {
       "name": "0023-Expose-live-turn-state-to-plugins.patch",
       "sha256": "cdfae0d3a0fcba80175bf1b3e92875f02d8aee188ba78d9909d5ec5bd6d623bc"
     },
@@ -102,5 +98,8 @@
       "sha256": "d622b09e4f6c7734ead694b49068589f08006e77cc79f86aad5f7ce7bdbb3ddd"
     }
   ],
-  "rebased": "v0.22.5 (bf0203a794). Two merge decisions: the steer buffer holds (ticket, text, kind) triples so the upstream ticket API keeps working while an adviser row stays labeled, and the plugin continuation gate runs before the late-LSP gate (a blocker outranks a note)."
+  "rebased": "v0.22.5 (bf0203a794). Two merge decisions: the steer buffer holds (ticket, text, kind) triples so the upstream ticket API keeps working while an adviser row stays labeled, and the plugin continuation gate runs before the late-LSP gate (a blocker outranks a note).",
+  "withdrawn": {
+    "0022-Kill-in-flight-tool-processes-on-a-plugin-interrupt.patch": "2026-10-29: revoked. omp's steer does not kill in-flight tools (agent-loop.ts:3292-3312); patch 0005's cooperative interrupt is the same shape. The hunks were reversed on the installed host and the record dropped before the patch left the series."
+  }
 }

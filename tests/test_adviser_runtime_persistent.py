@@ -70,10 +70,10 @@ def test_second_review_continues_with_history_and_stable_session(
     assert "first" in history[-1]["content"]
 
 
-def test_tool_event_keeps_the_ring_body_and_the_prompt_gets_a_skeleton(
+def test_the_ring_keeps_the_body_and_the_prompt_bounds_it_per_field(
         plugin_package, make_provider):
-    """The ring keeps the full result — it is evidence — while the prompt bounds a >24k event
-    (T4: 1.83% of real tool rows exceed that, the largest ~132k tokens)."""
+    """T4: the ring holds the full result — it is evidence — while the prompt keeps 8 KiB of it
+    (1.83% of real tool rows exceed that; the largest is 529k chars ~132k tokens)."""
     provider = _provider(make_provider)
     big = "R" * 20_000
     provider._adviser_mode.on_post_tool_call(
@@ -85,13 +85,12 @@ def test_tool_event_keeps_the_ring_body_and_the_prompt_gets_a_skeleton(
     assert "elided" not in event
     prompt = provider._adviser_mode._prompt(SESSION, "t1", "tool", [event])
     assert "R" * 20_000 not in prompt
-    assert "original_chars=" in prompt and "chars elided" in prompt
+    assert "elided…]" in prompt
 
 
-def test_a_tool_event_below_the_threshold_keeps_its_full_result(
-        plugin_package, make_provider):
+def test_a_result_below_the_byte_cap_keeps_its_full_body(plugin_package, make_provider):
     provider = _provider(make_provider)
-    body = "S" * 20_000
+    body = "S" * 4_000
     provider._adviser_mode.on_post_tool_call(
         session_id=SESSION, turn_id="t1", tool_name="read_file", status="ok",
         args="A" * 100, result=body)
@@ -99,21 +98,23 @@ def test_a_tool_event_below_the_threshold_keeps_its_full_result(
     prompt = provider._adviser_mode._prompt(
         SESSION, "t1", "tool", list(provider._adviser_mode._ring(SESSION)))
 
-    assert body in prompt and "chars elided" not in prompt
+    block = prompt.split("[result]\n", 1)[1].split("\n</tool>", 1)[0]
+    assert block == body, "a result under the byte cap is not touched"
 
 
-def test_full_reasoning_is_written_without_the_prompt_cap(
+def test_the_full_reasoning_trail_is_written_while_the_prompt_delta_is_bounded(
         plugin_package, make_provider, tmp_path):
+    """T7.2: the file keeps every character; the event's `_thinking:_` line is the delta, capped."""
     provider = _provider(make_provider, include_reasoning=True, reasoning_log=True)
     mode = provider._adviser_mode
     mode.on_stream_delta(SESSION, "R" * 9_000)
 
-    assert len(mode._reasoning[SESSION]) == 9_000
+    assert len(mode._reasoning_since[SESSION]) == 8_000, "the per-event delta is bounded"
     mode._flush_reasoning(SESSION)
 
     path = tmp_path / "minir-memory" / "sessions" / "default" / "reasoning" / "session-test.log"
     assert path.exists()
-    assert "R" * 9_000 in path.read_text(encoding="utf-8")
+    assert "R" * 9_000 in path.read_text(encoding="utf-8"), "the file is the whole trail"
 
 
 def test_deferred_note_is_held_mid_turn_and_rendered_at_turn_end(

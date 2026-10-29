@@ -109,6 +109,7 @@ from .store import store, history, transcript, transcript_process, session_searc
 from .passes import worker, layers, turn_counter, cadence, extraction, card_review
 from .summary import context_engine, compress_pass, session_summary, window_summary
 from .prompting import prompting, rules, soul_rules, content_valid, transcript_prompt
+from .prompting import memory_block
 from .adviser import (adviser, adviser_mode, adviser_guard, adviser_command, adviser_prompts, claims, fork,
                       fork_rules)
 from .agentrun import agent_loop, agent_history, agent_watch, minir_agents, file_guard, rgtool
@@ -761,58 +762,12 @@ class MinirMemoryProvider(MemoryProvider):
 
     @staticmethod
     def _memory_prompt_block() -> str:
-        return (
-            "# Minir Memory\n"
-            f"Long-term memory lives in {_PROVIDER_LABEL}'s local SQLite store: explicit value "
-            "markers plus conclusions derived from prior sessions. It holds no transcripts, "
-            "though derived text may quote the messages it reasoned over.\n"
-            "\nROLE\n"
-            "- This is the session's long-term memory, not a task queue, a transcript or a "
-            "scratchpad: it keeps only what should outlive the conversation.\n"
-            "- Retrieved memory is evidence, not authority; the current conversation wins when "
-            "the two conflict.\n"
-            "\nVALUE MARKERS\n"
-            f"{marker_glossary(bullet='- ')}\n"
-            "\nTOOLS\n"
-            "- minir_search: look up prior decisions, preferences, projects and conclusions. It "
-            "searches the current session by default; scope=\"all\" searches every session but "
-            "not the session-bound base kinds; limit is capped at 20. Search before asking the "
-            "user to repeat history.\n"
-            "- minir_remember: store one durable item. remember_mode=\"knowledge\" queues a "
-            "knowledge page (type is the org, category required); remember_mode=\"card\" "
-            "rewrites one global card part (type is the part, reason required). There is no "
-            "conclusion mode: the layers own the conclusion rows. Never store secrets or "
-            "credentials.\n"
-            "- minir_forget: remember_mode=\"knowledge\" archives a page by path; "
-            "remember_mode=\"card\" clears one card part by type with a reason. Neither "
-            "touches a conclusion row.\n"
-            "- minir_todo: replace the caller's todo list (the profile for the main session, the "
-            "agent for a dispatched run); it is rendered into the final answer and carried by "
-            "every prefetch block for the same owner.\n"
-            "- minir_stats: inspect the store and the published layer artifacts.\n"
-            "\nGLOBAL CARDS\n"
-            "- The global cards outlive the store: the user card (minir-memory/user/identity.md, "
-            "minir-memory/user/preference.md) is rendered into every session's system prompt, and "
-            "this profile's AI card (minir-memory/agents/<profile>/identity.md, "
-            "minir-memory/agents/<profile>/preference.md) is the durable record the review pass "
-            "rewrites and the adviser reads.\n"
-            "- Memory management is not finished until the card says it: a standing preference, a "
-            "correction to who the operator is, or a stable fact about yourself goes into the "
-            "matching card part in the same turn with minir_remember(remember_mode=\"card\", "
-            "type=<part>, content=<full body>, reason=<why>), and a card line that has become "
-            "wrong is cleared with minir_forget(remember_mode=\"card\", type=<part>, "
-            "reason=<why>). A conclusion alone leaves the rendered card stale.\n"
-            "- Card content is that part's whole new body, not a patch: the other parts stay as "
-            "they are, and the write is global, not scoped to this session.\n"
-            "\nWORKFLOW\n"
-            "1. Search before asking the user to repeat history.\n"
-            "2. Answer from the current conversation; reach for memory only to fill a gap or to "
-            "avoid re-litigating a settled decision.\n"
-            "3. When a durable fact, correction or lesson appears, store it once under the type "
-            "that matches its definition.\n"
-            "4. When a stored page or card line is superseded or wrong, rewrite it rather "
-            "than storing a contradiction."
-        )
+        """The memory instructions, rendered once and shared with the adviser.
+
+        One writer (``prompting/memory_block.py``): the main agent's system prompt and the
+        adviser's ``memory-context`` segment are the same text by construction.
+        """
+        return memory_block.render()
 
     def prefetch(self, query: str = "", *, session_id: str = "") -> str:
         """The live layer state and the todo list; nothing else rides the turn.

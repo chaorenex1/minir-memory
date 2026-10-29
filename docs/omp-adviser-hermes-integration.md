@@ -32,7 +32,7 @@
 1. primary turn 结束触发 `onPrimaryTurnEnd`。`reviewMode=turn` 每回合都触发，`agent-end` 只在最终 yield 触发；`reviewInterval=N` 每 N 个 eligible update 才真正 dispatch，被跳过的 update 仍然被捕获，随下一次 review 一起发（`session-advisors.ts:123-182`）。
 2. `runtime.onTurnEnd` 从自己的 cursor 取新增消息，渲染成 `### Session update`（实测 omp 18.12.2 的 advisor transcript 就是这个格式）：包含 user 文本、assistant 文本、reasoning、工具调用与结果；被截断的结果带 `elided` 标记；advisor 自己注入过的 `<advisory>` 在下一轮 delta 里被过滤，避免自我审阅。
 3. adviser 是一个完整 `Agent` 实例，`ToolSession` id 带 `-advisor` 后缀，与 primary 不共享文件快照/seen-lines/冲突状态（`docs/advisor-watchdog.md`，"Tools and isolation"）。
-4. system prompt 由五段拼成：`advisor/system.md`（含 `max_notes_per_update`）+ `context-files.md`（AGENTS.md 等）+ `memory-context.md`（记忆后端）+ `active-repo-watchdog.md`（父目录只有一个 git 子仓时）+ roster/共享 instructions（`session-advisors.ts:536-546`）。
+4. system prompt 由五段拼成：`advisor/system.md`（角色与通信规则，含 `max_notes_per_update`）+ `context-files.md`（AGENTS.md 等，贴正文）+ `memory-context.md`（记忆后端的 instructions）+ `active-repo-watchdog.md`（cwd 不在 repo 内、且恰好一个直接子仓时）+ advice 的规则和判定（omp 写在 `system.md` 的 `<critical>`/`<completeness>` 里，本插件拆成 `advice_target.md` / `advice_judgment.md`）；roster/共享 instructions 另在其后追加（`session-advisors.ts:536-546`、`session-advisors.ts:1314-1319`）。
 5. 默认只读工具 `read`/`grep`/`glob`，memory 后端存在时加 `recall`；`tools: []` 表示没有调查工具，`advise` 始终存在；roster 可以扩到 `write`/`edit`/`bash`/`eval`，被明确标注为安全边界（`session-advisors.ts:547-548`、`docs/advisor-watchdog.md`）。
 6. 建议走 `advise`，先过 emission guard：NFKC + 小写 + 去标点做 key；固定 noise 列表（"looks good"、"no issues" 等 40 余条）直接丢；同一 key 且 severity 不升级判 duplicate；每次 update 非 blocker 上限 `maxNotesPerUpdate`（默认 4，范围 1-32），blocker 豁免；已发 note 进 4096 条 FIFO 缓存（`emission-guard.ts:1-46`、`:97-134`）。
 7. 投递决策 `Tp()` 依据 severity、是否 streaming、是否 aborting、是否终局且无排队工作、plan mode、deferred、interrupt-immune 窗口，返回 `steer` / `aside` / `preserve`（`advise-tool.ts:29-43`）。
@@ -180,7 +180,7 @@ pre_verify（opt-in）
 ### 4.4 推理层
 
 - prompt 采用 omp `system.md` 的语义，压成 minir 现有的 `CORE + MODE_REVIEW` 结构：角色（user/code-quality/robustness 的影子审查者）、只报具体技术风险、不复述 agent 已经知道的错误、不评判用户意图、不在缺证据时断言、blocker 必须先自查。
-- 新增两段上下文：`<project-context>`（AGENTS.md + 从当前目录到 git root 的 `WATCHDOG.md`，带字符上限）和 `<memory-context>`（minir recall 的 top-N，标注"可能过期，当前对话优先"）。
+- 新增两段上下文：`<project-context>`（AGENTS.md + 从当前目录到 git root 的 `WATCHDOG.md`，带字符上限）和 `<memory-context>`（minir recall 的 top-N，标注"可能过期，当前对话优先"）。**2026-10-29 改判**：两段按 omp 的 system prompt 五段装配，不再作为 review 的 user 消息块；段的内容与未决项见 `docs/draft/adviser-parity-draft.md` §5.4。
 - 工具：`adviser_session_search`（只读）替代 omp 的 read/grep/glob；不给写工具。每次 review 的工具预算 2-3 次，对应 omp 的 "Per advise: 2-3 tool calls"。
 - 输出：`advise` 工具调用（`note`、`severity` 必填；`target`、`decision`、`evidence`、`claim`、`candidate_id`、`deferred` 可选；`forks`/`fork_grades`/`coverage` 随同一次调用）。不再有 JSON 契约，也没有散文→对象的修补链；`max_advices` 仍是单次投递上限 3，reviewer 每轮产出上限是 `max_notes_per_update`（默认 4，blocker 不限）。
 
@@ -239,7 +239,7 @@ memory.minir.adviser_mode:
   verify_continue: false  # pre_verify 续跑
   aside_at_turn_start: true
   notify_gateway: true
-  project_context: true   # AGENTS.md + WATCHDOG.md
+  project_context: true   # AGENTS.md + WATCHDOG.md 的 path 与正文进 system 消息（第 2 段）
   max_project_chars: 1500
   redact: true            # 宿主 redact_for_export，导入失败时占位
   roster: []              # [{name, enabled, model?, instructions?, toolsets?}]
@@ -458,9 +458,9 @@ Desktop 的 transcript 水合把 `display_kind="adviser"` 当作 machine notice 
 | 终局后续跑 | 仅 `pre_verify`（改过文件） | 任意文本收尾可 continuation；terminal advice ≥ `trigger_severity`（默认 concern）可 `queue_post_turn` 让 surface 自动开新回合（每 session 1 次） |
 | preserve 卡片 | 只有 ledger / gateway 消息 | 四个宿主 surface 都按 `display_kind="adviser"` 渲染 adviser 块：Desktop 水合成 advisory card（severity 着色、label、Markdown 正文）；TUI 画 `◆ adviser` 卡（live `message.adviser` 事件 + 水合行，按 `plugin_message_id` 去重），Web chat 走 TUI 的 PTY 自动继承；classic CLI 打印带 label 的块（流式回复框结束时释放，resume recap 单列）；Web session inspector 用 adviser 样式显示 label 与正文 |
 | plan mode | 拿不到 | 宿主 `set_flag` 可发布 `plan_mode`；另外 adviser 从 `plan_mode` 工具的 `on/off/submit/status` 结果镜像状态（插件装了就生效）。为真时只展示，不 steer/interrupt/trigger |
-| reasoning 流 | 拿不到 | 插件侧已可订阅 `on_stream_delta(kind="reasoning")`，但需宿主 `plugins.stream_reasoning_deltas: true` 且插件 `include_reasoning: true`；prompt 取全量（`max_reasoning_chars` 可设上限），全量落盘 `sessions/reasoning/<session>.log`（无字符上限） |
+| reasoning 流 | 拿不到 | 插件侧已可订阅 `on_stream_delta(kind="reasoning")`，但需宿主 `plugins.stream_reasoning_deltas: true` 且插件 `include_reasoning: true`；prompt 里只随事件带本次 delta（`_thinking:_` 行，默认上限 8,000 字符），全量落盘 `sessions/reasoning/<session>.log`（无字符上限） |
 | reviewer 会话 | 每次 review 新起 AIAgent，只回灌最近 3 批建议 | `AdvisorRuntime` 常驻：cursor、history、turn 计数、暂停状态；`agent_loop.run` 把 history 作为 `conversation_history` 传入 |
-| delta 保真 | args 500 / result 700 / error 300，单事件 1200 | transcript delta：args/result/error 不设单字段上限，事件级 reasoning 取 12k 预览；ring 96，prompt 24k 只丢最旧整事件，单个超大事件完整保留 |
+| delta 保真 | args 500 / result 700 / error 300，单事件 1200 | transcript delta 按字段有界（同 omp）：args 只留 120 字符主参数一行，result/error 8 KiB / 80 行、中段省略，diff 300 行；没有整事件或整 prompt 的预算层，ring 96 |
 | turn 语义 | 无 turns_ago / 聚合 / guidance / deferred | note 带 `turn` 和 `deferred`；turn-end 聚合 pending（单块 ≤ `max_advices`，其余留到下块）；每 50 turn 附 `[boundary-guidance]`；deferred 只在 turn-end 出现 |
 | roster | 最多 4 个 | 无上限；每个成员独立 runtime/host session；`paused: true` 或 usage-limit 只停该成员 |
 | 每 adviser 成本面板 | 自记 | 不变 |
@@ -482,17 +482,17 @@ Desktop 的 transcript 水合把 `display_kind="adviser"` 当作 machine notice 
   watchdog_roster: true   # 合并最近 WATCHDOG.yml 的 advisors[]
   roster: []              # {name, model?, instructions?, toolsets?, cadence?, review_mode?}
   include_reasoning: true   # 需同时开宿主 plugins.stream_reasoning_deltas
-  max_reasoning_chars: 0    # 0 = prompt 用全量；>0 只保留末尾 N 字符
+  max_reasoning_chars: 0    # 0 = 每条事件的 `_thinking:_` 取末尾 8,000 字符；>0 用该值
   reasoning_log: true       # include_reasoning 开启时，全量 reasoning 写 sessions/reasoning/
   pause_seconds: 300        # usage/rate-limit 失败后该 adviser 的暂停时长
   failure_pause_seconds: 60 # 连续失败达到上限后的短暂停
   max_consecutive_failures: 3
   boundary_every: 50        # turn-end block 每 N turn 附 boundary guidance
-  history_messages: 60      # 模型侧 history 最多条数
-  history_chars: 120000     # 模型侧 history 最多字符数
   sync_backlog: off       # off | wait(<=60s) | strict(<=strict_max_ms)
   strict_max_ms: 30000
 ```
+
+**system 消息的五段**（与 omp 同序）：1 `core.md` + `review.md` + `review_budget.md`；2 `<project-context>`（AGENTS.md / WATCHDOG.md 的 path 与正文，`max_project_chars` 0–6000）；3 `<memory-context>`（与主 agent 的 `system_prompt_block()` 同一渲染函数，含 stores 布局）；4 `<attention>`（cwd 不在任何 repo 内且恰好一个直接子仓时为真）；5 `advice_target.md` + `advice_judgment.md`。roster instructions 在第 5 段之后、按来源标名；consult 共用第 2–4 段，第 5 段只属 review。每段都 session-stable，因此落在缓存前缀里，review 的 user 消息只剩本回合素材。
 
 宿主 `agent.max_plugin_continuations`（默认 2）是安全阀，和插件的 `immune_turns`、`continue_severity` 正交。
 roster 的 `cadence` 只约束定时 tool review；final/error/mutation/显式 review 不受它限制。
@@ -531,8 +531,8 @@ reviewer 固定只读：`agent_loop` 在运行前移除 `write_file`/`patch` 以
 | omp 行为 | 本实现 |
 |---|---|
 | 常驻 `AdvisorRuntime`，保留同一个 adviser 会话和 cursor，增量喂 delta | `AdvisorRuntime` per `<session>--<adviser>`：cursor/messages/reviewed_turn/failures/paused_until；`agent_loop.run(history=...)` 把 history 作为 `conversation_history`；runtime 首次创建时从 `sessions/adviser/<id>.json` 恢复，重启后仍能接上 |
-| bounded transcript delta，含完整工具结果和 reasoning | 事件存完整 args/result/error，reasoning 取事件级 12k 预览（全文在 reasoning 文件）；prompt 渲染 `<transcript_delta>`，总量 24k 只丢最旧整事件，单个超大事件完整保留，丢旧事件时插 `[... N older events omitted ...]` |
-| reasoning 完整文件落盘、无字符限制 | `on_stream_delta` 同时写全量 prompt（`max_reasoning_chars` 可设上限）和 `sessions/reasoning/<safe-session>.log` 全量 append；每个 turn/工具边界 flush |
+| bounded transcript delta，含完整工具结果和 reasoning | 事件存完整 args/result/error；prompt 渲染 `<transcript_delta>`，工具 args 一行、result/error 8 KiB / 80 行（diff 300 行）中段省略，reasoning 以 `_thinking:_` 行随事件只带本次 delta；没有整事件/整 prompt 预算层，越窗时 provider 报错可见 |
+| reasoning 完整文件落盘、无字符限制 | `on_stream_delta` 只累积事件级 delta（`max_reasoning_chars`，默认 8,000）并 append `sessions/reasoning/<safe-session>.log` 全量；每个 turn/工具边界 flush |
 | note 带 turns_ago、回合结束聚合、50 turn boundary-guidance、单条 deferred | `advisories.turn/deferred` 列；`render_block(current_turn, guidance)` 加 `(N turns ago)` 和 `[boundary-guidance]`；`trigger=final` 读取 pending（单块 ≤ `max_advices`，其余留到下块）；中途通道跳过 deferred 和旧 turn 的非 blocker |
 | roster 无上限，每 adviser 独立 agent/tool session，可单独暂停 | `_advisers` 不再截断；每个成员独立 runtime + `minir-adviser:<session>--<name>` host session；`paused` 条目或 usage-limit 失败只暂停该成员（默认 300s） |
 
@@ -545,7 +545,7 @@ reviewer 固定只读：`agent_loop` 在运行前移除 `write_file`/`patch` 以
 - `trigger_turn` 依赖 surface 自动提交 leftover `pending_steer`；CLI/gateway 会在 0012 之后把该行持久化成 `display_kind="adviser"`，所以 trigger 回合也显示成卡片。Web chat 默认走 0013 的原生 transcript，PTY 仍可一键切换。未打补丁的 surface（消息平台等）仍按原始 user 行处理。
 - plan mode 有两条来源：宿主 `set_flag`（需插件发布）和 `plan_mode` 工具的 `on/off/submit/status` 结果镜像。plan-mode 插件未安装时 flag 保持 unknown，adviser 行为不变。
 - 实时卡片已由宿主 `message.adviser` 事件驱动；如果客户端断线，下一次 hydrate 仍会补上（同一 `plugin_message_id` 去重）。
-- reasoning 默认开启：宿主 `plugins.stream_reasoning_deltas` 与插件 `include_reasoning` 都开才生效；prompt 取全量（`max_reasoning_chars: 0`），全量写 `sessions/reasoning/`，不写进 adviser transcript。
+- reasoning 默认开启：宿主 `plugins.stream_reasoning_deltas` 与插件 `include_reasoning` 都开才生效；prompt 只随事件带本次 delta，全量写 `sessions/reasoning/`，不写进 adviser transcript。
 - roster 已无上限；配置错误会启动很多 reviewer，由 operator 负责。`paused: true` 只跳过该成员。
 - strict backlog 现在是"有界 strict"：`strict_max_ms` 默认 30s，`llm_request` 仍同步执行；无界等待会让 provider 请求和 gateway 头阻塞，不建议。
 - 宿主升级后 patch 冲突需要人工重做 hunk；`base_version`/`base_commit` 是提示，不是自动 rebase。

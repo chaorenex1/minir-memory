@@ -279,6 +279,25 @@ def _account(run: AgentRun, layer: str, task: str = "") -> None:
                       api_calls=run.api_calls)
 
 
+def _configure_tool_guardrails(agent: Any, settings: Mapping[str, Any]) -> None:
+    """Give one peer run its own loop guard (see ``tool_guardrails=`` in :func:`run`).
+
+    ``platform="subagent"`` makes the host treat the loop as unattended, so ``hard_stop_enabled``
+    is on even when the caller's mapping omits it. A host without the controller leaves the run
+    as it was; the guard is an improvement, never a precondition.
+    """
+    try:
+        from agent.tool_guardrails import ToolCallGuardrailConfig, ToolCallGuardrailController
+    except Exception:
+        logger.debug("agent_loop: host has no tool guardrail controller")
+        return
+    try:
+        agent._tool_guardrails = ToolCallGuardrailController(
+            ToolCallGuardrailConfig.from_mapping(dict(settings), platform="subagent"))
+    except Exception:
+        logger.debug("agent_loop: tool guardrails not applied", exc_info=True)
+
+
 def run(message: str, *, context: str = "", model: str = "", provider: str = "",
         api_mode: str = "", toolsets: Optional[Sequence[str]] = None,
         system_message: str | Sequence[str] = "", max_iterations: int = MAX_ITERATIONS,
@@ -292,6 +311,7 @@ def run(message: str, *, context: str = "", model: str = "", provider: str = "",
         load_soul_identity: bool = False,
         extra_tools: Optional[Sequence[Mapping[str, Any]]] = None,
         cache_scope: str = "",
+        tool_guardrails: Optional[Mapping[str, Any]] = None,
         meta: Optional[Mapping[str, Any]] = None) -> AgentRun:
     """Run one agent loop on *message* and return its answer. Never leaves an agent open.
 
@@ -317,6 +337,11 @@ def run(message: str, *, context: str = "", model: str = "", provider: str = "",
     ``layer`` binds the run to one transcript stream (``minir_agent_layer`` contextvar), so
     ``minir_aiagent_search`` can only read the caller's own history. An empty value leaves the
     tool unbound, which makes it refuse the call instead of reading every layer.
+
+    ``tool_guardrails`` replaces the host's guardrail controller for this run only. The host
+    builds one from the process config, whose defaults are tuned for an interactive session:
+    warnings only, no hard stop. An unattended peer loop (the adviser) passes its own thresholds
+    so a repeated failing call is corrected once and then stopped.
     """
     from run_agent import AIAgent  # first: it replaces sys.path (managed environment bootstrap)
 
@@ -357,6 +382,8 @@ def run(message: str, *, context: str = "", model: str = "", provider: str = "",
         # borrowing the main session's, and the host derives prompt_cache_key from it.
         cache_scope=str(cache_scope or "").strip(),
     )
+    if tool_guardrails:
+        _configure_tool_guardrails(agent, tool_guardrails)
     if read_only:
         dropped = apply_read_only(agent)
         if dropped:

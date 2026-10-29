@@ -196,6 +196,104 @@ def test_review_prompt_keeps_event_text_inside_one_transcript_block(
     assert "[literal transcript_delta tag]" in prompt
 
 
+def test_the_system_message_carries_the_five_segments(plugin_package, make_provider, monkeypatch,
+                                                     tmp_path):
+    """T9: contract, project text, memory block, watchdog and rules, in that order."""
+    (tmp_path / "AGENTS.md").write_text("Always run the verify script.", encoding="utf-8")
+    child = tmp_path / "proj"
+    (child / ".git").mkdir(parents=True)
+    (child / ".git" / "HEAD").write_text("ref: refs/heads/main\n", encoding="utf-8")
+    monkeypatch.chdir(tmp_path)
+    provider = _mode_provider(make_provider)
+    cfg = provider._adviser_mode._cfg()
+
+    system = plugin_package.adviser_mode._review_system(
+        cfg, "session-test", adviser={"name": "quality", "instructions": "watch the tests",
+                                      "instructions_source": "WATCHDOG.yml"})
+
+    order = [
+        system.index("You are the main adviser"),
+        system.index("<project-context>\n"),
+        system.index("<memory-context>\n"),
+        system.index("<attention>"),
+        system.rindex("## CONTRACT"),        # the rule bodies end segment 5
+        system.index("# Adviser instructions"),
+    ]
+    assert order == sorted(order)
+    assert "Always run the verify script." in system
+    assert "Source: WATCHDOG.yml." in system
+    assert system.rstrip().endswith("watch the tests")
+
+
+def test_the_system_message_is_stable_and_project_text_is_bounded(
+        plugin_package, make_provider, monkeypatch, tmp_path):
+    """T9: two reviews under the same config get the same bytes; max_project_chars still bites."""
+    (tmp_path / "AGENTS.md").write_text("rule text " * 2000, encoding="utf-8")
+    monkeypatch.chdir(tmp_path)
+    provider = _mode_provider(make_provider)
+    cfg = provider._adviser_mode._cfg()
+
+    first = plugin_package.adviser_mode._review_system(cfg, "session-test")
+    second = plugin_package.adviser_mode._review_system(cfg, "session-test")
+
+    assert first == second
+    project = first.split("<project-context>\n", 1)[1].split("\n</project-context>", 1)[0]
+    assert len(project) <= cfg["max_project_chars"] + 200
+    assert "truncated at max_project_chars" in project
+
+
+def test_the_adviser_memory_segment_is_the_main_agent_block(plugin_package, make_provider):
+    """T9.2: one renderer — the adviser's memory segment is the main prompt's block verbatim."""
+    provider = _mode_provider(make_provider)
+    cfg = provider._adviser_mode._cfg()
+    block = plugin_package.memory_block.render()
+
+    system = plugin_package.adviser_mode._review_system(cfg, "session-test")
+
+    assert f"<memory-context>\n{block}\n</memory-context>" in system
+    assert provider._memory_prompt_block() == block
+    assert "DATA LAYOUT" in block
+
+
+def test_active_repo_watchdog_needs_exactly_one_child_repo(plugin_package, monkeypatch, tmp_path):
+    """T9.3: cwd outside git with exactly one direct-child repo root, HEAD resolvable."""
+    mode = plugin_package.adviser_mode
+
+    def git_dir(path):
+        (path / ".git").mkdir(parents=True)
+        (path / ".git" / "HEAD").write_text("ref: refs/heads/main\n", encoding="utf-8")
+
+    parent = tmp_path / "parent"
+    parent.mkdir()
+    only = parent / "only"
+    only.mkdir()
+    git_dir(only)
+    monkeypatch.chdir(parent)
+    text = mode._active_repo_watchdog()
+    assert "<attention>" in text and "`only`" in text
+
+    second = parent / "second"
+    second.mkdir()
+    git_dir(second)
+    assert mode._active_repo_watchdog() == "", "two children: no segment"
+
+    git_dir(parent)
+    assert mode._active_repo_watchdog() == "", "inside a repo: no segment"
+
+    # A worktree's gitfile counts only when its HEAD resolves.
+    other = tmp_path / "other"
+    other.mkdir()
+    worktree = other / "wt"
+    worktree.mkdir()
+    target = tmp_path / "gitdirs" / "wt"
+    target.mkdir(parents=True)
+    (worktree / ".git").write_text(f"gitdir: {target}\n", encoding="utf-8")
+    monkeypatch.chdir(other)
+    assert mode._active_repo_watchdog() == "", "no HEAD, not a repo root"
+    (target / "HEAD").write_text("ref: refs/heads/main\n", encoding="utf-8")
+    assert "`wt`" in mode._active_repo_watchdog()
+
+
 def test_review_brief_carries_the_configured_limits(plugin_package):
     brief = plugin_package.adviser_mode._review_brief(
         {"max_advices": 5, "severity_floor": "blocker"})
@@ -206,8 +304,9 @@ def test_review_brief_carries_the_configured_limits(plugin_package):
     assert "ADVICE TARGETS" in brief
 
 
-def test_review_prompt_truncation_preserves_structure_and_reads_digest_once(
+def test_review_prompt_keeps_every_event_and_reads_digest_once(
         plugin_package, make_provider, monkeypatch):
+    """T4.7: no total budget layer — a long delta keeps every event and is bounded per field."""
     provider = _mode_provider(make_provider)
     reads = {"count": 0}
 
@@ -216,59 +315,107 @@ def test_review_prompt_truncation_preserves_structure_and_reads_digest_once(
         return "- User path: keep this"
 
     monkeypatch.setattr(provider._adviser_mode, "_digest", digest)
-    events = [{"seq": index, "kind": "intent", "text": "x" * 1200} for index in range(48)]
+    events = [{"seq": index, "kind": "intent", "text": f"event-{index} " + "x" * 1200}
+              for index in range(48)]
     prompt = provider._adviser_mode._prompt("session-test", "t1", "manual", events)
 
-    assert reads["count"] == 1, "the digest must not be re-read on every truncation attempt"
-    assert len(prompt) <= plugin_package.adviser_mode.MAX_PROMPT_CHARS
+    assert reads["count"] == 1, "the digest is read once per review"
     assert prompt.rstrip().endswith("do not answer with JSON.")
     assert prompt.count("<transcript_delta>") == prompt.count("</transcript_delta>") == 1
-    assert "older events omitted" in prompt
+    assert "older events omitted" not in prompt
+    assert all(f"event-{index}" in prompt for index in range(48))
 
 
-def test_oversized_tool_event_renders_a_skeleton(plugin_package, make_provider):
-    """One 500k-char result must not spend the review's whole window (measured: 1.83% of tool
-    rows exceed 24k, the largest 529k chars ~132k tokens)."""
+def test_a_529k_tool_result_is_bounded_per_field(plugin_package):
+    """T4.3: the measured largest row (529,008 chars) costs 8 KiB, not the model window."""
     mode = plugin_package.adviser_mode
-    body = "A" * 30_000 + "SECRET-MIDDLE" + "Z" * 10_000
-    event = {"seq": 4, "kind": "tool", "tool": "terminal", "status": "ok",
-             "tool_call_id": "call-9", "args": "q" * 900, "result": body,
-             "error": "exit 1: boom", "reasoning": "why I ran it"}
+    body = "HEAD-" + "A" * 500_000 + "SECRET-MIDDLE" + "Z" * 28_000 + "-TAIL"
+    event = {"seq": 4, "kind": "tool", "tool": "read_file", "status": "ok",
+             "tool_call_id": "call-9",
+             "args": json.dumps({"path": "a.py", "content": "SECRET-CONTENT"}),
+             "result": body, "error": "", "reasoning": "why I read it"}
 
     rendered = mode._render_event(event)
+    result = rendered.split("[result]\n", 1)[1].rsplit("\n</tool>", 1)[0]
 
-    assert len(rendered) < mode.REVIEW_EVENT_CHARS
+    assert len(result.encode("utf-8")) <= mode.RESULT_MAX_BYTES + 40
+    assert result.startswith("HEAD-") and result.endswith("-TAIL"), "head and tail both stay"
+    assert "[…" in result and "elided…]" in result
+    assert "SECRET-MIDDLE" not in rendered
+    assert "SECRET-CONTENT" not in rendered, "an args body never enters the prompt"
+    assert "[args]\na.py" in rendered
     assert "tool_call_id=call-9" in rendered
-    assert f"original_chars={len(body) + 900 + len('exit 1: boom') + len('why I ran it')}" in rendered
-    assert "SECRET-MIDDLE" not in rendered, "the middle of an oversized body is elided"
-    assert "chars elided" in rendered
-    assert "exit 1: boom" in rendered, "an error is evidence and stays whole"
-    assert rendered.split("[args]", 1)[1].splitlines()[1].startswith("q" * 400)
-    assert len(rendered.split("[args]", 1)[1].splitlines()[1]) <= 401
+    assert "_thinking:_ why I read it" in rendered
 
 
-def test_small_tool_event_keeps_its_full_body(plugin_package):
+def test_a_hundred_line_result_keeps_forty_lines_each_side(plugin_package):
     mode = plugin_package.adviser_mode
-    event = {"seq": 5, "kind": "tool", "tool": "patch", "status": "ok",
-             "tool_call_id": "call-10", "args": '{"path": "a.py"}',
-             "result": "line one\nline two", "error": ""}
+    event = {"seq": 6, "kind": "tool", "tool": "read_file", "status": "ok",
+             "tool_call_id": "call-11", "args": {"path": "a.py"},
+             "result": "\n".join(f"line-{index:03d}" for index in range(100))}
 
     rendered = mode._render_event(event)
+    kept = rendered.split("[result]\n", 1)[1].rsplit("\n</tool>", 1)[0].splitlines()
 
-    assert "[result]\nline one\nline two" in rendered
-    assert "original_chars" not in rendered and "elided" not in rendered
+    assert kept[0] == "line-000" and kept[-1] == "line-099"
+    marker = next(index for index, line in enumerate(kept) if line.startswith("[…"))
+    assert marker == 40 and kept[marker] == "[…20ln elided…]"
+    assert len(kept) == 81
 
 
-def test_the_skeleton_does_not_push_the_prompt_past_its_budget(plugin_package, make_provider):
+def test_a_diff_keeps_three_hundred_lines(plugin_package):
+    mode = plugin_package.adviser_mode
+    diff = "\n".join(["--- a/x", "+++ b/x"]
+                     + [f"@@-{index} +{index} @@" for index in range(400)] + ["tail"])
+    event = {"seq": 7, "kind": "tool", "tool": "patch", "status": "ok",
+             "tool_call_id": "call-12", "args": {"path": "x"}, "result": diff}
+
+    kept = mode._render_event(event).split("[result]\n", 1)[1].rsplit("\n</tool>", 1)[0].splitlines()
+
+    assert len(kept) == 301, "150 head + marker + 150 tail"
+    assert kept[0] == "--- a/x" and kept[-1] == "tail"
+
+
+def test_an_error_over_the_cap_is_bounded_like_a_result(plugin_package):
+    mode = plugin_package.adviser_mode
+    event = {"seq": 8, "kind": "tool", "tool": "terminal", "status": "error",
+             "tool_call_id": "call-13", "args": {"command": "pytest -q"},
+             "error": "E" * 40_000}
+
+    rendered = mode._render_event(event)
+    error = rendered.split("[error]\n", 1)[1].rsplit("\n</tool>", 1)[0]
+
+    assert len(error.encode("utf-8")) <= mode.RESULT_MAX_BYTES + 40
+    assert "elided…]" in error and "pytest -q" in rendered
+
+
+def test_a_byte_heavy_short_result_does_not_repeat_its_lines(plugin_package):
+    """A 60-line result over 8 KiB is cut by bytes; the head and tail windows must not overlap."""
+    mode = plugin_package.adviser_mode
+    lines = [f"line-{index:03d}-" + "x" * 400 for index in range(60)]
+    event = {"seq": 9, "kind": "tool", "tool": "read_file", "status": "ok",
+             "tool_call_id": "call-14", "args": {"path": "a.py"}, "result": "\n".join(lines)}
+
+    kept = mode._render_event(event).split("[result]\n", 1)[1].rsplit("\n</tool>", 1)[0].splitlines()
+
+    assert len(set(kept)) == len(kept), "no line is printed twice"
+    assert "[…" in kept[0] or kept[0].startswith("line-000")
+    assert len("\n".join(kept).encode("utf-8")) <= mode.RESULT_MAX_BYTES + 40
+
+
+def test_four_large_tool_events_all_survive_in_one_prompt(plugin_package, make_provider):
+    """T4.7 acceptance: a heavy history loses no event, and every result is bounded."""
     provider = _mode_provider(make_provider)
     events = [{"seq": 1, "kind": "tool", "tool": "terminal", "status": "ok",
-               "tool_call_id": f"call-{index}", "result": "R" * 30_000} for index in range(4)]
+               "tool_call_id": f"call-{index}", "args": {"command": "make"},
+               "result": "R" * 30_000} for index in range(4)]
     events.append({"seq": 5, "kind": "intent", "text": "next step"})
 
     prompt = provider._adviser_mode._prompt("session-test", "t1", "manual", events)
 
-    assert len(prompt) <= plugin_package.adviser_mode.MAX_PROMPT_CHARS
-    assert prompt.count("tool_call_id=") >= 1
+    assert all(f"tool_call_id=call-{index}" in prompt for index in range(4))
+    assert "next step" in prompt
+    assert prompt.count("elided…]") >= 4, "every oversized result carries its marker"
 
 
 def test_post_tool_call_keeps_the_tool_call_id(plugin_package, make_provider):
@@ -384,6 +531,103 @@ def test_a_review_uses_the_advise_tool_and_records_its_acks(
     assert [item["content"] for item in pending] == ["check the test"]
 
 
+def test_the_advise_acks_are_omp_sentences_verbatim(plugin_package, make_provider, monkeypatch):
+    """T1.6: the six acks are omp's wording word for word (advise-tool.ts:192-200)."""
+    mode = plugin_package.adviser_mode
+    assert mode.ADVISE_ACKS == {
+        "delivered": "Delivered.",
+        "queued": "Queued for the end of the turn. Do not re-raise.",
+        "empty": "Dropped: empty note.",
+        "noise": "Dropped: nothing actionable.",
+        "duplicate": "Dropped: already raised.",
+        "rate-limit": "Dropped: this update's advice budget is spent.",
+    }
+    provider = _mode_provider(make_provider, cadence=99)
+    acks: list[str] = []
+
+    def _fake(message, **kwargs):
+        acks.extend(drive_advise(kwargs, _advice("check the test")))
+        acks.extend(drive_advise(kwargs, _advice("")))  # an empty note is dropped
+        return SimpleNamespace(answer="", api_calls=1, model="reviewer", provider="test",
+                               toolsets=tuple(kwargs.get("toolsets") or ()))
+
+    monkeypatch.setattr(plugin_package.agent_loop, "run", _fake)
+    provider._adviser_mode.record_tool("session-test", "read_file", turn_id="t1",
+                                       status="ok", result="contents")
+
+    assert provider._adviser_mode.review_once("session-test", "test") is True
+
+    assert acks[0] in (mode.ADVISE_ACKS["delivered"], mode.ADVISE_ACKS["queued"])
+    assert acks[1] == mode.ADVISE_ACKS["empty"]
+
+
+def test_the_review_run_carries_its_own_loop_guard(plugin_package, make_provider, monkeypatch):
+    """T8.2: the nested run gets hard stops, so a repeated failing call is corrected and stopped."""
+    provider = _mode_provider(make_provider, cadence=99)
+    calls: list = []
+    monkeypatch.setattr(plugin_package.agent_loop, "run", _run(_advice("note"), calls))
+    provider._adviser_mode.record_tool("session-test", "read_file", turn_id="t1",
+                                       status="ok", result="contents")
+
+    assert provider._adviser_mode.review_once("session-test", "test") is True
+
+    guard = calls[0]["tool_guardrails"]
+    assert guard["hard_stop_enabled"] is True
+    assert guard["exact_failure_warn_after"] == 2
+    assert guard["same_tool_failure_halt_after"] == 3, "one correction, then stop"
+
+
+def test_the_loop_guard_corrects_once_then_halts(plugin_package):
+    """T8.2 end to end on the host controller: a repeated failing call warns, then halts."""
+    from agent.tool_guardrails import ToolCallGuardrailConfig, ToolCallGuardrailController
+
+    guard = ToolCallGuardrailController(ToolCallGuardrailConfig.from_mapping({
+        "warnings_enabled": True,
+        "hard_stop_enabled": True,
+        "same_tool_failure_warn_after": 2,
+        "same_tool_failure_halt_after": 3,
+    }, platform="subagent"))
+    # ``terminal`` is failure-tolerant on purpose (a run of distinct red commands is diagnosis,
+    # not a loop); a read tool is the loop shape the guard has to stop.
+    args = {"path": "missing.py"}
+
+    assert guard.before_call("read_file", args).action == "allow"
+    assert guard.after_call("read_file", args, "Error: not found", failed=True).action == "allow"
+    correction = guard.after_call("read_file", args, "Error: not found", failed=True)
+    assert correction.action == "warn" and correction.message
+    assert guard.after_call("read_file", args, "Error: not found", failed=True).action == "halt"
+
+
+def test_a_failed_auxiliary_route_is_retried_once_on_the_gateway(
+        plugin_package, make_provider, monkeypatch):
+    """T8.1: the pinned route fails once; the retry drops the pin instead of giving up."""
+    provider = _mode_provider(make_provider, cadence=99)
+    monkeypatch.setattr(plugin_package.adviser, "load_config",
+                        lambda: {"model": "reviewer", "provider": "pinned"})
+    routes: list[tuple] = []
+
+    def _fake(message, **kwargs):
+        routes.append((kwargs.get("provider"), kwargs.get("model")))
+        if len(routes) == 1:
+            raise RuntimeError("process ended")
+        drive_advise(kwargs, _advice("after the retry"))
+        return SimpleNamespace(answer="", api_calls=1, model="reviewer", provider="test",
+                               toolsets=tuple(kwargs.get("toolsets") or ()))
+
+    monkeypatch.setattr(plugin_package.agent_loop, "run", _fake)
+    provider._adviser_mode.record_tool("session-test", "read_file", turn_id="t1",
+                                       status="ok", result="contents")
+
+    assert provider._adviser_mode.review_once("session-test", "test") is True
+
+    assert len(routes) == 2
+    assert routes[1] == ("", ""), "the retry falls back to the gateway route"
+    row = provider._store.adviser_reviews("session-test")[0]
+    assert row["status"] == "advised"
+    pending = provider._store.pending_advisories("session-test", source="adviser_mode")
+    assert [item["content"] for item in pending] == ["after the retry"]
+
+
 def test_a_review_binds_the_escape_hatch_scope(plugin_package, make_provider, monkeypatch):
     """The one-read bound is per review: the scope is bound for the run and cleared after it."""
     provider = _mode_provider(make_provider, cadence=99)
@@ -471,7 +715,13 @@ def test_consult_uses_the_main_adviser_and_leaves_advice_alone(
 
     assert data["answer"] == "advice"
     call = calls[0]
-    assert call["system_message"] == plugin_package.adviser_prompts.consult_prompt()
+    system = call["system_message"]
+    # Segment 1 is core + consult; segments 2-4 are shared with the review (T9.5).
+    assert system.startswith(plugin_package.adviser_prompts.consult_prompt())
+    assert "<project-context>" not in system or "AGENTS.md" in system
+    assert "<memory-context>" in system
+    assert "# advice_target" not in system and "ADVICE SEVERITY" not in system, \
+        "the advice rules are review-only"
     assert call["project_dir"] == plugin_package.adviser.project_dir()
     assert "candidate_advices" not in call["context"]
     assert len(provider._store.pending_advisories(
@@ -885,31 +1135,43 @@ def test_review_prompt_carries_rulers_stats_and_soul(plugin_package, make_provid
         window_summary=json.dumps("### Objective\n- ship it"))
     Path(provider._hermes_home, "SOUL.md").write_text(
         "# Craft\nNo em dashes in prose.\n", encoding="utf-8")
+    card = Path(provider._hermes_home, "minir-memory", "user", "identity.md")
+    card.parent.mkdir(parents=True, exist_ok=True)
+    card.write_text("---\ntopic: user\n---\nengineer", encoding="utf-8")
 
     prompt = provider._adviser_mode._prompt(
         "session-test", "t1", "tool", [{"kind": "user", "text": "ship it"}])
 
-    assert "<rulers>" in prompt and "lead with the result" in prompt
-    assert "terse answers" in prompt and "### Window summary" in prompt and "ship it" in prompt
-    assert "### AI identity card" in prompt and "keep the system honest" in prompt
+    # The reference blocks carry paths and row handles; the text itself is fetched by the reviewer.
+    assert "<rulers>" in prompt and 'minir_state(layer="base", subject="user:default")' in prompt
+    assert "### Cards" in prompt and str(card) in prompt
+    rulers_block = prompt.split("<rulers>", 1)[1].split("</rulers>", 1)[0]
+    assert "lead with the result" not in rulers_block and "terse answers" not in rulers_block
+    assert "### Cards" in rulers_block and "### Rows" in rulers_block
     assert "<ruler_versions>" in prompt and "session row: id=" in prompt
-    assert "<soul_constraints>" in prompt and "No em dashes in prose." in prompt
+    assert "<soul_constraints>" in prompt and "SOUL.md" in prompt and "# Craft" in prompt
+    assert "No em dashes in prose." not in prompt
     assert "<target_stats>" in prompt and "TARGET STATS" in prompt
 
 
-def test_the_ruler_tracks_the_latest_base_row(plugin_package, make_provider):
-    """A once-per-session conclusion would freeze at the first card; the live row does not."""
+def test_the_ruler_versions_track_the_latest_base_row(plugin_package, make_provider):
+    """The handle stays put and the version moves: a changed id is what tells the reviewer the
+    row it is about to fetch has moved (a once-per-session conclusion would freeze at row 1)."""
     provider = _mode_provider(make_provider)
-    for version, stance in ((1, "first stance"), (2, "second stance")):
+    for version in (1, 2):
         provider._store.add_base_refresh(
             "session-test", "user:default", window_from_ts=float(version - 1),
             window_to_ts=float(version), window_from_turn=version, window_to_turn=version,
             user_representation="", user_peer_card=json.dumps("- [style] terse"),
-            ai_self_representation=json.dumps(stance), ai_identity_card="",
+            ai_self_representation=json.dumps(f"stance {version}"), ai_identity_card="",
             window_summary=json.dumps(f"### Objective\n- goal {version}"))
+
     rulers = provider._adviser_mode._rulers("session-test")
-    assert "second stance" in rulers and "first stance" not in rulers
-    assert "goal 2" in rulers and "### Preferences" in rulers
+    versions = provider._adviser_mode._ruler_versions("session-test")
+
+    assert 'minir_state(layer="base", subject="user:default")' in rulers
+    assert "stance 2" not in rulers, "the card text is fetched, not pasted"
+    assert "window_to_ts=2.0" in versions, "the version names the newest row, not the first"
 
 
 def test_knowledge_citation_suffix_is_validated(plugin_package, make_provider):
@@ -1154,13 +1416,16 @@ def test_target_needs_drops_what_the_child_cannot_do(plugin_package, make_provid
     assert json.loads(review.get("coverage") or "{}").get("soul_workflow_check") == "n/a"
 
 
-def test_a_child_prompt_is_bounded_more_tightly_than_the_primary(plugin_package, make_provider):
+def test_a_child_prompt_keeps_its_events_and_caps_only_the_borrowed_context(
+        plugin_package, make_provider):
+    """T4.7: a child bounds what it borrows, not its own delta (no total budget layer)."""
     provider = _mode_provider(make_provider)
     watch = _watch(plugin_package)
     events = [{"seq": index, "kind": "tool", "tool": "read_file",
-               "args": "x" * 4000, "result": "y" * 8000} for index in range(6)]
+               "args": {"path": "x"}, "result": "y" * 8000} for index in range(6)]
 
     prompt = provider._adviser_mode._prompt(watch.session, "t1", "manual", events)
 
-    assert len(prompt) <= plugin_package.adviser_mode.CHILD_PROMPT_CHARS
-    assert "events cut at" in prompt, "the cut is visible, not silent"
+    assert all(f"seq={index}" in prompt for index in range(6))
+    assert "<parent_context>" in prompt
+    assert "events cut at" not in prompt

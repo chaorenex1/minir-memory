@@ -321,6 +321,35 @@ def test_open_sets_a_busy_timeout_and_skips_a_current_schema(plugin_package, tmp
         again.close()
 
 
+def test_a_column_appended_without_a_version_bump_reaches_an_old_file(plugin_package, tmp_path):
+    """A v9 file predates the usage columns; opening it adds them.
+
+    A fresh file gets ``prompt_tokens``/``cache_read_tokens`` from ``CREATE TABLE``, so this is
+    the only shape that catches a column added to ``_ADDED_COLUMNS`` while ``_SCHEMA_VERSION``
+    stayed at the version already stamped in every deployed file.
+    """
+    path = tmp_path / "v9" / "memory.db"
+    old = plugin_package.store.MinirStore(path)
+    try:
+        old._conn.execute("ALTER TABLE adviser_reviews DROP COLUMN prompt_tokens")
+        old._conn.execute("ALTER TABLE adviser_reviews DROP COLUMN cache_read_tokens")
+        old._conn.execute("PRAGMA user_version = 9")
+        old._conn.commit()
+    finally:
+        old.close()
+
+    reopened = plugin_package.store.MinirStore(path)
+    try:
+        columns = {row["name"] for row in
+                   reopened._conn.execute("PRAGMA table_info(adviser_reviews)")}
+        assert {"prompt_tokens", "cache_read_tokens"} <= columns, \
+            "a file stamped at 9 skipped the migration, so the usage columns never landed"
+        assert reopened._conn.execute("PRAGMA user_version").fetchone()[0] == \
+            plugin_package.store._SCHEMA_VERSION
+    finally:
+        reopened.close()
+
+
 def test_migration_drops_a_legacy_transcript_table(plugin_package, tmp_path):
     """A database written by the version that captured every turn is migrated on open."""
     path = tmp_path / "legacy" / "memory.db"

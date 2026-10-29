@@ -986,7 +986,7 @@ adviser_mode:
   sync_backlog: off         # wait: let one in-flight review finish before the request
   wait_ms: 1500
   notify_gateway: true      # gateway turns: send preserved advice to the chat
-  project_context: true     # AGENTS.md + WATCHDOG.md into the review prompt
+  project_context: true     # AGENTS.md + WATCHDOG.md into the system message (segment 2)
   max_project_chars: 1500
   include_reasoning: false  # needs host plugins.stream_reasoning_deltas too
   reasoning_log: true       # with include_reasoning: full stream to sessions/reasoning/
@@ -994,8 +994,8 @@ adviser_mode:
   failure_pause_seconds: 60 # repeated generic failures pause the same member briefly
   max_consecutive_failures: 3
   boundary_every: 50        # turn-end blocks carry a boundary guidance line
-  history_messages: 60      # model-facing adviser history cap
-  history_chars: 120000
+  # The adviser's own history has no char/message cap: stale read/search results are evicted
+  # before every review (omp's rule), in tokens, and nothing else moves the start.
   roster: []                # empty = one `default` adviser; no fixed cap; see below
   # Fork dispatch (docs/draft/jev-fork-dispatch-draft.md §7). Off by default: with every key at its
   # default the plugin behaves exactly as it did before this layer existed.
@@ -1078,15 +1078,17 @@ The main adviser runs on the same `auxiliary.adviser` route with a five-iteratio
 Its input is a bounded transcript delta: `pre_llm_call` records the user goal,
 `on_interim_message`/`post_api_request` record the assistant's intent, `post_tool_call` records
 the tool arguments/result/error plus the reasoning since the previous event, and `post_llm_call`
-records the final answer. Tool rows keep the full result up to the per-field cap and mark every
-kept without a per-field cap. The delta budget is 24k of whole events: the oldest events drop
-first, and one oversized event is kept whole. Each review continues that
+records the final answer and the reasoning since the previous event. Tool rows keep the
+arguments as one primary parameter (120 characters) and the result/error as 8 KiB / 80 lines with
+the middle elided (a diff keeps 300 lines); no total budget exists, so an over-window turn
+surfaces the provider error instead of dropping events. Each review continues that
 adviser's own `AdvisorRuntime` through `conversation_history`, so it can build on its earlier
 tool reads instead of re-deriving them. It may call `minir_hermes_session_search` to ground a claim.
-Its system block is composed dynamically from
-`memory.minir.adviser_mode.enabled`: severity, every target in `prompting.ADVICE_TARGETS`
-(definition + usage), the severity × target handling matrix, the nit-report table, and the
-language rule. When the mode is off, those sections are absent.
+Its system message is five segments in omp's order: the contract (core + review + live budget),
+`<project-context>` (AGENTS.md / WATCHDOG.md path and text), `<memory-context>` (the same memory
+instructions the main agent gets), `<attention>` (cwd outside git with exactly one direct-child
+repo), and the advice rules (every target in `prompting.ADVICE_TARGETS` plus the judgment
+matrix). Roster instructions close it, named by source. Consult shares segments 2-4.
 
 Delivery is one chain with one producer: the live reviewer writes advice, the guard filters it,
 the ledger stages it, and the hooks deliver it.
@@ -1278,6 +1280,7 @@ host by importing both Python modules, and rolls back if verification fails. Its
 ```bash
 python scripts/install_host_patches.py --check     # patch status only
 python scripts/install_host_patches.py --revert    # undo what this install applied
+python scripts/install_host_patches.py --drop NAME # forget one name; the checkout is untouched
 python scripts/install.py --no-copy                # plugin installed by hermes; patch only
 ```
 

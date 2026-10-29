@@ -143,96 +143,195 @@ def test_agent_end_roster_entry_only_reviews_the_final_answer(plugin_package, ma
     assert len(calls) == 1
 
 
-def test_history_evicts_old_tool_results_before_moving_the_start(plugin_package, make_provider):
-    """T3: a middle cut is taken only when the text it saves beats the suffix it rewrites."""
+def _call(call_id: str, tool: str) -> dict:
+    return {"role": "assistant", "content": "", "tool_calls": [
+        {"id": call_id, "function": {"name": tool}}]}
+
+
+def test_eviction_cuts_where_the_saving_beats_the_rewrite(plugin_package, make_provider):
+    """T3.5/T3.7: token-priced margin-max cut, tail protected from the newest user message."""
     provider = _provider(make_provider)
     mode = provider._adviser_mode
-    cfg = {**mode._cfg(), "history_chars": 4000, "history_messages": 60}
     big = "x" * 5000
-    rows = [{"role": "user", "content": "review turn 1"},
-            {"role": "assistant", "content": "advice 1"},
-            {"role": "tool", "content": big},
-            {"role": "assistant", "content": "the tool failed to say anything"},
-            {"role": "user", "content": "review turn 2"},
-            {"role": "assistant", "content": "advice 2"},
-            {"role": "tool", "content": "small result"},
-            {"role": "assistant", "content": "none"},
-            {"role": "user", "content": "review turn 3"},
-            {"role": "assistant", "content": "advice 3"}]
+    rows = [
+        {"role": "user", "content": "review turn 1"},
+        _call("c1", "read_file"),
+        {"role": "tool", "content": big, "tool_call_id": "c1"},
+        {"role": "assistant", "content": "the tool failed to say anything"},
+        {"role": "user", "content": "review turn 2"},
+        _call("c2", "search_files"),
+        {"role": "tool", "content": "small result", "tool_call_id": "c2"},
+        {"role": "assistant", "content": "none"},
+        {"role": "user", "content": "review turn 3"},
+        {"role": "assistant", "content": "advice 3"},
+    ]
     runtime = plugin_package.adviser_mode.AdvisorRuntime(session=SESSION, adviser="default")
 
-    trimmed = mode._trim_history(rows, cfg, runtime)
+    trimmed = mode._trim_history(rows, runtime)
 
-    assert trimmed[0]["content"] == "review turn 1", "the start does not move"
-    assert "evicted tool output: 5000 chars" in trimmed[2]["content"]
+    assert trimmed[0]["content"] == "review turn 1", "the start never moves"
+    assert trimmed[2]["content"].startswith("[Stale result elided - ")
+    assert trimmed[2]["content"].endswith(" tokens]")
     assert trimmed[-1]["content"] == "advice 3"
-    assert runtime.evicted_chars == 5000 - len("[evicted tool output: 5000 chars]")
-    assert runtime.cache_epoch == 0, "an eviction is not a start move"
-    assert sum(len(row["content"]) for row in trimmed) <= 4000
+    assert runtime.evicted_chars > 4000
+    assert runtime.cache_epoch == 1, "the cut is a cache-epoch boundary"
+
+    # Pruned means pruned: a second pass finds no candidate and changes nothing.
+    again = mode._trim_history(trimmed, runtime)
+    assert again[2]["content"] == trimmed[2]["content"]
+    assert runtime.cache_epoch == 1
 
 
 def test_an_error_result_is_never_evicted(plugin_package, make_provider):
     provider = _provider(make_provider)
     mode = provider._adviser_mode
-    cfg = {**mode._cfg(), "history_chars": 4000}
     body = "Traceback (most recent call last): " + "y" * 5000
-    rows = ([{"role": "user", "content": "review turn 1"}]
-            + [{"role": "tool", "content": body}]
-            + [{"role": "assistant", "content": f"note {index}"} for index in range(3)]
-            + [{"role": "tool", "content": "ok"}]
-            + [{"role": "user", "content": "review turn 2"},
-               {"role": "assistant", "content": "advice"}])
+    rows = ([{"role": "user", "content": "review turn 1"}, _call("c1", "read_file"),
+             {"role": "tool", "content": body, "tool_call_id": "c1", "status": "error"},
+             {"role": "user", "content": "review turn 2"},
+             {"role": "assistant", "content": "advice"}])
 
-    trimmed, saved = mode._evict_tool_results(rows, 4000)
+    trimmed, saved, evicted = mode._evict_tool_results(rows)
 
-    assert saved == 0
+    assert (saved, evicted) == (0, 0)
     assert any(body in row["content"] for row in trimmed)
 
 
-def test_moving_the_start_is_the_fallback_and_bumps_the_cache_epoch(
-        plugin_package, make_provider):
+def test_only_rederivable_tool_results_are_candidates(plugin_package, make_provider):
+    """T3.6: read/grep are re-derivable; a write or a terminal run is evidence."""
     provider = _provider(make_provider)
     mode = provider._adviser_mode
-    cfg = {**mode._cfg(), "history_chars": 4000}
+    big = "z" * 4000
+    rows = [
+        {"role": "user", "content": "review turn 1"},
+        {"role": "assistant", "content": "", "tool_calls": [
+            {"id": "w", "function": {"name": "write_file"}},
+            {"id": "t", "function": {"name": "terminal"}},
+            {"id": "r", "function": {"name": "read_file"}}]},
+        {"role": "tool", "content": big, "tool_call_id": "w"},
+        {"role": "tool", "content": big, "tool_call_id": "t"},
+        {"role": "tool", "content": big, "tool_call_id": "r"},
+        {"role": "user", "content": "review turn 2"},
+    ]
+
+    trimmed, _saved, evicted = mode._evict_tool_results(rows)
+
+    assert evicted == 1
+    assert trimmed[2]["content"] == big and trimmed[3]["content"] == big
+    assert trimmed[4]["content"].startswith("[Stale result elided - ")
+
+
+def test_a_result_below_the_prune_threshold_is_left_alone(plugin_package, make_provider):
+    """T3.8: MIN_PRUNE_TOKENS — a result too small to pay for the rewrite is not a candidate."""
+    provider = _provider(make_provider)
+    mode = provider._adviser_mode
+    rows = [{"role": "user", "content": "review turn 1"}, _call("c1", "read_file"),
+            {"role": "tool", "content": "ok", "tool_call_id": "c1"},
+            {"role": "user", "content": "review turn 2"}]
+
+    assert mode._evict_tool_results(rows)[1:] == (0, 0)
+
+
+def test_the_newest_user_message_protects_the_tail(plugin_package, make_provider):
+    """T3.7: everything from the latest review's prompt on is the current evidence."""
+    provider = _provider(make_provider)
+    mode = provider._adviser_mode
+    stale, current = "q" * 8000, "r" * 1200
+    rows = [
+        {"role": "user", "content": "review turn 1"},
+        _call("c1", "read_file"), {"role": "tool", "content": stale, "tool_call_id": "c1"},
+        {"role": "assistant", "content": "advice 1"},
+        {"role": "user", "content": "review turn 2"},
+        _call("c2", "read_file"), {"role": "tool", "content": current, "tool_call_id": "c2"},
+        {"role": "assistant", "content": "advice 2"},
+    ]
+
+    trimmed, _saved, evicted = mode._evict_tool_results(rows)
+
+    assert evicted == 1
+    assert trimmed[2]["content"].startswith("[Stale result elided - ")
+    assert trimmed[6]["content"] == current, "the latest review's own evidence is untouched"
+
+
+def test_the_ledger_row_owns_what_this_review_evicted(plugin_package, make_provider,
+                                                      monkeypatch):
+    """T3.7 acceptance: eviction runs before the request, so its chars land on this row."""
+    provider = _provider(make_provider)
+    mode = provider._adviser_mode
+    runtime = mode._runtime(SESSION, "default")
+    runtime.messages = [
+        {"role": "user", "content": "review turn 1"},
+        _call("c1", "read_file"),
+        {"role": "tool", "content": "x" * 8000, "tool_call_id": "c1"},
+        {"role": "assistant", "content": "advice 1"},
+        {"role": "user", "content": "review turn 2"},
+        {"role": "assistant", "content": "advice 2"},
+    ]
+
+    def _fake(message, **kwargs):
+        drive_advise(kwargs, _advice("one more note"))
+        return SimpleNamespace(answer="", api_calls=1, model="reviewer", provider="test",
+                               toolsets=(), messages=tuple(kwargs.get("history") or ()))
+
+    monkeypatch.setattr(plugin_package.agent_loop, "run", _fake)
+    _event(provider, "second")
+
+    assert mode.review_once(SESSION, "test") is True
+
+    row = provider._store.adviser_reviews(SESSION)[0]
+    assert row["evicted_chars"] > 4000
+    assert row["cache_epoch"] == 1
+
+
+def test_a_long_assistant_message_never_moves_the_start(plugin_package, make_provider):
+    """T4.7: without a total budget the history is never cut at a start boundary."""
+    provider = _provider(make_provider)
+    mode = provider._adviser_mode
     rows = [{"role": "user", "content": "review turn 1"},
-            {"role": "tool", "content": "z" * 3000},
             {"role": "assistant", "content": "w" * 6000},
             {"role": "user", "content": "review turn 2"},
             {"role": "assistant", "content": "advice"}]
     runtime = plugin_package.adviser_mode.AdvisorRuntime(session=SESSION, adviser="default")
 
-    trimmed = mode._trim_history(rows, cfg, runtime)
+    trimmed = mode._trim_history(rows, runtime)
 
-    assert trimmed[0]["content"] == "review turn 2"
-    assert runtime.cache_epoch == 1
-    assert runtime.evicted_chars == 0, "the old tool result was too cheap to evict"
+    assert trimmed == rows
+    assert runtime.cache_epoch == 0
 
 
-def test_reasoning_is_captured_by_default_and_bounded(plugin_package, make_provider):
+def test_reasoning_rides_the_event_it_led_to(plugin_package, make_provider):
+    """T7.2: the delta since the last event, as that block's `_thinking:_` line."""
     provider = _provider(make_provider)
     mode = provider._adviser_mode
     mode.on_stream_delta(SESSION, "private thought")
-    assert mode._reasoning[SESSION] == "private thought"
+    mode.record_tool(SESSION, "read_file", turn_id="t1", status="ok",
+                     args={"path": "a.py"}, result="contents")
 
-    off = _provider(make_provider, include_reasoning=False)
-    off_mode = off._adviser_mode
-    off_mode.on_stream_delta(SESSION, "private thought")
-    assert SESSION not in off_mode._reasoning
+    block = plugin_package.adviser_mode._render_event(dict(mode._ring(SESSION)[-1]))
 
-    mode.on_stream_delta(SESSION, "x" * 9000)
-    assert len(mode._reasoning[SESSION]) == 15 + 9000
+    assert "_thinking:_ private thought" in block
+    # The delta does not carry over: the next event starts with no reasoning of its own.
+    mode.record_tool(SESSION, "read_file", turn_id="t1", status="ok",
+                     args={"path": "b.py"}, result="contents")
+    assert "_thinking:" not in plugin_package.adviser_mode._render_event(
+        dict(mode._ring(SESSION)[-1]))
+
+    # Bounded in the buffer, not in the prompt: the default keeps the last 8,000 characters.
+    mode.on_stream_delta(SESSION, "y" * 9_000)
+    assert len(mode._reasoning_since[SESSION]) == 8_000
 
     capped = _provider(make_provider, max_reasoning_chars=100)
-    capped._adviser_mode.on_stream_delta(SESSION, "y" * 250)
-    assert len(capped._adviser_mode._reasoning[SESSION]) == 100
+    capped._adviser_mode.on_stream_delta(SESSION, "z" * 250)
+    assert len(capped._adviser_mode._reasoning_since[SESSION]) == 100
 
-    prompt = mode._prompt(
-        SESSION, "t1", "test",
-        [{"seq": 1, "kind": "tool", "text": "read_file"}],
-        {"name": "default", "instructions": ""},
-    )
-    assert "<recent_reasoning>" in prompt
-    assert "x" * 9000 in prompt
+    prompt = mode._prompt(SESSION, "t1", "manual", [{"seq": 1, "kind": "intent", "text": "go"}])
+    assert "<recent_reasoning>" not in prompt, "reasoning rides the events, not a block"
+
+
+def test_reasoning_can_be_switched_off(plugin_package, make_provider):
+    off = _provider(make_provider, include_reasoning=False)
+    off._adviser_mode.on_stream_delta(SESSION, "private thought")
+    assert SESSION not in off._adviser_mode._reasoning_since
 
 
 def test_plan_mode_tool_state_is_mirrored(plugin_package, make_provider):

@@ -104,6 +104,36 @@ def sections_for(hermes_home: Any, target: str) -> str:
     return "\n\n".join(parts)
 
 
+def references(hermes_home: Any) -> str:
+    """Paths and section names for the rule text, instead of the text itself.
+
+    Same parsing and the same "no SOUL, no targets" rule as :func:`block`. Pasting the rules
+    costs more than the whole review budget, so the reviewer gets the two file paths plus the
+    headings each target judges, and reads the section a finding turns on.
+    """
+    home = Path(str(hermes_home or "")).expanduser()
+    if not home.is_dir():
+        return ""
+    loaded = load(home)
+    if not loaded or not isinstance(loaded, tuple):
+        return ""
+    sections, _digest = loaded
+    if not sections:
+        return ""
+    lines = ["Read the section by heading; SOUL.md wins when both files define it."]
+    soul = home / "SOUL.md"
+    skill = home / DISPATCH_SKILL_REL
+    if soul.is_file():
+        lines.append(f"- {soul}")
+    if skill.is_file():
+        lines.append(f"- {skill}")
+    for target, names in TARGET_SECTIONS.items():
+        present = [name for name in names if name in sections]
+        if present:
+            lines.append(f"{target}: " + ", ".join(f"# {name}" for name in present))
+    return "\n".join(lines) if len(lines) > 2 else ""
+
+
 def block(hermes_home: Any, targets: tuple[str, ...] | list[str] = ()) -> str:
     """All enabled soul targets' sections in one block, or ``""`` when none is readable."""
     wanted = tuple(targets) or tuple(TARGET_SECTIONS)

@@ -248,3 +248,34 @@ def test_an_upgrade_that_keeps_only_the_created_files_is_not_read_as_applied(tmp
     assert not any("already applied" in line for line in logs)
     # The blocked run leaves the tree as it found it, not half patched.
     assert (host / "module.py").read_text(encoding="utf-8") == BASE
+
+def test_a_drop_forgets_one_name_so_the_rest_can_revert(repo):
+    """T5.4: the record outlives the series — a dropped name must not block `--revert`."""
+    host, patches = repo
+    assert _run(host, patches)[0] == ihp.EXIT_OK
+    state_path = host.parent / "state.json"
+
+    # The operator reverses the hunk by hand and removes the patch from the series.
+    _git(host, "apply", "--reverse", str(patches / "0001-change-value.patch"))
+    assert (host / "module.py").read_text(encoding="utf-8") == BASE
+    (patches / "manifest.json").write_text(json.dumps({
+        "series": "test-v1", "capability": "test", "base_version": "0.0.0", "patches": [],
+    }), encoding="utf-8")
+    (patches / "0001-change-value.patch").unlink()
+
+    assert ihp.revert_series(host, patches, state_path=state_path,
+                             log=lambda line: None) == ihp.EXIT_BLOCKED
+
+    logs: list[str] = []
+    assert ihp.drop_recorded(names=["0001-change-value.patch"], state_path=state_path,
+                             log=logs.append) == ihp.EXIT_OK
+    assert any("the checkout is untouched" in line for line in logs)
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    assert state["applied"] == []
+
+    assert ihp.revert_series(host, patches, state_path=state_path,
+                             log=lambda line: None) == ihp.EXIT_OK
+    assert ihp.drop_recorded(names=["nope.patch"], state_path=state_path,
+                             log=logs.append) == ihp.EXIT_OK
+    assert any("not recorded" in line for line in logs)
+

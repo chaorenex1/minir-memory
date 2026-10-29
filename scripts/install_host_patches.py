@@ -499,6 +499,34 @@ def revert_series(
         return EXIT_BLOCKED
 
 
+def drop_recorded(*, names: list[str], state_path: Path,
+                  log: Callable[[str], None] = print) -> int:
+    """Forget recorded patches without touching the host checkout.
+
+    A patch can leave the series while a host still carries its record. ``revert_series`` then
+    refuses that name, because it has no file to reverse, and the rest of the series stays
+    applied. The operator reverses those hunks first (``git apply --reverse``), removes the patch
+    from the manifest, and drops the record here so the rest reverts normally. This never edits
+    the checkout: dropping a record is bookkeeping, and the warning says so.
+    """
+    state_path = Path(state_path)
+    state = read_state(state_path)
+    recorded = applied_names(state)
+    unknown = [name for name in names if name not in recorded]
+    for name in unknown:
+        log(f"skip: {name} is not recorded")
+    dropped = [name for name in names if name in recorded]
+    if not dropped:
+        return EXIT_OK
+    for name in dropped:
+        _drop(state, name)
+    state["updated_at"] = time.time()
+    write_state(state_path, state)
+    log("dropped from the record (the checkout is untouched): " + ", ".join(dropped))
+    log(f"state: {state_path}")
+    return EXIT_OK
+
+
 def verify_reverted(host: Path) -> tuple[bool, str]:
     python = host_python(host)
     code = "import hermes_cli.plugin_runtime"
@@ -518,6 +546,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--state", type=Path, help="state file (default: <hermes-home>/minir-memory/host-patches.json)")
     parser.add_argument("--check", action="store_true", help="report what would happen; change nothing")
     parser.add_argument("--revert", action="store_true", help="undo the recorded series")
+    parser.add_argument("--drop", action="append", default=[], metavar="NAME",
+                        help="forget one recorded patch without touching the checkout "
+                             "(use after reversing its hunks by hand)")
     parser.add_argument("--force", action="store_true", help="apply over local edits to touched files")
     parser.add_argument("--keep-on-failure", action="store_true", help="do not roll back a failed verification")
     return parser
@@ -530,6 +561,8 @@ def main(argv: Optional[list[str]] = None) -> int:
     patches_dir = args.patches or default_patches_dir()
     state_path = args.state or Path(hermes_home) / "minir-memory" / STATE_FILENAME
     backup_root = Path(hermes_home) / "minir-memory" / BACKUP_DIRNAME
+    if args.drop:
+        return drop_recorded(names=args.drop, state_path=state_path)
     if args.revert:
         return revert_series(host, patches_dir, state_path=state_path)
     return apply_series(
