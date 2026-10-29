@@ -1,6 +1,7 @@
 # adviser 观察后台 minir agent
 
-状态：已落地（2026-10-28）。§6 的改动点都已实现，代码与片段不完全相同，差异见 §11。没有新增 config 键，也没有改 config 示例。
+状态：已落地（2026-10-28）。§6 的改动点都已实现，代码与片段不完全相同，差异见 §11。
+2026-10-30 修订：子 agent 观察改为默认关闭，新增 `adviser_mode.observe_children`（默认 false）；§0.12、D4、§10、§11 已按此改写。
 依据：2026-10-27 的对话与四轮决定（U1 到 U4），加上对 `plugin/minir` 与本机 Hermes 源码（`C:\Users\zarag\AppData\Local\hermes\hermes-agent`）的追踪。机制事实都带 `file:line`，行号取自当天代码。
 代码验证状态见 §7：实现按 §6.4 的清单跑过测试（四个测试文件，加 conftest 一处 fixture；不跑全量、e2e、smoke）；运行期未验证项照旧列在 §7。
 
@@ -9,7 +10,7 @@
 已定：
 - 观察入口是一个独立的 watch 注册表，不放宽 `_primary`。
 - 每个后台 run 在派发时拿到确定性的 host session id，并交给 `agent_loop.run`。
-- 开关只有一个：`adviser_mode.enabled`。开则观察、评价、中止、进度一起开；关则一行都不记录。不新增 config 键。
+- 开关两个：`adviser_mode.enabled` 是总开关；`adviser_mode.observe_children`（默认 false）决定子 agent 的 run 是否进观察范围。关掉时它的 reasoning 日志、review 与 adviser 副本都不写，策略路径仍只有主会话。
 - 预算复用现有的 `max_reviews_per_turn` 与花名册 `cadence`，不另设冷却或每 run 上限。
 - 落盘分三股流：host 流、子 run 实时流、子 run 最终 transcript。子 run 的写入从不落 host 层，每一行都带 `run_id`。
 - 评审上下文（digest / rulers / stats / history）取父会话，事件与 reasoning 取子会话：子会话的评审质量与主会话一致。
@@ -65,7 +66,7 @@
 | D1 观察入口 | 放宽 `_primary` 还是另开注册表 | 另开 `agent_watch`；recorder hook 走 `_observe`，策略路径仍走 `_primary` | 零改动接入 |
 | D2 子 run 的 id | 随机 id 还是确定性 id | 派发时生成 `parent:minir:agent:job`，交给 `agent_loop.run(session_id=...)`，并写进句柄 | 不动 minir_agents |
 | D3 观察范围 | 只看评价还是全观察 | 全观察进 ring；评价、中止、进度三个消费者 | 一上来就做 pre-tool 门禁 |
-| D4 开关 | 每个消费者一个键还是一个总键 | 只用 `adviser_mode.enabled`；关掉时连记录都不做 | 分消费者开关 |
+| D4 开关 | 每个消费者一个键还是一个总键 | 两个键：`adviser_mode.enabled`（总开关）与 `adviser_mode.observe_children`（默认 false，子 agent 是否进观察范围，2026-10-30 修订） | 分消费者开关 |
 | D5 预算 | 每 run 评几次 | 复用 `max_reviews_per_turn` 加花名册 `cadence`；depth 常量 1 | 新增冷却与每 run 上限 |
 | D6 落盘 | 实时写哪里，怎么区分 host | 三股流：host / 子 run 实时（child session + run_id）/ 子 run 最终（parent session + run_id） | 混写一股流再靠 fp 去重 |
 | D7 评审上下文 | 子会话的空 digest 怎么补 | digest / rulers / stats / history 取父会话；事件与 reasoning 取子会话 | 给子会话补 store turn 行 |
@@ -562,7 +563,7 @@ TARGET_NEEDS = {
 - 策略同主会话：`adviser_only` 一开，被评的子 agent 就不能改文件。这是 D9 的设计选择，配置说明里写死。
 - 收缩靠派发时的 flags：子 run 的 flags 和 toolsets 就是它的能力清单，flag 写错评审就会多查或少查。
 - `agent.steer` 在子 run 的 in-process 路径是否每次都被 drain，只在代码里看到调用点（agent_runtime_helpers.py:3708-3745），没有真实 run 观察。
-- 没有新增 config 键；`adviser_mode.enabled` 一开，后台 run 的观察和评审就一起开。
+- 新增了 config 键 `observe_children`（默认 false）：后台 run 默认不进观察范围，`enabled` 一开也只观察主会话。
 
 ## 9 未决
 
@@ -575,6 +576,7 @@ TARGET_NEEDS = {
 - 2026-10-27 三稿：吸收 U5 到 U8。进度改成每批工具一行；实时轨迹可按 child session 查（先缓存再落盘）；子 run 继承配置里的策略，评审按 `adviser_target` 收缩（缺 SOUL 跳 soul_*）；每次子评审单独限额。
 - 2026-10-27 四稿：U9 到 U12 不再留作未决。限额落成常量（6k/12k/18k）；进度用 2 秒窗口合并；收缩落成 `TARGET_NEEDS` 映射；被拦时记 blocked 事件并返回拒绝文本。
 - 2026-10-28 落地：按 §6 实现，差异记在 §11；测试按 §6.4 的清单补上并执行。
+- 2026-10-30 修订：子 agent 观察默认关闭。落地后层内 pass（b3/b4）被当作可观察 run，review 与 reasoning 日志堆在 operator 会话旁（30 次 review、678,597 prompt tokens、0 条建议）；D4 改成两个键，`_observe` 加 `observe_children` 门槛，补测试 `test_a_child_run_stays_out_of_scope_by_default`。
 
 ## 11 实施记录
 
@@ -590,5 +592,7 @@ TARGET_NEEDS = {
 8. **`preserve` 与网关通知**：`_deliver_host` 的 `preserve` 分支也加了 `not child`（草稿只写了 continue 与 trigger）；`_maybe_notify` 对 watched child 直接返回，免得子 run 的建议走聊天通道。
 9. **未做**：`handle_llm_request`（`llm_request` 中间件）仍只认 `_primary`，所以子 run 的建议只有 steer / interrupt 一条路，与 D8 一致。
 10. **`Watch` 多一个 `profile`**：一个进程可以服务多个 profile，而 ring 与 transcript 按 profile 分区。`register` 记下派发者的 profile（取自 transcript），`_observe` 只在同一 profile 内放行该 child；两边都为空时不拦，测试和旧调用方不受影响。
+
+11. **子 agent 默认不观察**：`_observe` 增加 `adviser_mode.observe_children`（默认 false）。10-28 的实现把每个 `agent_watch` 登记的 run 直接放行，而 `minir_agents` 的每个 job（含 b3/b4 层内 pass）都会登记，于是 reasoning 日志与 adviser 副本按 `<parent>:minir:<agent>:<job>` 落盘。默认关闭后这些 run 的记录与评审全部不生效；要恢复旧行为把该键设为 true。策略门禁单独走 `_policy`，不复用 `_observe`：未观察的子 run 仍继承 `adviser_only`，不会被这个键顺带放开。`plugins/minir/agents` 下的 pass core（b3/b4）也不靠这个键：`minir_agents` 按 `prompt_source` 判定，注册时就带 `observe=False`，`_observe` 直接拒绝，所以 `observe_children: true` 不会把它们带回来。
 
 `minir_agents` 的 `record_aux` / `append_event` 本来就有 `run_id`，`transcript.py` 没有改。

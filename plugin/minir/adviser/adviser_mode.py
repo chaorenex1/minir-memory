@@ -118,6 +118,11 @@ _DEFAULTS: dict[str, Any] = {
     "cadence": 1,
     "severity_floor": "concern",
     "max_reviews_per_turn": 6,
+    # -- observation scope ----------------------------------------------------
+    # A background minir_agents run is a child session, not the operator's. Off keeps its
+    # reasoning log, its review and its adviser transcript unwritten; b3/b4 layer passes and
+    # every other dispatched agent stay out of the adviser's view.
+    "observe_children": False,
     # -- claims (P0-P3) -------------------------------------------------------
     # off: today's behaviour. shadow: select and store only. on: inject the offer.
     "claims": "on",
@@ -1518,23 +1523,29 @@ class AdviserMode:
     def _observe(self, session_id: str = "") -> str:
         """The session a recorder hook may write to: a watched child, else the primary.
 
-        ``_primary`` stays exactly as it was for the policy paths (``blocks_tool``,
-        ``late_blocker``, ``verify_continue``): a child must not inherit ``adviser_only`` from the
-        session that spawned it just because a recorder hook admitted the same session. Depth was
-        capped when the run was registered, so no second config key gates this.
+        A child is admitted only when ``observe_children`` is on. A background run is not the
+        operator's session: recording it puts its reasoning log and its review beside the
+        operator's own, and the run cannot act on prose mid-contract. The tool gate resolves in
+        :meth:`_policy` instead, so a child keeps inheriting ``adviser_only`` whether or not it is
+        observed. Depth is capped when the run is registered.
         """
         child = agent_watch.get(str(session_id or ""))
-        if child is not None and self._same_profile(child):
+        if (child is not None and child.observe and self._cfg().get("observe_children")
+                and self._same_profile(child)):
             return child.session
         return self._primary(session_id)
 
     def _policy(self, session_id: str = "") -> str:
         """The session a tool gate applies to: the watched child's own, else the primary's.
 
-        Named apart from :meth:`_observe` on purpose: the two resolve the same way today, and the
-        names are what keeps a later recorder change from silently widening the gate.
+        Named apart from :meth:`_observe` on purpose, and now resolved apart: ``observe_children``
+        narrows the recorders, not the gate, so an unobserved child still inherits ``adviser_only``
+        instead of silently gaining the right to mutate.
         """
-        return self._observe(session_id)
+        child = agent_watch.get(str(session_id or ""))
+        if child is not None and self._same_profile(child):
+            return child.session
+        return self._primary(session_id)
 
     def _same_profile(self, watch: Any) -> bool:
         """A watch belongs to the profile that dispatched it; an unset side admits anything."""

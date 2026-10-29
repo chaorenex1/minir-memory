@@ -484,6 +484,7 @@ Desktop 的 transcript 水合把 `display_kind="adviser"` 当作 machine notice 
   include_reasoning: true   # 需同时开宿主 plugins.stream_reasoning_deltas
   max_reasoning_chars: 0    # 0 = 每条事件的 `_thinking:_` 取末尾 8,000 字符；>0 用该值
   reasoning_log: true       # include_reasoning 开启时，全量 reasoning 写 sessions/reasoning/
+  observe_children: false   # 子 agent 是否进观察范围；关则不起 review、不写 reasoning 与 adviser 副本；plugins/minir/agents 下的 pass core 永远不进
   pause_seconds: 300        # usage/rate-limit 失败后该 adviser 的暂停时长
   failure_pause_seconds: 60 # 连续失败达到上限后的短暂停
   max_consecutive_failures: 3

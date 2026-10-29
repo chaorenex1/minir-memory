@@ -299,6 +299,24 @@ def _system_prompt(provider: Any, agent_name: str, skill_name: str,
     return argument, ("argument" if argument else "")
 
 
+def _observable_prompt(source: str) -> bool:
+    """Whether a run with this prompt source may be seen by the adviser at all.
+
+    ``plugins/minir/agents`` holds the layer-pass cores (b3 window summary, b4 value
+    markers …). The plugin dispatches them itself, their output is a JSON contract, and no
+    advisory prose can steer them, so they stay out of the adviser's scope whatever
+    ``adviser_mode.observe_children`` says. Every other source — ``.agents/``, ``agents/``,
+    a skill's agents dir, or the caller's inline text — stays observable.
+    """
+    try:
+        portable = Path(str(source or "")).as_posix()
+    except (TypeError, ValueError):
+        return False
+    if not portable or portable == "argument":
+        return True
+    return "/plugins/minir/agents/" not in f"/{portable.lstrip('/')}"
+
+
 @dataclass
 class _Job:
     """One background run: everything the calling thread resolved, ready for a worker thread.
@@ -435,6 +453,7 @@ def _execute(job: _Job) -> dict[str, Any]:
     watch = agent_watch.register(
         parent=job.session_key, agent=job.agent, job_id=job.job_id, depth=job.depth,
         profile=str(getattr(job.transcript, "profile", "") or ""),
+        observe=_observable_prompt(job.prompt_source),
         capabilities=_capabilities(job))
     try:
         return _run_and_record(job, watch)

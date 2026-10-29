@@ -25,6 +25,17 @@ def test_a_registered_run_is_addressable_by_its_own_session(plugin_package):
     assert module.is_child("session-test") is False, "the parent is not a watched run"
 
 
+def test_a_run_can_be_registered_without_being_observable(plugin_package):
+    """Observed and observable are different questions: a pass core is a child but not watched."""
+    module = plugin_package.agent_watch
+    watch = module.register(parent="session-test", agent="b3_window_summary", job_id="job-9",
+                            observe=False)
+
+    assert watch is not None and watch.observe is False
+    assert module.is_child(watch.session) is True, "it is addressable, just not observable"
+    assert module.register(parent="session-test", agent="a", job_id="j").observe is True
+
+
 def test_a_run_without_a_job_id_or_past_the_depth_limit_is_not_watched(plugin_package):
     module = plugin_package.agent_watch
 

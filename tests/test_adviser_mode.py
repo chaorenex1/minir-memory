@@ -43,11 +43,13 @@ def _agent_run(answer: str, calls: list | None = None):
 
 
 def _mode_provider(make_provider, *, cadence: int = 2, floor: str = "nit",
-                   mode: str = "watch"):
+                   mode: str = "watch", observe_children: bool = True):
     return make_provider({"adviser_mode": {
         "enabled": True, "mode": mode, "cadence": cadence, "severity_floor": floor,
         "max_reviews_per_turn": 4, "max_advices": 3, "max_chars": 900,
         "claims": "off",  # this file covers scheduling and storage, not the claim pool
+        # Most tests here need the child in scope; the default-off case has its own test.
+        "observe_children": observe_children,
     }})
 
 
@@ -1203,12 +1205,64 @@ def test_consistency_targets_are_delivered(plugin_package):
 # -- watched background runs --------------------------------------------------
 
 def _watch(plugin_package, *, parent: str = "session-test", agent: str = "researcher",
-           job: str = "job-1", capabilities: dict | None = None):
+           job: str = "job-1", capabilities: dict | None = None, observe: bool = True):
     """Register one background run the adviser may observe."""
     return plugin_package.agent_watch.register(
         parent=parent, agent=agent, job_id=job,
+        observe=observe,
         capabilities=(capabilities if capabilities is not None
                       else {"soul": True, "memory": True, "file": True}))
+
+
+def test_a_child_run_stays_out_of_scope_by_default(plugin_package, make_provider, monkeypatch):
+    """Registration is not admission: ``observe_children`` is off unless the config sets it."""
+    provider = _mode_provider(make_provider, cadence=1, observe_children=False)
+    calls: list = []
+    monkeypatch.setattr(plugin_package.agent_loop, "run", _run(_advice(), calls))
+    watch = _watch(plugin_package)
+    mode = provider._adviser_mode
+
+    assert mode._observe(watch.session) == "", "the default keeps a child run out of scope"
+    for path in ("a.py", "b.py"):
+        mode.on_post_tool_call(session_id=watch.session, turn_id="t1", tool_name="read_file",
+                               status="ok", args={"path": path}, result="contents")
+    assert mode.wait_idle(0.3)
+
+    assert mode._rings.get(watch.session) is None, "nothing recorded for a run out of scope"
+    assert calls == [], "no review is started for a run out of scope"
+    assert provider._transcript.read_events(
+        "default", "researcher", watch.session, kinds=["msg"])["rows"] == [], (
+        "the child's own stream is not written either")
+
+
+def test_a_child_keeps_the_adviser_only_gate_when_it_is_not_observed(plugin_package, make_provider):
+    """``observe_children`` narrows the recorders, not the tool gate."""
+    provider = _mode_provider(make_provider, mode="adviser_only", observe_children=False)
+    watch = _watch(plugin_package)
+    mode = provider._adviser_mode
+
+    assert mode._observe(watch.session) == "", "the child is not observed"
+    assert mode.blocks_tool(watch.session, "write_file") is True, \
+        "an unobserved child still inherits adviser_only"
+    assert mode.blocks_tool(watch.session, "read_file") is False
+
+
+def test_a_plugin_pass_child_is_not_observed_even_with_children_on(
+        plugin_package, make_provider, monkeypatch):
+    """``observe_children`` admits operator-dispatched runs; a shipped pass core stays out."""
+    provider = _mode_provider(make_provider, cadence=1, observe_children=True)
+    calls: list = []
+    monkeypatch.setattr(plugin_package.agent_loop, "run", _run(_advice(), calls))
+    watch = _watch(plugin_package, agent="b3_window_summary", observe=False)
+    mode = provider._adviser_mode
+
+    assert mode._observe(watch.session) == "", "an unobservable run is out of scope"
+    for path in ("a.py", "b.py"):
+        mode.on_post_tool_call(session_id=watch.session, turn_id="t1", tool_name="read_file",
+                               status="ok", args={"path": path}, result="contents")
+    assert mode.wait_idle(0.3)
+    assert mode._rings.get(watch.session) is None
+    assert calls == []
 
 
 def test_a_watched_child_run_is_recorded_and_reviewed(plugin_package, make_provider, monkeypatch):

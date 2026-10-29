@@ -9,8 +9,9 @@
 * the progress line, which keeps the run's last steps so the session that dispatched it sees the
   run move.
 
-Nothing here budgets reviews or reads config: one switch (``adviser_mode.enabled``) turns the
-whole observation on, and the adviser's existing per-turn cap and roster cadence bound the cost.
+Nothing here budgets reviews or reads config: ``adviser_mode.enabled`` turns the whole observation
+on, ``adviser_mode.observe_children`` (default false) decides whether a registered run is admitted
+at all, and the adviser's existing per-turn cap and roster cadence bound the cost.
 """
 
 from __future__ import annotations
@@ -48,6 +49,10 @@ class Watch:
     agent: str
     job_id: str
     depth: int = 1
+    #: Whether the adviser may record this run at all. A pass core shipped with the plugin
+    #: (``plugins/minir/agents``) is dispatched by the plugin itself, its output is a JSON
+    #: contract, and it stays unobservable whatever ``adviser_mode.observe_children`` says.
+    observe: bool = True
     #: The profile that dispatched the run. One process can serve more than one profile, and a
     #: watch may only be read by the profile whose streams it was written to.
     profile: str = ""
@@ -75,7 +80,8 @@ class WatchRegistry:
 
     def register(self, *, parent: str = "", agent: str = "", job_id: str = "",
                  depth: int = 1, max_depth: int = DEFAULT_MAX_DEPTH,
-                 capabilities: Optional[dict] = None, profile: str = "") -> Optional[Watch]:
+                 capabilities: Optional[dict] = None, profile: str = "",
+                 observe: bool = True) -> Optional[Watch]:
         """Watch one run; ``None`` when it has no job id or is too deep to watch."""
         if not str(job_id or "").strip():
             return None
@@ -91,7 +97,7 @@ class WatchRegistry:
             return None
         watch = Watch(session=child_session_id(parent, agent, job_id),
                       parent=str(parent or ""), agent=str(agent or ""),
-                      job_id=str(job_id).strip(), depth=level,
+                      job_id=str(job_id).strip(), depth=level, observe=bool(observe),
                       profile=str(profile or ""),
                       capabilities=dict(capabilities or {}))
         with self._lock:

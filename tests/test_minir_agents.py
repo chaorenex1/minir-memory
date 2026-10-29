@@ -301,6 +301,45 @@ def test_a_prompt_file_is_rendered_once_after_loading(provider, fake_run, tmp_pa
     assert "$HERMES_HOME" in system, "a variable this code does not own is left for its reader"
 
 
+def test_a_packaged_pass_core_is_not_observable(plugin_package):
+    """The b3/b4 cores ship in ``plugins/minir/agents`` and are never handed to the adviser."""
+    observable = plugin_package.minir_agents._observable_prompt
+
+    assert observable(
+        r"C:\Users\x\AppData\Local\hermes\plugins\minir\agents\b3_window_summary.md") is False
+    assert observable("plugins/minir/agents/b4_value_markers.md") is False
+    assert observable(r"C:\Users\x\AppData\Local\hermes\.agents\mine.md") is True
+    assert observable("skills/note-taking/agents/writer.md") is True
+    assert observable("argument") is True, "an inline prompt is the caller's own agent"
+    assert observable("") is True
+
+
+def test_a_packaged_pass_core_registers_unobservable(plugin_package, provider, fake_run,
+                                                    tmp_path, monkeypatch):
+    """The b3/b4 cores under plugins/minir/agents never reach the adviser; a caller's own does."""
+    module = plugin_package.minir_agents
+    core = tmp_path / "plugins" / "minir" / "agents"
+    core.mkdir(parents=True)
+    (core / "b3_window_summary.md").write_text("Summarize the window.\n", encoding="utf-8")
+    mine = tmp_path / ".agents"
+    mine.mkdir()
+    (mine / "researcher.md").write_text("You research.\n", encoding="utf-8")
+
+    seen: list = []
+    original = module.agent_watch.register
+
+    def spy(**kwargs):
+        seen.append(kwargs.get("observe"))
+        return original(**kwargs)
+
+    monkeypatch.setattr(module.agent_watch, "register", spy)
+
+    _payload(provider, agent_name="b3_window_summary", user_prompts="Summarize.")
+    _payload(provider, agent_name="researcher", user_prompts="Find it.")
+
+    assert seen == [False, True], "a packaged pass core is not observable, a caller's agent is"
+
+
 def test_every_packaged_prompt_renders_without_a_leftover_cap(plugin_package):
     """A packaged core states its caps as $NAME; a typo would ship a literal to the model."""
     agents = Path(plugin_package.layers.AGENTS_DIR)
