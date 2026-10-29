@@ -6,6 +6,8 @@ import json
 import time
 from types import SimpleNamespace
 
+from adviser_fakes import drive_advise
+
 
 def _advice(text: str, severity: str = "concern") -> str:
     return json.dumps({"action": "advise", "advices": [{
@@ -23,6 +25,7 @@ def _fake_run(answer_for):
     def _run(message, **kwargs):
         calls.append({"message": message, **kwargs})
         answer = answer_for(message, len(calls) - 1)
+        drive_advise(kwargs, answer)
         return SimpleNamespace(answer=answer, api_calls=1, model="reviewer", provider="test",
                                toolsets=tuple(kwargs.get("toolsets") or ()))
 

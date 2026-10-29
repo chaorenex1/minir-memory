@@ -116,7 +116,7 @@ minir 现状（已实现）：读 `staged_advisories(request_id)`，否则读 pe
 | omp 机制 | omp 实现 | Hermes 等价 | 判定 |
 |---|---|---|---|
 | 增量感知 | cursor + delta 渲染，含 reasoning 与工具意图 | `post_tool_call` + `on_interim_message` + `post_llm_call` 组 delta；无 reasoning | 降级 |
-| 结构化建议 | `advise(note, severity)` | reviewer 返回 JSON `advices[]`（已有 `severity`/`target`） | 直译 |
+| 结构化建议 | `advise(note, severity)`，schema 保证结构化，同轮 ack | `advise` 工具（nested run 的 `extra_tools`，P-0021）：一条 note 一次调用，schema 即输出契约，ack 为 omp 四句 | 相同 |
 | 发射护栏 | normalize + noise + dedupe + 预算 + 已发缓存 | 需补：目前只有 `max_advices`、severity floor、TTL | 部分 |
 | 中断 steer | `deliverAs: "steer"` + `triggerTurn` | 无 API；最近似的是 `pre_tool_call` block | 不可直译 |
 | 非中断 aside | yield queue，下一安全边界 | `llm_request` 在下一次 attempt 注入 | 直译 |
@@ -156,8 +156,8 @@ primary 回合
         └─> 事件环（内存，48 条 × 1200 字符）
                 └─> reviewer 后台线程（cadence / 工具错误 / 变更后触发）
                         ├─ delta 渲染（cursor → 新事件）
-                        ├─ adviser prompt（system + project + memory + roster）
-                        ├─ 输出 JSON advices
+                        ├─ advisor prompt（system + project + memory + roster）
+                        ├─ `advise` 工具调用（一条 note 一次，schema 即输出契约）
                         └─> EmissionGuard（normalize/dedupe/noise/budget/cache）
                                 └─> ledger: pending
 llm_request（每 attempt）
@@ -182,7 +182,7 @@ pre_verify（opt-in）
 - prompt 采用 omp `system.md` 的语义，压成 minir 现有的 `CORE + MODE_REVIEW` 结构：角色（user/code-quality/robustness 的影子审查者）、只报具体技术风险、不复述 agent 已经知道的错误、不评判用户意图、不在缺证据时断言、blocker 必须先自查。
 - 新增两段上下文：`<project-context>`（AGENTS.md + 从当前目录到 git root 的 `WATCHDOG.md`，带字符上限）和 `<memory-context>`（minir recall 的 top-N，标注"可能过期，当前对话优先"）。
 - 工具：`adviser_session_search`（只读）替代 omp 的 read/grep/glob；不给写工具。每次 review 的工具预算 2-3 次，对应 omp 的 "Per advise: 2-3 tool calls"。
-- 输出：保持 JSON，字段 `advices[]`（`note`、`severity`、`target`、`evidence`、`confidence`）。`max_advices` 仍是单次投递上限 3，reviewer 每轮产出上限改为 `max_notes_per_update`（默认 4，blocker 不限）。
+- 输出：`advise` 工具调用（`note`、`severity` 必填；`target`、`decision`、`evidence`、`claim`、`candidate_id`、`deferred` 可选；`forks`/`fork_grades`/`coverage` 随同一次调用）。不再有 JSON 契约，也没有散文→对象的修补链；`max_advices` 仍是单次投递上限 3，reviewer 每轮产出上限是 `max_notes_per_update`（默认 4，blocker 不限）。
 
 ### 4.5 发射层（补 EmissionGuard）
 
@@ -224,7 +224,7 @@ immune turns：记录最近一次 C/D 触发的 turn 号，`immune_turns` 内 co
 memory.minir.adviser_mode:
   enabled: false          # 现有
   mode: watch             # 现有：watch | adviser_only
-  cadence: 3              # 现有：工具错误/变更后仍触发
+  cadence: 1              # 现有：默认 1（omp 的 interval 1）；工具错误/变更后仍无条件触发
   severity_floor: concern # 现有
   max_advices: 3          # 现有
   max_chars: 900          # 现有

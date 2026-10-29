@@ -1,6 +1,6 @@
 {
   "series": "plugin-runtime-v1",
-  "capability": "plugin_runtime_v2",
+  "capability": "plugin_runtime_v3",
   "base_version": "0.22.5",
   "base_commit": "bf0203a794",
   "description": "Plugin control bridge (steer/continuation/interrupt), post-turn triggers, cooperative flags, live adviser events, a preserved card at the turn end, labeled adviser-triggered turns, and adviser rows on every host surface: Desktop card, TUI card, classic CLI block, web session inspector, and a native web chat transcript (the PTY stays available as a fallback); each adviser note carries its own severity on every surface; and the CLI's verbose tool progress prints each call's result body under its row, with the one-line modes as the fold; and a tool step's reasoning prints above the rows it asked for, never under the final answer; and a plugin callback may declare its own hook budget so a pre-tool gate can wait for one model answer without slowing every other hook. It also lets the minir memory plugin switch off the host's built-in MEMORY.md and USER.md stores through memory.minir.block_builtin_memory (on by default inside its own block), so the two native files are neither loaded nor rendered.",
@@ -84,6 +84,22 @@
     {
       "name": "0020-Let-a-memory-plugin-stop-the-host-loading-its-own-memory-files.patch",
       "sha256": "17abaf658411db6183fbe3d1dabf090801d2dfa83280fb6fbd5e080cbd4a1371"
+    },
+    {
+      "name": "0021-Let-a-nested-run-own-a-private-tool.patch",
+      "sha256": "8153781706705ea0beb9d0196ef2b4b1cb498621f2be7da929bd6bb5575d7694"
+    },
+    {
+      "name": "0022-Kill-in-flight-tool-processes-on-a-plugin-interrupt.patch",
+      "sha256": "6cdf8dadb28ca78975f18efc556586baed01028357723706f9547de0940bddd8"
+    },
+    {
+      "name": "0023-Expose-live-turn-state-to-plugins.patch",
+      "sha256": "cdfae0d3a0fcba80175bf1b3e92875f02d8aee188ba78d9909d5ec5bd6d623bc"
+    },
+    {
+      "name": "0024-Let-a-caller-pin-the-prompt-cache-scope.patch",
+      "sha256": "d622b09e4f6c7734ead694b49068589f08006e77cc79f86aad5f7ce7bdbb3ddd"
     }
   ],
   "rebased": "v0.22.5 (bf0203a794). Two merge decisions: the steer buffer holds (ticket, text, kind) triples so the upstream ticket API keeps working while an adviser row stays labeled, and the plugin continuation gate runs before the late-LSP gate (a blocker outranks a note)."

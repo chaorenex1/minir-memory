@@ -8,6 +8,8 @@ from __future__ import annotations
 import json
 from types import SimpleNamespace
 
+from adviser_fakes import drive_advise
+
 
 def _mode_provider(make_provider, **fork_overrides):
     block = {"enabled": True, "mode": "watch", "cadence": 1, "severity_floor": "nit",
@@ -186,6 +188,7 @@ def test_a_review_writes_a_low_rule_and_the_ledger(plugin_package, make_provider
 
     def _fake_run(message, **kwargs):
         calls.append({"message": message, **kwargs})
+        drive_advise(kwargs, answer)
         return SimpleNamespace(answer=answer, api_calls=1, model="reviewer", provider="test",
                                toolsets=list(kwargs.get("toolsets") or []), messages=[])
 
@@ -290,7 +293,7 @@ def test_minir_advise_rejects_an_unknown_phase(plugin_package, make_provider):
 
 
 def test_the_review_contract_declares_the_fork_fields(plugin_package):
-    schema = plugin_package.adviser_mode.REVIEW_RESPONSE_FORMAT["json_schema"]["schema"]
+    schema = plugin_package.adviser_mode.advise_tool_schema()["parameters"]
     assert "forks" in schema["properties"]
     assert "fork_grades" in schema["properties"]
     assert schema["properties"]["forks"]["items"]["properties"]["decision"]["enum"] == list(

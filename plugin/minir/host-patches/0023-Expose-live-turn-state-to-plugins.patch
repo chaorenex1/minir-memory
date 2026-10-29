@@ -1,0 +1,57 @@
+diff --git a/hermes_cli/plugin_runtime.py b/hermes_cli/plugin_runtime.py
+--- a/hermes_cli/plugin_runtime.py
++++ b/hermes_cli/plugin_runtime.py
+@@ -33,7 +33,9 @@
+ logger = logging.getLogger(__name__)
+ 
+ #: Bumped when the callable surface changes so a plugin can feature-detect.
+-CAPABILITY_VERSION = "plugin_runtime_v2"
++#: v3 adds ``live_state`` (P-0023), same-name per-run tools (P-0021), the interrupt tree kill
++#: (P-0022) and a caller-pinned cache scope (P-0024).
++CAPABILITY_VERSION = "plugin_runtime_v3"
+ #: ``display_kind`` on the durable row a continuation is delivered as. Clients
+ #: that do not know it still render the text; the value keeps it distinguishable
+ #: from a human prompt in the transcript.
+@@ -222,6 +224,42 @@
+     except Exception:
+         logger.debug("plugin_runtime: live tool process kill failed", exc_info=True)
+         return 0
++
++
++def live_state(session_id: str) -> dict[str, Any]:
++    """Facts about the live turn a delivery channel may branch on, read from the live agent.
++
++    * ``streaming``: a provider request is in flight for this turn (the host brackets every
++      model call with ``_model_request_active``), so the answer is being produced right now.
++    * ``aborting``: an interrupt is pending and has not been cleared.
++    * ``tool_batch``: a tool batch is executing.
++    * ``terminal_idle``: the turn is bound and none of the above is true.
++
++    A turn that is not bound reports every flag false: a caller must fall back to its own queue
++    rather than read ``terminal_idle`` as "safe to deliver".
++    """
++    session = str(session_id or "")
++    with _LOCK:
++        agent = _agent_for(session)
++        facts = dict(_TURNS.get(session) or {})
++    if agent is None:
++        return {"capability": CAPABILITY_VERSION, "live": False, "session_id": session,
++                "turn_id": "", "streaming": False, "aborting": False,
++                "tool_batch": False, "terminal_idle": False}
++    request_active = getattr(agent, "_model_request_active", None)
++    streaming = bool(request_active.is_set()) if request_active is not None else False
++    aborting = bool(getattr(agent, "_interrupt_requested", False))
++    tool_batch = bool(getattr(agent, "_executing_tools", False))
++    return {
++        "capability": CAPABILITY_VERSION,
++        "live": True,
++        "session_id": session,
++        "turn_id": str(getattr(agent, "_current_turn_id", "") or facts.get("turn_id") or ""),
++        "streaming": streaming,
++        "aborting": aborting,
++        "tool_batch": tool_batch,
++        "terminal_idle": not (streaming or aborting or tool_batch),
++    }
+ 
+ 
+ def interrupt(session_id: str, text: str, *, source: str = "plugin") -> dict[str, Any]:

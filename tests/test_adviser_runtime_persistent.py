@@ -5,6 +5,8 @@ from __future__ import annotations
 import json
 from types import SimpleNamespace
 
+from adviser_fakes import drive_advise
+
 SESSION = "session-test"
 
 
@@ -18,6 +20,7 @@ def _run(answer: str, calls: list | None = None):
     def _fake(message, **kwargs):
         if calls is not None:
             calls.append({"message": message, **kwargs})
+        drive_advise(kwargs, answer)
         # The host returns history + this run; mirror that shape so the runtime's merge
         # detects the prefix instead of appending a duplicate copy.
         prior = list(kwargs.get("history") or ())
@@ -67,8 +70,10 @@ def test_second_review_continues_with_history_and_stable_session(
     assert "first" in history[-1]["content"]
 
 
-def test_tool_event_keeps_the_full_result_without_a_cap(
+def test_tool_event_keeps_the_ring_body_and_the_prompt_gets_a_skeleton(
         plugin_package, make_provider):
+    """The ring keeps the full result — it is evidence — while the prompt bounds a >24k event
+    (T4: 1.83% of real tool rows exceed that, the largest ~132k tokens)."""
     provider = _provider(make_provider)
     big = "R" * 20_000
     provider._adviser_mode.on_post_tool_call(
@@ -76,11 +81,25 @@ def test_tool_event_keeps_the_full_result_without_a_cap(
         args="A" * 6_000, result=big)
 
     event = list(provider._adviser_mode._ring(SESSION))[-1]
-    assert event["result"] == big
+    assert event["result"] == big, "the ring is not capped"
     assert "elided" not in event
     prompt = provider._adviser_mode._prompt(SESSION, "t1", "tool", [event])
-    assert "R" * 20_000 in prompt
-    assert "chars elided" not in prompt
+    assert "R" * 20_000 not in prompt
+    assert "original_chars=" in prompt and "chars elided" in prompt
+
+
+def test_a_tool_event_below_the_threshold_keeps_its_full_result(
+        plugin_package, make_provider):
+    provider = _provider(make_provider)
+    body = "S" * 20_000
+    provider._adviser_mode.on_post_tool_call(
+        session_id=SESSION, turn_id="t1", tool_name="read_file", status="ok",
+        args="A" * 100, result=body)
+
+    prompt = provider._adviser_mode._prompt(
+        SESSION, "t1", "tool", list(provider._adviser_mode._ring(SESSION)))
+
+    assert body in prompt and "chars elided" not in prompt
 
 
 def test_full_reasoning_is_written_without_the_prompt_cap(

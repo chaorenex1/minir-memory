@@ -1,0 +1,49 @@
+diff --git a/run_agent.py b/run_agent.py
+--- a/run_agent.py
++++ b/run_agent.py
+@@ -279,6 +279,7 @@
+         side_agent: bool = False, memory_manager=None,
+         tool_result_metadata_callback: Optional[Callable[..., dict]] = None,
+         extra_tools: list[dict[str, Any]] | None = None,
++        cache_scope: str = "",
+     ):
+         """Forwarder — see ``agent.agent_init.init_agent`` (same keyword parameters, minus ``tool_delay``)."""
+         init_kwargs = {k: v for k, v in locals().items() if k not in ("self", "tool_delay")}
+diff --git a/agent/agent_init.py b/agent/agent_init.py
+--- a/agent/agent_init.py
++++ b/agent/agent_init.py
+@@ -2290,7 +2290,7 @@
+     acp_command: str | None = None, acp_args: list[str] | None = None, command: str | None = None,
+     args: list[str] | None = None, model: str = "", max_iterations: int = sys.maxsize,
+     enabled_toolsets: list[str] | None = None, disabled_toolsets: list[str] | None = None,
+-    extra_tools: list[dict[str, Any]] | None = None,
++    extra_tools: list[dict[str, Any]] | None = None, cache_scope: str = "",
+     save_trajectories: bool = False, verbose_logging: bool = False, quiet_mode: bool = False,
+     tool_progress_mode: str = "all", ephemeral_system_prompt: str | None = None,
+     log_prefix_chars: int = 100, log_prefix: str = "", providers_allowed: list[str] | None = None,
+@@ -2401,6 +2401,10 @@
+     _init_fallback_chain(agent, fallback_model)
+     _load_tools(agent, enabled_toolsets, disabled_toolsets)
+     _merge_extra_tools(agent, extra_tools)
++    # A caller that runs many agents against one logical conversation (the adviser) can pin the
++    # cache scope: the prompt_cache_key derivation then keys every run of that reviewer into its
++    # own shard instead of the process-wide session id. Empty keeps the host's own resolution.
++    agent._declared_cache_scope = str(cache_scope or "").strip()
+     _init_session_state(
+         agent, session_id, session_db, parent_session_id, reasoning_config, max_tokens,
+         checkpoints_enabled, checkpoint_max_snapshots, checkpoint_max_total_size_mb, checkpoint_max_file_size_mb,
+diff --git a/agent/prompt_cache_scope.py b/agent/prompt_cache_scope.py
+--- a/agent/prompt_cache_scope.py
++++ b/agent/prompt_cache_scope.py
+@@ -141,6 +141,11 @@
+     inherited = getattr(agent, "_inherited_cache_scope", None)
+     if isinstance(inherited, str) and inherited:
+         return _apply_fork_tag(agent, inherited)
++    # A caller-pinned scope (the adviser's ``<session>--<name>``) wins over the physical id: the
++    # runs of one reviewer are one logical conversation, and two reviewers must not share a shard.
++    declared = getattr(agent, "_declared_cache_scope", "")
++    if isinstance(declared, str) and declared:
++        return _apply_fork_tag(agent, declared)
+     sid = str(getattr(agent, "session_id", None) or "")
+     if not sid:
+         return ""

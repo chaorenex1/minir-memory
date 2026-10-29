@@ -33,6 +33,6 @@ COMMUNICATION
   consult.
 
 LANGUAGE
-- Write advice text and decisions in the language of the user or the conversation; keep JSON
-  keys, severity tokens, and target tokens in English.
+- Write advice text and decisions in the language of the user or the conversation; keep severity
+  tokens, target tokens, and tool/fork field names in English.
 - Preserve code, paths, commands, identifiers, and quoted errors verbatim.

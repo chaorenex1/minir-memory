@@ -5,6 +5,8 @@ from __future__ import annotations
 import json
 from types import SimpleNamespace
 
+from adviser_fakes import drive_advise
+
 SESSION = "session-test"
 
 
@@ -17,6 +19,7 @@ def _advice(text: str) -> str:
 def _fake_run(answer: str, *, messages=None, usage=None):
     def _run(message, **kwargs):
         prior = tuple(kwargs.get("history") or ())
+        drive_advise(kwargs, answer)
         return SimpleNamespace(
             answer=answer, api_calls=1, model="reviewer", provider="test",
             toolsets=tuple(kwargs.get("toolsets") or ()),
@@ -138,6 +141,71 @@ def test_agent_end_roster_entry_only_reviews_the_final_answer(plugin_package, ma
     assert _review(provider, "tool") is False
     assert _review(provider, "final") is True
     assert len(calls) == 1
+
+
+def test_history_evicts_old_tool_results_before_moving_the_start(plugin_package, make_provider):
+    """T3: a middle cut is taken only when the text it saves beats the suffix it rewrites."""
+    provider = _provider(make_provider)
+    mode = provider._adviser_mode
+    cfg = {**mode._cfg(), "history_chars": 4000, "history_messages": 60}
+    big = "x" * 5000
+    rows = [{"role": "user", "content": "review turn 1"},
+            {"role": "assistant", "content": "advice 1"},
+            {"role": "tool", "content": big},
+            {"role": "assistant", "content": "the tool failed to say anything"},
+            {"role": "user", "content": "review turn 2"},
+            {"role": "assistant", "content": "advice 2"},
+            {"role": "tool", "content": "small result"},
+            {"role": "assistant", "content": "none"},
+            {"role": "user", "content": "review turn 3"},
+            {"role": "assistant", "content": "advice 3"}]
+    runtime = plugin_package.adviser_mode.AdvisorRuntime(session=SESSION, adviser="default")
+
+    trimmed = mode._trim_history(rows, cfg, runtime)
+
+    assert trimmed[0]["content"] == "review turn 1", "the start does not move"
+    assert "evicted tool output: 5000 chars" in trimmed[2]["content"]
+    assert trimmed[-1]["content"] == "advice 3"
+    assert runtime.evicted_chars == 5000 - len("[evicted tool output: 5000 chars]")
+    assert runtime.cache_epoch == 0, "an eviction is not a start move"
+    assert sum(len(row["content"]) for row in trimmed) <= 4000
+
+
+def test_an_error_result_is_never_evicted(plugin_package, make_provider):
+    provider = _provider(make_provider)
+    mode = provider._adviser_mode
+    cfg = {**mode._cfg(), "history_chars": 4000}
+    body = "Traceback (most recent call last): " + "y" * 5000
+    rows = ([{"role": "user", "content": "review turn 1"}]
+            + [{"role": "tool", "content": body}]
+            + [{"role": "assistant", "content": f"note {index}"} for index in range(3)]
+            + [{"role": "tool", "content": "ok"}]
+            + [{"role": "user", "content": "review turn 2"},
+               {"role": "assistant", "content": "advice"}])
+
+    trimmed, saved = mode._evict_tool_results(rows, 4000)
+
+    assert saved == 0
+    assert any(body in row["content"] for row in trimmed)
+
+
+def test_moving_the_start_is_the_fallback_and_bumps_the_cache_epoch(
+        plugin_package, make_provider):
+    provider = _provider(make_provider)
+    mode = provider._adviser_mode
+    cfg = {**mode._cfg(), "history_chars": 4000}
+    rows = [{"role": "user", "content": "review turn 1"},
+            {"role": "tool", "content": "z" * 3000},
+            {"role": "assistant", "content": "w" * 6000},
+            {"role": "user", "content": "review turn 2"},
+            {"role": "assistant", "content": "advice"}]
+    runtime = plugin_package.adviser_mode.AdvisorRuntime(session=SESSION, adviser="default")
+
+    trimmed = mode._trim_history(rows, cfg, runtime)
+
+    assert trimmed[0]["content"] == "review turn 2"
+    assert runtime.cache_epoch == 1
+    assert runtime.evicted_chars == 0, "the old tool result was too cheap to evict"
 
 
 def test_reasoning_is_captured_by_default_and_bounded(plugin_package, make_provider):

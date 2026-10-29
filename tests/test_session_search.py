@@ -64,7 +64,7 @@ def _make_db(path):
                 id INTEGER PRIMARY KEY AUTOINCREMENT, session_id TEXT, role TEXT,
                 content TEXT, timestamp REAL, active INTEGER DEFAULT 1,
                 compacted INTEGER DEFAULT 0, _compressed_summary INTEGER DEFAULT 0,
-                tool_name TEXT, message_uid TEXT, display_kind TEXT
+                tool_name TEXT, message_uid TEXT, display_kind TEXT, tool_call_id TEXT
             );
         """)
         connection.executemany(
@@ -76,6 +76,7 @@ def _make_db(path):
             "INSERT INTO messages (id, session_id, role, content, timestamp, active, compacted, "
             "_compressed_summary, tool_name, message_uid, display_kind) "
             "VALUES (?,?,?,?,?,?,?,?,?,?,?)", MESSAGE_ROWS)
+        connection.execute("UPDATE messages SET tool_call_id = 'call-3' WHERE id = 3")
         connection.commit()
     finally:
         connection.close()
@@ -301,6 +302,54 @@ def test_messages_reads_the_transcript_with_filters(search, db):
     everything = _query(search, db, mode="messages", session_id="s1", include_inactive=True)
     assert [message["message_id"] for message in everything["messages"]] == [
         1, 2, 3, 6, 7, 8, 10]
+
+
+def test_messages_can_be_read_by_tool_call_id(search, db):
+    """The escape hatch for a skeletonised event: one WHERE, exact id, nothing else."""
+    data = _query(search, db, mode="messages", session_id="s1", tool_call_id="call-3")
+
+    assert [message["message_id"] for message in data["messages"]] == [3]
+    assert data["filters"]["tool_call_id"] == "call-3"
+
+    missing = _query(search, db, mode="messages", session_id="s1", tool_call_id="call-nope")
+    assert missing["messages"] == [] and missing["total"] == 0
+
+
+def test_a_review_may_read_one_tool_call_id_once(search, db):
+    """The escape hatch is one read per review: the same bytes are already in the tool result."""
+    token = search.READ_SCOPE.set("s1:1")
+    try:
+        first = _query(search, db, mode="messages", session_id="s1", tool_call_id="call-3")
+        assert first["count"] == 1
+        with pytest.raises(search.QueryError) as caught:
+            _query(search, db, mode="messages", session_id="s1", tool_call_id="call-3")
+        assert caught.value.kind == "duplicate_read"
+    finally:
+        search.READ_SCOPE.reset(token)
+
+    token = search.READ_SCOPE.set("s1:2")  # a later review starts a fresh scope
+    try:
+        assert _query(search, db, mode="messages", session_id="s1",
+                      tool_call_id="call-3")["count"] == 1
+    finally:
+        search.READ_SCOPE.reset(token)
+
+
+def test_tool_call_id_filter_refuses_a_store_without_the_column(search, tmp_path):
+    path = tmp_path / "old.db"
+    connection = sqlite3.connect(str(path))
+    try:
+        connection.executescript(
+            "CREATE TABLE sessions (id TEXT PRIMARY KEY);"
+            "CREATE TABLE messages (id INTEGER PRIMARY KEY, session_id TEXT, role TEXT, "
+            "content TEXT, timestamp REAL);")
+        connection.commit()
+    finally:
+        connection.close()
+
+    with pytest.raises(search.QueryError) as caught:
+        _query(search, path, mode="messages", session_id="s1", tool_call_id="call-3")
+    assert caught.value.kind == "state_db_error"
 
 
 def test_messages_pages_from_the_newest_end_but_returns_chronological(search, db):

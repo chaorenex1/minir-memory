@@ -1,0 +1,47 @@
+diff --git a/hermes_cli/plugin_runtime.py b/hermes_cli/plugin_runtime.py
+--- a/hermes_cli/plugin_runtime.py
++++ b/hermes_cli/plugin_runtime.py
+@@ -182,9 +182,13 @@
+ def request_interrupt(session_id: str, *, source: str = "plugin") -> dict[str, Any]:
+     """Ask the live turn to stop treating the current tool batch as authoritative.
+ 
+-    Reuses the host's cross-thread ``interrupt``: the executor cancels queued tool futures and
+-    stops waiting for running ones; cooperative tools see ``is_interrupted()``. A tool that
+-    never polls is abandoned, not killed.
++    Two steps, in this order: the cooperative flag (the executor cancels queued tool futures and
++    stops waiting for running ones; cooperative tools see ``is_interrupted()``), then a tree kill
++    of the foreground commands this host still has in flight. Without the second step a tool
++    that never polls — a terminal command, a PTY session — simply runs to its own timeout and
++    the turn keeps waiting, which is what "abandoned, not killed" used to mean. The two terminal
++    states stay distinct in the executor: a call that never started is *abandoned*; a running
++    call whose result was cut off is *cancelled*.
+     """
+     session = str(session_id or "")
+     with _LOCK:
+@@ -199,7 +203,25 @@
+     except Exception as exc:
+         logger.warning("plugin_runtime.interrupt failed (%s): %s", source, exc)
+         return {"ok": False, "reason": "host_error"}
+-    return {"ok": True, "reason": ""}
++    return {"ok": True, "reason": "", "killed": _kill_live_tool_processes()}
++
++
++def _kill_live_tool_processes() -> int:
++    """Tree-kill every in-flight foreground tool command; returns how many were signalled.
++
++    This reuses the host's existing exit-path registry (``tools.environments.base``): it knows
++    each command's process group / remote handle, so this is not a second registry. A host
++    without the module (an older tree) leaves the cooperative flag as the only mechanism.
++    """
++    try:
++        from tools.environments.base import kill_live_foreground_processes
++    except Exception:
++        return 0
++    try:
++        return int(kill_live_foreground_processes() or 0)
++    except Exception:
++        logger.debug("plugin_runtime: live tool process kill failed", exc_info=True)
++        return 0
+ 
+ 
+ def interrupt(session_id: str, text: str, *, source: str = "plugin") -> dict[str, Any]:

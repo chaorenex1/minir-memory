@@ -290,6 +290,8 @@ def run(message: str, *, context: str = "", model: str = "", provider: str = "",
         skip_memory: bool = True, skip_context_files: bool = True,
         skip_background_review: bool = True,
         load_soul_identity: bool = False,
+        extra_tools: Optional[Sequence[Mapping[str, Any]]] = None,
+        cache_scope: str = "",
         meta: Optional[Mapping[str, Any]] = None) -> AgentRun:
     """Run one agent loop on *message* and return its answer. Never leaves an agent open.
 
@@ -348,6 +350,12 @@ def run(message: str, *, context: str = "", model: str = "", provider: str = "",
         skip_memory=bool(skip_memory),
         skip_background_review=bool(skip_background_review),
         load_soul_identity=bool(load_soul_identity),
+        # Per-run tools the caller owns (adviser mode's ``advise``). The host merges them into
+        # this agent's table only; the process-wide registry never sees them.
+        extra_tools=[dict(tool) for tool in (extra_tools or ()) if isinstance(tool, Mapping)],
+        # A pinned logical cache scope (P-0024): the adviser's runs share one shard without
+        # borrowing the main session's, and the host derives prompt_cache_key from it.
+        cache_scope=str(cache_scope or "").strip(),
     )
     if read_only:
         dropped = apply_read_only(agent)

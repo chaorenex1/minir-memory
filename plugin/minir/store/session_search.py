@@ -31,12 +31,15 @@ usable.
 
 from __future__ import annotations
 
+import contextvars
 import json
 import logging
 import os
 import re
 import sqlite3
+import threading
 import time
+from collections import OrderedDict
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable, Optional
@@ -100,6 +103,38 @@ _RELATIVE_RE = re.compile(r"^(\d+)\s*(m|h|d|w)$", re.IGNORECASE)
 _RELATIVE_SECONDS = {"m": 60, "h": 3600, "d": 86400, "w": 604800}
 
 _LIKE_ESCAPE = "\\"
+
+#: Bound by the adviser around one review run (``<session>:<review id>``). The escape hatch for a
+#: skeletonised tool event may read one ``tool_call_id`` once per review: a repeated read buys
+#: the same bytes again, and the risk list in the parity draft names exactly that.
+READ_SCOPE: contextvars.ContextVar[str] = contextvars.ContextVar(
+    "minir_search_read_scope", default="")
+_SEEN_LOCK = threading.Lock()
+_SEEN_READS: "OrderedDict[str, set[str]]" = OrderedDict()
+_SEEN_SCOPES = 64
+
+
+def claim_tool_read(tool_call_id: str) -> bool:
+    """True when this read may proceed; False on a repeat inside the same review scope.
+
+    An unbound scope (a host caller, a test) always proceeds: the bound is for the reviewer's
+    escape hatch, not for the operator's search tool.
+    """
+    scope = str(READ_SCOPE.get() or "")
+    cid = str(tool_call_id or "").strip()
+    if not scope or not cid:
+        return True
+    with _SEEN_LOCK:
+        seen = _SEEN_READS.get(scope)
+        if seen is None:
+            seen = set()
+            _SEEN_READS[scope] = seen
+            while len(_SEEN_READS) > _SEEN_SCOPES:
+                _SEEN_READS.popitem(last=False)
+        if cid in seen:
+            return False
+        seen.add(cid)
+        return True
 
 
 def platform_sources(platform: str) -> list[str]:
@@ -789,6 +824,16 @@ def _message_where(args: dict[str, Any], mcols: set[str], session_id: str,
         roles=roles, sources=[])
     clauses.append("m.session_id = ?")
     params.append(session_id)
+    tool_call_id = str(args.get("tool_call_id") or "").strip()
+    if tool_call_id:
+        # One WHERE, no paging: the escape hatch for a skeletonised tool event. An old store
+        # without the column cannot answer it, and returning unrelated rows would be worse
+        # than refusing.
+        if "tool_call_id" not in mcols:
+            raise QueryError("state_db_error",
+                             "this state.db has no messages.tool_call_id column")
+        clauses.append("m.tool_call_id = ?")
+        params.append(tool_call_id)
     if after_ts is not None:
         clauses.append("m.timestamp >= ?")
         params.append(after_ts)
@@ -803,6 +848,11 @@ def _messages(connection: sqlite3.Connection, args: dict[str, Any], mcols: set[s
     session_id = str(args.get("session_id") or "").strip()
     if not session_id:
         raise QueryError("invalid_args", "session_id is required for mode=messages")
+    tool_call_id = str(args.get("tool_call_id") or "").strip()
+    if tool_call_id and not claim_tool_read(tool_call_id):
+        raise QueryError(
+            "duplicate_read",
+            f"this review already read tool_call_id {tool_call_id!r}; use the earlier tool result")
     roles = _roles(args.get("role"), None)
     after_ts, before_ts = _bounds(args)
     limit = _int(args.get("limit"), _DEFAULT_MESSAGES, 1, _MAX_MESSAGES)
@@ -833,7 +883,8 @@ def _messages(connection: sqlite3.Connection, args: dict[str, Any], mcols: set[s
         "mode": "messages",
         "db": str(path),
         "session": meta or {"id": session_id},
-        "filters": {"role": roles, "after": after_ts, "before": before_ts},
+        "filters": {"role": roles, "after": after_ts, "before": before_ts,
+                    "tool_call_id": str(args.get("tool_call_id") or "").strip() or None},
         "order": order,
         "count": len(entries),
         "total": total,
@@ -999,6 +1050,12 @@ SCHEMA = {
             "message_id": {
                 "type": "integer",
                 "description": "Anchor message id for mode=around (use a match's message_id).",
+            },
+            "tool_call_id": {
+                "type": "string",
+                "description": ("messages/around only: one tool call's id, as shown on a "
+                                "transcript event. Reads the full tool result that a skeleton "
+                                "event elided; the only filter that reaches it."),
             },
             "window": {
                 "type": "integer",

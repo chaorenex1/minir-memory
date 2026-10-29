@@ -9,11 +9,16 @@ import time
 from pathlib import Path
 from types import SimpleNamespace
 
+from adviser_fakes import drive_advise
+
 
 def _run(answer: str, calls: list | None = None, agent_run_cls=None):
     def _fake(message, **kwargs):
         if calls is not None:
             calls.append({"message": message, **kwargs})
+        # The review path has no JSON output contract any more: the answer is delivered through
+        # the advise tool the run owns. Tests keep expressing the review as the old object.
+        drive_advise(kwargs, answer)
         payload = dict(answer=answer, api_calls=1, model="reviewer", provider="test",
                        toolsets=tuple(kwargs.get("toolsets") or ()))
         return SimpleNamespace(**payload) if agent_run_cls is None else agent_run_cls(**payload)
@@ -216,9 +221,65 @@ def test_review_prompt_truncation_preserves_structure_and_reads_digest_once(
 
     assert reads["count"] == 1, "the digest must not be re-read on every truncation attempt"
     assert len(prompt) <= plugin_package.adviser_mode.MAX_PROMPT_CHARS
-    assert prompt.rstrip().endswith("Return one JSON object.")
+    assert prompt.rstrip().endswith("do not answer with JSON.")
     assert prompt.count("<transcript_delta>") == prompt.count("</transcript_delta>") == 1
     assert "older events omitted" in prompt
+
+
+def test_oversized_tool_event_renders_a_skeleton(plugin_package, make_provider):
+    """One 500k-char result must not spend the review's whole window (measured: 1.83% of tool
+    rows exceed 24k, the largest 529k chars ~132k tokens)."""
+    mode = plugin_package.adviser_mode
+    body = "A" * 30_000 + "SECRET-MIDDLE" + "Z" * 10_000
+    event = {"seq": 4, "kind": "tool", "tool": "terminal", "status": "ok",
+             "tool_call_id": "call-9", "args": "q" * 900, "result": body,
+             "error": "exit 1: boom", "reasoning": "why I ran it"}
+
+    rendered = mode._render_event(event)
+
+    assert len(rendered) < mode.REVIEW_EVENT_CHARS
+    assert "tool_call_id=call-9" in rendered
+    assert f"original_chars={len(body) + 900 + len('exit 1: boom') + len('why I ran it')}" in rendered
+    assert "SECRET-MIDDLE" not in rendered, "the middle of an oversized body is elided"
+    assert "chars elided" in rendered
+    assert "exit 1: boom" in rendered, "an error is evidence and stays whole"
+    assert rendered.split("[args]", 1)[1].splitlines()[1].startswith("q" * 400)
+    assert len(rendered.split("[args]", 1)[1].splitlines()[1]) <= 401
+
+
+def test_small_tool_event_keeps_its_full_body(plugin_package):
+    mode = plugin_package.adviser_mode
+    event = {"seq": 5, "kind": "tool", "tool": "patch", "status": "ok",
+             "tool_call_id": "call-10", "args": '{"path": "a.py"}',
+             "result": "line one\nline two", "error": ""}
+
+    rendered = mode._render_event(event)
+
+    assert "[result]\nline one\nline two" in rendered
+    assert "original_chars" not in rendered and "elided" not in rendered
+
+
+def test_the_skeleton_does_not_push_the_prompt_past_its_budget(plugin_package, make_provider):
+    provider = _mode_provider(make_provider)
+    events = [{"seq": 1, "kind": "tool", "tool": "terminal", "status": "ok",
+               "tool_call_id": f"call-{index}", "result": "R" * 30_000} for index in range(4)]
+    events.append({"seq": 5, "kind": "intent", "text": "next step"})
+
+    prompt = provider._adviser_mode._prompt("session-test", "t1", "manual", events)
+
+    assert len(prompt) <= plugin_package.adviser_mode.MAX_PROMPT_CHARS
+    assert prompt.count("tool_call_id=") >= 1
+
+
+def test_post_tool_call_keeps_the_tool_call_id(plugin_package, make_provider):
+    provider = _mode_provider(make_provider, cadence=99)
+
+    provider._adviser_mode.on_post_tool_call(
+        session_id="session-test", turn_id="t1", tool_name="read_file", status="ok",
+        args={"path": "a.py"}, result="ok", tool_call_id="call-42")
+
+    event = list(provider._adviser_mode._rings["session-test"])[-1]
+    assert event["tool_call_id"] == "call-42"
 
 
 def test_post_api_request_records_tool_call_intent(plugin_package, make_provider):
@@ -299,89 +360,87 @@ def test_failed_review_inserts_nothing_and_records_failure(
     assert provider._store.adviser_reviews("session-test")[0]["status"] == "failed"
 
 
-def test_a_non_json_review_is_restated_with_structured_output(plugin_package, make_provider,
-                                                              monkeypatch):
-    """The host log showed reviews answering in prose after spending the tool budget; the answer
-    goes to the provider's JSON mode instead of a second agent run, so the review still lands."""
+def test_a_review_uses_the_advise_tool_and_records_its_acks(
+        plugin_package, make_provider, monkeypatch):
+    """T1/T3 acceptance: one advise tool per run, one model call, acks and prompt cost on the
+    ledger row, and the pinned cache scope."""
     provider = _mode_provider(make_provider, cadence=99)
     calls: list = []
-    monkeypatch.setattr(plugin_package.agent_loop, "run",
-                        _run("the timeout looks wrong", calls, plugin_package.agent_loop.AgentRun))
-    seen: dict = {}
-
-    def _structured(task, system, prompt, *, response_format=None, **kwargs):
-        seen.update(task=task, response_format=response_format, prompt=prompt, system=system)
-        if (response_format or {}).get("type") == "json_schema":
-            return _advice("check the timeout")
-        return ""
-
-    monkeypatch.setattr(plugin_package.worker, "call_model", _structured)
+    monkeypatch.setattr(plugin_package.agent_loop, "run", _run(_advice("check the test"), calls))
     provider._adviser_mode.record_tool("session-test", "read_file", turn_id="t1",
                                        status="ok", result="contents")
 
     assert provider._adviser_mode.review_once("session-test", "test") is True
-    assert len(calls) == 1, "the agent runs once; the restatement spends no tool budget"
-    assert seen["task"] == "adviser"
-    assert seen["response_format"]["type"] == "json_schema"
-    assert "the timeout looks wrong" in seen["prompt"]
+
+    run = calls[0]
+    assert [tool["name"] for tool in run["extra_tools"]] == ["advise"]
+    assert run["cache_scope"] == "session-test--default"
+    row = provider._store.adviser_reviews("session-test")[0]
+    assert row["api_calls"] == 1, "the tool is the contract: no restatement call"
+    assert row["prompt_chars"] > 0
+    acks = json.loads(row["acks"])
+    assert acks["delivered"] + acks["queued"] == 1
     pending = provider._store.pending_advisories("session-test", source="adviser_mode")
-    assert [row["content"] for row in pending] == ["check the timeout"]
+    assert [item["content"] for item in pending] == ["check the test"]
 
 
-def test_the_structured_restatement_requests_json_mode(plugin_package, monkeypatch):
-    """The restatement goes through the aux client with response_format on the wire: json_schema
-    first, plain json_object when the provider refuses the schema envelope."""
-    import sys
-    import types as pytypes
+def test_a_review_binds_the_escape_hatch_scope(plugin_package, make_provider, monkeypatch):
+    """The one-read bound is per review: the scope is bound for the run and cleared after it."""
+    provider = _mode_provider(make_provider, cadence=99)
+    search = plugin_package.adviser.session_search
+    seen: dict = {}
 
-    calls: list[dict] = []
-    object_text = _advice("check the timeout")
+    def _fake(message, **kwargs):
+        seen["scope"] = search.READ_SCOPE.get()
+        return plugin_package.agent_loop.AgentRun(
+            answer="nothing to raise", api_calls=1, model="reviewer", provider="test",
+            toolsets=())
 
-    def _call_llm(**kwargs):
-        calls.append(kwargs)
-        structured = (kwargs.get("extra_body") or {}).get("response_format") or {}
-        content = object_text if structured.get("type") == "json_object" else "prose only"
-        return pytypes.SimpleNamespace(
-            choices=[pytypes.SimpleNamespace(
-                message=pytypes.SimpleNamespace(content=content))])
+    monkeypatch.setattr(plugin_package.agent_loop, "run", _fake)
+    provider._adviser_mode.record_tool("session-test", "read_file", turn_id="t1",
+                                       status="ok", result="contents")
 
-    fake = pytypes.ModuleType("agent.auxiliary_client")
-    fake.call_llm = _call_llm
-    parent = sys.modules.get("agent") or pytypes.ModuleType("agent")
-    monkeypatch.setitem(sys.modules, "agent", parent)
-    monkeypatch.setattr(parent, "auxiliary_client", fake, raising=False)
-    monkeypatch.setitem(sys.modules, "agent.auxiliary_client", fake)
+    assert provider._adviser_mode.review_once("session-test", "test") is True
 
-    text, made = plugin_package.adviser_mode.structured_review(
-        "the timeout looks wrong", "review the turn", {}, hermes_home="")
-    assert made == 2
-    assert plugin_package.adviser_mode._json_object(text)["action"] == "advise"
-    formats = [call["extra_body"]["response_format"]["type"] for call in calls]
-    assert formats == ["json_schema", "json_object"]
-    assert calls[0]["task"] == "adviser"
-    assert "the timeout looks wrong" in calls[0]["messages"][1]["content"]
+    assert seen["scope"].startswith("session-test:")
+    assert search.READ_SCOPE.get() == "", "the scope must not leak past the review"
 
 
-def test_non_json_review_inserts_nothing(plugin_package, make_provider, monkeypatch):
+def test_a_run_without_an_advise_call_is_silent(plugin_package, make_provider, monkeypatch):
+    """Silence is the contract's normal answer: no advise call, no advice, no failure row."""
     provider = _mode_provider(make_provider, cadence=99)
     calls: list = []
     monkeypatch.setattr(plugin_package.agent_loop, "run",
-                        _run("not json", calls, plugin_package.agent_loop.AgentRun))
-    attempts: list = []
+                        _run("nothing worth raising", calls,
+                             plugin_package.agent_loop.AgentRun))
+    provider._adviser_mode.record_tool("session-test", "read_file", turn_id="t1",
+                                       status="ok", result="contents")
 
-    def _empty(task, system, prompt, *, response_format=None, **kwargs):
-        attempts.append(response_format)
-        return ""
+    assert provider._adviser_mode.review_once("session-test", "test") is True
+    assert provider._store.pending_advisories("session-test") == []
+    row = provider._store.adviser_reviews("session-test")[0]
+    assert (row["status"], row["error"]) == ("silent", "")
+    assert row["api_calls"] == 1
 
-    monkeypatch.setattr(plugin_package.worker, "call_model", _empty)
+
+def test_a_run_that_answers_in_the_retired_json_is_recorded_as_no_object(
+        plugin_package, make_provider, monkeypatch):
+    """A model that ignores the tool and emits the old envelope fails once, with no re-ask."""
+    provider = _mode_provider(make_provider, cadence=99)
+
+    def _legacy(message, **kwargs):
+        return SimpleNamespace(answer=_advice("ignored the tool"), api_calls=1, model="reviewer",
+                               provider="test", toolsets=())
+
+    monkeypatch.setattr(plugin_package.agent_loop, "run", _legacy)
     provider._adviser_mode.record_tool("session-test", "read_file", turn_id="t1",
                                        status="ok", result="contents")
 
     assert provider._adviser_mode.review_once("session-test", "test") is False
-    assert len(calls) == 1
-    assert [fmt["type"] for fmt in attempts] == ["json_schema", "json_object"]
     assert provider._store.pending_advisories("session-test") == []
-    assert provider._store.adviser_reviews("session-test")[0]["status"] == "failed"
+    row = provider._store.adviser_reviews("session-test")[0]
+    assert (row["status"], row["error"]) == ("failed", "no_object")
+    assert row["api_calls"] == 1, "a non-object answer must not buy a second provider call"
 
 
 def test_dropped_review_inserts_nothing(plugin_package, make_provider, monkeypatch):
@@ -630,7 +689,8 @@ def test_review_contract_names_the_claim_field_the_parser_requires(plugin_packag
     brief = plugin_package.adviser_mode._review_brief({})
     flat = " ".join(brief.split())
 
-    assert '"claim":"<id copied from ACTIVE CLAIMS>"' in flat
+    assert '"claim":"<id copied from ACTIVE CLAIMS>"' not in flat
+    assert "`claim` is required whenever ACTIVE CLAIMS lists ids" in flat
     assert "dropped as unclaimed" in flat
 
 
@@ -947,6 +1007,9 @@ def test_child_advice_is_steered_and_never_queued(plugin_package, make_provider,
     bridge = plugin_package.host_bridge
     monkeypatch.setattr(bridge, "available", lambda: True)
     monkeypatch.setattr(bridge, "live", lambda session: True)
+    monkeypatch.setattr(bridge, "live_state", lambda session: {
+        "live": True, "streaming": False, "aborting": False, "tool_batch": False,
+        "terminal_idle": True})
     for name in ("interrupt", "continue_turn", "queue_post_turn", "preserve_handle"):
         monkeypatch.setattr(
             bridge, name,

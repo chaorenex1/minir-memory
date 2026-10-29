@@ -81,6 +81,27 @@ def live(session_id: str) -> bool:
         return False
 
 
+def live_state(session_id: str) -> dict[str, Any]:
+    """The host's four routing facts, or ``{}`` on a host without P-0023.
+
+    ``{streaming, aborting, tool_batch, terminal_idle}``: an empty dict means the host cannot
+    report them, and every caller must fall back to its own inference rather than read a missing
+    key as false. A bound-but-dead session reports all four false with ``live: false``.
+    """
+    mod = _module()
+    if mod is None or not session_id:
+        return {}
+    reader = getattr(mod, "live_state", None)
+    if not callable(reader):
+        return {}
+    try:
+        state = reader(str(session_id))
+        return dict(state) if isinstance(state, dict) else {}
+    except Exception:
+        logger.debug("host bridge live_state failed", exc_info=True)
+        return {}
+
+
 def turn_state(session_id: str) -> dict[str, Any]:
     mod = _module()
     if mod is None or not session_id:
@@ -201,6 +222,7 @@ __all__ = [
     "flags",
     "interrupt",
     "live",
+    "live_state",
     "max_continuations",
     "preserve_handle",
     "queue_post_turn",

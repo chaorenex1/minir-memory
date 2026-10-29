@@ -7,6 +7,8 @@ import sys
 import types
 from types import SimpleNamespace
 
+from adviser_fakes import drive_advise
+
 SOURCE = "adviser_mode"
 SESSION = "session-test"
 
@@ -19,6 +21,7 @@ def _advice(text: str = "steer this", severity: str = "concern") -> str:
 
 def _fake_run(answer: str):
     def _run(message, **kwargs):
+        drive_advise(kwargs, answer)
         return SimpleNamespace(answer=answer, api_calls=1, model="reviewer", provider="test",
                                toolsets=tuple(kwargs.get("toolsets") or ()))
     return _run
@@ -46,6 +49,14 @@ def _patch_bridge(plugin_package, monkeypatch, **overrides):
     calls: dict = {"steer": [], "continue": [], "interrupt": [], "post": [], "preserve": []}
     monkeypatch.setattr(bridge, "available", lambda: overrides.get("available", True))
     monkeypatch.setattr(bridge, "live", lambda session: overrides.get("live", True))
+    state = overrides.get("live_state")
+    monkeypatch.setattr(
+        bridge, "live_state",
+        lambda session: dict(state) if state is not None else {
+            "live": overrides.get("live", True), "streaming": False, "aborting": False,
+            "tool_batch": False, "terminal_idle": overrides.get("live", True),
+        },
+    )
     monkeypatch.setattr(bridge, "flags", lambda session: overrides.get("flags", {}))
     monkeypatch.setattr(
         bridge, "steer",
@@ -119,6 +130,45 @@ def test_blocker_interrupts_the_tool_batch(plugin_package, make_provider, monkey
     assert "this cannot work" in calls["interrupt"][0][1]
     assert calls["steer"] == []
     assert provider._store.pending_advisories(SESSION, source=SOURCE) == []
+
+
+def test_an_aborting_turn_is_left_pending(plugin_package, make_provider, monkeypatch):
+    """C2: the host says a stop is unwinding the turn. Another interrupt adds nothing and a
+    steer may die with the aborted request, so the note stays in the ledger."""
+    provider = _provider(make_provider)
+    monkeypatch.setattr(
+        plugin_package.agent_loop, "run",
+        _fake_run(_advice("this cannot work", severity="blocker")),
+    )
+    calls = _patch_bridge(plugin_package, monkeypatch, live_state={
+        "live": True, "streaming": True, "aborting": True, "tool_batch": False,
+        "terminal_idle": False,
+    })
+
+    _review(provider)
+
+    assert calls["interrupt"] == [] and calls["steer"] == [] and calls["continue"] == []
+    rows = provider._store.pending_advisories(SESSION, source=SOURCE)
+    assert [row["content"] for row in rows] == ["this cannot work"]
+
+
+def test_llm_request_does_not_inject_into_an_aborting_turn(
+        plugin_package, make_provider, monkeypatch):
+    provider = _provider(make_provider)
+    _patch_bridge(plugin_package, monkeypatch, live_state={
+        "live": True, "streaming": True, "aborting": True, "tool_batch": False,
+        "terminal_idle": False,
+    })
+    provider._store.add_advisories(SESSION, [{
+        "severity": "concern", "target": "current_step", "text": "check the diff first",
+    }], source=SOURCE)
+
+    result = provider._adviser_mode.handle_llm_request(
+        {"messages": [{"role": "user", "content": "hi"}]},
+        session_id=SESSION, api_request_id="req-1")
+
+    assert result is None
+    assert provider._store.staged_advisories("req-1") == []
 
 
 def test_plan_mode_flag_suppresses_every_host_channel(plugin_package, make_provider, monkeypatch):
@@ -328,10 +378,35 @@ def test_bridge_is_a_noop_when_the_host_module_is_absent(plugin_package, monkeyp
         assert bridge.capability() == ""
         assert bridge.available() is False
         assert bridge.live("session-test") is False
+        assert bridge.live_state("session-test") == {}
         assert bridge.steer("session-test", "text") == {
             "ok": False, "mode": "", "reason": "bridge_unavailable"}
         assert bridge.continue_turn("session-test", "text")["ok"] is False
         assert bridge.continuation_status("session-test", "tok") == "unknown"
+    finally:
+        bridge.reset_cache()
+
+
+def test_bridge_reports_live_state_only_when_the_host_carries_it(plugin_package, monkeypatch):
+    """P-0023 is optional: an older patched host has no ``live_state``, and an empty dict is
+    the signal that the caller must keep its own inference."""
+    bridge = plugin_package.host_bridge
+    bridge.reset_cache()
+    runtime = SimpleNamespace(
+        CAPABILITY_VERSION="plugin_runtime_v2",
+        live_turn=lambda session: True,
+        live_state=lambda session: {
+            "live": True, "streaming": False, "aborting": True, "tool_batch": False,
+            "terminal_idle": False},
+    )
+    host_pkg = types.ModuleType("hermes_cli")
+    host_pkg.plugin_runtime = runtime
+    monkeypatch.setitem(sys.modules, "hermes_cli", host_pkg)
+    try:
+        state = bridge.live_state("session-test")
+        assert state["aborting"] is True and state["terminal_idle"] is False
+        del runtime.live_state
+        assert bridge.live_state("session-test") == {}
     finally:
         bridge.reset_cache()
 

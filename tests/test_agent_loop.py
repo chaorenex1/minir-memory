@@ -135,6 +135,21 @@ def loop(plugin_package):
 
 # -- what the gateway resolves ------------------------------------------------
 
+def test_extra_tools_reach_the_agent_it_owns(loop, host):
+    """A per-run tool (the adviser's ``advise``) travels as ``extra_tools``: the host merges it
+    into that one agent's table, so the process-wide registry never sees it."""
+    handler = lambda args: "Delivered."
+
+    loop.run("review", extra_tools=[{
+        "name": "advise", "description": "deliver one note",
+        "parameters": {"type": "object", "properties": {}}, "handler": handler,
+    }])
+
+    (agent,) = FakeAgent.instances
+    assert agent.kwargs["extra_tools"][0]["name"] == "advise"
+    assert agent.kwargs["extra_tools"][0]["handler"] is handler
+
+
 def test_defaults_come_from_the_gateway_resolution(loop, host):
     result = loop.run("Should we ship?")
 
@@ -241,7 +256,7 @@ def test_only_the_intended_constructor_kwargs_are_passed(loop, host):
         "api_key", "base_url", "api_mode", "credential_pool", "request_overrides",
         "requested_provider", "capabilities", "command", "args", "session_id",
         "enabled_toolsets", "max_iterations", "quiet_mode", "skip_context_files", "skip_memory",
-        "skip_background_review", "load_soul_identity",
+        "skip_background_review", "load_soul_identity", "extra_tools", "cache_scope",
     }
 
 

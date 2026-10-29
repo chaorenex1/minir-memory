@@ -348,6 +348,33 @@ def test_migration_drops_a_legacy_transcript_table(plugin_package, tmp_path):
         store.close()
 
 
+def test_an_older_review_table_gains_the_new_columns_on_open(plugin_package, tmp_path):
+    """T3.6: ``acks`` / ``prompt_chars`` / ``evicted_chars`` / ``cache_epoch`` are additive, so
+    a database written by the previous release gains them without losing a row."""
+    path = tmp_path / "old" / "memory.db"
+    first = plugin_package.store.MinirStore(path)
+    for column in ("acks", "prompt_chars", "evicted_chars", "cache_epoch"):
+        first._conn.execute(f"ALTER TABLE adviser_reviews DROP COLUMN {column}")
+    first._conn.execute("PRAGMA user_version = 8")
+    first._conn.commit()
+    first.close()
+
+    reopened = plugin_package.store.MinirStore(path)
+    try:
+        columns = {row[1] for row in reopened._conn.execute(
+            "PRAGMA table_info(adviser_reviews)")}
+        assert {"acks", "prompt_chars", "evicted_chars", "cache_epoch"} <= columns
+        review = reopened.start_adviser_review("s", "t", "test", 0, 1)
+        reopened.finish_adviser_review(
+            review, status="silent", acks='{"delivered": 1}', prompt_chars=1200,
+            evicted_chars=40, cache_epoch=2)
+        row = reopened.adviser_reviews("s")[0]
+        assert (row["acks"], row["prompt_chars"], row["evicted_chars"], row["cache_epoch"]) == (
+            '{"delivered": 1}', 1200, 40, 2)
+    finally:
+        reopened.close()
+
+
 def test_close_is_idempotent(store):
     store.close()
     store.close()
