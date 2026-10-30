@@ -154,5 +154,5 @@ PLUGIN_DIRS = ("minir", "minir-adviser")     # 默认两个目录一起部署
 ## 5. 被否掉的替代
 
 - **B：host 补丁让 `commands.catalog` 收进 exclusive provider 的命令。** 治的是症状所在层，但要维护
-  一串 version-gated patch，且和现有 host-patches 机制绑死。
+  一串 version-gated patch，且和现有 host-patches 机制绑死（该机制已于 2026-10-30 退役）。
 - **C：只在文档写"第一轮之后再用"。** 零成本，但用户仍会踩到，且 unknown 的措辞会让人以为是没这个命令。

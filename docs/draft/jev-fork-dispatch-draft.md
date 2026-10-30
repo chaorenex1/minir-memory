@@ -1,6 +1,6 @@
 # JEV fork 层 · 设计草稿（插件内中央调度）
 
-状态：草稿，落在本插件 `docs/` 下。没有接线、没有建表、没有建文件、没有改 config；§5.1 的 host patch 0019 也只有规格，没有写、没有应用。代码块只说明形状，未抽出去跑。
+状态：草稿，落在本插件 `docs/` 下。没有接线、没有建表、没有建文件、没有改 config；§5.1 依赖的 0019 已由宿主原生提供（2026-10-30 随 `eb3c31cc72` 落地，见 `hermes_cli/plugins_dispatch.py` 的 `_CALLBACK_TIMEOUT_ATTR` / `_callback_budget`），本稿不再需要写补丁。代码块只说明形状，未抽出去跑。
 
 依据：本仓库 HEAD 工作树（`git status` 8 个已改文件，本文不碰它们）；宿主源码 `C:\Users\zarag\AppData\Local\hermes\hermes-agent`；另见 §1 的行号。
 
@@ -338,7 +338,7 @@ ctx.register_hook("pre_tool_call", pre_tool)
 
 验证：
 
-- `scripts/install_host_patches.py` 应用 0019，manifest 的 sha256 与 base commit 一起更新。
+- 0019 已是宿主代码，没有安装步骤；`_CALLBACK_TIMEOUT_ATTR` 与 `_callback_budget` 直接读宿主文件核对。
 - `scripts/verify_against_host.py` 加一条断言：`_CALLBACK_TIMEOUT_ATTR` 存在，且 `invoke_hook` 的 bounded 调用走 `_callback_budget`。
 - host 侧探针：全局 `hook_callback_timeout=0.2`，一个声明 `__hook_timeout__=3` 的 pre_tool callback sleep 1 s 必须放行；同一个 callback 去掉声明必须被 fail-closed 阻断。这条能证明声明覆盖了全局值，而不是被默认值掩盖。
 

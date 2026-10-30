@@ -1,11 +1,10 @@
-"""Optional bridge to the host's plugin control surface.
+"""Bridge to the host's plugin control surface.
 
-The host patch series under ``host-patches/`` adds ``hermes_cli.plugin_runtime``:
-a session-scoped handle that lets a plugin steer the live turn, interrupt the
-in-flight model request, and leave one continuation for the stop gate. The adviser
-is the only caller here.
+``hermes_cli.plugin_runtime`` is part of the host checkout: a session-scoped handle
+that lets a plugin steer the live turn, interrupt the in-flight model request, and
+leave one continuation for the stop gate. The adviser is the only caller here.
 
-Every function degrades to a no-op when the host predates the patch: the ledger
+Every function degrades to a no-op when the host has no such module: the ledger
 channels (``llm_request``, the turn-boundary aside, the gateway notify) remain the
 delivery of record. Nothing in this module imports the host at module import time,
 so a stock Hermes loads the plugin unchanged.
@@ -64,8 +63,8 @@ def available() -> bool:
     if mod is None and not _LOGGED_UNAVAILABLE:
         _LOGGED_UNAVAILABLE = True
         logger.info(
-            "minir host bridge unavailable: install the series in host-patches/ to enable "
-            "mid-turn steer and turn continuation"
+            "minir host bridge unavailable: this host has no hermes_cli.plugin_runtime; "
+            "mid-turn steer and turn continuation stay on the ledger channels"
         )
     return mod is not None
 

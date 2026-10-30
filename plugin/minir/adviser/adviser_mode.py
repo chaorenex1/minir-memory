@@ -153,13 +153,13 @@ _DEFAULTS: dict[str, Any] = {
     "strict_max_ms": 30000,         # strict still has a hard cap: llm_request is synchronous
     "notify_gateway": True,         # gateway turns: send preserved advice to the chat
     # End-of-turn advice that asks for no action goes to a card at the end of the turn
-    # (host `plugin_runtime.preserve`) instead of waiting for the next user message. Needs
-    # host-patches/0010; an unpatched host keeps the ledger channel.
+    # (host `plugin_runtime.preserve`) instead of waiting for the next user message. A host
+    # without that call keeps the ledger channel.
     "preserve": True,
     # On exit, give a queued/running review a bounded chance to finish before the session
     # state is dropped. 0 disables the wait; `sync_backlog: strict` uses strict_max_ms.
     "shutdown_wait_ms": 5000,
-    # -- host control bridge (requires plugin/minir/host-patches/) --------------
+    # -- host control bridge (hermes_cli.plugin_runtime) ------------------------
     # Steer the live turn through `hermes_cli.plugin_runtime` instead of waiting for the
     # next request. Off or an unpatched host keeps the llm_request path in charge.
     "host_steer": True,

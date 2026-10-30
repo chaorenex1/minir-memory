@@ -49,8 +49,7 @@ include = ["minir*"]
 minir = ["plugin.yaml", "prompts/*.md", "prompts/adviser/*.md", "agents/*.md",
          "templates/*.md", "rules/*.md", "skills/*/SKILL.md",
          "skills/*/agents/*.md", "skills/*/references/*.md",
-         "skills/*/references/*.yaml",
-         "host-patches/*.patch", "host-patches/manifest.json"]
+         "skills/*/references/*.yaml"]
 
 [tool.setuptools.exclude-package-data]
 minir = ["__pycache__/*", "*.py[cod]"]

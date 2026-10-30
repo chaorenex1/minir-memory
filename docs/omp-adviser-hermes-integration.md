@@ -1,8 +1,8 @@
 # omp adviser 机制与 Hermes 接入设计
 
-- 状态：design + implementation（§1–§8 为设计与插件侧实现；§9 记录补齐 steer/续跑的宿主补丁系列与安装器）
+- 状态：design + implementation（§1–§8 为设计与插件侧实现；§9 记录补齐 steer/续跑的宿主改动。2026-10-30：原 `host-patches/` 系列 23 条改动已全部进宿主提交 `eb3c31cc72`，系列、安装器与状态文件退役；§9 里的补丁编号与安装器描述是历史记录，现行机制是宿主自己的 `hermes_cli/plugin_runtime`，capability `plugin_runtime_v3`）
 - omp 基线：本机 `omp/18.12.2`（`C:\Users\zarag\AppData\Local\Tern\omp\bin\omp.exe`）；行号与文件引用取自上游 `can1357/oh-my-pi` 的 `packages/coding-agent/src/`，关键常量已在本机二进制里逐条核对
-- Hermes 基线：本机安装 `C:\Users\zarag\AppData\Local\hermes\hermes-agent`（v0.22.5，`bf0203a794`；补丁系列从 v0.22.2 重基到该版本，见 §9.4/§9.7）
+- Hermes 基线：本机安装 `C:\Users\zarag\AppData\Local\hermes\hermes-agent`（当时 v0.22.5，`bf0203a794`；这些改动现落在 `v0.22.6-3-geb3c31cc72`，见 §9.4）
 - 本文回答一件事：omp 的 adviser 如何工作，哪些部分能落到 Hermes 的 hook / middleware / memory-provider 三个缝上，落不上的用什么替代，以及为"完整 adviser"新增的最小宿主面
 
 ## 0. 结论
@@ -12,7 +12,7 @@
 3. "blocker 立刻改变行为"保留 `pre_tool_call` block（执行前拦截，block 文案作为该次工具结果返回给模型），并新增 steer：模型在下一次尝试前就能看到理由，不必先撞一次被拒绝的工具。steer 不中止已经执行的工具，只在下一个安全边界生效。
 4. "终局回答后自动续跑"原来只有半个通道（`pre_verify` 仅对改过文件的收尾生效）。补丁 0002 新增独立的 plugin stop gate：任意文本收尾都能续跑，预算 `agent.max_plugin_continuations`（默认 2），不占用编码验证的 `max_verify_nudges`。
 5. adviser 应继续挂在 minir（memory provider）里，而不是做成纯 hook 插件：hook 无法注册工具、无法声明配置、无法进入 `hermes memory setup`；minir 已经拥有 ledger、后台 worker、`llm_request` 投递、`auxiliary.adviser` 路由和 `adviser_only` 策略。
-6. 宿主补丁以 `git format-patch` 系列随插件发布，`scripts/install.py` 在安装时自动应用、验证、记录状态并支持回滚；宿主升级后重跑安装器即可。细节与验证见 §9。
+6. 宿主面不再以补丁系列分发：23 条改动已进宿主提交 `eb3c31cc72`（2026-10-30），插件只探测 `hermes_cli.plugin_runtime` 的 capability，缺失时退回 ledger 通道。细节见 §9，退役决定见 §9.4。
 
 ## 1. omp 的 adviser 是什么
 
@@ -326,12 +326,14 @@ memory.minir.adviser_mode:
 | adviser 成本统计入口 | `agent/auxiliary_hooks.py`（`post_auxiliary_call` + usage summary） |
 | minir 现有投递 | `plugin/minir/adviser_mode.py:798-863`、`:879-905` |
 | 宿主已有 steer/redirect（未暴露给插件） | `agent/interrupt_control.py:267-341`；`agent/turn_iteration_prep.py:175-181` |
-| 插件控制桥与 stop gate | `hermes_cli/plugin_runtime.py`；`agent/turn_stop_gates.py`（patch 0001/0002） |
-| 安装器与状态 | `scripts/install_host_patches.py`；`$HERMES_HOME/minir-memory/host-patches.json` |
+| 插件控制桥与 stop gate | `hermes_cli/plugin_runtime.py`（`CAPABILITY_VERSION`）；`agent/turn_stop_gates.py`（宿主原生） |
+| 控制面能力探测 | `hermes_cli/plugin_runtime.CAPABILITY_VERSION`；插件侧 `plugin/minir/runtime/host_bridge.py:capability()` |
 
 ## 9. Host 补丁：完整 adviser（已落地）
 
 §1–§8 描述的是"只用插件缝"能到达的上限。完整 adviser 缺的三件事都在宿主里：没有 agent 句柄就 steer 不了正在跑的回合，插件发不起新回合的续跑，插件的续跑请求也没有落点。这一节记录补齐它们的最小宿主改动、打包方式、安装/回滚路径和验证证据。
+
+> 2026-10-30 退役：下面这些改动已全部作为宿主代码提交（`eb3c31cc72`）。`plugin/minir/host-patches/`、`scripts/install_host_patches.py`、`$HERMES_HOME/minir-memory/host-patches.json` 已删除；正文里的 `patch NNNN` 是历史编号，对应能力现在读宿主文件本身。
 
 ### 9.1 新增的宿主面
 
@@ -379,45 +381,20 @@ memory.minir.adviser_mode:
 
 竞态处理：host 调用前先 `stage_advisories` 预占，防止 `llm_request` 同时把同一批建议注入；host 接受后标 `injected`，拒绝则 `reset_staged` 放回。若该回合已经出了终局回答（`_terminal` 有值），`_deliver_host` 直接返回，不做 continuation：stop gate 已经跑过，强塞只会和"回合结束"竞态；这些行留给 gateway notify 或下一回合的 aside。continuation 的 token 记在 `_host_tokens`，下一回合 `on_pre_llm_call` 调 `_reconcile_host_delivery`：`taken` 结束，其余状态把行退回 `pending`（新 `store.release_advisories`），避免"标了 injected 但没人看过"。
 
-### 9.4 打包、安装、回滚
+### 9.4 打包与安装（已退役）
 
-宿主补丁不能靠插件加载时 monkeypatch（代码已 import、进程不会重载）。它们以 `git format-patch` 系列存放：
+宿主补丁不能靠插件加载时 monkeypatch（代码已 import、进程不会重载），所以它们最初以 `git format-patch` 系列随插件发布：`plugin/minir/host-patches/` 放 23 个 patch 与 `manifest.json`，`scripts/install_host_patches.py` 负责 apply/check/revert，状态写 `$HERMES_HOME/minir-memory/host-patches.json`。安装器先 `git apply --check`，冲突或本地改动覆盖到同一文件就退出码 2 且不写任何文件；应用前把涉及文件复制到 `host-patches-backup/<timestamp>/`，应用后 `compileall` + 用宿主解释器 import 两个模块，失败逆序回滚。
 
-```
-plugin/minir/host-patches/
-  manifest.json     series/capability/base_version/base_commit + 每个 patch 的 sha256
-  0001-...patch     plugin_runtime + run_conversation 绑定 + 单测
-  0002-...patch     stop gate + 每回合预算 + 单测
-  0003-...patch     Desktop 的 adviser transcript card + hydration/等价性 + 单测
-  0004-...patch     history/compaction 把 adviser row 当"user-shaped but not human"处理
-  0005-...patch     plugin interrupt、post-turn trigger、协作式 session flags
-  0006-...patch     message.adviser 实时事件 + gateway/Desktop/TUI 消费
-  0007-...patch     TUI adviser 卡（severity、hydrate）
-  0008-...patch     classic CLI 的 adviser 块
-  0009-...patch     web session inspector 的 adviser 标签
-  0010-...patch     preserve writer：回合末尾追加卡片并 flush 进 session DB
-  0011-...patch     web inspector 按 severity 着色 + turns-ago
-  0012-...patch     adviser trigger 回合标 display_kind；adviser steer 不计用户介入
-  0013-...patch     web 原生聊天 transcript（gateway WS + adviser 卡 + 工具/审批）
-  0014-...patch     每条 adviser 建议按自身 severity 着色（Desktop/TUI/classic CLI/web）
-  0015-...patch     classic CLI 的 verbose 工具进程：完成的工具行下打印 result 正文；all/new/off 为折叠，`/verbose <mode>` 直接指定
-  0016-...patch     工具步骤的思考打印在它发起的工具行之上；思考不再出现在最终回答之后
-scripts/install.py              复制插件 → 应用系列 → 验证
-scripts/install_host_patches.py 应用/检查/回滚（可单独运行）
-```
+2026-10-30 这套机制退役，因为要维护的部分已经变成宿主代码：23 条改动全部提交进 `hermes-agent`（`eb3c31cc72`，"port oh-my-pi adviser as a native turn reviewer"）。退役后：
 
-安装器行为：
+- `plugin/minir/host-patches/`、`scripts/install_host_patches.py`、`tests/test_install_host_patches.py` 从仓库删除；`scripts/install.py` 只做目录镜像（备份旧副本、删掉新构建不再发布的文件），不碰宿主检出。
+- 安装器状态文件与 `host-patches-backup/` 不再被读写，它们记录的是退役前那次应用。
+- 版本判定改为运行期探测：插件读 `hermes_cli.plugin_runtime.CAPABILITY_VERSION`，没有该模块就退回 ledger 通道（`plugin/minir/runtime/host_bridge.py`）。
+- §9.7 里与安装器、状态文件相关的两行是退役前的记录，命令本身已不可用。
 
-- 先 `git apply --check`，再 `git apply`；只查/写 patch 涉及的文件，宿主上无关的本地改动不受影响。
-- 冲突、本地改动覆盖到同一文件、manifest 校验和不符 → 退出码 2，不写任何文件。
-- 应用前把涉及文件复制到 `$HERMES_HOME/minir-memory/host-patches-backup/<timestamp>/`；应用后 `compileall` + 用宿主解释器 import `hermes_cli.plugin_runtime` 与 `agent.turn_stop_gates`，失败自动逆序回滚。
-- 状态写 `$HERMES_HOME/minir-memory/host-patches.json`；重复运行按"已应用"跳过（幂等）。记录里的 `host_head` 与当前 HEAD 不一致时，"反向能打上"不再算证据：宿主升级只撤掉已跟踪文件的改动、留下补丁新建的文件，末位补丁仍能反向匹配而前面全部丢失，安装器会打印原因并逐条重查，冲突时不写任何文件。
-- 系列按前缀判定"已应用"：后一个 patch 可以修改前一个新建的文件，所以不能拿每个 patch 的反向检查独立判断；`--check` 只对第一个未应用 patch 做独立检查，其余标 "after predecessors"。
-- `--check` 只报告；`--revert` 逆序撤销并验证模块消失；宿主升级后 `git apply --check` 失败时，安装器报告系列期望的基线版本，不做 `reset`/`stash`。
+保留的历史事实（退役时核对过）：系列按前缀判定"已应用"（后一个 patch 可以改前一个新建的文件）；宿主升级只撤已跟踪文件的改动、留下补丁新建的文件，所以升级后"反向能打上"不算证据；`--check` 只对第一个未应用 patch 做独立检查，其余标 "after predecessors"。退役时按"效果在位"复核：23 个 patch 里 22 个的加行逐字在宿主树里，0017 的那一行改由 `hermes_cli/gateway_agent.py` 直接调 `_sync_show_reasoning()` 实现。
 
-自动应用的边界：Hermes 的 `hermes plugins install` 没有 post-install hook，所以"安装时自动应用"落在仓库的 `scripts/install.py`（一条命令完成复制+打补丁）。宿主升级会覆盖补丁，重跑安装器即可；状态文件保留，已补的 patch 会被识别。
-
-### 9.4.1 UI 补丁（0003）
+### 9.4.1 UI 落地（0003，现为宿主代码）
 
 Desktop 的 transcript 水合把 `display_kind="adviser"` 当作 machine notice 处理：
 
@@ -523,9 +500,9 @@ reviewer 固定只读：`agent_loop` 在运行前移除 `write_file`/`patch` 以
 | Adviser 历史/roster | `pytest tests/test_adviser_history.py tests/test_agent_loop.py tests/test_transcript.py` | 全绿（历史落盘、usage、WATCHDOG 合并、per-entry cadence、reasoning、strict 配置） |
 | 宿主升级 → 重基（v0.22.2 → v0.22.5 `bf0203a794`） | 干净 v0.22.5 worktree 上逐条 `git apply --3way` | 7 个冲突文件，落在 0001（steer 缓冲）、0002（turn_context/turn_stop_gates 锚点）、0006（生成的 openrpc）、0007（TUI import）、0008（会话初始化）、0012（steer 干预标记 + 测试） |
 | 重基后系列等价 | `git add -A && git write-tree`（干净 v0.22.5 worktree） | 重新生成的 14 个 patch 重放得到 `fe1e80d13c…`，与重基树一致（0015 在这次重基之后新增） |
-| 装到 live host | `python scripts/install_host_patches.py` | apply 14 → `verified: plugin_runtime_v2`、状态 14 行、`host_head=bf0203a794`；0015 单独应用后状态 15 行，`--check` 逐条 "already applied" |
+| 装到 live host（退役前记录） | `python scripts/install_host_patches.py`（已删） | apply 14 → `verified: plugin_runtime_v2`、状态 14 行、`host_head=bf0203a794`；0015 单独应用后状态 15 行，`--check` 逐条 "already applied" |
 | 安装后宿主单测 | `pytest tests/agent/test_plugin_runtime.py tests/agent/test_plugin_continuation_gate.py tests/agent/test_steer.py tests/hermes_cli/test_adviser_items.py tests/tui_gateway/test_adviser_row_callback.py tests/tui_gateway/test_adviser_trigger_row.py tests/tui_gateway/contracts/test_generated.py` | 66 passed，1 failed（`home_io_guard` 误报，基线 worktree 上同样失败） |
-| 安装器陈旧状态回归 | `python -m pytest tests/test_install_host_patches.py` | 8 passed（新增用例：升级只留下补丁新建的文件时不再报"已应用"） |
+| 安装器陈旧状态回归（退役前记录） | `python -m pytest tests/test_install_host_patches.py`（已删） | 8 passed（新增用例：升级只留下补丁新建的文件时不再报"已应用"） |
 
 ### 9.8 reviewer 自身：常驻 runtime（已实现）
 

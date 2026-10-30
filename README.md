@@ -37,19 +37,19 @@ cannot call the adviser as a tool. Unlike the dialectic layer the adviser never 
 base cards or revisions. It is controlled by configuration only
 (`memory.minir.adviser_mode.enabled`; there is no `/adviser` command).
 
-The adviser has two delivery tiers. Without host changes it uses `llm_request`, the
-turn-boundary aside, `pre_tool_call` and `pre_verify`. With the **host patch series** in
-`plugin/minir/host-patches/` installed it also steers the live turn (a queued
-`agent.steer(kind="adviser")` through `hermes_cli.plugin_runtime`), **interrupts the current
-tool batch for blocker advice** (`agent.interrupt`; tools that poll stop, tools that never
-poll are abandoned), can keep a finished turn open for one more answer (the plugin stop gate, budget
-`agent.max_plugin_continuations`), and can hand the surface one fresh turn after a terminal
-blocker (the existing `pending_steer` contract; bounded per session). The Desktop transcript
-draws its durable rows as an **adviser card** (severity, label, Markdown body) instead of a
-user bubble, **including a live `message.adviser` event while the turn runs**.
-`scripts/install.py` applies the patch series on install, verifies it, records it, and
-`--revert` takes it back off. On an unpatched host every bridge call is a no-op and the ledger
-channels remain in charge; the Desktop patch degrades to showing the self-describing text row.
+The adviser has two delivery tiers. The ledger tier uses `llm_request`, the turn-boundary
+aside, `pre_tool_call` and `pre_verify`. The control tier uses the host's own plugin control
+surface (`hermes_cli.plugin_runtime`, capability `plugin_runtime_v3`), which current Hermes
+checkouts ship: it steers the live turn (a queued `agent.steer(kind="adviser")`),
+**interrupts the current tool batch for blocker advice** (`agent.interrupt`; tools that poll
+stop, tools that never poll are abandoned), keeps a finished turn open for one more answer
+(the plugin stop gate, budget `agent.max_plugin_continuations`), and hands the surface one
+fresh turn after a terminal blocker (the `pending_steer` contract; bounded per session). The
+Desktop transcript draws durable rows as an **adviser card** (severity, label, Markdown body)
+instead of a user bubble, **including a live `message.adviser` event while the turn runs**.
+Nothing here installs that surface: the plugin probes `hermes_cli.plugin_runtime` at run time
+and, on a host without it, every bridge call is a no-op, the ledger channels remain in charge,
+and the Desktop shows the self-describing text row.
 
 A plan-mode publisher can call `plugin_runtime.set_flag(session, "plan_mode", True)`; the adviser
 also mirrors the `plan_mode` tool's `on/off/submit/status` results when that plugin is installed.
@@ -125,13 +125,11 @@ plugin/minir/          the deployable plugin directory (copy this to plugins/min
   adviser.py           auxiliary routes: task registration (adviser + three layer routes) + host session search
   adviser_prompts.py   adviser prompt loader: prompts/adviser sections + rule bodies
   adviser_mode.py      the only advice producer: event ring, review, guard, delivery channels
-  host_bridge.py       optional bridge to hermes_cli.plugin_runtime (steer / continuation)
-  host-patches/        git patch series for the host control surface + manifest.json
+  host_bridge.py       bridge to hermes_cli.plugin_runtime (steer / continuation)
   session_search.py    read-only multi-shape search over the host's session store (state.db)
   prompts/adviser/     the adviser prompt sections read at run time
 tests/                 pytest suite: contract, store, transcript, provider, counting, worker, engine
-scripts/install.py               copy the plugin + apply/verify the host patch series
-scripts/install_host_patches.py  apply/check/revert the series on a hermes-agent checkout
+scripts/install.py               mirror the plugin directories into HERMES_HOME
 scripts/verify_against_host.py   end-to-end check against the real Hermes install
 ```
 
@@ -1251,45 +1249,31 @@ provider name** and point `memory.provider` at it:
 # Windows (git-bash); use $HERMES_HOME on Linux/macOS
 git clone <your-fork-url> ~/src/minir-memory
 cd ~/src/minir-memory
-python scripts/install.py --check   # report: plugin target + patch status, change nothing
-python scripts/install.py           # copy the plugin, apply + verify the host series
+python scripts/install.py --check   # report: plugin targets, change nothing
+python scripts/install.py           # mirror both plugin directories into $HERMES_HOME
 ```
 
-`scripts/install.py` is the one-command install. It mirrors `plugin/minir` into
-`$HERMES_HOME/plugins/minir` (backing up the previous copy under
-`$HERMES_HOME/minir-memory/plugin-backup/`), then applies `plugin/minir/host-patches/` to
-`$HERMES_HOME/hermes-agent` with `git apply`. The series adds the plugin control bridge
-(`hermes_cli/plugin_runtime.py`), the stop-gate continuation channel, the live `message.adviser`
-event with a labelled adviser block on every host surface (Desktop card, TUI card that the web
-chat inherits over its PTY, classic CLI block, web session-inspector row), and the
-history/compaction guards that keep an adviser row from being treated as a human turn, plus the
-CLI's verbose tool transcript (`display.tool_progress: verbose` prints each finished call's
-result body under its row; `all`/`new`/`off` are the fold and `/verbose <mode>` pins one);
-without it the adviser falls back to the ledger channels (see the adviser section).
+`scripts/install.py` is the one-command install. It mirrors `plugin/minir` and
+`plugin/minir-adviser` into `$HERMES_HOME/plugins/` (backing up the previous copies under
+`$HERMES_HOME/minir-memory/plugin-backup/`) and deletes files a newer build no longer ships. It
+does not touch the host checkout: the control surface the adviser steers through
+(`hermes_cli/plugin_runtime.py`, capability `plugin_runtime_v3`), the stop-gate continuation
+channel, the live `message.adviser` event with a labelled adviser block on every host surface
+(Desktop card, TUI card that the web chat inherits over its PTY, classic CLI block, web
+session-inspector row), the history/compaction guards that keep an adviser row from being
+treated as a human turn, and the CLI's verbose tool transcript (`display.tool_progress: verbose`
+prints each finished call's result body under its row; `all`/`new`/`off` are the fold and
+`/verbose <mode>` pins one) are all part of the host itself.
 
-Patch 0020 adds `memory.minir.block_builtin_memory` (default `true`): while the plugin is in
+`memory.minir.block_builtin_memory` (default `true`) is a host key: while this provider is in
 use the host builds no built-in `MemoryStore`, so `MEMORY.md` and `USER.md` are neither loaded
 nor rendered into the system prompt. Set it to `false` to keep the built-in stores alongside the
 plugin. A host without a `memory.minir` block, or one whose `memory.provider` names a different
-provider, is unaffected. The key does nothing until the patch is installed.
+provider, is unaffected.
 
-The installer is idempotent, refuses to apply over overlapping local edits, verifies the patched
-host by importing both Python modules, and rolls back if verification fails. Its record lives in
-`$HERMES_HOME/minir-memory/host-patches.json`; `--revert` undoes the series in reverse order.
-
-```bash
-python scripts/install_host_patches.py --check     # patch status only
-python scripts/install_host_patches.py --revert    # undo what this install applied
-python scripts/install_host_patches.py --drop NAME # forget one name; the checkout is untouched
-python scripts/install.py --no-copy                # plugin installed by hermes; patch only
-```
-
-Hermes has no post-install hook, so the patch step belongs to this script rather than
-`hermes plugins install`; re-run it after a host update (the update overwrites patched files, the
-state file remembers what was applied). An update reverts only the tracked edits and leaves the
-files the series created behind, so when the recorded `host_head` no longer matches the checkout
-the installer re-checks every patch instead of trusting a reverse-apply match, and reports the
-first one that conflicts without writing anything.
+The install is idempotent and re-runs cleanly after a plugin update. A host update needs no
+follow-up step: the plugin probes the control surface at run time and falls back to the ledger
+channels on a host that does not have it (see the adviser section).
 
 `pip install .` is the alternative for the **memory provider**: the wheel ships
 `plugin/minir` as a top-level `minir` package and declares the `hermes_agent.memory_providers`
@@ -1322,7 +1306,7 @@ memory:
     knowledge_idle_hours: 24      # quiet hours after session end before that run (0 = next tick)
     adviser_mode:
       enabled: false              # the optional main adviser
-      host_steer: true            # use the host control bridge when the patch series is installed
+      host_steer: true            # steer the live turn through hermes_cli.plugin_runtime
       host_continue: true         # let a finished turn be kept open for advice
       watchdog_roster: true       # merge advisors[] from the nearest WATCHDOG.yml
       roster: []                  # [{name, model?, instructions?, toolsets?, cadence?, review_mode?}]
@@ -1387,10 +1371,9 @@ python scripts/verify_against_host.py
 hermes plugins validate plugin/minir
 hermes plugins doctor plugin/minir
 
-# 5. host patch series: installer logic is covered without a host; the series itself is
-#    verified against the real checkout by the installer's post-apply probe
-python -m pytest tests/test_install_host_patches.py -q
-python scripts/install_host_patches.py --check
+# 5. the host control surface the adviser steers through; run it inside the hermes-agent
+#    checkout with the host's own interpreter, expect plugin_runtime_v3
+python -c "from hermes_cli import plugin_runtime as m; print(m.CAPABILITY_VERSION)"
 ```
 
 `tests/conftest.py` reports which mode it ran in (`contract mode = host|partial|shim`).

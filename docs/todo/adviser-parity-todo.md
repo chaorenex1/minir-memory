@@ -3,13 +3,15 @@
 来源：`docs/draft/adviser-parity-draft.md`（论证、决定与实测都在那里；本文件只是它的可执行映射）。
 每个目标两级：**目标**（带草稿出处）→ **实现步骤 / 检查列表 / 关联文件**。没有检查通过不算完成。
 基线：`main` `50831ae`；核对在 `63c4b25`。参照：`docs/omp-adviser-hermes-integration.md`、`docs/draft/adviser-runtime-persistent-draft.md`。
-约定：`[ ]` 未开始、`[~]` 进行中、`[x]` 完成、`[x] ~~…~~` 取消或作废；补丁不应用时，插件侧行为必须退回今天。
+约定：`[ ]` 未开始、`[~]` 进行中、`[x]` 完成、`[x] ~~…~~` 取消或作废；宿主控制面缺失时，插件侧行为必须退回 ledger 通道。
+
+2026-10-30：补丁系列已退役——23 条改动全部进宿主提交 `eb3c31cc72`，`plugin/minir/host-patches/`、`scripts/install_host_patches.py`、`tests/test_install_host_patches.py` 已删除。下文提到补丁文件、安装器或 `host-patches.json` 的行都是历史记录。
 
 源码位置写法（只写文件名与相对路径，不写家目录、用户名或绝对路径；行号按当前检出，代码优先于行号）：
 
-- 本仓库：`adviser_mode.py`、`adviser_guard.py` 在 `plugin/minir/adviser/`；提示词在 `plugin/minir/prompts/adviser/`；补丁在 `plugin/minir/host-patches/`；安装器在 `scripts/install_host_patches.py`；测试在 `tests/`。
+- 本仓库：`adviser_mode.py`、`adviser_guard.py` 在 `plugin/minir/adviser/`；提示词在 `plugin/minir/prompts/adviser/`；控制面探测在 `plugin/minir/runtime/host_bridge.py`；测试在 `tests/`。
 - omp：`advise-tool.ts`/`runtime.ts` 等在 `hermes-omp-ui/vendor/oh-my-pi/packages/coding-agent/src/advisor/`；`session-*.ts` 在 `…/src/session/`；`agent-loop.ts` 在 `packages/agent/src/`。
-- 宿主：已安装的 hermes-agent 检出（`agent/…`、`run_agent.py`、`config.yaml`）；`host-patches.json` 是宿主的补丁安装状态。
+- 宿主：已安装的 hermes-agent 检出（`agent/…`、`run_agent.py`、`config.yaml`）；控制面是 `hermes_cli/plugin_runtime.py`（capability 见其 `CAPABILITY_VERSION`）。
 
 状态（2026-10-29，第二批已落）：T1–T4、T7.2、T8、T9 的代码与测试已落；T5.4 已在 live host 撤消 0022（T5.5 的 live 回归未跑）；T6.3 口径已定。T7.3、T5.5 与全部账本类验收（p50、`prompt_tokens`、注入率、误打断率、逃生口使用率）要真实流量。补丁 0021 / 0023 / 0024 已装入 live host（`plugin_runtime_v3`），系列 23 个补丁 `--check` 全 `already applied`。2026-10-30 修 T3.3：`prompt_tokens` / `cache_read_tokens` 是 stamp 之后才追加进 `_ADDED_COLUMNS` 的，`_SCHEMA_VERSION` 没跟着从 9 抬，旧库 `version >= _SCHEMA_VERSION` 提前 return，补列从未执行，`finish_adviser_review` 每次 `no such column` 被 `_finish_safe` 吞掉，23:53 起的 review 全卡在 `running`；版本已提到 10，补了 v9 旧库补列回归测试，live 库已迁到 10，迁后 4 条 review 正常收尾。同一批加了 `observe_children`（默认 false）：子 agent（含 b3/b4 层内 pass）不再进观察范围，之前 30 次 review / 678,597 prompt tokens 全打在 pass run 上、零建议；prompt 位于 `plugins/minir/agents` 的 pass core 即使 `observe_children: true` 也不进观察范围。
 基线（草稿 §11.3）：2,596 条 review，p50 6,652 ms、p90 38,783 ms；1 次调用 82.6%；回合内注入 15.6%；静默 76.2%；失败 3.9%（non-JSON 58）。账本类验收（p50、`prompt_tokens` 中位、注入率、误打断率）要真实流量，列为上线后复核，不代表未实现。

@@ -27,6 +27,8 @@
 
 不重开：五通道投递、EmissionGuard、常驻 runtime、claims/forks、turns_ago/deferred、roster、暂停、宿主补丁 0001/0005/0006/0010 的语义。
 
+2026-10-30：补丁系列退役——23 条改动全部进宿主提交 `eb3c31cc72`；`plugin/minir/host-patches/`、`scripts/install_host_patches.py`、`tests/test_install_host_patches.py` 已删除。下文 §4 的补丁条目、§7 的落地顺序里凡以补丁文件为交付物的步骤都是历史记录；宿主能力以 `hermes_cli/plugin_runtime`（`plugin_runtime_v3`）为准。
+
 ---
 
 ## 1. 同构的定义：六个控制点，不是"行为接近"
